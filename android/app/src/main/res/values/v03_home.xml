@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="v03_home_search">搜索会话</string>
+    <string name="v03_home_hide_search">收起搜索</string>
+    <string name="v03_home_choose_project">选择项目</string>
+    <string name="v03_home_computer">尚未连接电脑</string>
+    <string name="v03_home_loading">正在处理…</string>
+    <string name="v03_home_cached">电脑离线，显示已缓存的会话</string>
+    <string name="v03_home_sync_error">操作未完成，可刷新会话</string>
+    <string name="v03_home_retry">刷新</string>
+</resources>

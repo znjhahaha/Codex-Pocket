@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="v04_transcript_loading">正在读取会话…</string>
+    <string name="v04_transcript_refreshing">正在更新此会话，已有内容仍可阅读</string>
+    <string name="v04_transcript_failed">暂时无法读取此会话，请重试。</string>
+    <string name="v04_transcript_retry">重新读取</string>
+    <string name="v04_transcript_cwd">目录：%1$s</string>
+    <!-- Codex desktop style: one gray sentence per step, verbs in past tense once finished. -->
+    <string name="v04_trace_ran">已运行</string>
+    <string name="v04_trace_ran_in">已在 %1$s 内运行</string>
+    <string name="v04_trace_running">正在运行</string>
+    <string name="v04_trace_edited">已编辑</string>
+    <string name="v04_trace_editing">正在编辑</string>
+    <string name="v04_trace_called">已调用</string>
+    <string name="v04_trace_calling">正在调用</string>
+    <string name="v04_trace_searched">已搜索网页</string>
+    <string name="v04_trace_opened">已打开网页</string>
+    <string name="v04_trace_found">已在网页中查找</string>
+    <string name="v04_trace_viewed_image">已查看图像</string>
+    <string name="v04_trace_generated_image">已生成图像</string>
+    <string name="v04_trace_thought">已思考</string>
+    <string name="v04_trace_thinking">正在思考</string>
+    <string name="v04_trace_sum_commands">运行了 %1$d 条命令</string>
+    <string name="v04_trace_sum_files">编辑了 %1$d 个文件</string>
+    <string name="v04_trace_sum_tools">调用了 %1$d 个工具</string>
+    <string name="v04_trace_sum_agents">协作了 %1$d 次</string>
+    <string name="v04_trace_sum_web">搜索了网页</string>
+    <string name="v04_trace_sum_images">查看了 %1$d 张图像</string>
+    <string name="v04_trace_sum_failed">%1$d 项失败</string>
+    <string name="v04_trace_more">还有 %1$d 项</string>
+    <!-- Codex's parsed shell actions: exploration lines rather than commands. -->
+    <string name="v05_trace_read">已读取</string>
+    <string name="v05_trace_reading">正在读取</string>
+    <string name="v05_trace_skill">已读取%1$s 技能</string>
+    <string name="v05_trace_skill_loading">正在读取%1$s 技能</string>
+    <string name="v05_trace_searched">已搜索</string>
+    <string name="v05_trace_searching">正在搜索</string>
+    <string name="v05_trace_listed">已列出</string>
+    <string name="v05_trace_listing">正在列出</string>
+    <string name="v05_trace_in">（%1$s）</string>
+    <string name="v05_trace_sum_reads">已读取 %1$d 个文件</string>
+    <string name="v05_home_count">%1$d 个</string>
+    <string name="v05_trace_sum_searches">已搜索 %1$d 次</string>
+    <string name="v05_trace_sum_lists">已列出 %1$d 个目录</string>
+    <string name="v05_trace_sum_skills">加载了 %1$d 个技能</string>
+    <string name="v05_trace_sum_web">已搜索网页</string>
+    <string name="v04_saved_on_desktop">在电脑上</string>
+    <string name="v04_attached_file">附件</string>
+    <string name="v04_desktop_images">%1$d 张图片</string>
+    <string name="v04_attachments">%1$d 个附件</string>
+</resources>

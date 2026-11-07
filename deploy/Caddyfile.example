@@ -1,0 +1,5 @@
+# Insert this handler inside the existing HTTPS site; do not replace its other handlers.
+# With a QR relayUrl of wss://YOUR_EXISTING_HOST/pocket, strip the /pocket prefix.
+handle_path /pocket/* {
+    reverse_proxy 127.0.0.1:18080
+}

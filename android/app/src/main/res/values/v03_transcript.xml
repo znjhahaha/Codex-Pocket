@@ -1,0 +1,34 @@
+<resources>
+    <string name="v03_expanded">已展开</string>
+    <string name="v03_collapsed">已收起</string>
+    <string name="v03_trace">工作记录</string>
+    <string name="v03_trace_commands">%1$d 条命令</string>
+    <string name="v03_trace_files">%1$d 项文件变更</string>
+    <string name="v03_trace_tools">%1$d 次工具调用</string>
+    <string name="v03_trace_agents">%1$d 次协作</string>
+    <string name="v03_trace_failed">%1$d 项失败</string>
+    <string name="v03_activity_agents">子代理</string>
+    <string name="v03_activity_web">网页操作</string>
+    <string name="v03_activity_result">工具结果</string>
+    <string name="v03_activity_image">图像</string>
+    <string name="v03_exit_code">退出码 %1$d</string>
+    <string name="v03_file_unknown">文件路径未提供</string>
+    <string name="v03_diff_source">差异 / 源文件</string>
+    <string name="v03_more_files">另有 %1$d 项文件变更</string>
+    <string name="v03_more_agents">另有 %1$d 个子代理</string>
+    <string name="v03_output_waiting">等待输出</string>
+    <string name="v03_output_unavailable">未提供可显示的文本结果</string>
+    <string name="v03_output_truncated">输出较长，这里只显示一部分</string>
+    <string name="v03_web_search">搜索网页</string>
+    <string name="v03_web_open">打开网页</string>
+    <string name="v03_web_find">在网页中查找</string>
+    <string name="v03_agent_spawn">启动子代理</string>
+    <string name="v03_agent_message">向子代理发送消息</string>
+    <string name="v03_agent_resume">继续子代理</string>
+    <string name="v03_agent_wait">等待子代理</string>
+    <string name="v03_agent_close">关闭子代理</string>
+    <string name="v03_agent_interrupt">中断子代理</string>
+    <string name="v03_agent_followup">跟进子代理任务</string>
+    <string name="v03_agent_list">查看子代理</string>
+    <string name="v03_agent_complete">子代理已完成</string>
+</resources>

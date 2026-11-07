@@ -1,0 +1,35 @@
+services:
+  pocket-relay:
+    build:
+      context: ..
+      dockerfile: deploy/relay.Dockerfile
+    image: pocket-relay:0.1.0
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.50
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - type: bind
+        source: ./relay.json
+        target: /run/pocket/relay.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [pocket-private]
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+networks:
+  pocket-private:
+    internal: true

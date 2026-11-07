@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+import net from 'node:net';
+import {createInterface} from 'node:readline';
+const descriptor=JSON.parse(fs.readFileSync(process.argv[2]));
+const request=JSON.parse(fs.readFileSync(process.argv[3]));
+const socket=net.connect(descriptor.port,'127.0.0.1');
+const send=v=>socket.write(JSON.stringify(v)+'\n');
+send({token:descriptor.token});send({id:'probe',...request});
+const timer=setTimeout(()=>{socket.destroy();console.error('RPC timeout');process.exitCode=1},15000);
+createInterface({input:socket}).on('line',s=>{const v=JSON.parse(s);if(v.id==='probe'){clearTimeout(timer);fs.writeFileSync(process.argv[4],JSON.stringify(v,null,2));console.log(v.error?'native error':'response saved');socket.destroy();}});

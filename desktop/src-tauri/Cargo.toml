@@ -1,0 +1,27 @@
+[package]
+name = "pocket-desktop"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+pocket-desktop-runtime = { path = "../runtime" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "pocket-desktop"
+path = "src/main.rs"

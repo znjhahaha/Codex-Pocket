@@ -1,0 +1,16 @@
+**
+!Cargo.toml
+!Cargo.lock
+!crates
+!crates/**
+!deploy
+!deploy/relay.Dockerfile
+**/target
+**/target/**
+**/*.log
+**/worker-*.md
+**/task-*.md
+**/*output.txt
+**/review-*.md
+**/Cargo.lock
+!Cargo.lock

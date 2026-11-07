@@ -1,0 +1,130 @@
+use anyhow::{bail,Context,Result};
+use serde::{Serialize,Deserialize};
+use std::{fs::{self,File,OpenOptions},io::Write,path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
+use fs2::FileExt;
+
+pub fn now()->u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+pub fn plain(path:&Path)->Result<()> {
+    if !path.is_absolute() { bail!("An absolute path is required") }
+    if path.components().any(|c|matches!(c,std::path::Component::ParentDir)) { bail!("Parent traversal is refused") }
+    #[cfg(windows)] {
+        use std::path::{Component,Prefix};
+        if !matches!(path.components().next(),Some(Component::Prefix(p)) if matches!(p.kind(),Prefix::Disk(_))) { bail!("Only ordinary local drive paths are allowed") }
+        if path.to_string_lossy().chars().skip(2).any(|c|c==':') { bail!("Alternate data streams are refused") }
+    }
+    for ancestor in path.ancestors() {
+        if let Ok(m)=fs::symlink_metadata(ancestor) {
+            #[cfg(windows)] { use std::os::windows::fs::MetadataExt; if m.file_attributes() & 0x400 != 0 {bail!("Reparse paths are refused")} }
+            if m.file_type().is_symlink(){bail!("Symlink paths are refused")}
+        }
+    }
+    Ok(())
+}
+#[derive(Debug)]
+pub struct RedirectedPath;
+impl std::fmt::Display for RedirectedPath { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"State path is redirected by the launching process")} }
+impl std::error::Error for RedirectedPath {}
+
+/// Validate the actual handle, since MSIX can redirect a file but not its parent.
+pub fn unredirected(path:&Path)->Result<()> {
+    plain(path)?;
+    #[cfg(windows)] unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{Foundation::*,Storage::FileSystem::*};
+        let mut existing=path;
+        while !existing.try_exists()? { existing=existing.parent().context("No existing ancestor")?; }
+        let name:Vec<u16>=existing.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle=CreateFileW(name.as_ptr(),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,std::ptr::null(),OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,std::ptr::null_mut());
+        if handle==INVALID_HANDLE_VALUE{return Err(std::io::Error::last_os_error().into())}
+        let mut buffer=vec![0u16;32768];
+        let count=GetFinalPathNameByHandleW(handle,buffer.as_mut_ptr(),buffer.len() as u32,0);
+        let error=std::io::Error::last_os_error();CloseHandle(handle);
+        if count==0{return Err(error.into())}
+        if count as usize>=buffer.len(){bail!("Physical path exceeds limit")}
+        let physical=String::from_utf16_lossy(&buffer[..count as usize]);
+        let physical=physical.strip_prefix(r"\\?\").unwrap_or(&physical);
+        let expected=existing.to_string_lossy().replace('/',"\\");
+        if !physical.eq_ignore_ascii_case(&expected){return Err(RedirectedPath.into())}
+    }
+    Ok(())
+}
+pub fn local_app_data()->Result<PathBuf>{
+    #[cfg(windows)] unsafe {
+        use windows_sys::Win32::{UI::Shell::{SHGetKnownFolderPath,FOLDERID_LocalAppData},System::Com::CoTaskMemFree};
+        let mut raw=std::ptr::null_mut();
+        // KF_FLAG_NO_PACKAGE_REDIRECTION: do not follow MSIX LocalCache virtualization.
+        let hr=SHGetKnownFolderPath(&FOLDERID_LocalAppData,0x00010000,std::ptr::null_mut(),&mut raw);
+        if hr<0 {bail!("Cannot resolve canonical LocalAppData")}
+        let mut len=0;while *raw.add(len)!=0{len+=1;}
+        let s=String::from_utf16_lossy(std::slice::from_raw_parts(raw,len));
+        CoTaskMemFree(raw as _);let p=PathBuf::from(s);plain(&p)?;Ok(p)
+    }
+    #[cfg(not(windows))] { Ok(std::env::temp_dir()) }
+}
+pub fn powershell()->PathBuf { PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||"C:\\Windows".into())).join("System32/WindowsPowerShell/v1.0/powershell.exe") }
+pub fn private_dir(path:&Path)->Result<()> {
+    unredirected(path)?;fs::create_dir_all(path)?;unredirected(path)?;
+    #[cfg(windows)] private_windows_directory(path)?;
+    Ok(())
+}
+pub fn atomic<T:Serialize>(path:&Path,value:&T)->Result<()> {
+    unredirected(path)?;let parent=path.parent().context("No parent directory")?;
+    let mut f=tempfile::NamedTempFile::new_in(parent)?;
+    unredirected(f.path())?;
+    f.write_all(&serde_json::to_vec_pretty(value)?)?;f.as_file().sync_all()?;
+    // Windows readers may briefly omit FILE_SHARE_DELETE. Retain the temp file
+    // and retry replacement without truncating the current complete snapshot.
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+    loop {
+        match f.persist(path) {
+            Ok(_)=>return Ok(()),
+            Err(error)=>{
+                let transient=cfg!(windows)&&matches!(error.error.raw_os_error(),Some(5|32|33));
+                if !transient||std::time::Instant::now()>=deadline{return Err(error.error.into())}
+                f=error.file;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                unredirected(path)?;
+            }
+        }
+    }
+}
+pub fn read<T:serde::de::DeserializeOwned>(path:&Path)->Result<T>{unredirected(path)?;let m=fs::metadata(path)?;if m.len()>1024*1024{bail!("State file exceeds limit")};Ok(serde_json::from_slice(&fs::read(path)?)?)}
+pub struct Lock(File);
+impl Lock {pub fn acquire(path:&Path)->Result<Self>{plain(path)?;let f=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;f.try_lock_exclusive().context("Another instance already owns this state or user")?;Ok(Self(f))}}
+impl Drop for Lock {fn drop(&mut self){let _=FileExt::unlock(&self.0);}}
+#[derive(Serialize,Deserialize,Clone,Debug,Default)]
+#[serde(rename_all="camelCase")]
+pub struct Desired{pub enabled:bool, pub changed_at:u64}
+pub fn control(state:&Path)->PathBuf{state.join("desktop")}
+pub fn desired(state:&Path)->bool{read::<Desired>(&control(state).join("desired.json")).map(|d|d.enabled).unwrap_or(false)}
+pub fn set_desired(state:&Path,enabled:bool)->Result<()>{let p=control(state);private_dir(&p)?;atomic(&p.join("desired.json"),&Desired{enabled,changed_at:now()})}
+
+#[cfg(windows)]
+fn private_windows_directory(path:&Path)->Result<()> {
+    use std::{os::windows::ffi::OsStrExt,ptr::null_mut};
+    use windows_sys::Win32::{Foundation::*,Security::{Authorization::*,*},System::Threading::*};
+    struct Handle(HANDLE);impl Drop for Handle{fn drop(&mut self){unsafe{CloseHandle(self.0);}}}
+    struct Descriptor(PSECURITY_DESCRIPTOR);impl Drop for Descriptor{fn drop(&mut self){unsafe{LocalFree(self.0);}}}
+    unsafe {
+        let mut token=null_mut();if OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&mut token)==0{return Err(std::io::Error::last_os_error().into())}
+        let token=Handle(token);let mut size=0;GetTokenInformation(token.0,TokenUser,null_mut(),0,&mut size);
+        let mut data=vec![0usize;(size as usize).div_ceil(std::mem::size_of::<usize>())];
+        if GetTokenInformation(token.0,TokenUser,data.as_mut_ptr().cast(),size,&mut size)==0{return Err(std::io::Error::last_os_error().into())}
+        let sid=(*(data.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+        let name:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner=null_mut();let mut old=null_mut();
+        let result=GetNamedSecurityInfoW(name.as_ptr(),SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION,&mut owner,null_mut(),null_mut(),null_mut(),&mut old);
+        if result!=0{return Err(std::io::Error::from_raw_os_error(result as i32).into())}
+        let _old=Descriptor(old);if EqualSid(owner,sid)==0{bail!("Unexpected control directory owner")}
+        let mut raw=null_mut();if ConvertSidToStringSidW(sid,&mut raw)==0{return Err(std::io::Error::last_os_error().into())}
+        let mut len=0;while *raw.add(len)!=0{len+=1;}
+        let sid_text=String::from_utf16_lossy(std::slice::from_raw_parts(raw,len));LocalFree(raw.cast());
+        let sddl:Vec<u16>=format!("D:P(A;OICI;FA;;;{sid_text})").encode_utf16().chain(Some(0)).collect();
+        let mut descriptor=null_mut();if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(),SDDL_REVISION_1,&mut descriptor,null_mut())==0{return Err(std::io::Error::last_os_error().into())}
+        let descriptor=Descriptor(descriptor);let(mut present,mut defaulted)=(0,0);let mut dacl=null_mut();
+        if GetSecurityDescriptorDacl(descriptor.0,&mut present,&mut dacl,&mut defaulted)==0{return Err(std::io::Error::last_os_error().into())}
+        let result=SetNamedSecurityInfoW(name.as_ptr(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,null_mut(),null_mut(),dacl,null_mut());
+        if result!=0{return Err(std::io::Error::from_raw_os_error(result as i32).into())}
+    }
+    Ok(())
+}

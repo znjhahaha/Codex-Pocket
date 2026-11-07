@@ -1,0 +1,30 @@
+[package]
+name = "pocket-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+pocket-tunnel = { path = "../tunnel" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tempfile = "3"
+

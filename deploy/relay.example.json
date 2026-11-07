@@ -1,0 +1,11 @@
+{
+  "bind": "0.0.0.0:8080",
+  "queue_capacity": 8,
+  "rooms": [
+    {
+      "id": "REPLACE_ROOM_ID",
+      "helper_token_sha256": "REPLACE_WITH_SHA256_HEX_OF_HELPER_TOKEN",
+      "phone_token_sha256": "REPLACE_WITH_SHA256_HEX_OF_PHONE_TOKEN"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="delivery_preview_image">预览 %1$s</string>
+    <string name="delivery_close_preview">关闭图片预览</string>
+    <string name="delivery_image_unavailable">图片暂不可用</string>
+    <string name="delivery_native_queue">原生队列</string>
+    <string name="delivery_queue_count">待执行 · %1$d 条</string>
+    <string name="delivery_queue_attachment">包含附件或其他原生输入</string>
+    <string name="delivery_queue_changed">电脑上的队列已更新</string>
+    <string name="delivery_queue_unavailable">当前事件未提供队列内容，请在电脑上查看和调整。</string>
+    <string name="delivery_plan_progress">已完成 %1$d / %2$d 项</string>
+    <string name="delivery_native_shape_unknown">暂不支持此原生内容的结构化展示，可展开完整详情查看。</string>
+    <string name="delivery_changed_files">变更文件 · %1$d</string>
+    <string name="delivery_back_files">返回文件列表</string>
+    <string name="delivery_unnamed_file">未提供文件名</string>
+    <string name="delivery_diff_counts">新增 %1$d 行 · 删除 %2$d 行</string>
+    <string name="delivery_diff_empty">原生记录未提供文本差异，可能是二进制文件或仅有文件元数据。</string>
+    <string name="delivery_file_added">新增</string>
+    <string name="delivery_file_deleted">删除</string>
+    <string name="delivery_file_modified">修改</string>
+    <string name="delivery_file_renamed">重命名</string>
+    <string name="delivery_history_exhausted">已显示全部历史</string>
+    <string name="delivery_history_loading">正在加载更早消息…</string>
+    <string name="delivery_stopping">正在请求停止</string>
+    <string name="delivery_not_loaded">未加载</string>
+    <string name="delivery_inspect_history">核对原生历史</string>
+    <string name="delivery_finish_inspection">完成核对</string>
+    <string name="delivery_inspection_ready">历史已刷新。请检查上方记录及电脑上的执行结果，再确认完成核对。</string>
+    <string name="delivery_resolve_title">确认已核对执行结果</string>
+    <string name="delivery_resolve_explainer">未找到记录不代表操作未执行。确认后将保存人工核对结果并解除发送限制，不会重发这些操作。请先检查保留的草稿，避免重复发送已经执行的内容。</string>
+    <string name="delivery_history_checked">我已核对原生历史和执行结果</string>
+    <string name="delivery_confirm_resolution">记录核对结果</string>
+    <string name="delivery_watch_connected">已连接 · 正在关注任务进展</string>
+    <string name="delivery_watch_no_runtime">电脑已连接 · 暂无在线运行时</string>
+    <string name="delivery_watch_connecting">正在连接电脑</string>
+    <string name="delivery_watch_reconnecting">正在重新连接电脑</string>
+    <string name="delivery_watch_offline">连接已断开 · 等待恢复连接</string>
+    <string name="delivery_watch_unpaired">尚未配对电脑</string>
+</resources>
