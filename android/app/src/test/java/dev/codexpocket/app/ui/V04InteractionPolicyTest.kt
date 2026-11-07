@@ -26,7 +26,8 @@ class V04InteractionPolicyTest {
         assertEquals(94f, bounds.top, .01f)
         assertEquals(button.right, bounds.right, .01f)
         assertEquals(272f, bounds.width, .01f)
-        assertEquals(viewport.bottom, bounds.bottom, .01f)
+        assertEquals(viewport.height * .65f, bounds.height, .01f)
+        assertTrue(bounds.bottom <= viewport.bottom)
     }
 
     @Test fun largeFontOrShortViewportNeverPlacesMenuUnderInput() {
@@ -54,6 +55,7 @@ class V04InteractionPolicyTest {
         assertTrue(nativeComposerControlsEnabled(s, "thread/settings/update"))
         listOf(s.copy(paired = false), s.copy(online = false), s.copy(busy = true),
             s.copy(timeline = NativeTimeline(activeTurn = "turn")), s.copy(selected = s.selected!!.copy(conflict = true)),
+            s.copy(runtimes = listOf(runtime.copy(online = false))),
             s.copy(runtimes = listOf(runtime.copy(capabilities = emptySet())))).forEach {
             assertFalse(nativeComposerControlsEnabled(it, "collaborationMode/list"))
             assertFalse(nativeComposerControlsEnabled(it, "thread/settings/update"))

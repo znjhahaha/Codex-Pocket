@@ -29,7 +29,7 @@ class LiveStatusTest {
         assertEquals(LiveStatus.Thinking, ConversationPresentation.liveStatus(timeline("t", user)))
         assertEquals(LiveStatus.Thinking, ConversationPresentation.liveStatus(timeline("t", user, TimelineItem("t", "r", "reasoning", "", complete = false))))
         assertEquals(LiveStatus.Working, ConversationPresentation.liveStatus(timeline("t", user, TimelineItem("t", "c", "commandExecution", "ls", complete = false))))
-        assertEquals(LiveStatus.Compacting, ConversationPresentation.liveStatus(timeline("t", user, TimelineItem("t", "k", "contextCompaction", complete = false))))
+        assertEquals(LiveStatus.Compacting, ConversationPresentation.liveStatus(timeline("t", user, TimelineItem("t", "k", "contextCompaction", complete = false, liveStarted = true))))
     }
 
     @Test fun elapsedReadsLikeCodex() {
@@ -39,12 +39,12 @@ class LiveStatusTest {
         assertEquals("0:00", elapsedLabel(-1))
     }
 
-    @Test fun onlyNativeSummaryFromTheCurrentThinkingItemIsExposed() {
+    @Test fun onlyNativeSummaryFromTheActiveTurnIsExposedWhileToolsRun() {
         val summary = TimelineItem("t", "r", "reasoning", "**Checking layout**\n\nReviewing the constraints.")
         assertEquals(summary, ConversationPresentation.liveReasoning(timeline("t", summary)))
         assertNull(ConversationPresentation.liveReasoning(timeline(null, summary)))
         assertNull(ConversationPresentation.liveReasoning(timeline("other", summary)))
         assertNull(ConversationPresentation.liveReasoning(timeline("t", summary.copy(text = ""))))
-        assertNull(ConversationPresentation.liveReasoning(timeline("t", summary, TimelineItem("t", "c", "commandExecution", "check"))))
+        assertEquals(summary, ConversationPresentation.liveReasoning(timeline("t", summary, TimelineItem("t", "c", "commandExecution", "check"))))
     }
 }

@@ -44,17 +44,27 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 
 @Composable
-internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> Unit, onDetail: (TimelineItem) -> Unit, onReferences: () -> Unit, onReadingHistory: (Boolean) -> Unit = {}, header: @Composable () -> Unit = {}) {
+internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> Unit, onDetail: (TimelineItem) -> Unit, onReferences: () -> Unit, onReadingHistory: (Boolean) -> Unit = {}, onAgent: (String) -> Unit = {}, onComposerAction: (ComposerAction) -> Unit = {}, header: @Composable () -> Unit = {}) {
     val context = LocalContext.current
     val chat = s.selected ?: return
     key(chat.key.encoded) {
-        val rows = remember(s.timeline.items, s.timeline.completedTurns) { ConversationPresentation.rows(s.timeline) }
+        var composerFocusRequest by remember { mutableIntStateOf(0) }
+        val proposedPlan = remember(s.timeline, s.resolvedPlans) { PlanPresentation.latest(s.timeline)?.takeUnless { it.revision in s.resolvedPlans } }
+        val expansions = remember(s.draft?.expansions) { runCatching { pocketJson.parseToJsonElement(s.draft?.expansions ?: "[]").jsonArray.map { it.jsonPrimitive.content }.toSet() }.getOrDefault(emptySet()) }
+        val blockedTurns = remember(s.approvals, s.timeline.activeTurn) { s.approvals.filter { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId }.mapNotNull { it.params.string("turnId").takeIf(String::isNotBlank) ?: s.timeline.activeTurn }.toSet() }
+        val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns)
         val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty())
         val live = s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
         val reasoning = remember(s.timeline) { ConversationPresentation.liveReasoning(s.timeline) }
+        val agents = remember(s.timeline, s.agentStatuses, chat.key) { s.currentAgents() }
+        LaunchedEffect(chat.key, s.online, agents.map { it.threadId }) {
+            if (s.online) repo.refreshAgentNames().join()
+        }
+        val agentNames = remember(s.agentChats, chat.key) { s.agentChats.filter { it.key.computerId == chat.key.computerId && it.key.configStoreId == chat.key.configStoreId }
+            .associate { it.key.nativeId to it.title } }
         // Keep observation time above the lazy item: scrolling the footer away must not reset it.
-        val observedAt = rememberSaveable(live?.first) { android.os.SystemClock.elapsedRealtime() }
-        val keys = remember(rows, live != null) { listOf("history-control") + rows.map { it.key } + listOfNotNull("live-status".takeIf { live != null }) + "timeline-end" }
+        val timing = live?.first?.let { s.timeline.turns[it] }
+        val keys = remember(rows, live != null) { listOf("history-control") + rows.map { it.key } + listOfNotNull("live-status".takeIf { live != null }) + listOf("agent-working", "timeline-end") }
         var anchorKey by rememberSaveable { mutableStateOf(s.draft?.scrollItemKey) }
         var anchorOffset by rememberSaveable { mutableIntStateOf(s.draft?.scrollOffset ?: 0) }
         val list = rememberLazyListState(TranscriptAnchor(anchorKey).resolve(keys, s.draft?.scrollIndex ?: 0), anchorOffset)
@@ -67,6 +77,29 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val scope = rememberCoroutineScope()
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { repo.attach(it) }
         var attachmentSheet by rememberSaveable { mutableStateOf(false) }
+        var permissionPanel by remember { mutableStateOf(false) }
+        var permissionAnchor by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+        var trigger by remember { mutableStateOf<ComposerTrigger?>(null) }
+        LaunchedEffect(trigger?.kind, trigger?.query, s.online, chat.runtimeId) {
+            if (trigger != null && s.online && s.supports("references/list")) {
+                kotlinx.coroutines.delay(180)
+                repo.loadReferences(trigger!!.query).join()
+            }
+        }
+        val suggestionActions = buildSet {
+            if (s.online && s.supports("model/list")) add(ComposerAction.Models)
+            if (s.online && s.supports("collaborationMode/list") && s.modes.any { it.mode == "plan" }) add(ComposerAction.Plan)
+            if (canMutate(s, "thread/goal/set")) add(ComposerAction.Goal)
+            if (canMutate(s, "thread/name/set")) add(ComposerAction.Rename)
+            if (canMutate(s, "thread/compact/start")) add(ComposerAction.Compact)
+            if (s.online && s.supports("references/list")) add(ComposerAction.Files)
+        }
+        val queryMatches = s.advanced.referencesQuery == trigger?.query
+        val suggestions = ComposerSuggestionsState(trigger = trigger, online = s.online,
+            loading = trigger != null && s.supports("references/list") && (!queryMatches || s.advanced.referencesLoading),
+            data = if (queryMatches) s.advanced.references else emptyList(),
+            error = if (queryMatches) s.advanced.referencesError else null,
+            unsupported = s.advanced.referencesUnsupported, actions = suggestionActions)
         var capture by rememberSaveable { mutableStateOf<String?>(null) }
         val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
             val uri = capture?.let(android.net.Uri::parse)
@@ -74,7 +107,6 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             else if (uri != null) runCatching { context.contentResolver.delete(uri, null, null) }
             capture = null
         }
-        val expansions = remember(s.draft?.expansions) { runCatching { pocketJson.parseToJsonElement(s.draft?.expansions ?: "[]").jsonArray.map { it.jsonPrimitive.content }.toSet() }.getOrDefault(emptySet()) }
         val pending = s.approvals.filter { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method) }
         val background = MaterialTheme.colorScheme.background
         val transcriptBackdrop = rememberLayerBackdrop { drawRect(background); drawContent() }
@@ -116,8 +148,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             if (rows.isNotEmpty()) {
                 if (!following && !list.isScrollInProgress && (!restoredAnchor || anchorKey !in keys)) {
                     val fallback = if (!restoredAnchor) s.draft?.scrollIndex ?: 0 else list.firstVisibleItemIndex
-                    list.scrollToItem(TranscriptAnchor(resolved).resolve(keys, fallback), anchorOffset)
+                    // A collapsed process header has a different height than its former child.
+                    val restoredOffset = if (resolved == anchorKey) anchorOffset else 0
+                    list.scrollToItem(TranscriptAnchor(resolved).resolve(keys, fallback), restoredOffset)
                     anchorKey = resolved
+                    anchorOffset = restoredOffset
                 }
                 restoredAnchor = true
             }
@@ -130,7 +165,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         }
         Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))) {
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                val transcriptInset = maxOf(22.dp, (maxWidth - 720.dp) / 2)
+                val transcriptInset = maxOf(28.dp, (maxWidth - 720.dp) / 2)
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
                 LazyColumn(state = list, modifier = Modifier.fillMaxSize().layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item(key = "history-control") {
@@ -151,16 +186,13 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                                 // No one-tap fork under answers: it silently moved the chat to a new desktop thread.
                                 // Branch/side chat stay in the "…" menu, where the choice is explicit.
                                 {}, false,
-                                onPlan = if (canMutate(s, "turn/start") && s.timeline.activeTurn == null) { edit ->
-                                    val mode = if (edit) "plan" else "default"
-                                    if (s.supports("collaborationMode/list") && s.modes.any { it.mode == mode }) repo.chooseMode(mode)
-                                    repo.editDraft(listOf(s.draft?.text.orEmpty(), context.getString(if (edit) R.string.v02_plan_edit_draft else R.string.v02_plan_continue_draft)).filter(String::isNotBlank).joinToString("\n\n"))
-                                } else null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion)
+                                onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline)
                         }
                     }
                     if (live != null) item(key = "live-status", contentType = "live-status") {
-                        LiveTurnStatus(live.first, live.second, reasoning = reasoning, observedAtMillis = observedAt)
+                        LiveTurnStatus(live.first, live.second, reasoning = reasoning, timing = timing)
                     }
+                    item(key = "agent-working", contentType = "agent-working") { NativeAgentWorkingStrip(agents, onOpen = { repo.showAgentReader() }) }
                     item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
                 }
                 if (read.empty) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
@@ -168,16 +200,15 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                         EmptyState(stringResource(R.string.what_working), stringResource(R.string.continue_chat))
                     }
                 }
-            // Edge fades: text dissolves into the page before it reaches the header or composer,
-            // instead of running underneath them. Drawn outside the backdrop layer, so glass is unaffected.
-            val pageColor = MaterialTheme.colorScheme.background
-            Box(Modifier.align(Alignment.TopCenter).fillMaxWidth().height(topInset + 12.dp)
-                .background(androidx.compose.ui.graphics.Brush.verticalGradient(0f to pageColor, .55f to pageColor.copy(alpha = .86f), 1f to pageColor.copy(alpha = 0f))))
-            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(bottomInset + 18.dp)
-                .background(androidx.compose.ui.graphics.Brush.verticalGradient(0f to pageColor.copy(alpha = 0f), .3f to pageColor.copy(alpha = .9f), 1f to pageColor)))
+                if (rows.size > 2) ConversationMinimap(rows, keys, list,
+                    Modifier.align(Alignment.CenterStart).padding(top = topInset + 8.dp, bottom = bottomInset + 8.dp),
+                    backdrop = transcriptBackdrop, onSeek = { following = false })
             CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
                 header()
+                AgentRosterChip(agents, s.online, s.busy, onAgent,
+                    Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp, vertical = 2.dp),
+                    names = agentNames, onShow = repo::showAgentReader)
                 Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth().padding(horizontal = 16.dp)) {
                     ConversationReadStatus(read.copy(skeleton = false), s.conversationLoadError, onRetry = { repo.reloadConversation() })
                 }
@@ -207,26 +238,14 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             }
             FlowRow(Modifier.weight(1f),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (pending.isNotEmpty() || s.advanced.asyncQuestions.isNotEmpty()) {
-                var showAttention by rememberSaveable { mutableStateOf(false) }
-                PocketGlassSurface(onClick = { showAttention = true }, modifier = Modifier.widthIn(max = 240.dp), shape = PocketOval) {
-                    Row(Modifier.heightIn(min = 48.dp).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        Icon(PocketIcons.PendingActions, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.secondary)
-                        Text(stringResource(R.string.v02_attention) + " · " + (pending.size + s.advanced.asyncQuestions.size), Modifier.weight(1f, fill = false),
-                            style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Icon(PocketIcons.ChevronRight, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-                if (showAttention) PocketSheet(stringResource(R.string.v02_attention), { showAttention = false }, "此会话需要你确认的事项") {
-                androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxWidth().padding(horizontal = 16.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-                    if (!s.approvalsFresh) item { Text("待重新同步 · 连接电脑后确认是否仍需审批", Modifier.padding(16.dp)) }
-                    items(pending, key = { it.key }) { ApprovalCard(it, s.online && s.approvalsFresh && !s.busy && s.activeRuntime?.online == true, repo::respond) }
-                    items(s.advanced.asyncQuestions, key = { it.string("id") }) { AsyncQuestionForm(it, s, repo::answerAsync) }
-                }
-                }
             }
             }
-            }
+            QuestionDock(s, repo::respond, { repo.answerAsyncBatch(it) },
+                Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+            if (proposedPlan != null && !readingHistory) PlanConfirmation(proposedPlan, PlanPresentation.unavailable(s, proposedPlan),
+                onImplement = { repo.implementPlan(proposedPlan) }, onModify = {
+                    if (repo.beginPlanFeedback(proposedPlan)) composerFocusRequest++
+                }, modifier = Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
             // Queued messages: inline rows directly above the input, never a separate screen.
             androidx.compose.animation.AnimatedVisibility(s.nativeQueue.isNotEmpty(), Modifier.align(Alignment.CenterHorizontally),
                 enter = fadeIn(tween(pocketMotionMillis(160))) + androidx.compose.animation.expandVertically(tween(pocketMotionMillis(200)), expandFrom = Alignment.Bottom),
@@ -234,19 +253,36 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 NativeQueue(s, { id, text -> repo.queueEdit(id, text) }, { repo.queueDelete(it) }, { id, before -> repo.queueMove(id, before) },
                     onSteer = { repo.queueSteer(it) }, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp).widthIn(max = 720.dp))
             }
-            PocketComposer(s.draft?.text.orEmpty(), s.currentModel?.name?.takeIf(String::isNotBlank) ?: s.model ?: stringResource(R.string.native_default),
-                listOfNotNull((s.effort ?: s.currentModel?.defaultEffort?.takeIf(String::isNotBlank))?.let(context::effortLabel), s.mode?.let { context.modeLabel(it, it) }).joinToString(" · "),
+            PocketComposer(s.draft?.text.orEmpty(), s.modelSelectionLabel,
+                listOfNotNull(s.effort?.let(context::effortLabel), s.mode?.takeUnless { it == "default" }?.let { context.modeLabel(it, it) }).filter(String::isNotBlank).joinToString(" · "),
                 s.timeline.activeTurn != null, composerAvailability(s), repo::editDraft, onModels,
                 { attachmentSheet = true }, onReferences,
                 { repo.send() }, { repo.send(steer = true) }, { repo.stop() }, s.online && s.supports("references/list"),
+                attachmentCount = s.attachments.size,
+                onPermissions = { permissionPanel = true; repo.refreshPermissions() }, permissionsExpanded = permissionPanel,
+                permissionLabel = s.permissions.label,
+                onPermissionAnchor = { permissionAnchor = it },
+                suggestions = suggestions, onQuery = { trigger = it }, onReference = repo::insertReferenceAt,
+                onSelectAction = { action ->
+                    when (action) {
+                        ComposerAction.Models -> onModels()
+                        ComposerAction.Plan -> repo.chooseMode(if (s.mode == "plan") "default" else "plan")
+                        ComposerAction.Files -> onReferences()
+                        else -> onComposerAction(action)
+                    }
+                },
                 attachments = {
                     if (s.attachments.isNotEmpty()) AttachmentStrip(s.attachments, repo::attachmentFile, repo::removeAttachment)
                     if (s.advanced.uploadProgress.values.any { it < 1f }) PocketProgressStatus("正在上传附件", Modifier.padding(vertical = 4.dp))
-                }, readingHistory = readingHistory, transcriptScrolling = list.isScrollInProgress)
+                }, readingHistory = readingHistory, transcriptScrolling = list.isScrollInProgress, focusRequest = composerFocusRequest,
+                referenceSpans = remember(s.draft?.text, s.draft?.references) { restoreReferenceDraft(s.draft?.text.orEmpty(), s.draft?.references ?: "[]").spans },
+                onTextEdit = { before, after, edit -> repo.editDraft(before, after, edit, s.selected?.key) })
             }
             }
             }
         }
+        if (permissionPanel) PermissionPanel(s.permissions, s.online, s.timeline.activeTurn != null,
+            onDismiss = { permissionPanel = false }, onRefresh = { repo.refreshPermissions() }, onSelect = { repo.choosePermission(it) }, anchor = permissionAnchor)
         if (attachmentSheet) AttachmentActionSheet(s.currentModel?.images == true, onDismiss = { attachmentSheet = false }, onCamera = {
             attachmentSheet = false
             runCatching { captureUri(context).also { capture = it.toString(); camera.launch(it) } }.onFailure { capture = null; repo.reportError(context.getString(R.string.v02_camera_unavailable)) }

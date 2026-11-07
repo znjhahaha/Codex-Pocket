@@ -15,13 +15,20 @@ class RoomConverters {
 }
 
 @Entity(tableName = "chats")
-data class ChatEntity(@PrimaryKey val key: ThreadKey, val runtimeId: String, val source: String, val title: String, val preview: String, val cwd: String, val updatedAt: Long, val status: String, val conflict: Boolean, val archived: Boolean = false, val pinned: Boolean = false)
+data class ChatEntity(@PrimaryKey val key: ThreadKey, val runtimeId: String, val source: String, val title: String, val preview: String, val cwd: String, val updatedAt: Long, val status: String, val conflict: Boolean, val archived: Boolean = false, val pinned: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val isSubagent: Boolean = false, val parentThreadId: String? = null, val relationSource: String? = null)
+
+@Entity(tableName = "context_usage")
+data class ContextEntity(@PrimaryKey val chatKey: ThreadKey, val snapshot: String)
 
 @Entity(tableName = "items", primaryKeys = ["chatKey", "itemKey"], indices = [Index("chatKey")])
 data class ItemEntity(val chatKey: ThreadKey, val itemKey: String, val turnId: String, val itemId: String, val type: String, val text: String, val status: String, val raw: JsonElement, val complete: Boolean, val ordinal: Long) {
     fun item() = TimelineItem(turnId, itemId, type, text, status, raw.asObject(), complete)
     companion object { fun from(chat: ThreadKey, i: TimelineItem, order: Long) = ItemEntity(chat, i.key, i.turnId, i.itemId, i.type, i.text, i.status, i.raw, i.complete, order) }
 }
+
+data class CachedItemHeader(val chatKey: ThreadKey, val itemKey: String, val turnId: String, val itemId: String,
+    val type: String, val status: String, val complete: Boolean, val ordinal: Long, val textLength: Int, val rawLength: Int)
 
 @Entity(tableName = "drafts")
 data class DraftEntity(@PrimaryKey val chatKey: ThreadKey, val text: String = "", val attachments: String = "[]", val scrollIndex: Int = 0, val scrollOffset: Int = 0, val expansions: String = "[]", val followEnd: Boolean = true,
@@ -38,12 +45,22 @@ data class CommandEntity(@PrimaryKey val id: String, val computerId: String, val
 
 @Dao
 interface PocketDao {
+    @Query("SELECT * FROM context_usage WHERE chatKey = :key") suspend fun contextUsage(key: ThreadKey): ContextEntity?
+    @Upsert suspend fun putContextUsage(value: ContextEntity)
+    @Query("UPDATE chats SET isSubagent = 1, parentThreadId = :parent, relationSource = :source WHERE `key` = :key")
+    suspend fun markSubagent(key: ThreadKey, parent: String, source: String)
     @Query("SELECT * FROM chats ORDER BY pinned DESC, updatedAt DESC") fun chats(): Flow<List<ChatEntity>>
     @Query("SELECT * FROM chats") suspend fun allChats(): List<ChatEntity>
     @Query("SELECT * FROM chats WHERE `key` = :key") suspend fun chat(key: ThreadKey): ChatEntity?
     @Upsert suspend fun putChat(chat: ChatEntity)
     @Upsert suspend fun putChats(chats: List<ChatEntity>)
     @Query("SELECT * FROM items WHERE chatKey = :key ORDER BY ordinal ASC") suspend fun items(key: ThreadKey): List<ItemEntity>
+    @Query("SELECT chatKey,itemKey,turnId,itemId,type,status,complete,ordinal,length(text) AS textLength,length(raw) AS rawLength FROM items WHERE chatKey = :key ORDER BY ordinal ASC")
+    suspend fun itemHeaders(key: ThreadKey): List<CachedItemHeader>
+    @Query("SELECT substr(text,:start,:count) FROM items WHERE chatKey = :key AND itemKey = :item")
+    suspend fun textChunk(key: ThreadKey, item: String, start: Int, count: Int): String?
+    @Query("SELECT substr(raw,:start,:count) FROM items WHERE chatKey = :key AND itemKey = :item")
+    suspend fun rawChunk(key: ThreadKey, item: String, start: Int, count: Int): String?
     @Upsert suspend fun putItems(items: List<ItemEntity>)
     @Query("DELETE FROM items WHERE chatKey = :key") suspend fun clearItems(key: ThreadKey)
     @Query("SELECT * FROM drafts WHERE chatKey = :key") suspend fun draft(key: ThreadKey): DraftEntity?
@@ -64,7 +81,7 @@ interface PocketDao {
     @Query("DELETE FROM drafts") suspend fun clearDrafts()
 }
 
-@Database(entities = [ChatEntity::class, ItemEntity::class, DraftEntity::class, CursorEntity::class, SnapshotEntity::class, CommandEntity::class], version = 2, exportSchema = true)
+@Database(entities = [ChatEntity::class, ContextEntity::class, ItemEntity::class, DraftEntity::class, CursorEntity::class, SnapshotEntity::class, CommandEntity::class], version = 3, exportSchema = true)
 @TypeConverters(RoomConverters::class)
 abstract class PocketDatabase : RoomDatabase() {
     abstract fun dao(): PocketDao
@@ -75,6 +92,14 @@ abstract class PocketDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE drafts ADD COLUMN `references` TEXT NOT NULL DEFAULT '[]'")
             }
         }
-        fun create(context: Context) = Room.databaseBuilder(context, PocketDatabase::class.java, "pocket.db").addMigrations(MIGRATION_1_2).build()
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chats ADD COLUMN isSubagent INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE chats ADD COLUMN parentThreadId TEXT")
+                db.execSQL("ALTER TABLE chats ADD COLUMN relationSource TEXT")
+                db.execSQL("CREATE TABLE IF NOT EXISTS context_usage (chatKey TEXT NOT NULL PRIMARY KEY, snapshot TEXT NOT NULL)")
+            }
+        }
+        fun create(context: Context) = Room.databaseBuilder(context, PocketDatabase::class.java, "pocket.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
     }
 }

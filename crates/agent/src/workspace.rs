@@ -88,13 +88,18 @@ impl Workspace {
     /// CODEX_HOME/generated_images). Only `image` may use these extra roots.
     pub fn with_image_roots(mut self, extra: Vec<PathBuf>) -> Self {
         for root in extra {
-            if lexical(&root.to_string_lossy()).is_err() || !root.is_absolute() || guard(&root).is_err() || !root.is_dir() {
+            if lexical(&root.to_string_lossy()).is_err()
+                || !root.is_absolute()
+                || guard(&root).is_err()
+                || !root.is_dir()
+            {
                 continue;
             }
-            if let Ok(root) = dunce::canonicalize(root) {
-                if !self.roots.contains(&root) && self.roots.len() < 32 {
-                    self.roots.push(root);
-                }
+            if let Ok(root) = dunce::canonicalize(root)
+                && !self.roots.contains(&root)
+                && self.roots.len() < 32
+            {
+                self.roots.push(root);
             }
         }
         self
@@ -105,7 +110,10 @@ impl Workspace {
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
-        if !matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")) {
+        if !matches!(
+            ext.as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+        ) {
             bail!("Not an image file");
         }
         let (path, _held) = self.resolve(Some(path))?;
@@ -130,8 +138,10 @@ impl Workspace {
         file.take(IMAGE_CHUNK as u64).read_to_end(&mut bytes)?;
         use base64::Engine;
         let end = offset + bytes.len() as u64;
-        Ok(json!({"path":path,"mime":mime,"size":size,"offset":offset,"eof":end >= size,
-            "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}))
+        Ok(
+            json!({"path":path,"mime":mime,"size":size,"offset":offset,"eof":end >= size,
+            "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}),
+        )
     }
     pub fn read(&self, path: &str) -> Result<Value> {
         let (path, _held) = self.resolve(Some(path))?;
@@ -177,7 +187,21 @@ fn image_mime(head: &[u8]) -> Option<&'static str> {
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
         [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
         [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
         [b'B', b'M', ..] => Some("image/bmp"),
         _ => None,
     }
@@ -304,17 +328,27 @@ mod tests {
         let plain = Workspace::new(vec![root.clone()]).unwrap();
         let shot = images.join("shot.png");
         assert!(plain.image(shot.to_str().unwrap(), 0).is_err());
-        let w = Workspace::new(vec![root]).unwrap().with_image_roots(vec![images.clone(), temp.path().join("missing")]);
+        let w = Workspace::new(vec![root])
+            .unwrap()
+            .with_image_roots(vec![images.clone(), temp.path().join("missing")]);
         let first = w.image(shot.to_str().unwrap(), 0).unwrap();
         assert_eq!(first["mime"], "image/png");
         assert_eq!(first["eof"], false);
         let next = w.image(shot.to_str().unwrap(), IMAGE_CHUNK as u64).unwrap();
         assert_eq!(next["eof"], true);
         use base64::Engine;
-        let tail = base64::engine::general_purpose::STANDARD.decode(next["data"].as_str().unwrap()).unwrap();
+        let tail = base64::engine::general_purpose::STANDARD
+            .decode(next["data"].as_str().unwrap())
+            .unwrap();
         assert_eq!(tail.len(), png.len() - IMAGE_CHUNK);
-        assert!(w.image(images.join("fake.png").to_str().unwrap(), 0).is_err());
-        assert!(w.image(images.join("note.txt").to_str().unwrap(), 0).is_err());
+        assert!(
+            w.image(images.join("fake.png").to_str().unwrap(), 0)
+                .is_err()
+        );
+        assert!(
+            w.image(images.join("note.txt").to_str().unwrap(), 0)
+                .is_err()
+        );
         assert!(w.image(shot.to_str().unwrap(), png.len() as u64).is_err());
     }
     #[test]

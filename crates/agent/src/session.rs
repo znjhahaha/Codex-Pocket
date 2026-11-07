@@ -59,13 +59,13 @@ where
 }
 async fn write_reply<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> Result<()> {
     match write_json(writer, value).await {
-        Ok(()) => {},
+        Ok(()) => {}
         Err(pocket_tunnel::Error::FrameLength) => {
             // The codec validates the whole frame before writing any bytes.
             // A read error must not close the authenticated session. Mutation
             // clients still reconcile because this code never proves rejection.
             write_json(writer, &json!({"id":value["id"],"error":{"code":"payload_too_large","message":"Response exceeds bounded preview size"}})).await?;
-        },
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())
@@ -86,17 +86,85 @@ mod tests {
     use crate::{auth, config::Config, storage};
     use tokio::io::AsyncWriteExt;
     #[tokio::test]
+    async fn quota_failure_keeps_authenticated_transport_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (b, _) = Broker::open(
+            Config::create("wss://example.org/pocket".into()).unwrap(),
+            temp.path().into(),
+        )
+        .unwrap();
+        storage::atomic_write(
+            &temp.path().join("pairing.json"),
+            &serde_json::to_vec(
+                &json!({"tokenHash":auth::hash("pair"),"expiresAt":storage::now()+60}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pair = b
+            .pair(&json!({"pairingToken":"pair","deviceId":"phone","deviceName":"Test"}))
+            .await
+            .unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(server, b));
+        let (mut r, mut w) = tokio::io::split(client);
+        for (id, method, params, success) in [
+            ("unauth", "quota/sources", json!({"runtimeId":"r"}), false),
+            (
+                "hello",
+                "hello",
+                json!({"protocol":1,"deviceId":"phone","deviceSecret":pair["deviceSecret"]}),
+                true,
+            ),
+            (
+                "invalid",
+                "quota/read",
+                json!({"runtimeId":"r","sourceId":uuid::Uuid::new_v4(),"url":"https://bad"}),
+                false,
+            ),
+            (
+                "missing",
+                "quota/sources",
+                json!({"runtimeId":"absent"}),
+                false,
+            ),
+            ("ping", "ping", json!({}), true),
+        ] {
+            write_json(&mut w, &json!({"id":id,"method":method,"params":params}))
+                .await
+                .unwrap();
+            let reply: Value = tokio::time::timeout(Duration::from_secs(2), read_json(&mut r))
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("transport must stay open");
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply.get("result").is_some(), success);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn oversized_history_returns_scoped_error_and_next_request_still_works() {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            let large = json!({"id":"history","result":{"text":"x".repeat(pocket_tunnel::MAX_JSON_FRAME)}});
+            let large =
+                json!({"id":"history","result":{"text":"x".repeat(pocket_tunnel::MAX_JSON_FRAME)}});
             write_reply(&mut writer, &large).await.unwrap();
-            write_reply(&mut writer, &json!({"id":"ping","result":{"ok":true}})).await.unwrap();
+            write_reply(&mut writer, &json!({"id":"ping","result":{"ok":true}}))
+                .await
+                .unwrap();
         });
-        let first: Value = pocket_tunnel::read_json(&mut reader).await.unwrap().unwrap();
+        let first: Value = pocket_tunnel::read_json(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first["id"], "history");
         assert_eq!(first["error"]["code"], "payload_too_large");
-        let next: Value = pocket_tunnel::read_json(&mut reader).await.unwrap().unwrap();
+        let next: Value = pocket_tunnel::read_json(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(next["id"], "ping");
         task.await.unwrap();
     }
@@ -206,22 +274,41 @@ mod tests {
         assert_eq!(hello["result"]["protocol"], 1);
         let delta = "x".repeat(200);
         for sequence in 0..(crate::broker::NOTIFICATION_CAPACITY * 2) {
-            b.notify_for_test(json!({"method":"codex/event","params":{"sequence":sequence,"delta":delta}}));
-            if sequence % 256 == 0 { tokio::task::yield_now().await; }
+            b.notify_for_test(
+                json!({"method":"codex/event","params":{"sequence":sequence,"delta":delta}}),
+            );
+            if sequence % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
-        let mut resync = false;
-        loop {
+        let resync = loop {
             let value: Value = tokio::time::timeout(Duration::from_secs(10), read_json(&mut r))
-                .await.expect("session stalled").unwrap().expect("session closed after event backlog");
-            if value["method"] == "pocket/resync" { resync = true; break; }
-        }
-        assert!(resync);
+                .await
+                .expect("session stalled")
+                .unwrap()
+                .expect("session closed after event backlog");
+            if value["method"] == "pocket/resync" {
+                break value;
+            }
+        };
+        assert_eq!(resync["params"]["reason"], "event_backlog");
         // The authenticated session remains usable after the backlog.
-        write_json(&mut w, &json!({"id":"l","method":"runtimes/list","params":{}})).await.unwrap();
+        write_json(
+            &mut w,
+            &json!({"id":"l","method":"runtimes/list","params":{}}),
+        )
+        .await
+        .unwrap();
         loop {
             let value: Value = tokio::time::timeout(Duration::from_secs(10), read_json(&mut r))
-                .await.unwrap().unwrap().expect("session closed");
-            if value["id"] == "l" { assert!(value.get("result").is_some(), "{value}"); break; }
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("session closed");
+            if value["id"] == "l" {
+                assert!(value.get("result").is_some(), "{value}");
+                break;
+            }
         }
         // Queued events may still be in flight when the pipe closes; either outcome is fine.
         drop(r);

@@ -1,78 +1,57 @@
 package dev.codexpocket.app.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import dev.codexpocket.app.R
-import dev.codexpocket.app.data.ActivityStatus
-import dev.codexpocket.app.data.NativeActivityPresentation
-import dev.codexpocket.app.data.TimelineItem
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import androidx.compose.ui.unit.sp
+import dev.codexpocket.app.data.*
 
+/** Native proposals and execution checklists are separate presentations. */
 @Composable
-internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded: Boolean, onExpand: () -> Unit, onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null) {
-    val plan by produceState<PresentedPlan?>(null, item.raw, item.type) { value = withContext(Dispatchers.Default) { nativePlan(item) } }
-    val queue = item.type == "thread/queue/changed"
-    val expansionState = stringResource(if (expanded) R.string.v03_expanded else R.string.v03_collapsed)
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        PocketGlassSurface(modifier = Modifier.widthIn(max = 560.dp).semantics { stateDescription = expansionState }, shape = PocketOval, onClick = onExpand) {
-            Row(Modifier.heightIn(min = 48.dp).padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(if (queue) PocketIcons.PendingActions else PocketIcons.Checklist, null, Modifier.size(16.dp))
-                Text(listOfNotNull(stringResource(if (queue) R.string.delivery_native_queue else R.string.plan), plan?.activeStep?.text).joinToString(" · "),
-                    Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                plan?.let { value ->
-                    Text(stringResource(R.string.delivery_plan_progress, value.completed, value.steps.size), Modifier.widthIn(max = 160.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                ActivityExpansionIcon(expanded)
-            }
+internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded: Boolean, onExpand: () -> Unit,
+    onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null) {
+    val plan = remember(item.raw, item.type) { nativePlan(item) }
+    val proposal = item.type == "plan"
+    var proposalOpen by androidx.compose.runtime.saveable.rememberSaveable(messageKey) { mutableStateOf(true) }
+    val open = if (proposal) proposalOpen else expanded
+    val c = MaterialTheme.colorScheme
+    Column(Modifier.fillMaxWidth().testTag(if (proposal) "proposed-plan" else "execution-plan")) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 32.dp)
+            .semantics { stateDescription = if (open) "已展开" else "已收起" }
+            .clickable { if (proposal) proposalOpen = !proposalOpen else onExpand() }
+            .padding(horizontal = 4.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Icon(PocketIcons.Checklist, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
+            Text(if (proposal) "计划" else plan?.activeStep?.text ?: "执行计划", Modifier.weight(1f, fill = false),
+                fontSize = 14.sp, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            plan?.let { Text("${it.completed}/${it.steps.size}", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
+            ActivityExpansionIcon(open)
         }
-        if (queue) Text(stringResource(R.string.delivery_queue_unavailable), Modifier.padding(horizontal = 14.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (expanded) {
-            Column(Modifier.padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                val value = plan
-                when {
-                    item.type == "plan" -> MarkdownText(item.text, messageKey)
-                    value != null -> {
-                        if (value.explanation.isNotBlank()) MarkdownText(value.explanation, "$messageKey/explanation")
-                        value.steps.forEach { step ->
-                            val status = NativeActivityPresentation.status(step.status)
-                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.Top) {
-                                Icon(when (status) {
-                                    ActivityStatus.Completed -> PocketIcons.CheckCircle
-                                    ActivityStatus.Running -> PocketIcons.PlayCircle
-                                    ActivityStatus.Failed -> PocketIcons.ErrorOutline
-                                    else -> PocketIcons.RadioButtonUnchecked
-                                }, null, Modifier.size(20.dp), tint = when (status) {
-                                    ActivityStatus.Running -> MaterialTheme.colorScheme.primary
-                                    ActivityStatus.Failed -> MaterialTheme.colorScheme.error
-                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                })
-                                Column(Modifier.weight(1f)) {
-                                    Text(step.text)
-                                    Text(activityStatusLabel(status), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-                        }
+        if (open) {
+            if (proposal) Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp)) { MarkdownText(item.text, messageKey) }
+            else if (plan != null) Column(Modifier.padding(start = 26.dp, bottom = 8.dp)) {
+                if (plan.explanation.isNotBlank()) MarkdownText(plan.explanation, "$messageKey/explanation")
+                plan.steps.forEach { step ->
+                    val status = NativeActivityPresentation.status(step.status)
+                    Row(Modifier.fillMaxWidth().heightIn(min = 32.dp).padding(vertical = 5.dp), verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(when (status) {
+                            ActivityStatus.Completed -> PocketIcons.Check
+                            ActivityStatus.Running -> PocketIcons.PlayCircle
+                            ActivityStatus.Failed -> PocketIcons.ErrorOutline
+                            else -> PocketIcons.RadioButtonUnchecked
+                        }, activityStatusLabel(status), Modifier.size(16.dp), tint = if (status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
+                        Text(step.text, fontSize = 14.sp, lineHeight = 20.sp, color = if (status == ActivityStatus.Completed) c.onSurfaceVariant else c.onSurface)
                     }
-                    !queue -> Text(stringResource(R.string.delivery_native_shape_unknown), style = MaterialTheme.typography.bodySmall)
                 }
-                PocketTextButton(onClick = onDetail, modifier = Modifier.align(Alignment.End).heightIn(min = 48.dp)) { Text(stringResource(R.string.full_details)) }
-            }
-        }
-        if (onPlan != null && !queue) {
-            // A column avoids clipping both actions at large accessibility font scales.
-            Column(Modifier.padding(horizontal = 8.dp)) {
-                PocketTextButton(onClick = { onPlan(false) }) { Text(stringResource(R.string.v02_plan_continue)) }
-                PocketTextButton(onClick = { onPlan(true) }) { Text(stringResource(R.string.v02_plan_edit)) }
             }
         }
     }

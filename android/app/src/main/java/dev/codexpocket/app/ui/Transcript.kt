@@ -35,10 +35,17 @@ import kotlinx.coroutines.delay
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit, onSideChat: (TimelineItem) -> Unit = {}, canFork: Boolean = false, onPlan: ((Boolean) -> Unit)? = null,
-    activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null) {
+    activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null) {
     val item = row.items.first()
     val clipboard = LocalClipboardManager.current
     when (row.kind) {
+        TranscriptKind.Process -> Column(Modifier.fillMaxWidth()) {
+            PocketTextButton(onClick = onExpand, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(row.processLabel ?: "查看过程", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val angle by androidx.compose.animation.core.animateFloatAsState(if (expanded) 180f else 0f, pocketPressSpring(), label = "process-chevron")
+                Icon(PocketIcons.ExpandMore, null, Modifier.padding(start = 5.dp).size(16.dp).graphicsLayer { rotationZ = angle }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
         TranscriptKind.User -> Column(Modifier.fillMaxWidth().padding(start = 48.dp), horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
             val message = remember(item.text) { UserMessageParsing.parse(item.text) }
@@ -55,7 +62,16 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             if (prose.isNotBlank() || hasImages) Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh,
                 modifier = Modifier.widthIn(max = 560.dp)) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
-                    if (prose.isNotBlank()) SelectionContainer { Text(prose, style = MaterialTheme.typography.bodyLarge) }
+                    val implementation = remember(item, timeline) { timeline?.let { PlanPresentation.implementedProposal(item, it) } }
+                    if (implementation != null) {
+                        var showingPlan by androidx.compose.runtime.saveable.rememberSaveable(messageScope, item.key) { mutableStateOf(false) }
+                        Row(Modifier.heightIn(min = 32.dp).clickable { showingPlan = !showingPlan }, verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("是，实施此计划", style = MaterialTheme.typography.bodyLarge)
+                            ActivityExpansionIcon(showingPlan)
+                        }
+                        if (showingPlan) SelectionContainer { Text(item.text, Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodyMedium) }
+                    } else if (prose.isNotBlank()) SelectionContainer { SentReferenceText(prose, item.raw) }
                     TranscriptImages(item, includeLocal = false)
                 }
             }

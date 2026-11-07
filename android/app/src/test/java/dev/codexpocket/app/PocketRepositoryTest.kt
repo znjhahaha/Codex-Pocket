@@ -51,6 +51,7 @@ class PocketRepositoryTest {
         repo.setForeground(true)
         await { it.online && it.chats.any { c -> c.key == key } }
         repo.select(repo.state.value.chats.first { it.key == key }).join()
+        await { it.nativeSettings.model.known && it.model == "model" }
         assertNull(repo.state.value.error)
     }
 
@@ -81,6 +82,122 @@ class PocketRepositoryTest {
         await { it.initialized }
     }
 
+    private suspend fun childLink() {
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "parent-turn")
+            put("item", buildJsonObject {
+                put("id", "spawn"); put("type", "collabAgentToolCall"); put("tool", "spawnAgent"); put("status", "completed")
+                put("senderThreadId", "t"); put("receiverThreadIds", buildJsonArray { add("child") })
+                put("agentsStates", buildJsonObject { put("child", buildJsonObject { put("status", "running") }) })
+            })
+        })
+        await { it.timeline.items.values.any { item -> item.itemId == "spawn" } }
+    }
+    @Test fun referenceSearchDiscardsLateQueriesAndNeverBlocksChatConnection() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        update { s -> s.copy(runtimes = s.runtimes.map { it.copy(capabilities = (it.capabilities ?: emptySet()) + "references/list") }) }
+        server.intercept = { method, params, _ ->
+            if (method == "references/list") {
+                val query = params.string("query")
+                if (query == "old") { entered.complete(Unit); release.await() }
+                buildJsonObject { put("data", buildJsonArray { add(buildJsonObject {
+                    put("type", "file"); put("name", "$query.md"); put("path", "D:/fixture/$query.md")
+                }) }) }
+            } else null
+        }
+        val old = repo.loadReferences("old")
+        withTimeout(5_000) { entered.await() }
+        repo.loadReferences("new").join()
+        release.complete(Unit); old.join()
+        assertEquals("new.md", repo.state.value.advanced.references.single().string("name"))
+        assertTrue(repo.state.value.online)
+        assertNull(repo.state.value.error)
+    }
+    @Test fun verifiedReferenceReplacesCurrentTokenWithNoSubmission() = runBlocking<Unit> {
+        val ref = buildJsonObject { put("type", "skill"); put("name", "review"); put("path", "D:/fixture/SKILL.md") }
+        update { it.copy(advanced = it.advanced.copy(references = listOf(ref))) }
+        repo.editDraft("/rev 请保留后缀")
+        val before = server.calls.size
+        assertTrue(repo.insertReferenceAt(ref, "/rev 请保留后缀", 0, 4))
+        assertEquals("review 请保留后缀", repo.state.value.draft?.text)
+        assertEquals(before, server.calls.size)
+        assertFalse(repo.insertReferenceAt(ref, "/rev 请保留后缀", 0, 4))
+        assertEquals("review 请保留后缀", repo.state.value.draft?.text)
+        val refs = restoreReferenceDraft(repo.state.value.draft!!.text, repo.state.value.draft!!.references)
+        assertEquals("\$review 请保留后缀", prepareReferenceInputs(refs.text, refs.spans).text)
+        assertTrue(repo.state.value.draft!!.references.contains("D:/fixture/SKILL.md"))
+    }
+    @Test fun nativeEditorRemovalCannotTransferAReferenceToAnIdenticalPlainWord() = runBlocking<Unit> {
+        val ref = buildJsonObject { put("type", "skill"); put("name", "review"); put("path", "D:/fixture/SKILL.md") }
+        update { it.copy(advanced = it.advanced.copy(references = listOf(ref))) }
+        repo.editDraft("/rev review")
+        assertTrue(repo.insertReferenceAt(ref, "/rev review", 0, 4))
+        repo.editDraft("review review", "review", ReferenceTextEdit(0, 7, ""), key)
+        assertEquals("review", repo.state.value.draft?.text)
+        assertTrue(restoreReferenceDraft("review", repo.state.value.draft!!.references).spans.isEmpty())
+        // A delayed editor callback must not overwrite a newer repository edit or another chat.
+        repo.editDraft("newer")
+        repo.editDraft("review", "stale", null, key)
+        repo.editDraft("newer", "wrong chat", null, otherKey)
+        assertEquals("newer", repo.state.value.draft?.text)
+    }
+    @Test fun namedChildStatusRefreshAndOrderedLifecycleUpdateTheRoster() = runBlocking<Unit> {
+        childLink()
+        val childKey = key.copy(nativeId = "child")
+        until { repo.state.value.agentChats.any { it.key == childKey } }
+        server.emit("thread/status/changed", buildJsonObject {
+            put("threadId", "child"); put("status", buildJsonObject { put("type", "active"); put("activeFlags", JsonArray(emptyList())) })
+        })
+        await { it.agentStatuses[childKey]?.status == ActivityStatus.Running }
+        assertEquals(ActivityStatus.Running, repo.state.value.currentAgents().single { it.threadId == "child" }.status)
+        server.emit("turn/completed", buildJsonObject {
+            put("threadId", "child"); put("turn", buildJsonObject { put("id", "child-turn"); put("status", "completed") })
+        })
+        await { it.agentStatuses[childKey]?.status == ActivityStatus.Completed }
+        assertEquals(0, repo.state.value.currentAgents().count { it.status == ActivityStatus.Running })
+    }
+    @Test fun nativeChildMissingFromDirectoryOpensReadOnlyAndReturnsToParentDraft() = runBlocking<Unit> {
+        childLink()
+        repo.editDraft("parent draft")
+        val before = server.calls.size
+        repo.openAgent("child").join()
+        assertEquals("child", repo.state.value.selected?.key?.nativeId)
+        assertTrue(repo.state.value.online)
+        assertTrue(server.calls.drop(before).all { it.commandId == null })
+        assertTrue(server.calls.drop(before).none { it.nativeMethod in setOf("thread/start", "thread/resume", "turn/start") })
+        repo.returnFromAgent(key).join()
+        assertEquals(key, repo.state.value.selected?.key)
+        assertEquals("parent draft", repo.state.value.draft?.text)
+    }
+    @Test fun unverifiedChildAndMismatchedIdentityCannotNavigateAway() = runBlocking<Unit> {
+        val before = server.calls.size
+        repo.openAgent("invented").join()
+        assertEquals(before, server.calls.size)
+        childLink()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child")
+                buildJsonObject { put("thread", server.thread("wrong-id")) } else null
+        }
+        repo.openAgent("child").join()
+        assertEquals(key, repo.state.value.selected?.key)
+        assertTrue(repo.state.value.online)
+    }
+    @Test fun lateChildReadCannotOverrideNewSelection() = runBlocking<Unit> {
+        childLink()
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child") {
+                entered.complete(Unit); release.await()
+            }
+            null
+        }
+        val opening = repo.openAgent("child")
+        withTimeout(5_000) { entered.await() }
+        repo.select(repo.state.value.chats.first { it.key == otherKey }).join()
+        release.complete(Unit); opening.join()
+        assertEquals(otherKey, repo.state.value.selected?.key)
+        assertTrue(repo.state.value.online)
+    }
     @Test fun failedSelectedHistoryCannotKeepAuthenticatedConnectionOffline() = runBlocking<Unit> {
         server.intercept = { method, params, _ ->
             if (method == "codex/request" && params.string("method") == "thread/read") throw WireException("remote_error", "fixture missing history")
@@ -202,7 +319,7 @@ class PocketRepositoryTest {
             server.emit("thread/goal/updated", buildJsonObject { put("threadId", "t"); put("goal", newGoal) })
             server.emit("thread/tokenUsage/updated", buildJsonObject { put("threadId", "t"); put("tokenUsage", newUsage) })
             server.emit("thread/settings/updated", buildJsonObject {
-                put("threadId", "t"); put("settings", buildJsonObject { put("serviceTier", "fast") })
+                put("threadId", "t"); put("threadSettings", buildJsonObject { put("serviceTier", "fast") })
             })
             await { it.advanced.goal == newGoal && it.advanced.usage == newUsage && it.advanced.fastMode }
             // State updates precede cursor persistence; wait for consumption, not merely rendering.
@@ -876,9 +993,11 @@ class PocketRepositoryTest {
 
     @Test fun networkAvailabilityWakesReconnectBackoff() = runBlocking<Unit> {
         server.failConnections = true
-        server.links.last().close()
         val baseline = server.attempts.get()
-        until { server.attempts.get() >= baseline + 3 }
+        server.links.last().close()
+        // Allow the exponential 1s/2s/4s backoff plus jitter to establish itself;
+        // the restoration assertion below still requires a wake within one second.
+        withTimeout(12_000) { while (server.attempts.get() < baseline + 3) delay(10) }
         server.failConnections = false
         network.emit(Unit)
         assertTrue("Network restore slept through backoff", withTimeoutOrNull(1_000) { repo.state.first { it.online }; true } == true)
@@ -1178,6 +1297,133 @@ class PocketRepositoryTest {
         assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
     }
 
+    private suspend fun completedProposal(): ProposedPlan {
+        server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "proposal-turn"); put("status", "inProgress") }) })
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "proposal-turn")
+            put("item", buildJsonObject { put("id", "proposal"); put("type", "plan"); put("text", "# A verified proposal\n\nUpdate the requested UI.") })
+        })
+        server.emit("turn/completed", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "proposal-turn"); put("status", "completed") }) })
+        return PlanPresentation.latest(await { PlanPresentation.latest(it.timeline) != null }.timeline)!!
+    }
+
+    @Test fun planImplementationSendsOnceAndPreservesOrdinaryDraftAndAttachments() = runBlocking<Unit> {
+        val plan = completedProposal()
+        repo.editDraft("保留我的中文草稿")
+        val attachment = image()
+        update { it.copy(attachments = listOf(attachment)) }
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") { entered.complete(Unit); release.await() }
+            null
+        }
+        val first = repo.implementPlan(plan)
+        entered.await()
+        repo.implementPlan(plan).join()
+        release.complete(Unit); first.join()
+        val submissions = server.calls.filter { it.nativeMethod == "turn/start" }
+        assertEquals(1, submissions.size)
+        val payload = submissions.single().params.obj("params")
+        assertEquals(1, payload.array("input").size)
+        assertEquals(plan.prompt, payload.array("input").single().asObject().string("text"))
+        assertEquals("default", payload.obj("collaborationMode").string("mode"))
+        assertEquals("保留我的中文草稿", repo.state.value.draft?.text)
+        assertEquals(listOf(attachment), repo.state.value.attachments)
+        assertTrue(repo.attachmentFile(attachment).exists())
+        assertTrue(plan.revision in repo.state.value.resolvedPlans)
+        repo.implementPlan(plan).join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun stalePlanAndUnknownSubmissionCannotBeReplayed() = runBlocking<Unit> {
+        val plan = completedProposal()
+        repo.implementPlan(plan.copy(content = "stale content")).join()
+        assertEquals(0, server.calls.count { it.nativeMethod == "turn/start" })
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") throw java.io.IOException("Response lost")
+            null
+        }
+        repo.implementPlan(plan).join()
+        assertTrue(plan.revision in repo.state.value.resolvedPlans)
+        repo.implementPlan(plan).join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+        assertTrue(db.dao().uncertain("computer").any { it.draftText.contains(plan.revision) })
+    }
+
+    @Test fun definitelyRejectedPlanCanBeRetriedWithoutConsumingDraft() = runBlocking<Unit> {
+        val plan = completedProposal()
+        repo.editDraft("keep")
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") throw WireException("rejected", "Fixture policy")
+            null
+        }
+        repo.implementPlan(plan).join()
+        assertFalse(plan.revision in repo.state.value.resolvedPlans)
+        assertEquals("keep", repo.state.value.draft?.text)
+    }
+
+    @Test fun planFeedbackModeIsAcknowledgedWithoutLosingLaterLocalChoice() = runBlocking<Unit> {
+        val plan = completedProposal()
+        assertTrue(repo.beginPlanFeedback(plan))
+        assertEquals("plan", repo.state.value.mode)
+        repo.implementPlan(plan).join()
+        assertEquals("default", repo.state.value.mode)
+        assertFalse(NativeSettingsField.Mode in repo.state.value.pendingSettings)
+    }
+
+    @Test fun resyncInvalidatesPlanBeforeItsHistoryRefreshFinishes() = runBlocking<Unit> {
+        val plan = completedProposal()
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, _, _ -> if (method == "sync") { entered.complete(Unit); release.await() }; null }
+        server.notify("pocket/resync", buildJsonObject {})
+        withTimeout(5_000) { entered.await() }
+        try {
+            assertTrue(repo.state.value.online)
+            assertNotEquals(ConversationLoadState.Ready, repo.state.value.conversationLoadState)
+            repo.implementPlan(plan).join()
+            assertEquals(0, server.calls.count { it.nativeMethod == "turn/start" })
+        } finally { release.complete(Unit) }
+    }
+
+    @Test fun acknowledgedPlanUpdatesItsOriginalConversationAfterSelectionChanges() = runBlocking<Unit> {
+        val plan = completedProposal()
+        assertTrue(repo.beginPlanFeedback(plan))
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") { entered.complete(Unit); release.await() }
+            null
+        }
+        val job = repo.implementPlan(plan)
+        withTimeout(5_000) { entered.await() }
+        repo.select(repo.state.value.chats.first { it.key == otherKey }).join()
+        release.complete(Unit); job.join()
+        repo.select(repo.state.value.chats.first { it.key == key }).join()
+        assertEquals("default", repo.state.value.mode)
+        assertFalse(NativeSettingsField.Mode in repo.state.value.pendingSettings)
+    }
+
+    @Test fun acceptedUnknownPlanAcknowledgesModeWithoutReplayingOrConsumingDraft() = runBlocking<Unit> {
+        val plan = completedProposal()
+        assertTrue(repo.beginPlanFeedback(plan))
+        repo.editDraft("保留")
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"
+                throw UnknownOutcomeException(id)
+            }
+            null
+        }
+        repo.implementPlan(plan).join()
+        val command = db.dao().uncertain("computer").single { it.method == "turn/start" }
+        server.statuses[command.id] = "accepted"
+        repo.checkCommands().join()
+        assertEquals("default", repo.state.value.mode)
+        assertFalse(NativeSettingsField.Mode in repo.state.value.pendingSettings)
+        assertEquals("保留", repo.state.value.draft?.text)
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
     private data class Call(val method: String, val params: JsonObject, val commandId: String?) { val nativeMethod get() = params.string("method") }
     private class BrokerFixture {
         val calls = CopyOnWriteArrayList<Call>()
@@ -1244,6 +1490,10 @@ class PocketRepositoryTest {
                     "commands/status" -> buildJsonObject { put("status", statuses[params.string("commandId")] ?: "accepted") }
                     "approvals/respond" -> { statuses[commandId!!] = "submitted"; buildJsonObject { put("status", "submitted") } }
                     "attachment/upload" -> buildJsonObject { put("attachmentId", "uploaded") }
+                    "thread/settings/read" -> buildJsonObject {
+                        put("runtimeId", owner); put("threadId", params.string("threadId")); put("known", true)
+                        put("settings", buildJsonObject { put("model", "model"); put("effort", JsonNull) })
+                    }
                     "codex/request" -> when (params.string("method")) {
                         "thread/queue/list" -> {
                             val p = params.obj("params"); val id = queuePrefix + if (p["cursor"] == null) "1" else "2"

@@ -6,10 +6,14 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -21,9 +25,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import dev.codexpocket.app.data.*
@@ -34,102 +35,94 @@ import kotlinx.serialization.json.*
 @Composable
 internal fun ApprovalCard(a: PendingApproval, online: Boolean, onRespond: (PendingApproval, JsonObject) -> Unit) {
     if (ConversationPresentation.hookType(a.method)) return
+    if (a.method == "item/tool/requestUserInput") {
+        BlockingQuestionApproval(a, online, onRespond)
+        return
+    }
     val context = LocalContext.current
-    val enabled = online && !a.submitted
-    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(20.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(if (a.submitted) PocketIcons.PendingActions else PocketIcons.ShieldCheck, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.secondary)
-                Text(if (a.submitted) context.getString(R.string.waiting_resolution) else context.getString(R.string.attention), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    val c = MaterialTheme.colorScheme
+    var sent by remember(a.key) { mutableStateOf(false) }
+    var details by rememberSaveable(a.key) { mutableStateOf(false) }
+    LaunchedEffect(a.submitted, online) { if (!a.submitted && online) sent = false }
+    val enabled = online && !a.submitted && !sent
+    val supported = a.method in setOf("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
+    val command = a.params.string("command")
+    val paths = a.params.array("changes").map { it.asObject().string("path") }.filter(String::isNotBlank)
+    fun respond(decision: String) {
+        if (!enabled || sent) return
+        sent = true
+        onRespond(a, buildJsonObject { put("decision", decision) })
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("approval-card"),
+        verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(PocketIcons.ShieldCheck, null, Modifier.size(18.dp), tint = c.onSurfaceVariant)
+            Text(if (a.method.contains("commandExecution")) "允许执行此命令？" else if (supported) "允许这些文件更改？" else context.getString(R.string.desktop_required),
+                Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
+            if (a.submitted || sent) Text("等待确认", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+        }
+        if (!online) Text("待重新同步 · 确认请求仍有效后可审批", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+        if (supported) {
+            if (command.isNotBlank()) Text(command.replace('\n', ' '), fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (paths.isNotEmpty()) Text(paths.joinToString("、") { compactFileName(it) }, style = MaterialTheme.typography.bodySmall,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            a.params.string("reason").takeIf(String::isNotBlank)?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant, maxLines = if (details) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis)
             }
-            when (a.method) {
-                "item/commandExecution/requestApproval", "item/fileChange/requestApproval" -> {
-                    Text(if (a.method.contains("commandExecution")) context.getString(R.string.run_command) else context.getString(R.string.apply_changes), style = MaterialTheme.typography.titleMedium)
-                    a.params.string("command").takeIf(String::isNotBlank)?.let { command ->
-                        Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
-                            SelectionContainer { Text(command, Modifier.fillMaxWidth().padding(14.dp), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
-                        }
-                    }
-                    a.params.string("cwd").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    a.params.string("reason").takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    var details by rememberSaveable(a.key) { mutableStateOf(false) }
-                    PocketActionRow(
-                        title = if (details) context.getString(R.string.hide_request) else context.getString(R.string.review_request),
-                        icon = PocketIcons.Info,
-                        onClick = { details = !details },
-                        trailing = { Icon(if (details) PocketIcons.ExpandLess else PocketIcons.ExpandMore, null, Modifier.size(18.dp)) },
-                    )
-                    AnimatedVisibility(details, enter = fadeIn(tween(pocketMotionMillis(180))) + expandVertically(tween(pocketMotionMillis(180))), exit = fadeOut(tween(pocketMotionMillis(120))) + shrinkVertically(tween(pocketMotionMillis(180)))) {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            val paths = a.params.array("changes").map { it.asObject().string("path") }.filter(String::isNotBlank)
-                            if (paths.isNotEmpty()) {
-                                PocketSectionLabel(stringResource(R.string.v02_request_files))
-                                paths.forEach { Text(it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
-                            }
-                            Text(stringResource(R.string.v02_permissions), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    // Keep native decision strings and exact advertised option filtering unchanged.
-                    val advertised = a.params["availableDecisions"] as? JsonArray
-                    fun allowed(decision: String) = advertised == null || JsonPrimitive(decision) in advertised
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (allowed("accept")) PocketButton(context.getString(R.string.allow_once), { onRespond(a, buildJsonObject { put("decision", "accept") }) }, enabled = enabled)
-                        if (allowed("decline")) PocketButton(context.getString(R.string.decline), { onRespond(a, buildJsonObject { put("decision", "decline") }) }, enabled = enabled, secondary = true)
-                        if (allowed("cancel")) PocketButton(context.getString(R.string.deny_stop), { onRespond(a, buildJsonObject { put("decision", "cancel") }) }, enabled = enabled, secondary = true, destructive = true)
-                    }
+            a.params.string("cwd").takeIf(String::isNotBlank)?.let {
+                Text("工作目录 · $it", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant,
+                    maxLines = if (details) Int.MAX_VALUE else 1, overflow = TextOverflow.Ellipsis)
+            }
+            Row(Modifier.heightIn(min = 40.dp).clickable { details = !details }.testTag("approval-details-toggle"),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(if (details) "收起操作详情" else "查看完整操作与权限", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                ActivityExpansionIcon(details)
+            }
+            if (details) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState())
+                .background(c.surfaceContainerLow, RoundedCornerShape(8.dp)).padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (command.isNotBlank()) SelectionContainer {
+                    Text(command, Modifier.horizontalScroll(rememberScrollState()), fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall, softWrap = false)
                 }
-                "item/tool/requestUserInput" -> UserInputQuestions(a, enabled, onRespond)
-                else -> {
-                    Text(context.getString(R.string.desktop_required))
-                    a.params.string("reason").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-                }
+                paths.forEach { Text(it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
+                Text("仅批准本次请求公布的操作；不会更改会话权限预设。", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+            }
+            val advertised = a.params["availableDecisions"] as? JsonArray
+            fun allowed(decision: String) = if (advertised == null) decision in setOf("accept", "decline", "cancel") else JsonPrimitive(decision) in advertised
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (allowed("accept")) ApprovalDecision("允许一次", enabled, primary = true) { respond("accept") }
+                if (allowed("acceptForSession")) ApprovalDecision("本会话允许", enabled) { respond("acceptForSession") }
+                if (allowed("decline")) ApprovalDecision("拒绝", enabled) { respond("decline") }
+                if (allowed("cancel")) ApprovalDecision("取消任务", enabled, destructive = true) { respond("cancel") }
             }
         }
     }
 }
 
 @Composable
-private fun UserInputQuestions(a: PendingApproval, enabled: Boolean, onRespond: (PendingApproval, JsonObject) -> Unit) {
-    val context = LocalContext.current
-    val questions = a.params.array("questions").map(JsonElement::asObject)
-    // Answers, especially isSecret input, stay in memory until native resolution.
-    val answers = remember(a.key) { mutableStateMapOf<String, String>() }
-    questions.forEach { q ->
-        val id = q.string("id")
-        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            q.string("header").takeIf(String::isNotBlank)?.let { PocketSectionLabel(it) }
-            Text(q.string("question"), style = MaterialTheme.typography.bodyLarge)
-            val options = q.array("options").map(JsonElement::asObject)
-            options.forEach { option ->
-                val label = option.string("label")
-                PocketActionRow(
-                    title = label,
-                    icon = if (answers[id] == label) PocketIcons.CheckCircle else PocketIcons.RadioButtonUnchecked,
-                    onClick = { answers[id] = label },
-                    subtitle = option.string("description").takeIf(String::isNotBlank),
-                    selected = answers[id] == label,
-                    enabled = enabled,
-                )
-            }
-            if (options.isEmpty() || q.flag("isOther")) {
-                val value = answers[id].orEmpty().takeUnless { text -> options.any { it.string("label") == text } }.orEmpty()
-                val secret = q.flag("isSecret")
-                PocketTextField(
-                    value, { answers[id] = it }, enabled = enabled,
-                    label = if (options.isEmpty()) context.getString(R.string.your_answer) else context.getString(R.string.other_answer),
-                    visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-                    keyboardOptions = if (secret) KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false) else KeyboardOptions.Default,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
+private fun ApprovalDecision(label: String, enabled: Boolean, primary: Boolean = false, destructive: Boolean = false, onClick: () -> Unit) {
+    val c = MaterialTheme.colorScheme
+    Box(Modifier.heightIn(min = 48.dp).clip(PocketCapsule)
+        .background(if (primary) c.onSurface.copy(alpha = if (enabled) 1f else .35f) else Color.Transparent)
+        .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+        .padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+        Text(label, style = MaterialTheme.typography.labelLarge,
+            color = if (primary) c.surface else if (destructive && enabled) c.error else if (enabled) c.onSurface else c.onSurfaceVariant)
     }
-    PocketButton(
-        text = context.getString(R.string.submit_answers),
-        enabled = enabled && questions.isNotEmpty() && questions.all { !answers[it.string("id")].isNullOrBlank() },
-        onClick = {
-            onRespond(a, buildJsonObject { put("answers", buildJsonObject { questions.forEach { q -> put(q.string("id"), buildJsonObject { put("answers", buildJsonArray { add(answers.getValue(q.string("id"))) }) }) } }) })
-        },
-        modifier = Modifier.fillMaxWidth(),
-    )
+}
+
+@Composable
+private fun BlockingQuestionApproval(a: PendingApproval, online: Boolean, onRespond: (PendingApproval, JsonObject) -> Unit) {
+    val batch = QuestionBatches.blocking(a.key, a.params)
+    val session = remember(a.key) { QuestionSession(batch) }
+    DisposableEffect(session) { onDispose { session.clear() } }
+    session.update(batch)
+    session.observe(a.submitted, submitting = false, pendingConfirmed = online)
+    Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
+        QuestionCard(batch, session, if (!online) QuestionPhase.Offline else session.phase,
+            onSubmit = { answers -> QuestionBatches.blockingResponse(batch, answers)?.let { onRespond(a, it) } },
+            modifier = Modifier.padding(16.dp))
+    }
 }

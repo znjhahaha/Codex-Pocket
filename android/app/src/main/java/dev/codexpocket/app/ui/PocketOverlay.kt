@@ -147,6 +147,8 @@ internal fun PocketModal(
     menuWidth: Float = 300f,
     alignStart: Boolean = false,
     below: Boolean = false,
+    maxWidthDp: Float = 360f,
+    maxHeightFraction: Float = .55f,
     content: @Composable ColumnScope.(Modifier) -> Unit,
 ) {
     PocketOverlay { top ->
@@ -202,7 +204,7 @@ internal fun PocketModal(
             // Standalone destinations own an opaque page; only small menus use sampled glass.
             BoxWithConstraints(Modifier.fillMaxSize()
                 .then(if (screen) Modifier.background(MaterialTheme.colorScheme.background) else Modifier)
-                .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else 12.dp),
+                .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else if (maxWidthDp > 360f) 16.dp else 12.dp),
                 // Sheets rise from the bottom edge like iOS action sheets; dialogs stay centered.
                 contentAlignment = if (sheet && !screen && !anchored) Alignment.BottomCenter else Alignment.Center) {
                 val handle = if (sheet && !screen && !anchored && interactive) Modifier.pointerInput(Unit) {
@@ -222,8 +224,8 @@ internal fun PocketModal(
                     )
                 } else Modifier
                 val panelModifier = Modifier
-                        .then(if (screen) Modifier.fillMaxSize() else Modifier.widthIn(max = 360.dp).fillMaxWidth())
-                        .heightIn(max = if (screen || anchored) maxHeight else maxHeight * .55f).graphicsLayer {
+                        .then(if (screen) Modifier.fillMaxSize() else Modifier.widthIn(max = maxWidthDp.dp).fillMaxWidth())
+                        .heightIn(max = if (screen || anchored) maxHeight else maxHeight * maxHeightFraction.coerceIn(.1f, 1f)).graphicsLayer {
                             translationY = drag.value + if (screen) 0f else (1f - progress) * (if (sheet) 28 else 8).dp.toPx()
                             // Pages push in from the trailing edge (a third of a screen), like UINavigationController.
                             translationX = if (screen) (1f - progress) * size.width * .32f else 0f

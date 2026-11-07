@@ -105,8 +105,23 @@ function Write-PocketAtomic([string]$Path, [byte[]]$Bytes) {
     $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     try {
         [IO.File]::WriteAllBytes($temporary, $Bytes)
-        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
-        else { [IO.File]::Move($temporary, $Path) }
+        $deadline=[DateTime]::UtcNow.AddSeconds(2)
+        while ($true) {
+            try {
+                if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
+                else { [IO.File]::Move($temporary, $Path) }
+                break
+            } catch {
+                $cause=$_.Exception
+                while ($null -ne $cause.InnerException) { $cause=$cause.InnerException }
+                # Readers and Explorer can briefly deny replacement. Keep both
+                # complete files and retry the same atomic operation, never truncate.
+                $code=$cause.HResult -band 65535
+                if ($code -notin @(5,32,33,1175,1176,1177) -or [DateTime]::UtcNow -ge $deadline -or -not [IO.File]::Exists($temporary)) { throw }
+                Start-Sleep -Milliseconds 40
+                Assert-PocketPlainPath $Path
+            }
+        }
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 function Write-PocketJson([string]$Path, $Value) {

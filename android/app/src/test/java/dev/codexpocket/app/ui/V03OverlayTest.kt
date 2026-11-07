@@ -96,7 +96,8 @@ class V03OverlayTest {
                 attachments = { Text("attachment.txt") })
         }
         compose.onNodeWithTag("composer-input").performTextInputSelection(androidx.compose.ui.text.TextRange(2, 5))
-        compose.onNodeWithContentDescription("展开输入框").performClick()
+        compose.onNodeWithContentDescription("添加引用").performClick()
+        compose.onNodeWithText("展开输入框").performScrollTo().assertIsDisplayed().performClick()
         compose.onNodeWithTag("composer-expanded-input").assertTextEquals("draft text")
         assertEquals(androidx.compose.ui.text.TextRange(2, 5), compose.onNodeWithTag("composer-expanded-input").fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.TextSelectionRange])
         compose.onNodeWithText("attachment.txt").assertExists()

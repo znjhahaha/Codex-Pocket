@@ -30,6 +30,7 @@ class LiveBrowseTest {
                 repo.state.first { it.initialized }
                 withContext(Dispatchers.Main) { repo.setForeground(true) }
                 withTimeout(45_000) { repo.state.first { it.online } }
+                stage = "directory"
                 repo.refresh().join()
                 fun inProject(chat: ChatEntity): Boolean {
                     val cwd = chat.cwd.replace('\\', '/').removePrefix("//?/").trimEnd('/')
@@ -71,6 +72,13 @@ class LiveBrowseTest {
             } }
         } catch (failure: Throwable) {
             val s = repo.state.value
+            writeLiveReport("browse-report.json", buildJsonObject {
+                put("runtimes", buildJsonArray { s.runtimes.forEach { r -> add(buildJsonObject {
+                    put("id", r.id); put("online", r.online); put("source", r.source); put("store", r.configStoreId)
+                }) } })
+                put("chats", s.chats.size); put("error", s.error); put("notice", s.notice)
+                put("owners", buildJsonArray { s.chats.map { it.runtimeId }.distinct().forEach { add(it) } })
+            })
             writeLiveReport("browse-report.json", buildJsonObject { put("passed", false); put("stage", stage); put("exception", failure.javaClass.simpleName); put("online", s.online); put("phase", s.connectionPhase); put("detail", s.connectionDetail); put("connectionDrops", drops); put("modelRequests", 0); put("checks", JsonArray(checks)); put("diagnostics", buildJsonArray { repo.connectionDiagnostics().forEach { add(buildJsonObject { put("generation", it.generation); put("stage", it.stage); put("code", it.code); put("elapsedMs", it.elapsedMs) }) } }) })
             throw AssertionError("Read-only browse failed at $stage (${failure.javaClass.simpleName})")
         } finally { runBlocking { withContext(Dispatchers.Main) { repo.setForeground(false) } } }

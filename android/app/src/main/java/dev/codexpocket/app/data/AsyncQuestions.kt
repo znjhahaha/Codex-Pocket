@@ -32,6 +32,7 @@ object AsyncQuestions {
                 if (title.isBlank() || id in answered) null else buildJsonObject {
                     put("id", id); put("questionItemId", id); put("title", title)
                     put("options", question["options"] as? JsonArray ?: JsonArray(emptyList()))
+                    put("isSecret", question.flag("isSecret"))
                     put("submitted", id in submitted)
                 }
             }

@@ -34,8 +34,8 @@ data class ActivitySummary(val commands: Int = 0, val files: Int = 0, val tools:
 
 /** Presentation only: native identities are retained; arbitrary arguments and JSON are never UI text. */
 object NativeActivityPresentation {
+    /** Legacy preview budget retained for API compatibility; projection no longer truncates text. */
     const val OUTPUT_LIMIT = 16_000
-    private const val LABEL_LIMIT = 600
 
     fun attentionBoundary(item: TimelineItem): Boolean {
         val raw = item.raw
@@ -96,14 +96,14 @@ object NativeActivityPresentation {
                 val output = when {
                     command.isNotBlank() && item.text.startsWith(command) -> {
                         val start = command.length + if (item.text.startsWith("\n\n", command.length)) 2 else 0
-                        item.text.substring(start, minOf(item.text.length, start + OUTPUT_LIMIT + 1))
+                        item.text.substring(start)
                     }
                     item.text.isNotBlank() -> item.text
                     else -> raw.string("aggregatedOutput")
                 }.ifBlank { raw.string("aggregatedOutput") }
-                PresentedActivity(item.key, ActivityKind.Command, state, command.take(LABEL_LIMIT), raw.string("cwd").take(LABEL_LIMIT),
+                PresentedActivity(item.key, ActivityKind.Command, state, command, raw.string("cwd"),
                     bounded(sequenceOf(output)).let { if (raw.flag("pocketOutputTruncated")) it.copy(truncated = true) else it }, ActivityCommand(command, raw.string("cwd"), (raw["exitCode"] as? JsonPrimitive)?.intOrNull,
-                        displayCommand(raw, command).take(LABEL_LIMIT), (raw["durationMs"] as? JsonPrimitive)?.longOrNull?.takeIf { it >= 0 }, commandSteps(raw)))
+                        displayCommand(raw, command), (raw["durationMs"] as? JsonPrimitive)?.longOrNull?.takeIf { it >= 0 }, commandSteps(raw)))
             }
             "fileChange", "turn/diff/updated" -> PresentedActivity(item.key, ActivityKind.Files, state, files = activityFiles(item))
             "mcpToolCall", "dynamicToolCall", "functionCallOutput" -> {
@@ -130,13 +130,13 @@ object NativeActivityPresentation {
                     if (item.text.isNotBlank() && item.type != "functionCallOutput") yield(item.text)
                 }
                 PresentedActivity(item.key, ActivityKind.Tool, state,
-                    raw.obj("appContext").string("actionName").ifBlank { raw.string("tool", raw.string("name")) }.take(LABEL_LIMIT),
-                    raw.obj("appContext").string("appName").ifBlank { raw.string("server", raw.string("namespace")) }.take(LABEL_LIMIT), bounded(text))
+                    raw.obj("appContext").string("actionName").ifBlank { raw.string("tool", raw.string("name")) },
+                    raw.obj("appContext").string("appName").ifBlank { raw.string("server", raw.string("namespace")) }, bounded(text))
             }
             "webSearch" -> {
                 val action = raw.obj("action")
                 val kind = when (action.string("type")) { "search" -> WebAction.Search; "openPage" -> WebAction.Open; "findInPage" -> WebAction.Find; else -> WebAction.Other }
-                val queries = action.array("queries").asSequence().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.take(8).map { it.take(LABEL_LIMIT) }.joinToString(" · ")
+                val queries = action.array("queries").asSequence().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.joinToString(" · ")
                 val subtitle = when (kind) {
                     WebAction.Open -> action.string("url")
                     WebAction.Find -> listOf(action.string("pattern"), action.string("url")).filter(String::isNotBlank).joinToString(" · ")
@@ -147,14 +147,15 @@ object NativeActivityPresentation {
                     val record = result.asObject()
                     sequenceOf(record.string("title"), record.string("url"), record.string("snippet"))
                 }
-                PresentedActivity(item.key, ActivityKind.Web, state, subtitle = subtitle.take(LABEL_LIMIT), output = bounded(results), webAction = kind)
+                PresentedActivity(item.key, ActivityKind.Web, state, subtitle = subtitle, output = bounded(results), webAction = kind)
             }
             "collabAgentToolCall", "subAgentActivity" -> PresentedActivity(item.key, ActivityKind.Agents, state,
-                title = raw.string("tool", raw.string("kind")).take(LABEL_LIMIT),
+                title = raw.string("tool", raw.string("kind")),
                 output = bounded(sequenceOf(raw.string("prompt"))), agents = agents(item))
-            "reasoning", "agentMessage" -> PresentedActivity(item.key, if (item.type == "reasoning") ActivityKind.Reasoning else ActivityKind.Commentary, state, output = bounded(sequenceOf(item.text)))
+            "reasoning" -> PresentedActivity(item.key, ActivityKind.Reasoning, state, output = bounded(sequenceOf(item.summaryParts.filter(String::isNotBlank).joinToString("\n\n"))))
+            "agentMessage" -> PresentedActivity(item.key, ActivityKind.Commentary, state, output = bounded(sequenceOf(item.text)))
             "imageView", "imageGeneration" -> PresentedActivity(item.key, ActivityKind.Image, state,
-                subtitle = raw.string("path", raw.string("savedPath")).take(LABEL_LIMIT), output = bounded(sequenceOf(raw.string("revisedPrompt"), raw.obj("failure").string("message"))))
+                subtitle = raw.string("path", raw.string("savedPath")), output = bounded(sequenceOf(raw.string("revisedPrompt"), raw.obj("failure").string("message"))))
             else -> PresentedActivity(item.key, ActivityKind.Unknown, state)
         }
     }
@@ -197,15 +198,15 @@ object NativeActivityPresentation {
 
     fun commandSteps(raw: JsonObject): List<CommandStep> = raw.array("commandActions").mapNotNull { element ->
         val action = element as? JsonObject ?: return@mapNotNull null
-        val command = action.string("command", action.string("cmd")).take(LABEL_LIMIT)
-        val path = action.string("path").take(LABEL_LIMIT)
+        val command = action.string("command", action.string("cmd"))
+        val path = action.string("path")
         when (action.string("type")) {
             "read" -> {
-                val name = action.string("name").ifBlank { path.substringAfterLast('/').substringAfterLast('\\') }.take(LABEL_LIMIT)
+                val name = action.string("name").ifBlank { path.substringAfterLast('/').substringAfterLast('\\') }
                 skillName(path, name)?.let { CommandStep(StepKind.Skill, it, path, command = command) } ?: CommandStep(StepKind.Read, name, path, command = command)
             }
             "listFiles", "list_files" -> CommandStep(StepKind.ListFiles, path = path, command = command)
-            "search" -> CommandStep(StepKind.Search, path = path, query = action.string("query").take(LABEL_LIMIT), command = command)
+            "search" -> CommandStep(StepKind.Search, path = path, query = action.string("query"), command = command)
             else -> CommandStep(StepKind.Unknown, command = command)
         }
     }
@@ -277,17 +278,53 @@ object NativeActivityPresentation {
         else -> "${ms / 3_600_000}h ${(ms / 60_000) % 60}m".removeSuffix(" 0m")
     }
 
-    private fun agents(item: TimelineItem): List<ActivityAgent> {
+    /** Parent-call lifecycle is distinct from the state of its receivers. No identifiers in labels. */
+    fun agentCallLabel(value: PresentedActivity): String {
+        val count = value.agents.size
+        val target = if (count > 0) " $count 个智能体" else "智能体"
+        val action = when (value.title) {
+            "spawnAgent" -> "创建"
+            "sendInput", "sendMessage", "interacted" -> "发送消息"
+            "resumeAgent" -> "恢复"
+            "wait" -> "等待"
+            "closeAgent" -> "关闭"
+            "interruptAgent", "interrupted" -> "中断"
+            "followupTask" -> "继续任务"
+            "listAgents" -> "查看"
+            "started" -> return "${target}开始工作".trim()
+            "completed" -> return "${target}已完成".trim()
+            else -> return "智能体协作"
+        }
+        return when (value.status) {
+            ActivityStatus.Completed -> "已$action$target"
+            ActivityStatus.Running -> "正在$action$target"
+            ActivityStatus.Waiting -> "等待$action$target"
+            ActivityStatus.Failed -> "$action${target}失败"
+            ActivityStatus.Interrupted -> "$action$target · 已中断"
+            ActivityStatus.Unknown -> "$action$target"
+        }
+    }
+
+    /** Child identity/state only; the collab call's lifecycle belongs to the parent tool call. */
+    fun agents(item: TimelineItem): List<ActivityAgent> {
         val raw = item.raw
         if (item.type == "subAgentActivity") {
-            val id = raw.string("agentThreadId").takeIf(String::isNotBlank) ?: return emptyList()
-            return listOf(ActivityAgent(id, raw.string("agentPath"), status(raw.string("kind")), raw.string("kind"), ActivityOutput()))
+            val id = raw.agentString("agentThreadId").takeIf(String::isNotBlank) ?: return emptyList()
+            // `interacted` records contact, not a state transition. Preserve an earlier child state.
+            val kind = raw.agentString("kind").takeIf { it in setOf("started", "completed", "interrupted") }.orEmpty()
+            return listOf(ActivityAgent(id, raw.agentString("agentPath"), status(kind), kind, ActivityOutput()))
         }
+        if (item.type != "collabAgentToolCall") return emptyList()
         val states = raw.obj("agentsStates")
-        val ids = (raw.array("receiverThreadIds").mapNotNull { (it as? JsonPrimitive)?.contentOrNull } + states.keys).filter(String::isNotBlank).distinct()
+        val sender = raw.agentString("senderThreadId")
+        val ids = (raw.array("receiverThreadIds").mapNotNull { (it as? JsonPrimitive)?.takeIf { value -> value.isString }?.content } + states.keys)
+            .filter { it.isNotBlank() && it != sender }.distinct()
         return ids.map { id ->
             val agent = states.obj(id)
-            ActivityAgent(id, agent.string("name", agent.string("nickname")), status(agent.string("status")), agent.string("status"), bounded(sequenceOf(agent.string("message"))))
+            // Current CollabAgentState has status/message; retain direct names from older caches.
+            val name = agent.agentString("name").ifBlank { agent.agentString("nickname") }
+            val nativeStatus = agent.agentString("status")
+            ActivityAgent(id, name, status(nativeStatus), nativeStatus, bounded(sequenceOf(agent.agentString("message"))))
         }
     }
 
@@ -296,18 +333,8 @@ object NativeActivityPresentation {
         part.string("text").takeIf { _ -> part.string("type") in setOf("text", "inputText", "input_text") }
     }
 
-    private fun bounded(parts: Sequence<String>): ActivityOutput {
-        val text = StringBuilder()
-        for (part in parts.filter(String::isNotBlank)) {
-            val separator = if (text.isEmpty()) "" else "\n"
-            if (text.length + separator.length + part.length > OUTPUT_LIMIT) {
-                val remaining = (OUTPUT_LIMIT - text.length).coerceAtLeast(0)
-                text.append(separator.take(remaining))
-                text.append(part, 0, minOf(part.length, (remaining - separator.length).coerceAtLeast(0)))
-                return ActivityOutput(text.toString(), true)
-            }
-            text.append(separator).append(part)
-        }
-        return ActivityOutput(text.toString())
-    }
+    // Responses are bounded at transport/read boundaries. Presentation never cuts human text:
+    // compact lines ellipsize in Compose; expanded details retain the exact native payload.
+    private fun bounded(parts: Sequence<String>): ActivityOutput =
+        ActivityOutput(parts.filter(String::isNotBlank).joinToString("\n"))
 }

@@ -52,14 +52,15 @@ class V03ModalRegressionTest {
             .config[SemanticsProperties.TextSelectionRange])
     }
 
-    @Test fun nestedMenuRestoresExpandedEditorSelectionAndTypingThenCompactSelection() {
+    @Test fun nestedMenuRestoresExpandedEditorSelectionAndTypingThenInlineSelection() {
         content {
             var draft by remember { mutableStateOf("draft text") }
             PocketComposer(draft, "Codex", "", false, ComposerAvailability(true, false, true, false),
                 { draft = it }, {}, {}, {}, {}, {}, {}, true)
         }
         compose.onNodeWithTag("composer-input").performTextInputSelection(TextRange(2, 5))
-        compose.onNodeWithContentDescription("展开输入框").performClick()
+        compose.onNodeWithContentDescription(compose.activity.getString(R.string.v02_references)).performClick()
+        compose.onNodeWithText("展开输入框").performScrollTo().assertIsDisplayed().performClick()
         compose.onNodeWithTag("composer-expanded-input").assertIsFocused()
         selection("composer-expanded-input", TextRange(2, 5))
         compose.onNodeWithContentDescription(compose.activity.getString(R.string.v02_references)).performClick()

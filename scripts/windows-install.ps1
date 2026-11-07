@@ -195,6 +195,33 @@ function Get-PocketProperty($Value,[string]$Name,$Fallback) {
     elseif($null -ne $Value -and $Value.PSObject.Properties[$Name]) { return $Value.$Name }
     return $Fallback
 }
+function Save-PocketRollbackSnapshot($Snapshot,[string]$InstallRoot) {
+    Assert-PocketBackup $Snapshot.manifest
+    $hash=$Snapshot.manifest.hash
+    if ($hash -notmatch '^[a-f0-9]{64}$') { throw 'Invalid rollback record hash.' }
+    $directory=Join-Path $InstallRoot 'rollback'
+    Assert-PocketUnredirectedPath $directory
+    [void][IO.Directory]::CreateDirectory($directory)
+    $path=Join-Path $directory ($hash+'.json')
+    Assert-PocketUnredirectedPath $path
+    if ([IO.File]::Exists($path)) {
+        if ((Get-PocketFileHash $path) -ne $hash) { throw 'Rollback archive integrity failed.' }
+    } else { Write-PocketAtomic $path ([Convert]::FromBase64String($Snapshot.manifest.bytes)) }
+    # Never embed the preceding installation recursively: the stable bootstrap
+    # intentionally bounds its current record to 1 MiB.
+    return @{manifest=@{path=$Snapshot.manifest.path;hash=$hash;bytes=$null;archiveFile=$hash+'.json'};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=$Snapshot.cliKind;task=$Snapshot.task}
+}
+function Read-PocketRollbackSnapshot($Snapshot,[string]$InstallRoot) {
+    $archive=Get-PocketProperty $Snapshot.manifest 'archiveFile' $null
+    if ($null -eq $archive) { return $Snapshot } # Existing inline records remain readable.
+    if ($archive -cne ($Snapshot.manifest.hash+'.json') -or $archive -cnotmatch '^[a-f0-9]{64}\.json$' -or $null -ne $Snapshot.manifest.bytes) { throw 'Invalid rollback archive reference.' }
+    $path=Join-Path (Join-Path $InstallRoot 'rollback') $archive
+    Assert-PocketUnredirectedPath $path
+    if ((Get-Item -LiteralPath $path).Length -gt 64MB) { throw 'Rollback archive exceeds limit.' }
+    $backup=Get-PocketBackup $path
+    if ($backup.hash -ne $Snapshot.manifest.hash) { throw 'Rollback archive integrity failed.' }
+    return @{manifest=@{path=$Snapshot.manifest.path;hash=$backup.hash;bytes=$backup.bytes};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=(Get-PocketProperty $Snapshot 'cliKind' 'String');task=$Snapshot.task}
+}
 function Assert-PocketSnapshot($Snapshot,[string]$Manifest,[string[]]$Links) {
     if ($Snapshot.manifest.path -ne $Manifest -or $Snapshot.links.Count -ne $Links.Count) { throw 'Invalid recovery record path.' }
     Assert-PocketBackup $Snapshot.manifest
@@ -304,7 +331,7 @@ function Invoke-PocketWindowsInstall {
         if (-not $Apply) { return $plan }
         [void][IO.Directory]::CreateDirectory($installRoot)
         if ($Rollback) {
-            $after=$saved.rollback
+            $after=Read-PocketRollbackSnapshot $saved.rollback $installRoot
             Assert-PocketSnapshot $after $manifestPath $links
         } elseif ($Uninstall) {
             $after=@{manifest=$before.manifest;cli=$saved.previousCliPath;cliKind=(Get-PocketProperty $saved 'previousCliKind' 'String');task=$(if($saved.version -eq 3){$saved.previousTask}else{$null});links=@()}
@@ -327,7 +354,7 @@ function Invoke-PocketWindowsInstall {
             elseif (-not $saved -and (Get-PocketFileHash $launcher) -ne (Get-PocketFileHash (Join-Path $bin 'pocket-launcher.exe'))) { throw 'Unmanaged stable launcher exists.' }
             $savedUi=$saved -and $saved.version -eq 3 -and $null -ne $saved.shortcuts[2].installed
             $uiEnabled=if($UiStartup -eq 'Preserve'){$savedUi}else{$UiStartup -eq 'Enable'}
-            $unchanged=$saved -and $saved.version -eq 3 -and $saved.generation -eq $generation -and $savedUi -eq $uiEnabled
+            $unchanged=$saved -and $saved.version -eq 3 -and $saved.generation -eq $generation -and $savedUi -eq $uiEnabled -and ([Convert]::FromBase64String($before.manifest.bytes)).Length -lt 1MB
             if ($unchanged) { $candidate=$saved }
             else {
                 $entries=@()
@@ -337,7 +364,7 @@ function Invoke-PocketWindowsInstall {
                     $bytes=if($i -eq 2 -and -not $uiEnabled){$null}else{New-PocketShortcutBytes (Join-Path $installRoot ([guid]::NewGuid().ToString('N')+'.lnk')) $launcher $(if($i -eq 1){'--pocket-desktop'}else{'--pocket-ui'})}
                     $entries+=@{path=$links[$i];original=$original;originalHash=$originalHash;installed=$(if($null -ne $bytes){[Convert]::ToBase64String($bytes)}else{$null});installedHash=$(if($null -ne $bytes){Get-PocketBytesHash $bytes}else{$null})}
                 }
-                $candidate=[ordered]@{version=3;installRoot=$installRoot;generation=$generation;releaseHash=$releaseHash;bridge=$launcher;launcherHash=(Get-PocketFileHash $launcher);stateDirectory=$StateDirectory;previousCliPath=$(if($saved){$saved.previousCliPath}else{$before.cli});previousCliKind=$(if($saved){Get-PocketProperty $saved 'previousCliKind' 'String'}else{$before.cliKind});previousTask=$(if($saved -and $saved.version -eq 3){$saved.previousTask}else{$before.task});shortcuts=$entries;rollback=$(if($saved){$before}else{$null})}
+                $candidate=[ordered]@{version=3;installRoot=$installRoot;generation=$generation;releaseHash=$releaseHash;bridge=$launcher;launcherHash=(Get-PocketFileHash $launcher);stateDirectory=$StateDirectory;previousCliPath=$(if($saved){$saved.previousCliPath}else{$before.cli});previousCliKind=$(if($saved){Get-PocketProperty $saved 'previousCliKind' 'String'}else{$before.cliKind});previousTask=$(if($saved -and $saved.version -eq 3){$saved.previousTask}else{$before.task});shortcuts=$entries;rollback=$(if($saved){Save-PocketRollbackSnapshot $before $installRoot}else{$null})}
                 if ($saved) {
                     $archive=Join-Path $installRoot ('desktop-install.'+$saved.generation+'.json')
                     if (-not [IO.File]::Exists($archive)) { Write-PocketAtomic $archive ([Convert]::FromBase64String($before.manifest.bytes)) }

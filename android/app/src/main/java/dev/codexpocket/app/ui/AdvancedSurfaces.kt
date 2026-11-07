@@ -18,35 +18,20 @@ import dev.codexpocket.app.data.*
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.*
 
-internal fun canMutate(s: PocketState, method: String) = s.online && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false && s.supports(method)
+internal fun canMutate(s: PocketState, method: String) = s.online && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false && s.selected?.isSubagent == false && s.supports(method)
 
 @Composable
 internal fun AsyncQuestionForm(question: JsonObject, s: PocketState, onAnswer: (String, JsonObject) -> Any) {
-    val id = question.string("id")
-    var answer by remember(id) { mutableStateOf("") }
-    val enabled = !question.flag("submitted") && canMutate(s, if (s.timeline.activeTurn == null) "turn/start" else "turn/steer")
-    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        PocketSectionLabel(stringResource(R.string.v02_async))
-        Text(question.string("title"), style = MaterialTheme.typography.titleMedium)
-        question.array("options").forEach { option ->
-            val label = (option as? JsonPrimitive)?.contentOrNull ?: option.asObject().string("label")
-            if (label.isNotBlank()) PocketActionRow(
-                title = label,
-                icon = if (answer == label) PocketIcons.CheckCircle else PocketIcons.RadioButtonUnchecked,
-                onClick = { answer = label },
-                subtitle = option.asObject().string("description").takeIf(String::isNotBlank),
-                enabled = enabled,
-                selected = answer == label,
-            )
-        }
-        PocketTextField(answer, { answer = it }, Modifier.fillMaxWidth(), label = stringResource(R.string.your_answer), enabled = enabled, maxLines = 5)
-        PocketButton(
-            text = stringResource(if (question.flag("submitted")) R.string.waiting_resolution else R.string.submit_answers),
-            onClick = { onAnswer(id, buildJsonObject { put("answer", answer) }) },
-            enabled = enabled && answer.isNotBlank(),
-            modifier = Modifier.fillMaxWidth(),
-        )
-    }
+    val batch = QuestionBatches.async(s.selected?.key?.encoded.orEmpty(), listOf(question)).single()
+    val session = remember(batch.id) { QuestionSession(batch) }
+    DisposableEffect(session) { onDispose { session.clear() } }
+    session.update(batch)
+    val availability = questionAvailability(s, QuestionDockEntry(batch.id, batch))
+    session.observe(question.flag("submitted"), session.phase == QuestionPhase.Submitting && (s.sendBusy || s.busy),
+        pendingConfirmed = availability == QuestionPhase.Waiting)
+    QuestionCard(batch, session, availability, onSubmit = { answers ->
+        answers.singleOrNull()?.let { (_, answer) -> onAnswer(question.string("id"), buildJsonObject { put("answer", answer) }) }
+    }, modifier = Modifier.padding(vertical = 12.dp), enabled = !s.busy && !s.sendBusy)
 }
 
 @Composable

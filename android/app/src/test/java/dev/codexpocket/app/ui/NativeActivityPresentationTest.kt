@@ -123,8 +123,8 @@ class NativeActivityPresentationTest {
             })
         })
         val output = NativeActivityPresentation.describe(large).output
-        assertTrue(output.truncated)
-        assertTrue(output.text.length <= NativeActivityPresentation.OUTPUT_LIMIT)
+        assertFalse(output.truncated)
+        assertEquals(30_000, output.text.length)
     }
 
     @Test fun structuredResultsExposeOnlyAllowlistedHumanFields() {

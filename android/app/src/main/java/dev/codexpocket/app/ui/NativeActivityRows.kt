@@ -24,9 +24,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -47,6 +51,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
 import kotlinx.coroutines.Dispatchers
@@ -60,6 +65,9 @@ internal fun NativeActivityTrace(row: TranscriptRow, scope: String, expanded: Bo
     // Store item choices above the conditional subtree so folding and completion retain them.
     var expandedItems by rememberSaveable(scope, row.key) { mutableStateOf(emptyList<String>()) }
     var manualGroupExpanded by rememberSaveable(scope, row.key) { mutableStateOf<Boolean?>(null) }
+    val itemStates = rememberSaveableStateHolder()
+    val groupScroll = rememberScrollState()
+    val largeGroupScroll = rememberLazyListState()
     // Draft-backed native item keys survive regrouping when a tool fails or asks for approval.
     val openItems = expansionKeys?.filter { it.startsWith("activity-item:") }?.map { it.removePrefix("activity-item:") } ?: expandedItems
     val collapsedKey = "activity-collapsed:${row.key}"
@@ -77,7 +85,8 @@ internal fun NativeActivityTrace(row: TranscriptRow, scope: String, expanded: Bo
             val summary by produceState<ActivitySummary?>(null, row.items) {
                 value = withContext(Dispatchers.Default) { NativeActivityPresentation.summary(row.items) }
             }
-            val label = summary?.let { traceLabel(it) } ?: stringResource(R.string.v03_trace)
+            val confirmed = row.items.all { NativeActivityPresentation.state(it) == ActivityStatus.Completed }
+            val label = summary?.let { traceLabel(it, confirmed) } ?: stringResource(R.string.v03_trace)
             val expansionState = stringResource(if (showItems) R.string.v03_expanded else R.string.v03_collapsed)
             TraceHeader(label, summary?.let(::summaryIcon), (summary?.failed ?: 0) > 0, showItems,
                 Modifier.testTag("activity-group-toggle:${row.key}").semantics { stateDescription = expansionState }) {
@@ -92,13 +101,22 @@ internal fun NativeActivityTrace(row: TranscriptRow, scope: String, expanded: Bo
         AnimatedVisibility(showItems,
             enter = fadeIn(tween(pocketMotionMillis(180))) + expandVertically(tween(pocketMotionMillis(240), easing = FastOutSlowInEasing), expandFrom = Alignment.Top),
             exit = fadeOut(tween(pocketMotionMillis(120))) + shrinkVertically(tween(pocketMotionMillis(200), easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top)) {
-            Column(Modifier.fillMaxWidth().padding(start = if (folded) 4.dp else 0.dp)) {
-                row.items.forEach { item -> key(item.key) {
+            if (row.items.size > 20) LazyColumn(Modifier.fillMaxWidth().height(360.dp)
+                .testTag("activity-group-scroll:${row.key}").padding(start = if (folded) 4.dp else 0.dp), state = largeGroupScroll) {
+                items(row.items, key = { it.key }, contentType = { it.type }) { item ->
                     NativeToolRow(item, scope, row.completedTurn, item.key in openItems, {
                         if (onExpansionKey != null) onExpansionKey("activity-item:${item.key}")
                         else expandedItems = if (item.key in expandedItems) expandedItems - item.key else expandedItems + item.key
                     }, onDetail)
-                } }
+                }
+            } else Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(groupScroll)
+                .testTag("activity-group-scroll:${row.key}").padding(start = if (folded) 4.dp else 0.dp)) {
+                row.items.forEach { item -> key(item.key) { itemStates.SaveableStateProvider(item.key) {
+                    NativeToolRow(item, scope, row.completedTurn, item.key in openItems, {
+                        if (onExpansionKey != null) onExpansionKey("activity-item:${item.key}")
+                        else expandedItems = if (item.key in expandedItems) expandedItems - item.key else expandedItems + item.key
+                    }, onDetail)
+                } } }
             }
         }
     }
@@ -131,14 +149,14 @@ private fun TraceHeader(label: String, icon: androidx.compose.ui.graphics.vector
     val pressed by interaction.collectIsPressedAsState()
     val tone = traceTone(pressed || open)
     CompositionLocalProvider(LocalTraceTone provides tone) {
-        Row(modifier.heightIn(min = 40.dp)
+        Row(modifier.fillMaxWidth().heightIn(min = 32.dp)
             .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
-            .padding(start = 4.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            if (failed) Icon(PocketIcons.ErrorOutline, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.error)
+            .padding(start = 4.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (failed) Icon(PocketIcons.ErrorOutline, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
             else if (icon != null) TraceGlyph(icon)
-            Text(label, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium, color = tone.text,
-                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(label, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = tone.text,
+                maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
             ActivityExpansionIcon(open)
         }
     }
@@ -146,21 +164,25 @@ private fun TraceHeader(label: String, icon: androidx.compose.ui.graphics.vector
 
 /** Group glyph: the leading kind of work, the way Codex prefixes a folded group. */
 internal fun summaryIcon(s: ActivitySummary) = when {
+    s.files > 0 -> PocketIcons.Edit
     s.skills > 0 -> PocketIcons.Wrench
     s.reads > 0 -> PocketIcons.BookOpen
     s.searches > 0 -> PocketIcons.Search
     s.lists > 0 -> PocketIcons.Folder
     s.commands > 0 -> PocketIcons.Terminal
-    s.files > 0 -> PocketIcons.FilePen
     s.web > 0 -> PocketIcons.Globe
     s.images > 0 -> PocketIcons.Image
-    s.agents > 0 -> PocketIcons.Users
+    s.agents > 0 -> PocketIcons.RobotOutline
     s.tools > 0 -> PocketIcons.Wrench
     else -> PocketIcons.Sparkle
 }
 
 @Composable
-private fun traceLabel(summary: ActivitySummary): String = listOfNotNull(
+private fun traceLabel(summary: ActivitySummary, confirmed: Boolean): String {
+    val onlyEditCommands = summary.commands > 0 && summary.files > 0 && summary.failed == 0 &&
+        summary.tools + summary.agents + summary.web + summary.images + summary.reads + summary.searches + summary.lists + summary.skills == 0
+    if (onlyEditCommands) return if (confirmed) "编辑了文件运行了命令" else "文件修改与命令执行"
+    return listOfNotNull(
     summary.reasoning.takeIf { it > 0 && summary.commands + summary.files + summary.tools + summary.agents + summary.web + summary.images +
         summary.reads + summary.searches + summary.lists + summary.skills == 0 }
         ?.let { stringResource(R.string.v04_trace_thought) },
@@ -175,7 +197,8 @@ private fun traceLabel(summary: ActivitySummary): String = listOfNotNull(
     summary.tools.takeIf { it > 0 }?.let { stringResource(R.string.v04_trace_sum_tools, it) },
     summary.agents.takeIf { it > 0 }?.let { stringResource(R.string.v04_trace_sum_agents, it) },
     summary.failed.takeIf { it > 0 }?.let { stringResource(R.string.v04_trace_sum_failed, it) },
-).joinToString("，").ifBlank { stringResource(R.string.v03_trace) }
+    ).joinToString("，").ifBlank { stringResource(R.string.v03_trace) }
+}
 
 @Composable
 internal fun pocketDiffColors(): Pair<Color, Color> = if (MaterialTheme.colorScheme.background.luminance() < .5f)
@@ -193,13 +216,28 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
     val expansionState = stringResource(if (expanded) R.string.v03_expanded else R.string.v03_collapsed)
     val running = state == ActivityStatus.Running || state == ActivityStatus.Waiting
     val c = MaterialTheme.colorScheme
+    var selectedFile by rememberSaveable(scope, item.key) { mutableStateOf<String?>(null) }
+    val fileStates = rememberSaveableStateHolder()
     Column(Modifier.fillMaxWidth().testTag("native-activity:${item.key}")) {
-        val files = value?.files.orEmpty()
+        val files = remember(item, value?.files) { reviewActivityFiles(item, value?.files.orEmpty()) }
         if (value?.kind == ActivityKind.Files && files.isNotEmpty()) {
-            // Codex shows every edited file as its own sentence; the name opens the diff.
-            files.take(if (expanded) files.size else VISIBLE_FILES).forEach { file -> key(file.id) { FileLine(file, running) { onDetail(item) } } }
+            // A file opens its own patch, never the entire multi-file native item.
+            files.take(if (expanded) files.size else VISIBLE_FILES).forEach { file -> key(file.id) {
+                val fileKey = file.id + ":" + file.path
+                val truncated = item.raw.flag("pocketOutputTruncated") || item.raw.flag("diffTruncated")
+                FileLine(file, state, selectedFile == fileKey, truncated) {
+                    selectedFile = if (selectedFile == fileKey) null else fileKey
+                    // Completion can regroup this run; retain the explicit open choice above it.
+                    if (selectedFile != null && !expanded) onExpand()
+                }
+                if (selectedFile == fileKey) fileStates.SaveableStateProvider(fileKey) {
+                    InlineDiffPreview(file, Modifier.padding(start = 4.dp, bottom = 4.dp),
+                        stateKey = "$scope/${item.key}/$fileKey", truncated = truncated)
+                }
+            } }
             if (!expanded && files.size > VISIBLE_FILES) TraceLine(onClick = onExpand) {
-                Text(stringResource(R.string.v04_trace_more, files.size - VISIBLE_FILES), style = MaterialTheme.typography.bodyMedium, color = toneText())
+                Text(stringResource(R.string.v04_trace_more, files.size - VISIBLE_FILES), style = MaterialTheme.typography.bodyMedium,
+                    fontSize = 14.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, color = toneText())
             }
             return@Column
         }
@@ -207,19 +245,30 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             Box(Modifier.padding(vertical = 4.dp)) { MarkdownText(value.output.text, "$scope/${item.key}/commentary") }
             return@Column
         }
+        if (value?.kind == ActivityKind.Reasoning) {
+            // A task's expanded process retains the native paragraph boundaries without a thought card.
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                item.summaryParts.filter(String::isNotBlank).forEachIndexed { index, paragraph ->
+                    NativeSummaryProse(paragraph, "$scope/${item.key}/reasoning:$index")
+                }
+            }
+            return@Column
+        }
         val command = value?.command
         if (command != null && command.explored) {
             // Codex shows a parsed read/search/list as what it did, one line per action, never as the shell call.
             command.steps.forEachIndexed { index, step -> key(index) {
-                val (verb, subject) = stepSentence(step, running)
+                val (verb, subject) = stepSentence(step, state)
                 TraceLine(onClick = onExpand, active = expanded, modifier = Modifier.testTag(if (index == 0) "activity-toggle:${item.key}" else "activity-step:${item.key}:$index")
                     .semantics { stateDescription = "$status · $expansionState" }) {
                     StatusGlyph(running, stepIcon(step.kind))
-                    Text(verb, style = MaterialTheme.typography.bodyMedium, color = toneText(), maxLines = 1)
-                    if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        style = MaterialTheme.typography.bodyMedium, color = toneSubject())
+                    Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
+                        style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                    if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneSubject())
                     if (state == ActivityStatus.Failed) Text(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
-                        maxLines = 1, style = MaterialTheme.typography.labelSmall, color = c.error)
+                        maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
+                    ActivityExpansionIcon(expanded)
                 }
             } }
             AnimatedVisibility(expanded,
@@ -229,21 +278,24 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             }
             return@Column
         }
-        val (verb, subject) = traceSentence(item, value, running)
+        val (verb, subject) = traceSentence(item, value, state)
         // A finished thought with no recorded text has nothing to open; Codex shows it as a plain label.
         val empty = value?.kind == ActivityKind.Reasoning && value.output.text.isBlank() && !running
         val image = value?.kind == ActivityKind.Image
         TraceLine(onClick = onExpand, active = expanded, enabled = !empty,
             modifier = Modifier.testTag("activity-toggle:${item.key}").semantics { stateDescription = "$status · $expansionState" }) {
-            StatusGlyph(running, kindIcon(value?.kind, value?.webAction))
-            Text(verb, style = MaterialTheme.typography.bodyMedium, color = toneText(), maxLines = 1)
-            if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                style = if (value?.kind == ActivityKind.Command) MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace) else MaterialTheme.typography.bodyMedium,
+            // The robot glyph remains recognisable even while its native call is running.
+            if (value?.kind == ActivityKind.Agents) TraceGlyph(PocketIcons.RobotOutline)
+            else StatusGlyph(running, kindIcon(value?.kind, value?.webAction))
+            Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
+                style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+            if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp),
                 color = toneSubject())
-            if (state == ActivityStatus.Failed) Text(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
-                maxLines = 1, style = MaterialTheme.typography.labelSmall, color = c.error)
-            else if (state == ActivityStatus.Interrupted) Text(status, maxLines = 1, style = MaterialTheme.typography.labelSmall, color = toneText())
-            if (!empty) ActivityExpansionIcon(expanded)
+            if (state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) Text(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
+                maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
+            else if (state == ActivityStatus.Interrupted) Text(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = toneText())
+            if (!empty && (value?.kind != ActivityKind.Agents || expanded)) ActivityExpansionIcon(expanded)
         }
         if (image && value != null) AnimatedVisibility(expanded,
             enter = fadeIn(tween(pocketMotionMillis(160))) + expandVertically(tween(pocketMotionMillis(220), easing = FastOutSlowInEasing), expandFrom = Alignment.Top),
@@ -264,16 +316,16 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
 
 @Composable
 private fun TraceGlyph(icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    Icon(icon, null, Modifier.size(15.dp), tint = toneText().copy(alpha = .85f))
+    Icon(icon, null, Modifier.size(16.dp), tint = toneText().copy(alpha = .85f))
 }
 
 /** The breathing dot of a running step morphs into its kind glyph when it finishes (scale + fade on a spring). */
 @Composable
 private fun StatusGlyph(running: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    androidx.compose.animation.AnimatedContent(running, Modifier.size(15.dp), contentAlignment = Alignment.Center, transitionSpec = {
+    androidx.compose.animation.AnimatedContent(running, Modifier.size(16.dp), contentAlignment = Alignment.Center, transitionSpec = {
         (fadeIn(tween(pocketMotionMillis(160))) + androidx.compose.animation.scaleIn(androidx.compose.animation.core.spring(dampingRatio = .55f, stiffness = 700f), initialScale = .4f)) togetherWith
             (fadeOut(tween(pocketMotionMillis(100))) + androidx.compose.animation.scaleOut(tween(pocketMotionMillis(120)), targetScale = .4f))
-    }, label = "trace-status") { busy -> if (busy) Box(Modifier.size(15.dp), contentAlignment = Alignment.Center) { RunningDot() } else TraceGlyph(icon) }
+    }, label = "trace-status") { busy -> if (busy) Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) { RunningDot() } else TraceGlyph(icon) }
 }
 
 internal fun stepIcon(kind: StepKind) = when (kind) {
@@ -286,10 +338,10 @@ internal fun stepIcon(kind: StepKind) = when (kind) {
 
 internal fun kindIcon(kind: ActivityKind?, web: WebAction? = null) = when (kind) {
     ActivityKind.Command -> PocketIcons.Terminal
-    ActivityKind.Files -> PocketIcons.FilePen
+    ActivityKind.Files -> PocketIcons.Edit
     ActivityKind.Tool -> PocketIcons.Wrench
     ActivityKind.Web -> if (web == WebAction.Search) PocketIcons.Globe else PocketIcons.Link
-    ActivityKind.Agents -> PocketIcons.Users
+    ActivityKind.Agents -> PocketIcons.RobotOutline
     ActivityKind.Reasoning -> PocketIcons.Sparkle
     ActivityKind.Image -> PocketIcons.Image
     else -> PocketIcons.Wrench
@@ -299,29 +351,34 @@ internal fun kindIcon(kind: ActivityKind?, web: WebAction? = null) = when (kind)
 internal fun skillLabel(name: String) = if (name.length <= 4 && name.all { it.isLetter() }) name.uppercase() else name
 
 @Composable
-private fun stepSentence(step: CommandStep, running: Boolean): Pair<String, String> = when (step.kind) {
+private fun stepSentence(step: CommandStep, state: ActivityStatus): Pair<String, String> {
+    val running = state == ActivityStatus.Running || state == ActivityStatus.Waiting
+    if (state !in setOf(ActivityStatus.Completed, ActivityStatus.Running, ActivityStatus.Waiting)) return when (step.kind) {
+        StepKind.Read -> "读取" to step.name.ifBlank { compactFileName(step.path) }
+        StepKind.Skill -> "技能" to skillLabel(step.name)
+        StepKind.Search -> "搜索" to listOf(step.query, compactFileName(step.path)).filter(String::isNotBlank).joinToString(" · ").ifBlank { step.command }
+        StepKind.ListFiles -> "列出目录" to compactFileName(step.path).ifBlank { step.command }
+        StepKind.Unknown -> "命令" to compactCommandLabel(step.command)
+    }
+    return when (step.kind) {
     StepKind.Skill -> stringResource(if (running) R.string.v05_trace_skill_loading else R.string.v05_trace_skill, skillLabel(step.name)) to ""
     StepKind.Read -> stringResource(if (running) R.string.v05_trace_reading else R.string.v05_trace_read) to step.name.ifBlank { compactFileName(step.path) }
     StepKind.Search -> stringResource(if (running) R.string.v05_trace_searching else R.string.v05_trace_searched) to
         listOf(step.query, compactFileName(step.path)).filter(String::isNotBlank).joinToString(" · ").ifBlank { step.command }
     StepKind.ListFiles -> stringResource(if (running) R.string.v05_trace_listing else R.string.v05_trace_listed) to
         compactFileName(step.path).ifBlank { step.path.ifBlank { step.command } }
-    StepKind.Unknown -> stringResource(if (running) R.string.v04_trace_running else R.string.v04_trace_ran) to step.command
+    StepKind.Unknown -> (if (running) "执行中" else "执行") to compactCommandLabel(step.command)
+    }
 }
 
 /** One gray sentence: verb + subject. Running items use present tense. */
 @Composable
-private fun traceSentence(item: TimelineItem, value: PresentedActivity?, running: Boolean): Pair<String, String> {
+private fun traceSentence(item: TimelineItem, value: PresentedActivity?, state: ActivityStatus): Pair<String, String> {
     if (value == null) return itemLabel(item.type) to ""
+    val running = state == ActivityStatus.Running || state == ActivityStatus.Waiting
     return when (value.kind) {
         ActivityKind.Command -> {
-            val command = value.command
-            val verb = when {
-                running -> stringResource(R.string.v04_trace_running)
-                command?.durationMs != null && command.durationMs >= 1_000 -> stringResource(R.string.v04_trace_ran_in, NativeActivityPresentation.duration(command.durationMs))
-                else -> stringResource(R.string.v04_trace_ran)
-            }
-            verb to NativeActivityPresentation.headline(command?.display ?: value.title)
+            commandActionLabel(state) to compactCommandLabel(value.command?.command ?: value.title)
         }
         ActivityKind.Files -> stringResource(if (running) R.string.v04_trace_editing else R.string.v04_trace_edited) to ""
         ActivityKind.Web -> stringResource(when (value.webAction) {
@@ -332,11 +389,53 @@ private fun traceSentence(item: TimelineItem, value: PresentedActivity?, running
         }) to value.subtitle
         ActivityKind.Image -> stringResource(if (item.type == "imageGeneration") R.string.v04_trace_generated_image else R.string.v04_trace_viewed_image) to
             compactFileName(value.subtitle)
-        ActivityKind.Agents -> agentActionLabel(value.title) to value.agents.joinToString("、") { it.name.ifBlank { it.threadId.take(8) } }
-        ActivityKind.Reasoning -> stringResource(if (running) R.string.v04_trace_thinking else R.string.v04_trace_thought) to ""
+        ActivityKind.Agents -> NativeActivityPresentation.agentCallLabel(value) to ""
+        ActivityKind.Reasoning -> "摘要" to ""
         ActivityKind.Tool -> stringResource(if (running) R.string.v04_trace_calling else R.string.v04_trace_called) to
             listOf(value.subtitle, value.title).filter(String::isNotBlank).joinToString(" · ").ifBlank { itemLabel(item.type) }
         else -> itemLabel(item.type) to value.title
+    }
+}
+
+internal fun commandActionLabel(state: ActivityStatus): String = when (state) {
+    ActivityStatus.Running -> "正在运行"
+    ActivityStatus.Completed -> "已运行"
+    ActivityStatus.Waiting -> "等待运行"
+    ActivityStatus.Failed -> "运行失败"
+    ActivityStatus.Interrupted -> "已中断"
+    ActivityStatus.Unknown -> "命令"
+}
+
+/** One strip below currently executing content, fed by the parent's authoritative current roster. */
+internal fun activeAgentWorkSummary(agents: List<AgentRosterEntry>, names: Map<String, String>): String {
+    val active = agents.filter { it.isCurrent && it.status == ActivityStatus.Running }.distinctBy { it.threadId }
+    if (active.isEmpty()) return ""
+    val visibleNames = active.map { nativeAgentDisplayName(it.threadId, it.name, names) }.filter(String::isNotBlank).take(2)
+    if (visibleNames.isEmpty()) return "${active.size} 个智能体正在工作"
+    val others = active.size - visibleNames.size
+    return visibleNames.joinToString("、") + (if (others > 0) "和另外${others}个子智能体" else "") + "开始工作"
+}
+
+@Composable
+internal fun NativeAgentWorkingStrip(agents: List<AgentRosterEntry>, modifier: Modifier = Modifier, onOpen: ((String) -> Unit)? = null) {
+    val names = LocalNativeAgentNames.current
+    val active = agents.filter { it.isCurrent && it.status == ActivityStatus.Running }.distinctBy { it.threadId }
+    val label = activeAgentWorkSummary(active, names)
+    if (label.isBlank()) return
+    Row(modifier.fillMaxWidth().heightIn(min = 32.dp).testTag("native-agents-working")
+        .then(if (onOpen != null) Modifier.clickable(role = Role.Button) { onOpen(active.first().threadId) } else Modifier)
+        .padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        val colors = listOf(Color(0xFF6C9EE8), Color(0xFF63B99B), Color(0xFF89CBB7))
+        val glyphs = listOf(PocketIcons.AgentFlower, PocketIcons.AgentOrbit, PocketIcons.AgentWave)
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            active.take(3).forEachIndexed { index, agent -> key(agent.threadId) {
+                Box(Modifier.size(17.dp).background(colors[index].copy(alpha = .18f), CircleShape), contentAlignment = Alignment.Center) {
+                    Icon(glyphs[index], null, Modifier.size(16.dp), tint = colors[index])
+                }
+            } }
+        }
+        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -347,28 +446,37 @@ private fun TraceLine(onClick: () -> Unit, modifier: Modifier = Modifier, active
     val pressed by interaction.collectIsPressedAsState()
     val tone = traceTone(enabled && (pressed || active))
     CompositionLocalProvider(LocalTraceTone provides tone) {
-        Row(modifier.fillMaxWidth().heightIn(min = 40.dp)
+        Row(modifier.fillMaxWidth().heightIn(min = 32.dp)
             .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
-            .padding(horizontal = 4.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp), content = content)
+            .padding(horizontal = 4.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), content = content)
     }
 }
 
 @Composable
-private fun FileLine(file: ActivityFile, running: Boolean, onOpen: () -> Unit) {
+private fun FileLine(file: ActivityFile, state: ActivityStatus, expanded: Boolean, truncated: Boolean, onOpen: () -> Unit) {
     val (add, remove) = pocketDiffColors()
     val c = MaterialTheme.colorScheme
     val name = compactFileName(file.path).ifBlank { stringResource(R.string.v03_file_unknown) }
-    TraceLine(onClick = onOpen, modifier = Modifier.semantics { contentDescription = file.path }) {
-        StatusGlyph(running, PocketIcons.FilePen)
-        Text(stringResource(if (running) R.string.v04_trace_editing else R.string.v04_trace_edited), style = MaterialTheme.typography.bodyMedium, color = toneText(), maxLines = 1)
-        Text(name, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.bodyMedium.copy(textDecoration = TextDecoration.Underline), color = c.onSurface)
-        Text(buildAnnotatedString {
+    TraceLine(onClick = onOpen, active = expanded, modifier = Modifier.testTag("activity-file:${file.id}")
+        .semantics { contentDescription = file.path; stateDescription = if (expanded) "已展开" else "已折叠" }) {
+        StatusGlyph(state == ActivityStatus.Running, PocketIcons.Edit)
+        Text(fileActionLabel(file.kind, state), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp,
+            color = if (state == ActivityStatus.Failed) c.error else toneText(), maxLines = 1, softWrap = false)
+        Text(name, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium.copy(textDecoration = TextDecoration.Underline), fontSize = 14.sp, color = c.onSurface)
+        val fallback = remember(file.diff, truncated) { inlineDiffFallback(file.diff, truncated) }
+        if (fallback != null) Text(when (fallback) {
+            InlineDiffFallback.Binary -> "二进制"
+            InlineDiffFallback.Truncated -> "差异已截断"
+            InlineDiffFallback.Empty -> "无差异"
+        }, fontSize = 14.sp, maxLines = 1, softWrap = false, color = toneSubject())
+        else Text(buildAnnotatedString {
             withStyle(SpanStyle(color = add)) { append("+${file.additions}") }
             append("  ")
             withStyle(SpanStyle(color = remove)) { append("−${file.deletions}") }
-        }, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        }, style = MaterialTheme.typography.labelMedium, fontSize = 14.sp, maxLines = 1, softWrap = false)
+        ActivityExpansionIcon(expanded)
     }
 }
 
@@ -385,36 +493,38 @@ private fun RunningDot() {
 
 @Composable
 private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: String, state: ActivityStatus, onDetail: () -> Unit) {
+    val openAgent = LocalNativeAgentReader.current
     val c = MaterialTheme.colorScheme
-    Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 2.dp, bottom = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    val names = LocalNativeAgentNames.current
+    Column(Modifier.fillMaxWidth().padding(start = 26.dp, top = 2.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (value.kind == ActivityKind.Reasoning) {
-            if (value.output.text.isNotBlank()) Box(Modifier.padding(start = 8.dp)) { MarkdownText(value.output.text, "$scope/${item.key}/reasoning") }
-            else Text(stringResource(R.string.v03_output_waiting), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
+            item.summaryParts.filter(String::isNotBlank).forEachIndexed { index, part -> NativeSummaryProse(part, "$scope/${item.key}/reasoning:$index") }
             return@Column
         }
-        value.agents.forEach { agent -> key(agent.threadId) {
-            Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(12.dp)).clickable(onClick = onDetail)
-                .testTag("agent-summary:${agent.threadId}").padding(horizontal = 8.dp, vertical = 6.dp)) {
-                // A native thread ID is an honest fallback when no name was recorded.
+        value.agents.forEachIndexed { index, agent -> key(agent.threadId) {
+            val name = nativeAgentDisplayName(agent, names).ifBlank { "智能体 ${index + 1}" }
+            Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { if (openAgent != null) openAgent(agent.threadId) else onDetail() }
+                .testTag("agent-summary:${agent.threadId}").padding(vertical = 6.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(PocketIcons.Users, null, Modifier.size(17.dp), tint = c.onSurfaceVariant)
-                    Text(agent.name.ifBlank { agent.threadId.take(12) }, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = c.onSurface,
+                    Icon(PocketIcons.RobotOutline, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
+                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(activityStatusLabel(agent.status), style = MaterialTheme.typography.labelSmall, color = if (agent.status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
-                    Icon(PocketIcons.ChevronRight, "查看子任务详情", Modifier.size(16.dp), tint = c.onSurfaceVariant)
+                    Icon(PocketIcons.ChevronRight, "查看智能体详情", Modifier.size(14.dp), tint = c.onSurfaceVariant)
                 }
-                if (agent.message.text.isNotBlank()) Text(agent.message.text, Modifier.padding(start = 25.dp), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
-                    maxLines = 3, overflow = TextOverflow.Ellipsis)
+                if (agent.message.text.isNotBlank()) SelectionContainer {
+                    Text(agent.message.text, Modifier.padding(start = 23.dp), style = MaterialTheme.typography.bodySmall,
+                        color = if (agent.status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
+                }
             }
         } }
         val command = value.command
-        // The header line is one truncated line; the detail shows the whole readable script, never the shell launcher.
-        val shownCommand = command?.display?.trim().orEmpty().ifBlank { command?.command?.trim().orEmpty() }
+        // Keep the original invocation in details so launchers, quoting and arguments remain inspectable.
+        val shownCommand = command?.command?.trim().orEmpty()
         val showCommand = command != null && shownCommand.isNotBlank()
         val hasOutput = value.output.text.isNotBlank()
         if (showCommand || (command?.cwd?.isNotBlank() == true) || hasOutput) {
-            Surface(shape = RoundedCornerShape(14.dp), color = c.surfaceContainerLow) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (showCommand) SelectionContainer {
                         Text(buildAnnotatedString {
                             withStyle(SpanStyle(color = c.onSurfaceVariant)) { append("$ ") }
@@ -423,18 +533,24 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
                     }
                     if (command != null && command.cwd.isNotBlank()) Text(stringResource(R.string.v04_transcript_cwd, command.cwd),
                         fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    if (command != null) {
+                        val result = listOfNotNull(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) },
+                            command.durationMs?.let { NativeActivityPresentation.duration(it) }).joinToString(" · ")
+                        if (result.isNotBlank()) Text(result, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    }
                     if (value.command == null && value.subtitle.isNotBlank() && value.kind != ActivityKind.Web) Text(value.subtitle,
                         style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
                     if (hasOutput) {
+                        if (value.kind == ActivityKind.Agents) Text(if (value.title == "spawnAgent") "任务" else "消息",
+                            style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
                         if (showCommand || command?.cwd?.isNotBlank() == true) HorizontalDivider(color = c.outlineVariant.copy(alpha = .5f))
                         Box(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                             SelectionContainer {
-                                Text(value.output.text, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodySmall, color = c.onSurface,
+                                Text(value.output.text, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
                                     fontFamily = if (value.kind == ActivityKind.Command) FontFamily.Monospace else FontFamily.Default)
                             }
                         }
                     }
-                }
             }
         } else if (value.files.isEmpty() && value.agents.isEmpty()) Text(
             stringResource(if (state == ActivityStatus.Running) R.string.v03_output_waiting else R.string.v03_output_unavailable),
@@ -462,17 +578,3 @@ internal fun activityStatusLabel(status: ActivityStatus): String = stringResourc
     ActivityStatus.Interrupted -> R.string.state_interrupted
     ActivityStatus.Unknown -> R.string.state_unknown
 })
-
-@Composable
-private fun agentActionLabel(action: String): String = when (action) {
-    "spawnAgent", "started" -> stringResource(R.string.v03_agent_spawn)
-    "sendInput", "sendMessage", "interacted" -> stringResource(R.string.v03_agent_message)
-    "resumeAgent" -> stringResource(R.string.v03_agent_resume)
-    "wait" -> stringResource(R.string.v03_agent_wait)
-    "closeAgent" -> stringResource(R.string.v03_agent_close)
-    "interruptAgent", "interrupted" -> stringResource(R.string.v03_agent_interrupt)
-    "followupTask" -> stringResource(R.string.v03_agent_followup)
-    "listAgents" -> stringResource(R.string.v03_agent_list)
-    "completed" -> stringResource(R.string.v03_agent_complete)
-    else -> action.ifBlank { stringResource(R.string.v03_activity_agents) }
-}

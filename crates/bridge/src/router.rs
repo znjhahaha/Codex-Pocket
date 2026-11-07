@@ -20,6 +20,7 @@ struct Pending {
     original_id: Value,
     method: String,
     requested_thread: Option<String>,
+    settings: Option<crate::settings::Observation>,
 }
 struct ServerPending {
     id: Value,
@@ -47,9 +48,12 @@ pub struct Router {
     server: HashMap<String, ServerPending>,
     completed: VecDeque<Completed>,
     verified_history: HashMap<Client, VecDeque<String>>,
+    verified_cwds: HashMap<Client, VecDeque<String>>,
+    verified_profiles: HashMap<Client, std::collections::BTreeSet<String>>,
     pub loaded: HashSet<String>,
     pub initialized: bool,
     pub native_version: Option<String>,
+    settings: crate::settings::SettingsCache,
 }
 
 impl Default for Router {
@@ -62,9 +66,12 @@ impl Default for Router {
             server: HashMap::new(),
             completed: VecDeque::new(),
             verified_history: HashMap::new(),
+            verified_cwds: HashMap::new(),
+            verified_profiles: HashMap::new(),
             loaded: HashSet::new(),
             initialized: false,
             native_version: None,
+            settings: Default::default(),
         }
     }
 }
@@ -76,6 +83,24 @@ impl Router {
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            if matches!(client, Client::Remote(_)) && method == "pocket/threadSettings" {
+                if !value["params"].as_object().is_some_and(|p| {
+                    p.len() == 1
+                        && p.get("threadId")
+                            .and_then(Value::as_str)
+                            .is_some_and(crate::settings::valid_thread)
+                }) {
+                    return Self::reject(
+                        client,
+                        &value,
+                        "Settings read accepts only a native threadId",
+                    );
+                }
+                return vec![Route::Client(
+                    client,
+                    json!({"id":value["id"],"result":self.settings.read(value["params"]["threadId"].as_str().unwrap())}),
+                )];
+            }
             if matches!(client, Client::Remote(_)) && method == "pocket/approvals/list" {
                 if value["params"].as_object().is_none_or(|p| !p.is_empty()) {
                     return Self::reject(client, &value, "Pending snapshot takes no parameters");
@@ -97,6 +122,26 @@ impl Router {
                 )];
             }
             if client != Client::Desktop {
+                let quota_read =
+                    matches!(method.as_str(), "account/rateLimits/read" | "config/read");
+                if quota_read
+                    && (!(value["params"].as_object().is_some_and(|p| p.is_empty())
+                        || (method == "config/read"
+                            && value["params"].as_object().is_some_and(|p| p.len() == 2)
+                            && value["params"]["includeLayers"] == false
+                            && value["params"]["cwd"].as_str().is_some_and(|cwd| {
+                                self.verified_cwds
+                                    .get(&client)
+                                    .is_some_and(|cwds| cwds.iter().any(|v| v == cwd))
+                            })))
+                        || !self.capabilities.supports(&method, &value["params"]))
+                {
+                    return Self::reject(
+                        client,
+                        &value,
+                        "Read requires native capability evidence and empty or verified read-only parameters",
+                    );
+                }
                 let permitted = matches!(
                     method.as_str(),
                     "thread/list"
@@ -129,7 +174,7 @@ impl Router {
                         | "skills/list"
                         | "plugin/list"
                 );
-                if !permitted {
+                if !permitted && !quota_read {
                     return Self::reject(
                         client,
                         &value,
@@ -138,7 +183,13 @@ impl Router {
                 }
                 if crate::capabilities::advanced(&method)
                     && (!self.capabilities.supports(&method, &value["params"])
-                        || !safe_advanced(&method, &value["params"]))
+                        || !safe_advanced(&method, &value["params"])
+                        || (value["params"]["approvalsReviewer"] == "auto_review"
+                            && !self
+                                .capabilities
+                                .0
+                                .get(&method)
+                                .is_some_and(|f| f.contains("$autoReview"))))
                 {
                     return Self::reject(
                         client,
@@ -212,6 +263,19 @@ impl Router {
                         }
                     }
                 }
+                if method == "thread/settings/update"
+                    && let Some(id) = value["params"]["permissions"].as_str()
+                    && !self
+                        .verified_profiles
+                        .get_mut(&client)
+                        .is_some_and(|ids| ids.remove(id))
+                {
+                    return Self::reject(
+                        client,
+                        &value,
+                        "Permission profile requires verified native config",
+                    );
+                }
             }
             if let Some(id) = value.get("id").cloned() {
                 let Some(next) = self.next.checked_add(1) else {
@@ -224,6 +288,7 @@ impl Router {
                     Pending {
                         client,
                         original_id: id,
+                        settings: self.settings.prepare(&method, &value["params"]),
                         requested_thread: if method == "thread/read"
                             && value["params"]["includeTurns"] == false
                         {
@@ -347,6 +412,14 @@ impl Router {
                 }
                 return routes;
             }
+            let settings_event = self.settings.event(&value);
+            if method == "thread/settings/updated" {
+                let mut routes = vec![Route::Client(Client::Desktop, value)];
+                if let Some(event) = settings_event {
+                    routes.push(Route::Broadcast(event));
+                }
+                return routes;
+            }
             if method == "thread/started"
                 && let Some(id) = value["params"]["thread"]["id"].as_str()
             {
@@ -409,6 +482,12 @@ impl Router {
         if let Some(id) = value.get("id").and_then(Value::as_str)
             && let Some(p) = self.pending.remove(id)
         {
+            let settings_event = if value.get("error").is_none() && value.get("result").is_some() {
+                p.settings
+                    .and_then(|settings| self.settings.accepted(settings, &value["result"]))
+            } else {
+                None
+            };
             if value.get("error").is_none() {
                 if p.method == "thread/read"
                     && matches!(p.client, Client::Remote(_))
@@ -423,6 +502,23 @@ impl Router {
                         history.pop_front();
                     }
                     history.push_back(thread.to_owned());
+                    if let Some(cwd) = value["result"]["thread"]["cwd"]
+                        .as_str()
+                        .filter(|cwd| crate::settings::valid_thread(cwd))
+                    {
+                        let cwds = self.verified_cwds.entry(p.client.clone()).or_default();
+                        cwds.retain(|v| v != cwd);
+                        if cwds.len() == 64 {
+                            cwds.pop_front();
+                        }
+                        cwds.push_back(cwd.to_owned());
+                    }
+                }
+                if p.method == "config/read" && matches!(p.client, Client::Remote(_)) {
+                    self.verified_profiles.insert(
+                        p.client.clone(),
+                        crate::permission_policy::configured_profiles(&value["result"]),
+                    );
                 }
                 if p.method == "initialize" {
                     self.initialized = true;
@@ -440,7 +536,11 @@ impl Router {
                 }
             }
             value["id"] = p.original_id;
-            return vec![Route::Client(p.client, value)];
+            let mut routes = vec![Route::Client(p.client, value)];
+            if let Some(event) = settings_event {
+                routes.push(Route::Broadcast(event));
+            }
+            return routes;
         }
         vec![Route::Drop]
     }
@@ -492,6 +592,8 @@ impl Router {
     pub fn disconnect(&mut self, client: &Client) {
         self.pending.retain(|_, p| &p.client != client);
         self.verified_history.remove(client);
+        self.verified_cwds.remove(client);
+        self.verified_profiles.remove(client);
         for completed in &mut self.completed {
             if completed
                 .winner
@@ -504,6 +606,9 @@ impl Router {
     }
 }
 fn safe_advanced(method: &str, params: &Value) -> bool {
+    if method == "thread/settings/update" && crate::permission_policy::valid_update(params) {
+        return true;
+    }
     let allowed: &[&str] = match method {
         "thread/queue/add" => &["threadId", "clientUserMessageId", "input"],
         "thread/queue/update" => &["threadId", "queuedSubmissionId", "input"],
@@ -530,6 +635,232 @@ fn safe_advanced(method: &str, params: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v052_presets_and_profiles_require_exact_schema_and_config_evidence() {
+        let mut r = Router::default();
+        let helper = Client::Remote("helper".into());
+        r.loaded.insert("t".into());
+        r.capabilities.0.insert(
+            "thread/settings/update".into(),
+            [
+                "threadId",
+                "approvalPolicy",
+                "approvalsReviewer",
+                "sandboxPolicy",
+                "permissions",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        );
+        let update = |params| json!({"id":1,"method":"thread/settings/update","params":params});
+        assert!(
+            !r.from_client(
+                helper.clone(),
+                update(crate::permission_policy::preset("t", "auto").unwrap())
+            )
+            .iter()
+            .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        r.capabilities
+            .0
+            .get_mut("thread/settings/update")
+            .unwrap()
+            .insert("$autoReview".into());
+        for id in ["request", "auto", "full"] {
+            assert!(
+                r.from_client(
+                    helper.clone(),
+                    update(crate::permission_policy::preset("t", id).unwrap())
+                )
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+            );
+        }
+        let named = update(json!({"threadId":"t","permissions":"existing"}));
+        assert!(
+            !r.from_client(helper.clone(), named.clone())
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        r.capabilities
+            .0
+            .insert("config/read".into(), Default::default());
+        let routes = r.from_client(
+            helper.clone(),
+            json!({"id":2,"method":"config/read","params":{}}),
+        );
+        let Route::Runtime(sent) = &routes[0] else {
+            panic!("config");
+        };
+        r.from_runtime(json!({"id":sent["id"],"result":{"config":{"permissions":{"existing":{"extends":":workspace"},"bad":{"apiKey":"secret"}}}}}));
+        assert!(
+            r.from_client(helper.clone(), named.clone())
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(helper.clone(), named)
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(helper, update(json!({"threadId":"t","permissions":"bad"})))
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+    }
+    #[test]
+    fn v052_config_cwd_requires_native_proof_on_this_connection() {
+        let mut r = Router::default();
+        r.capabilities.0.insert(
+            "config/read".into(),
+            ["cwd", "includeLayers"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        let helper = Client::Remote("helper".into());
+        let read = json!({"id":1,"method":"config/read","params":{"cwd":"C:/verified","includeLayers":false}});
+        assert!(
+            !r.from_client(helper.clone(), read.clone())
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        let routes = r.from_client(
+            helper.clone(),
+            json!({"id":2,"method":"thread/read","params":{"threadId":"t","includeTurns":false}}),
+        );
+        let Route::Runtime(sent) = &routes[0] else {
+            panic!("read");
+        };
+        r.from_runtime(json!({"id":sent["id"],"result":{"thread":{"id":"t","cwd":"C:/verified"}}}));
+        assert!(
+            r.from_client(helper.clone(), read.clone())
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(Client::Remote("other".into()), read.clone())
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+        for params in [
+            json!({"cwd":"C:/different","includeLayers":false}),
+            json!({"cwd":"C:/verified","includeLayers":true}),
+            json!({"cwd":"C:/verified","includeLayers":false,"profile":"x"}),
+        ] {
+            assert!(
+                !r.from_client(
+                    helper.clone(),
+                    json!({"id":3,"method":"config/read","params":params})
+                )
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+            );
+        }
+        r.disconnect(&helper);
+        assert!(
+            !r.from_client(helper, read)
+                .iter()
+                .any(|r| matches!(r, Route::Runtime(_)))
+        );
+    }
+    fn read_settings(r: &mut Router, thread: &str) -> Value {
+        let routes = r.from_client(
+            Client::Remote("helper".into()),
+            json!({"id":"read","method":"pocket/threadSettings","params":{"threadId":thread}}),
+        );
+        let Route::Client(_, value) = &routes[0] else {
+            panic!("local settings read")
+        };
+        value["result"].clone()
+    }
+    #[test]
+    fn settings_event_uses_thread_settings_and_filters_config() {
+        let mut r = Router::default();
+        let native = json!({"method":"thread/settings/updated","params":{"threadId":"t","threadSettings":{"model":"gpt-test","effort":null,"serviceTier":"fast","collaborationMode":{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":"private"}},"cwd":"C:/private","permissions":"all","approvalPolicy":"never","config":{"apiKey":"secret"}}}});
+        let routes = r.from_runtime(native.clone());
+        assert!(matches!(&routes[0], Route::Client(Client::Desktop, v) if v == &native));
+        let expected = json!({"approvalPolicy":"never","model":"gpt-test","effort":null,"serviceTier":"fast","collaborationMode":{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high"}}});
+        assert!(
+            matches!(&routes[1], Route::Broadcast(v) if v["params"]["threadSettings"] == expected)
+        );
+        assert_eq!(
+            read_settings(&mut r, "t"),
+            json!({"threadId":"t","settings":expected,"known":true})
+        );
+        assert_eq!(read_settings(&mut r, "other")["known"], false);
+        r.disconnect(&Client::Remote("helper".into()));
+        assert_eq!(read_settings(&mut r, "t")["settings"], expected);
+    }
+    #[test]
+    fn settings_only_accepted_requests_apply_and_late_results_cannot_overwrite() {
+        let mut r = Router::default();
+        let request = |model: &str| json!({"id":1,"method":"turn/start","params":{"threadId":"t","model":model,"input":[],"permissions":"all"}});
+        let rejected = runtime(r.from_client(Client::Desktop, request("rejected")));
+        r.from_runtime(json!({"id":rejected["id"],"error":{"code":-1,"message":"no"}}));
+        assert_eq!(read_settings(&mut r, "t")["known"], false);
+        let old = runtime(r.from_client(Client::Desktop, request("old")));
+        let new = runtime(r.from_client(Client::Desktop, request("new")));
+        assert_eq!(read_settings(&mut r, "t")["known"], false);
+        r.from_runtime(json!({"id":new["id"],"result":{"turn":{"id":"turn"}}}));
+        r.from_runtime(json!({"id":old["id"],"result":{"turn":{"id":"turn"}}}));
+        assert_eq!(
+            read_settings(&mut r, "t")["settings"],
+            json!({"model":"new"})
+        );
+        let read = runtime(r.from_client(
+            Client::Desktop,
+            json!({"id":2,"method":"thread/read","params":{"threadId":"t","includeTurns":false}}),
+        ));
+        r.from_runtime(json!({"id":read["id"],"result":{"thread":{"id":"other","model":"wrong"}}}));
+        assert_eq!(
+            read_settings(&mut r, "t")["settings"],
+            json!({"model":"new"})
+        );
+        assert_eq!(read_settings(&mut r, "other")["known"], false);
+    }
+    #[test]
+    fn settings_metadata_does_not_infer_plan_or_default_effort() {
+        let mut r = Router::default();
+        let read = runtime(r.from_client(
+            Client::Desktop,
+            json!({"id":2,"method":"thread/read","params":{"threadId":"t","includeTurns":false}}),
+        ));
+        r.from_runtime(json!({"id":read["id"],"result":{"thread":{"id":"t","model":"persisted","reasoningEffort":null,"turns":[{"model":"ignore-content"}]}}}));
+        assert_eq!(
+            read_settings(&mut r, "t")["settings"],
+            json!({"model":"persisted","effort":null})
+        );
+        let request = runtime(r.from_client(Client::Desktop, json!({"id":3,"method":"turn/start","params":{"threadId":"t","model":null,"effort":null,"collaborationMode":null,"input":[]}})));
+        r.from_runtime(json!({"id":request["id"],"result":{}}));
+        assert_eq!(
+            read_settings(&mut r, "t")["settings"],
+            json!({"model":"persisted","effort":null})
+        );
+    }
+    #[test]
+    fn settings_read_is_local_unknown_and_strictly_scoped() {
+        let mut r = Router::default();
+        let phone = Client::Remote("helper".into());
+        let routes = r.from_client(
+            phone.clone(),
+            json!({"id":1,"method":"pocket/threadSettings","params":{"threadId":"t"}}),
+        );
+        assert!(
+            matches!(&routes[..], [Route::Client(_, v)] if v["result"] == json!({"threadId":"t","settings":{},"known":false}))
+        );
+        for params in [
+            json!({}),
+            json!({"threadId":"t","permissions":"all"}),
+            json!({"threadId":"t","method":"config/read"}),
+        ] {
+            assert!(
+                matches!(&r.from_client(phone.clone(), json!({"id":2,"method":"pocket/threadSettings","params":params}))[..], [Route::Client(_,v)] if v.get("error").is_some())
+            );
+        }
+    }
     use super::*;
     use serde_json::json;
     fn runtime(routes: Vec<Route>) -> Value {
@@ -538,6 +869,69 @@ mod tests {
             _ => panic!("expected runtime"),
         }
     }
+    #[test]
+    fn helper_quota_reads_require_empty_params_and_actual_capabilities() {
+        for method in ["account/rateLimits/read", "config/read"] {
+            let mut router = Router::default();
+            let helper = Client::Remote("authenticated-helper".into());
+            let request = json!({"id":"original","method":method,"params":{}});
+            assert!(
+                matches!(&router.from_client(helper.clone(),request.clone())[..],[Route::Client(_,v)] if v.get("error").is_some())
+            );
+            router.capabilities.0.insert(
+                method.into(),
+                ["cwd".into(), "includeLayers".into(), "accountId".into()]
+                    .into_iter()
+                    .collect(),
+            );
+            let routes = router.from_client(helper.clone(), request);
+            let [Route::Runtime(sent)] = &routes[..] else {
+                panic!("capability-gated read must be routed")
+            };
+            assert_eq!(sent["method"], method);
+            assert_eq!(sent["params"], json!({}));
+            let routed = router.from_runtime(json!({"id":sent["id"],"result":{"fixture":true}}));
+            assert!(
+                matches!(&routed[..],[Route::Client(c,v)] if c==&helper && v["id"]=="original" && v["result"]["fixture"]==true)
+            );
+            for params in [
+                Value::Null,
+                json!([]),
+                json!("bad"),
+                json!({"cwd":"C:/secret"}),
+                json!({"includeLayers":true}),
+                json!({"accountId":"other"}),
+                json!({"apiKey":"secret"}),
+            ] {
+                let routes = router.from_client(
+                    helper.clone(),
+                    json!({"id":"bad","method":method,"params":params}),
+                );
+                assert!(matches!(&routes[..],[Route::Client(_,v)] if v.get("error").is_some()));
+            }
+            let missing =
+                router.from_client(helper.clone(), json!({"id":"missing","method":method}));
+            assert!(matches!(&missing[..],[Route::Client(_,v)] if v.get("error").is_some()));
+            router.capabilities.0.remove(method);
+            assert!(
+                !router
+                    .from_client(helper, json!({"id":"retired","method":method,"params":{}}))
+                    .iter()
+                    .any(|r| matches!(r, Route::Runtime(_)))
+            );
+            // Desktop keeps its native API and does not inherit the helper-only restriction.
+            assert!(
+                router
+                    .from_client(
+                        Client::Desktop,
+                        json!({"id":"desktop","method":method,"params":{"includeLayers":true}})
+                    )
+                    .iter()
+                    .any(|r| matches!(r, Route::Runtime(_)))
+            );
+        }
+    }
+
     #[test]
     fn concurrent_request_ids_never_collide_and_are_restored() {
         let mut r = Router::default();

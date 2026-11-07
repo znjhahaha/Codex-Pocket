@@ -45,6 +45,7 @@ enum Outgoing {
 pub struct Rpc {
     tx: mpsc::Sender<Outgoing>,
     online: Arc<AtomicBool>,
+    capability_failed: bool,
 }
 #[derive(Debug)]
 pub enum NativeEvent {
@@ -117,6 +118,9 @@ impl Connection {
     }
 }
 impl Rpc {
+    pub fn capability_failed(&self) -> bool {
+        self.capability_failed
+    }
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Acquire)
     }
@@ -180,7 +184,11 @@ fn spawn(
             })
             .await;
     });
-    Rpc { tx, online }
+    Rpc {
+        tx,
+        online,
+        capability_failed: false,
+    }
 }
 pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Connected> {
     let bytes = tokio::fs::read(descriptor).await?;
@@ -223,12 +231,8 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
     {
         bail!("Invalid native process identity");
     }
-    if status["initialized"] != true {
-        bail!("Desktop runtime is initializing")
-    };
-    if status["schemaPending"] == true {
-        bail!("Desktop native schema discovery pending");
-    }
+    // Keep the authenticated runtime visible while discovery initializes.
+    // Permission reads refresh pocket/status before claiming native support.
     let capabilities = status
         .get("nativeCapabilities")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -273,15 +277,15 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
         }
     })
     .await??;
-    let capabilities = match native_process
+    let discovered = match native_process
         .as_ref()
         .and_then(|p| native_binary(p.pid).ok())
     {
-        Some(binary) => crate::capabilities::discover(&binary)
-            .await
-            .unwrap_or_default(),
-        None => Default::default(),
+        Some(binary) => crate::capabilities::discover(&binary).await,
+        None => Err(anyhow::anyhow!("Native schema identity unavailable")),
     };
+    let capability_failed = discovered.is_err();
+    let capabilities = discovered.unwrap_or_default();
     connection.write(&json!({"method":"initialized"})).await?;
     let generation = if let Some(process) = &native_process {
         format!("{}:{}", process.pid, process.created_at)
@@ -298,12 +302,13 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
         &crate::auth::hash(&format!("{store}:{generation}"))[..24]
     );
     let connection_id = uuid::Uuid::new_v4().to_string();
-    let rpc = spawn(
+    let mut rpc = spawn(
         Connection::Cli(Box::new(connection)),
         runtime_id.clone(),
         connection_id.clone(),
         events,
     );
+    rpc.capability_failed = capability_failed;
     Ok(Connected {
         capabilities,
         rpc,
@@ -407,6 +412,14 @@ pub(crate) mod test_peer {
         )
     }
     impl Peer {
+        pub async fn assert_idle(&mut self) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), self.reader.next_line())
+                    .await
+                    .is_err(),
+                "unexpected native dispatch"
+            );
+        }
         pub async fn recv(&mut self) -> Value {
             let line = tokio::time::timeout(Duration::from_secs(3), self.reader.next_line())
                 .await

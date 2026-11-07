@@ -2,6 +2,7 @@ package dev.codexpocket.app.ui
 
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.*
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import dev.codexpocket.app.MainActivity
@@ -19,20 +20,24 @@ import org.robolectric.annotation.Config
 class ResumedInteractionTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
 
-    @Test fun scrollingHidesTheModelEvenWithDraftAndActiveTurn() {
-        var scrolling by mutableStateOf(false)
+    @Test fun readingHistoryHidesTheModelEvenWithDraftAndActiveTurn() {
+        var readingHistory by mutableStateOf(false)
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
             PocketComposer("existing draft", "Model", "高", true, ComposerAvailability(false, false, true, true),
-                {}, {}, {}, {}, {}, {}, {}, true, transcriptScrolling = scrolling)
+                {}, {}, {}, {}, {}, {}, {}, true, readingHistory = readingHistory)
         } } }
         compose.onNodeWithTag("composer-model").assertExists()
-        compose.runOnIdle { scrolling = true }
+        compose.runOnIdle { readingHistory = true }
         compose.waitForIdle()
         compose.onNodeWithTag("composer-model").assertDoesNotExist()
-        compose.onNodeWithTag("composer-input").assertTextEquals("existing draft")
-        compose.runOnIdle { scrolling = false }
+        compose.onNodeWithTag("composer-input").assertDoesNotExist()
+        compose.onNodeWithTag("composer-history-preview").assertTextEquals("existing draft")
+            .assert(SemanticsMatcher.keyNotDefined(SemanticsActions.SetText))
+        compose.runOnIdle { readingHistory = false }
         compose.waitForIdle()
         compose.onNodeWithTag("composer-model").assertExists()
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        compose.onNodeWithTag("composer-input").assertTextEquals("existing draft")
     }
 
     @Test fun summaryFoldSurvivesNativeTextUpdatesAndNoSummaryHasNoDisclosure() {
@@ -40,14 +45,22 @@ class ResumedInteractionTest {
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") { ProvideMarkdownRendering {
             LiveTurnStatus("turn", ConversationPresentation.LiveStatus.Thinking, reasoning = summary)
         } } } }
-        compose.onNodeWithTag("live-reasoning-summary").assertExists()
+        compose.onNodeWithTag("live-reasoning-summary", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithTag("live-reasoning-toggle").performClick()
-        compose.onNodeWithTag("live-reasoning-summary").assertDoesNotExist()
+        compose.onNodeWithTag("live-reasoning-summary", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("native-summary-paragraph:0", useUnmergedTree = true).assertTextEquals("Reviewing layout")
         compose.runOnIdle { summary = summary?.copy(text = "**Reviewing constraints**") }
-        compose.onNodeWithTag("live-reasoning-summary").assertDoesNotExist()
+        compose.onNodeWithTag("live-reasoning-summary", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("native-summary-paragraph:0", useUnmergedTree = true).assertTextEquals("Reviewing constraints")
+        compose.onNodeWithTag("live-reasoning-toggle").performClick()
+        compose.onNodeWithTag("live-reasoning-summary", useUnmergedTree = true).assertDoesNotExist()
+        compose.runOnIdle { summary = summary?.copy(text = "**Reviewing changes**") }
+        compose.onNodeWithTag("live-reasoning-summary", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("live-reasoning-toggle").assertTextEquals("Reviewing changes")
         compose.runOnIdle { summary = null }
         compose.onNodeWithTag("live-reasoning-toggle").assertDoesNotExist()
-        compose.onNodeWithText("正在思考").assertExists()
+        compose.onNodeWithTag("live-turn-status").assertDoesNotExist()
+        compose.onNodeWithText("正在思考").assertDoesNotExist()
     }
 
     @Test fun agentDetailsOfferOnlyDirectoryVerifiedChildAndKeepActualIdentity() {

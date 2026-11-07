@@ -160,6 +160,9 @@ internal fun MarkdownText(text: String, messageKey: String) {
     }
     val current = rendered
     val parts = current?.parts.orEmpty()
+    // Markdown owns its block flow. Callers may host it in a Box (plans/tool details),
+    // so emitting sibling AndroidViews here would paint every heading at the same origin.
+    Column(Modifier.fillMaxWidth()) {
     // Until the off-thread render lands, show the prose without Markdown punctuation instead of flashing `**`.
     if (current == null) Text(remember(text) { markdownPreview(text) }, style = MaterialTheme.typography.bodyLarge)
     parts.forEachIndexed { index, part ->
@@ -173,6 +176,7 @@ internal fun MarkdownText(text: String, messageKey: String) {
     val topCodes = parts.mapNotNull { it.code }.toMutableList()
     current?.code?.forEachIndexed { index, code ->
         if (topCodes.contains(code)) topCodes.remove(code) else PocketTextButton(onClick = { clipboard.setText(AnnotatedString(code)) }) { Text(context.getString(R.string.copy_code_number, index + 1)) }
+    }
     }
 }
 

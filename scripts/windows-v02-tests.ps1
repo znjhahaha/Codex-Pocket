@@ -244,5 +244,37 @@ Test 'registered scheduler omission of defaults and account-name trigger remains
     Fails { Assert-PocketTaskOwned ($xml.Replace('<LogonType>InteractiveToken</LogonType>','<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel>')) $launcher } 'drift'
     Fails { Assert-PocketTaskOwned ($xml.Replace('<LogonTrigger>','<LogonTrigger><Enabled>false</Enabled>')) $launcher } 'drift'
 }
+Test 'repeated upgrades keep bootstrap record bounded with exact verified rollback' {
+    $small=@{InstallRoot=(Join-Path $testRoot 'bounded-install');Programs=(Join-Path $testRoot 'bounded-programs');Startup=(Join-Path $testRoot 'bounded-startup')}
+    $script:fakeCli='C:\original fixture\codex.exe';$script:fakeKind='String';$script:fakeTask=$null
+    $argsBounded=@{Context=$small;SourceDirectory=$source;StateDirectory=$state;Apply=$true}
+    Invoke-PocketWindowsInstall @argsBounded | Out-Null
+    $recordPath=Join-Path $small.InstallRoot 'desktop-install.json'
+    for($upgrade=0;$upgrade -lt 24;$upgrade++) {
+        $previous=Get-PocketFileHash $recordPath
+        Invoke-PocketWindowsInstall @argsBounded -UiStartup $(if($upgrade%2 -eq 0){'Enable'}else{'Disable'}) | Out-Null
+        Assert ((Get-Item -LiteralPath $recordPath).Length -lt 128KB) 'Repeated integration grew the bootstrap record'
+        $record=Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $snapshot=Read-PocketRollbackSnapshot $record.rollback $small.InstallRoot
+        Assert ($snapshot.manifest.hash -eq $previous) 'Previous installation was not retained exactly'
+        Assert-PocketBackup $snapshot.manifest
+    }
+    # Repair an already oversized legacy record without updating the stable launcher.
+    $legacyBytes=[IO.File]::ReadAllText($recordPath)+(' '*1MB)
+    [IO.File]::WriteAllText($recordPath,$legacyBytes,[Text.UTF8Encoding]::new($false))
+    $legacyHash=Get-PocketFileHash $recordPath
+    Invoke-PocketWindowsInstall @argsBounded | Out-Null
+    Assert ((Get-Item -LiteralPath $recordPath).Length -lt 128KB) 'Oversized same-generation record was not repaired'
+    $record=Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $archivePath=Join-Path (Join-Path $small.InstallRoot 'rollback') $record.rollback.manifest.archiveFile
+    Assert ((Get-PocketFileHash $archivePath) -eq $legacyHash) 'Legacy snapshot bytes lost'
+    $archiveBytes=[IO.File]::ReadAllBytes($archivePath)
+    try {
+        [IO.File]::WriteAllText($archivePath,'tampered')
+        Fails { Invoke-PocketWindowsInstall -Context $small -Rollback -Apply } 'integrity'
+    } finally { [IO.File]::WriteAllBytes($archivePath,$archiveBytes) }
+    Invoke-PocketWindowsInstall -Context $small -Rollback -Apply | Out-Null
+    Assert ((Get-PocketFileHash $recordPath) -eq $legacyHash) 'Rollback failed to restore legacy record exactly'
+}
 Write-Output ("$script:passed passed; $script:failed failed; fixtures: $testRoot")
 if($script:failed){exit 1}

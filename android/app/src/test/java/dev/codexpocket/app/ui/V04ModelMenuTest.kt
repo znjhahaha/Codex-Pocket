@@ -7,6 +7,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.material3.Text
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.*
@@ -26,6 +27,15 @@ import org.robolectric.annotation.GraphicsMode
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class V04ModelMenuTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
+
+    private fun modelState(model: NativeModel, runtimeOnline: Boolean = true): PocketState {
+        val key = ThreadKey("pc", "store", "chat")
+        return PocketState(paired = true, online = true,
+            selected = ChatEntity(key, "runtime", "desktop", "Chat", "", "", 0, "", false),
+            runtimes = listOf(RuntimeInfo("runtime", "desktop", "v", "store", runtimeOnline, emptySet(),
+                setOf("thread/settings/update"))),
+            models = listOf(model), model = model.model, modelCatalogState = ModelCatalogState.Ready)
+    }
 
     @Test fun searchSelectsImmediatelyWithoutConfirmationAndKeepsDraft() {
         val first = NativeModel("a", "alpha", "Alpha", "", listOf("low"), "low", false, true)
@@ -48,7 +58,7 @@ class V04ModelMenuTest {
         } } } }
         compose.onNodeWithTag("composer-model").performClick()
         compose.onNodeWithTag("composer-input").assertDoesNotExist()
-        compose.onNodeWithTag("model-picker-entry").performClick()
+        compose.onNodeWithText("选择模型").assertExists()
         compose.onNodeWithTag("model-search").performTextInput("beta")
         compose.onNodeWithText("Alpha").assertDoesNotExist()
         compose.onNodeWithText("Beta").performClick()
@@ -58,35 +68,47 @@ class V04ModelMenuTest {
         compose.onNodeWithTag("model-search").assertDoesNotExist()
     }
 
-    @Test fun effortCardShowsLevelModelEntryAndSteppedSlider() {
+    @Test fun modelFirstMenuShowsNativeEffortSliderAndDisablesOfflineEffortChanges() {
         val model = NativeModel("a", "astra", "6 Astra", "", listOf("low", "medium", "high", "xhigh"), "medium", false, true)
         var chosen: String? = null
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
-            ModelSheet(PocketState(online = true, models = listOf(model), modelCatalogState = ModelCatalogState.Ready, effort = "high"),
+            ModelSheet(modelState(model, runtimeOnline = false).copy(effort = "high"),
                 { _, _ -> }, {}, onEffort = { _, effort -> chosen = effort })
         } } }
-        compose.onNodeWithTag("effort-title").assertTextEquals(compose.activity.effortLabel("high"))
+        compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertTextEquals("high")
         compose.onNodeWithText("6 Astra").assertExists()
-        compose.onNodeWithTag("composer-effort").assert(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo))
-        // Effort changes are honest no-ops while the computer is not ready.
-        compose.onNodeWithTag("composer-effort").assert(SemanticsMatcher.keyNotDefined(androidx.compose.ui.semantics.SemanticsActions.SetProgress))
+        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo(2f, 0f..3f, 2)).assertIsNotEnabled()
+        compose.onNodeWithTag("effort-track").assert(SemanticsMatcher.keyNotDefined(SemanticsActions.SetProgress))
+        compose.onNodeWithTag("composer-effort").assertDoesNotExist()
         compose.runOnIdle { assertNull(chosen) }
-        compose.onNodeWithTag("model-picker-entry").performClick()
-        compose.onNodeWithText("选择模型").assertExists()
-        compose.onNodeWithTag("model-list-back").performClick()
-        compose.onNodeWithTag("effort-title").assertExists()
+        compose.onNodeWithTag("model-picker-open").assertExists()
+        compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertExists()
     }
 
     @Test fun independentEffortNeverOffersValuesAbsentFromCatalog() {
-        var effort by mutableStateOf<String?>(null)
+        val model = NativeModel("a", "astra", "Astra", "", listOf("none", "high", "minimal", "low", "ultra"), "low", false, true)
+        var state by mutableStateOf(modelState(model))
+        var modelSelections = 0
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
-            PocketEffortSelector(listOf("low", "high"), effort, true, { effort = it })
+            ModelSheet(state, { _, _ -> modelSelections++ }, {},
+                onEffort = { _, effort -> state = state.copy(effort = effort) })
         } } }
-        compose.onNodeWithTag("effort-high").performClick().assertIsSelected()
-        assertEquals("high", effort)
-        compose.onNodeWithTag("effort-max").assertDoesNotExist()
-        compose.onNodeWithTag("effort-default").performClick().assertIsSelected()
-        assertNull(effort)
+        compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertTextEquals("请选择强度")
+        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo.Indeterminate)
+        compose.onNodeWithTag("effort-default").assertDoesNotExist()
+        compose.onNodeWithTag("composer-effort").assertDoesNotExist()
+        compose.onNodeWithTag("effort-track").performSemanticsAction(SemanticsActions.SetProgress) { it(1f) }
+        assertEquals("high", state.effort)
+        compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertTextEquals("high")
+        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo(1f, 0f..1f))
+        // The native catalog skips medium and max; out-of-range progress stays on its high endpoint.
+        compose.onNodeWithTag("effort-track").performSemanticsAction(SemanticsActions.SetProgress) { it(4f) }
+        assertEquals("high", state.effort)
+        compose.onNodeWithTag("effort-track").performSemanticsAction(SemanticsActions.SetProgress) { it(0f) }
+        assertEquals("low", state.effort)
+        compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertTextEquals("low")
+        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo(0f, 0f..1f))
+        assertEquals(0, modelSelections)
     }
 
     @Test fun sourcePageKeepsDiffMountedAndBackRestoresItsSelection() {

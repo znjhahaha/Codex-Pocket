@@ -31,13 +31,13 @@ internal object PocketIcons {
     val ExpandMore: ImageVector by lazy { icon("ExpandMore", "M5.5 9L12 15.5 18.5 9") }
     val Search: ImageVector by lazy { icon("Search", "M16.5 10a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0z", "M15 15l5.5 5.5") }
     val MoreHoriz: ImageVector by lazy { icon("MoreHoriz", "M5.75 12a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zM12.75 12a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zM19.75 12a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z") }
-    val Edit: ImageVector by lazy { icon("Edit", "M14.5 5.5l4 4M5 15l11-11a2.8 2.8 0 0 1 4 4L9 19l-5 1z") }
+    val Edit: ImageVector by lazy { icon("Edit", "M15 4.5l4.5 4.5M4.5 15.5l12-12a2.5 2.5 0 0 1 3.5 3.5l-12 12-4.5 1z") }
     val ContentCopy: ImageVector by lazy { icon("ContentCopy", "M9 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z", "M15 4H5a2 2 0 0 0-2 2v10") }
     val Description: ImageVector by lazy { icon("Description", "M7 3.5h7l5.5 5.5v9.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2z", "M14 3.5V9h5.5M8 13h8M8 16.5h5") }
     val FolderOpen: ImageVector by lazy { icon("FolderOpen", "M4 9V6a2 2 0 0 1 2-2h4l2 3h6a2 2 0 0 1 2 2", "M5 10h16l-2 9H3L1.5 10H5") }
-    val Image: ImageVector by lazy { icon("Image", "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M4 16l5-5 5 5 3-3 3 3M16 8h.01") }
+    val Image: ImageVector by lazy { icon("Image", "M5.5 4.5h13a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z", "M3.5 16l5-5 5 5 3-3 4 4M15.5 8.5h.01") }
     val PhotoCamera: ImageVector by lazy { icon("PhotoCamera", "M7 6l2-2h6l2 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z", "M16 13a4 4 0 1 1-8 0 4 4 0 0 1 8 0z") }
-    val Terminal: ImageVector by lazy { icon("Terminal", "M5 4.5h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z", "M7 9l3 3-3 3M13 15h4") }
+    val Terminal: ImageVector by lazy { icon("Terminal", "M5.5 4.5h13a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z", "M7 9l3 3-3 3M13 15h4") }
     val Code: ImageVector by lazy { icon("Code", "M8 6l-5 6 5 6M16 6l5 6-5 6M13 4l-2 16") }
     val Checklist: ImageVector by lazy { icon("Checklist", "M3.5 7l2 2 3-4M12 7h8M3.5 16l2 2 3-4M12 16h8") }
     val PlaylistAdd: ImageVector by lazy { icon("PlaylistAdd", "M4 6h16M4 11h10M4 16h6M18 14v7M14.5 17.5h7") }
@@ -76,7 +76,7 @@ internal object PocketIcons {
     val Unplug: ImageVector by lazy { icon("Unplug", "M5 10l9 9M6.5 11.5l-1 1a4 4 0 0 0 6 6l1-1M11 6l1-1a4 4 0 0 1 6 6l-1 1M15 3l2 2M19 7l2 2M3 21l3-3M8 8l2-2M16 16l2-2M3 3l18 18") }
     val LoaderCircle: ImageVector by lazy { icon("LoaderCircle", "M20 12a8 8 0 1 1-8-8") }
     val KeyboardArrowDown: ImageVector by lazy { icon("KeyboardArrowDown", "M5.5 9L12 15.5 18.5 9") }
-    val Command: ImageVector by lazy { icon("Command", "M5 4.5h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z", "M7 9l3 3-3 3M13 15h4") }
+    val Command: ImageVector by lazy { icon("Command", "M5.5 4.5h13a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z", "M7 9l3 3-3 3M13 15h4") }
     val Monitor: ImageVector by lazy { icon("Monitor", "M6 4.5h12a2.5 2.5 0 0 1 2.5 2.5v8a2.5 2.5 0 0 1-2.5 2.5H6A2.5 2.5 0 0 1 3.5 15V7A2.5 2.5 0 0 1 6 4.5z", "M3.5 13.5h17M12 17.5v3M8.5 20.5h7") }
     val Smartphone: ImageVector by lazy { icon("Smartphone", "M8 3.5h8A2.5 2.5 0 0 1 18.5 6v12a2.5 2.5 0 0 1-2.5 2.5H8A2.5 2.5 0 0 1 5.5 18V6A2.5 2.5 0 0 1 8 3.5z", "M10 6h4M11 18h2") }
     val Plus: ImageVector by lazy { icon("Plus", "M12 5v14M5 12h14") }
@@ -90,8 +90,14 @@ internal object PocketIcons {
     val FilePen: ImageVector by lazy { icon("FilePen", "M12.5 22H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v9.5", "M14 2v4a2 2 0 0 0 2 2h4M13.38 15.62a2.12 2.12 0 0 0-3-3L5 18l-.75 3.75L8 21z") }
     val Sparkle: ImageVector by lazy { icon("Sparkle", "M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.13-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.13a.5.5 0 0 1 .96 0L14.06 8.5a2 2 0 0 0 1.44 1.44l6.13 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.13a.5.5 0 0 1-.96 0z") }
     val Users: ImageVector by lazy { icon("Users", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0z", "M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75") }
+    // Original robot head/person outline for Codex-style agent activity lines.
+    val RobotOutline: ImageVector by lazy { icon("RobotOutline", "M12 2v3M9.5 3h2.5", "M8 5h8a3 3 0 0 1 3 3v3a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3V8a3 3 0 0 1 3-3z", "M9 8.5h.01M15 8.5h.01M9.5 11.5h5M4.5 21.5a7.5 5.5 0 0 1 15 0M9.5 17l2.5 2 2.5-2") }
+    val AgentFlower: ImageVector by lazy { icon("AgentFlower", "M12 12C5 8 8 2 12 2s7 6 0 10C16 5 22 8 22 12s-6 7-10 0C19 16 16 22 12 22s-7-6 0-10C8 19 2 16 2 12s6-7 10 0z") }
+    val AgentOrbit: ImageVector by lazy { icon("AgentOrbit", "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z", "M18.5 12a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0z", "M15.5 12a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0zM12 3v5.5M21 12h-5.5M12 21v-5.5M3 12h5.5") }
+    val AgentWave: ImageVector by lazy { icon("AgentWave", "M20 18a9 9 0 1 0-16 0M18 20a7 7 0 1 0-12 0M16 21a5 5 0 1 0-8 0M14 22a3 3 0 1 0-4 0") }
     val WrapText: ImageVector by lazy { icon("WrapText", "M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7") }
     val ListTree: ImageVector by lazy { icon("ListTree", "M21 12h-8M21 6H8M21 18h-8M3 6v4c0 1.1.9 2 2 2h3M3 10v6c0 1.1.9 2 2 2h3") }
     val ChevronLeft: ImageVector by lazy { icon("ChevronLeft", "M15 5.5L8.5 12l6.5 6.5") }
     val RefreshCw: ImageVector by lazy { icon("RefreshCw", "M20 9a8 8 0 0 0-14-3L3 9M3 3v6h6M4 15a8 8 0 0 0 14 3l3-3M15 15h6v6") }
+    val Cube: ImageVector by lazy { icon("Cube", "M12 2.5l9 5v9l-9 5-9-5v-9z", "M3 7.5l9 5 9-5M12 12.5v9") }
 }

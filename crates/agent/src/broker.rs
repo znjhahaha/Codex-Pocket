@@ -26,6 +26,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
+mod v051;
 
 /// Streaming deltas from every desktop thread share this fan-out. A phone session
 /// that is writing a large history reply over the relay must not fall behind it
@@ -33,6 +34,9 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 pub(crate) const NOTIFICATION_CAPACITY: usize = 4096;
 
 struct Runtime {
+    usage: crate::context_usage::UsageCache,
+    config_home: PathBuf,
+    settings: crate::settings::SettingsCache,
     fast_models: BTreeSet<String>,
     capabilities: crate::capabilities::Capabilities,
     rpc: Rpc,
@@ -75,6 +79,7 @@ struct State {
     ownership_persist_failed: bool,
 }
 pub struct Broker {
+    quota: crate::quota::Quota,
     pub push: Arc<crate::push::PushDelivery>,
     push_delivery: Arc<Mutex<()>>,
     pub connection: Arc<crate::connection::Connection>,
@@ -88,11 +93,13 @@ pub struct Broker {
 /// Where desktop-pasted attachments and generated images live, outside any project root.
 fn image_roots(state_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = vec![state_dir.join("attachments"), std::env::temp_dir()];
-    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(|h| PathBuf::from(h).join(".codex"))
-    });
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|h| PathBuf::from(h).join(".codex"))
+        });
     if let Some(home) = home {
         roots.push(home.join("generated_images"));
     }
@@ -117,21 +124,34 @@ pub(crate) const HISTORY_OUTPUT_TAIL: usize = 2000;
 /// so keep its tail (where results and errors are) and mark the item. Live deltas stay complete.
 fn trim_history_outputs(value: &mut Value) {
     let trim = |turn: &mut Value| {
-        let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else { return };
+        let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
+            return;
+        };
         for item in items.iter_mut().filter(|i| i["type"] == "commandExecution") {
-            let Some(output) = item.get("aggregatedOutput").and_then(Value::as_str) else { continue };
+            let Some(output) = item.get("aggregatedOutput").and_then(Value::as_str) else {
+                continue;
+            };
             let count = output.chars().count();
-            if count <= HISTORY_OUTPUT_TAIL { continue }
+            if count <= HISTORY_OUTPUT_TAIL {
+                continue;
+            }
             let tail: String = output.chars().skip(count - HISTORY_OUTPUT_TAIL).collect();
             item["aggregatedOutput"] = Value::String(tail);
             item["pocketOutputTruncated"] = Value::Bool(true);
         }
     };
     if let Some(page) = value.get_mut("data").and_then(Value::as_array_mut) {
-        for turn in page { trim(turn) }
+        for turn in page {
+            trim(turn)
+        }
     }
-    if let Some(list) = value.pointer_mut("/thread/turns").and_then(Value::as_array_mut) {
-        for turn in list { trim(turn) }
+    if let Some(list) = value
+        .pointer_mut("/thread/turns")
+        .and_then(Value::as_array_mut)
+    {
+        for turn in list {
+            trim(turn)
+        }
     }
 }
 
@@ -291,6 +311,13 @@ impl Broker {
             .map_err(|e| anyhow::anyhow!("Invalid ownership state: {e:?}"))?;
         Ok((
             Arc::new(Self {
+                quota: {
+                    #[cfg(test)]
+                    let quota = crate::quota::Quota::new(state_dir.join("test-cc-switch.db"));
+                    #[cfg(not(test))]
+                    let quota = crate::quota::Quota::default();
+                    quota
+                },
                 push: Arc::new(crate::push::PushDelivery::open(state_dir.clone())?),
                 push_delivery: Arc::new(Mutex::new(())),
                 connection: Arc::new(crate::connection::Connection::default()),
@@ -337,7 +364,10 @@ impl Broker {
     fn runtime_values(state: &State) -> Vec<Value> {
         state.runtimes.iter().map(|(id,r)| {
             let mut capabilities=r.capabilities.methods();
-            if r.fast_models.is_empty() {capabilities.retain(|m|m!="thread/settings/update");}
+            capabilities.push("thread/settings/read".into());
+            capabilities.retain(|m| !matches!(m.as_str(), "config/read" | "account/rateLimits/read"));
+            capabilities.extend(["quota/sources", "quota/read"].into_iter().map(str::to_owned));
+            capabilities.extend(["thread/context/read","thread/permissions/read","thread/permissions/update"].into_iter().map(str::to_owned));
             if r.capabilities.supports("thread/read",&json!({"threadId":"probe","includeTurns":false})) {
                 capabilities.extend(["workspace/list","workspace/read","workspace/image","references/list"].into_iter().map(str::to_owned));
             }
@@ -554,6 +584,12 @@ impl Broker {
                 "workspace/read",
                 "workspace/image",
                 "references/list",
+                "thread/settings/read",
+                "thread/context/read",
+                "thread/permissions/read",
+                "thread/permissions/update",
+                "quota/sources",
+                "quota/read",
                 "push/status",
                 "push/register",
                 "push/unregister",
@@ -667,9 +703,23 @@ impl Broker {
         let loaded = known
             .map(|a| a.advertisement.loaded_native_thread_ids)
             .unwrap_or_default();
+        let settings = s
+            .runtimes
+            .get(&c.runtime_id)
+            .filter(|r| {
+                r.store == store && r.native_process.is_some() && r.native_process == native_process
+            })
+            .map(|r| r.settings.clone())
+            .unwrap_or_default();
+        let usage = s.runtimes.get(&c.runtime_id)
+            .filter(|r| r.store==store && r.native_process.is_some() && r.native_process==native_process)
+            .map(|r|r.usage.clone().stale()).unwrap_or_default();
         s.runtimes.insert(
             c.runtime_id,
             Runtime {
+                usage,
+                config_home: c.config_home,
+                settings,
                 fast_models: BTreeSet::new(),
                 capabilities: c.capabilities,
                 rpc: c.rpc,
@@ -1202,6 +1252,29 @@ impl Broker {
                         continue;
                     }
                     let method = value["method"].as_str().unwrap_or_default().to_owned();
+                    if method == "account/updated" {
+                        drop(state);
+                        if let Some(result) =
+                            self.quota.account_changed(&runtime_id, &connection_id)
+                        {
+                            let _ = self
+                                .notifications
+                                .send(json!({"method":"quota/updated","params":result}));
+                        }
+                        continue;
+                    }
+                    if method == "account/rateLimits/updated" {
+                        drop(state);
+                        if let Some(result) =
+                            self.quota
+                                .update(&runtime_id, &connection_id, &value["params"])
+                        {
+                            let _ = self
+                                .notifications
+                                .send(json!({"method":"quota/updated","params":result}));
+                        }
+                        continue;
+                    }
                     if push_event(&value)
                         && self.push.configured()
                         && let Some(thread) = value["params"]["threadId"].as_str()
@@ -1322,6 +1395,24 @@ impl Broker {
                         }
                     }
                     if let Some(r) = state.runtimes.get_mut(&runtime_id) {
+                        r.usage.event(&value);
+                        if method == "thread/settings/updated" {
+                            let Some(thread) = value["params"]["threadId"]
+                                .as_str()
+                                .filter(|t| crate::settings::valid_thread(t))
+                            else {
+                                continue;
+                            };
+                            let settings =
+                                crate::settings::canonical(&value["params"]["threadSettings"]);
+                            if settings.as_object().is_none_or(|s| s.is_empty()) {
+                                continue;
+                            }
+                            r.settings.event(&value);
+                            value = crate::settings::notification(thread, settings);
+                        } else {
+                            r.settings.event(&value);
+                        }
                         if method == "thread/started"
                             && let Some(id) = value["params"]["thread"]["id"].as_str()
                         {
@@ -1361,6 +1452,66 @@ impl Broker {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
         match method {
+            "thread/context/read" => return self.read_context(device, &p).await,
+            "thread/permissions/read" => return self.permission_data(device, &p).await.map(|(value,_)|value),
+            "thread/settings/read" => return self.read_settings(device, &p).await,
+            "quota/sources" | "quota/read" => {
+                crate::quota::validate(method, &p).map_err(|_| {
+                    classify(
+                        anyhow::anyhow!("Invalid quota request"),
+                        Code::InvalidParams,
+                    )
+                })?;
+                let runtime = field(&p, "runtimeId")?;
+                // Clone native identity under the event lock; release it before all I/O.
+                let (rpc, capabilities, generation) = {
+                    let state = self.state.lock().await;
+                    let r = state.runtimes.get(runtime).ok_or_else(|| {
+                        classify(anyhow::anyhow!("Runtime unavailable"), Code::NotFound)
+                    })?;
+                    (
+                        r.rpc.clone(),
+                        r.capabilities.clone(),
+                        r.connection_id.clone(),
+                    )
+                };
+                let sources = self
+                    .quota
+                    .sources(runtime, &generation, rpc, capabilities)
+                    .await;
+                let result = if method == "quota/sources" {
+                    Ok(sources)
+                } else {
+                    self.quota
+                        .read(
+                            runtime,
+                            &generation,
+                            field(&p, "sourceId")?,
+                            p["refresh"].as_bool().unwrap_or(false),
+                        )
+                        .await
+                        .map_err(|_| {
+                            classify(anyhow::anyhow!("Unknown quota source"), Code::InvalidParams)
+                        })
+                };
+                if !self.device_exists(device).await {
+                    return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
+                }
+                if self
+                    .state
+                    .lock()
+                    .await
+                    .runtimes
+                    .get(runtime)
+                    .is_none_or(|r| r.connection_id != generation)
+                {
+                    return Err(classify(
+                        anyhow::anyhow!("Runtime changed during quota request"),
+                        Code::NotFound,
+                    ));
+                }
+                return result;
+            }
             "push/status" => {
                 validate_push(method, &p)?;
                 return Ok(json!({"configured":self.push.configured()}));
@@ -1414,6 +1565,10 @@ impl Broker {
             _ => {}
         }
         let mutation = match method {
+            "thread/permissions/update" => {
+                if !crate::permissions::validate(&p,true) { return Err(classify(anyhow::anyhow!("Invalid permission update"),Code::InvalidParams)); }
+                true
+            }
             "codex/request" => access::validate(field(&p, "method")?, &p["params"])
                 .map_err(access::AccessError::into_request_error)?,
             "push/register" | "push/unregister" => {
@@ -1492,6 +1647,7 @@ impl Broker {
             }
         }
         let result = match method {
+            "thread/permissions/update" => self.update_permissions(device,&p).await,
             "push/register" => self
                 .push
                 .register(device, field(&p, "token")?)
@@ -1573,6 +1729,129 @@ impl Broker {
         self.save_ledger(&s)
             .map_err(|e| classify(e, Code::Unknown))?;
         result.map_err(|e| classify(e, failure_code))
+    }
+    fn publish_settings(&self, runtime: &str, r: &mut Runtime, event: Value) {
+        let record = JournalEvent {
+            native_thread_id: event["params"]["threadId"].as_str().map(str::to_owned),
+            native_turn_id: None,
+            native_item_id: None,
+            payload: event.clone(),
+        };
+        if r.journal.append(record).is_ok() {
+            let _ = self.notifications.send(json!({"method":"codex/event","params":{"runtimeId":runtime,"cursor":cursor_value(&r.journal.cursor()),"event":event}}));
+        }
+    }
+    async fn read_settings(&self, device: &str, p: &Value) -> Result<Value> {
+        if !p.as_object().is_some_and(|p| {
+            p.len() == 2
+                && p.contains_key("runtimeId")
+                && p.get("threadId")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::settings::valid_thread)
+        }) {
+            return Err(classify(
+                anyhow::anyhow!("Settings read accepts only runtimeId and threadId"),
+                Code::InvalidParams,
+            ));
+        }
+        let runtime = field(p, "runtimeId")?;
+        let thread = field(p, "threadId")?;
+        let (rpc, generation, desktop, metadata, revision) = {
+            let mut s = self.state.lock().await;
+            let r = s
+                .runtimes
+                .get_mut(runtime)
+                .filter(|r| r.rpc.online())
+                .context("Runtime offline")?;
+            (
+                r.rpc.clone(),
+                r.connection_id.clone(),
+                r.source == "desktop",
+                r.capabilities.supports(
+                    "thread/read",
+                    &json!({"threadId":thread,"includeTurns":false}),
+                ),
+                r.settings.checkpoint(),
+            )
+        };
+        let mut cached = false;
+        if desktop {
+            match rpc
+                .call("pocket/threadSettings", json!({"threadId":thread}))
+                .await
+            {
+                Ok(value) => {
+                    if value["threadId"] != thread || !value["known"].is_boolean() {
+                        bail!("Native settings cache identity mismatch");
+                    }
+                    let mut s = self.state.lock().await;
+                    let r = s
+                        .runtimes
+                        .get_mut(runtime)
+                        .filter(|r| r.connection_id == generation && r.rpc.online())
+                        .ok_or(RpcFailure::Disconnected)?;
+                    if value["known"] == true {
+                        if let Some(event) =
+                            r.settings.snapshot(thread, &value["settings"], revision)
+                        {
+                            self.publish_settings(runtime, r, event);
+                        }
+                        cached = r.settings.read(thread)["known"] == true;
+                    }
+                }
+                Err(RpcFailure::Native(_)) => {} // Older local bridge: try verified metadata.
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !cached && metadata {
+            let observed = {
+                let mut s = self.state.lock().await;
+                let r = s
+                    .runtimes
+                    .get_mut(runtime)
+                    .filter(|r| r.connection_id == generation && r.rpc.online())
+                    .ok_or(RpcFailure::Disconnected)?;
+                r.settings
+                    .prepare("thread/read", &json!({"threadId":thread}))
+                    .unwrap()
+            };
+            match rpc
+                .call(
+                    "thread/read",
+                    json!({"threadId":thread,"includeTurns":false}),
+                )
+                .await
+            {
+                Ok(value) => {
+                    if value["thread"]["id"] != thread {
+                        bail!("Native thread metadata identity mismatch");
+                    }
+                    let mut s = self.state.lock().await;
+                    let r = s
+                        .runtimes
+                        .get_mut(runtime)
+                        .filter(|r| r.connection_id == generation && r.rpc.online())
+                        .ok_or(RpcFailure::Disconnected)?;
+                    if let Some(event) = r.settings.accepted(observed, &value) {
+                        self.publish_settings(runtime, r, event);
+                    }
+                }
+                Err(RpcFailure::Native(_)) => {} // No settings evidence available.
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let s = self.state.lock().await;
+        if !s.devices.devices.contains_key(device) {
+            return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
+        }
+        let r = s
+            .runtimes
+            .get(runtime)
+            .filter(|r| r.connection_id == generation && r.rpc.online())
+            .ok_or(RpcFailure::Disconnected)?;
+        let mut value = r.settings.read(thread);
+        value["runtimeId"] = json!(runtime);
+        Ok(value)
     }
     async fn workspace_proof(
         &self,
@@ -1720,7 +1999,14 @@ impl Broker {
                         }
                         for skill in entry["skills"].as_array().into_iter().flatten() {
                             if skill["enabled"] == true && valid_reference(skill) {
-                                data.push(json!({"type":"skill","name":skill["name"],"path":skill["path"]}));
+                                let mut reference = json!({"type":"skill","name":skill["name"],"path":skill["path"]});
+                                if let Some(description) = skill
+                                    .get("description")
+                                    .filter(|v| v.as_str().is_some_and(|s| s.len() <= 4096))
+                                {
+                                    reference["description"] = description.clone();
+                                }
+                                data.push(reference);
                             }
                         }
                     }
@@ -1799,18 +2085,27 @@ impl Broker {
             .flatten()
             .filter(|v| matches!(v["type"].as_str(), Some("skill" | "mention")))
         {
-            if !refs["data"].as_array().unwrap().iter().any(|v| v == item) {
+            if !refs["data"].as_array().unwrap().iter().any(|v| {
+                ["type", "name", "path"]
+                    .iter()
+                    .all(|key| v[key] == item[key])
+            }) {
                 bail!("Reference was not enabled for this native thread");
             }
         }
         Ok(())
     }
     async fn native_request(&self, device: &str, p: &Value) -> Result<Value> {
+        self.native_request_checked(device,p,None).await
+    }
+    async fn native_request_checked(&self, device: &str, p: &Value, permission_guard: Option<(&str,&BTreeMap<String,String>)>) -> Result<Value> {
         let runtime = field(p, "runtimeId")?;
         let method = field(p, "method")?;
         let mut params = p["params"].clone();
-        let mutation =
-            access::validate(method, &params).map_err(access::AccessError::into_request_error)?;
+        let mutation = if permission_guard.is_some() {
+            if method!="thread/settings/update" || !crate::permission_policy::valid_update(&params) {bail!("Invalid internal permission update");}
+            true
+        } else {access::validate(method, &params).map_err(access::AccessError::into_request_error)?};
         // Catalog and workspace proofs must remain bound to this connection,
         // including the interval before ownership refresh and native dispatch.
         let proof_generation = self
@@ -1939,16 +2234,20 @@ impl Broker {
                 Err(e) => bail!("Cannot establish thread ownership: {e:?}"),
             }
         }
-        if self
-            .state
-            .lock()
-            .await
-            .runtimes
-            .get(runtime)
-            .is_none_or(|r| r.connection_id != connection_id || !r.rpc.online())
-        {
-            return Err(RpcFailure::Disconnected.into());
-        }
+        let settings_observation = {
+            let mut s = self.state.lock().await;
+            let r = s
+                .runtimes
+                .get_mut(runtime)
+                .filter(|r| r.connection_id == connection_id && r.rpc.online())
+                .ok_or(RpcFailure::Disconnected)?;
+            if let Some((expected,custom)) = permission_guard {
+                let thread=field(&params,"threadId")?;
+                let current=crate::permissions::response(runtime,thread,&r.connection_id,&r.settings.read(thread)["settings"],&r.capabilities,custom);
+                if current["revision"]!=expected {return Err(classify(anyhow::anyhow!("Permission revision changed before dispatch"),Code::Rejected));}
+            }
+            r.settings.prepare(method, &params)
+        };
         let result = rpc.call(method, params).await?;
         let mut s = self.state.lock().await;
         let r = s
@@ -1956,6 +2255,11 @@ impl Broker {
             .get_mut(runtime)
             .filter(|r| r.connection_id == connection_id)
             .ok_or(RpcFailure::Disconnected)?;
+        if let Some(event) =
+            settings_observation.and_then(|observed| r.settings.accepted(observed, &result))
+        {
+            self.publish_settings(runtime, r, event);
+        }
         if method == "thread/fork"
             && (result["thread"]["id"]
                 .as_str()
@@ -2095,7 +2399,9 @@ impl Broker {
                     .get(selected)
                     .map(|r| r.source.as_str())
                     .unwrap_or("cli");
-                data.push(json!({"id":thread_id,"runtimeId":selected,"configStoreId":store,"source":source,"name":thread["name"],"preview":thread["preview"],"cwd":thread["cwd"],"updatedAt":thread["updatedAt"],"status":thread["status"],"conflict":matches!(owner,Err(ResolveError::AmbiguousOwners))}));
+                let mut row=json!({"id":thread_id,"runtimeId":selected,"configStoreId":store,"source":source,"name":thread["name"],"preview":thread["preview"],"cwd":thread["cwd"],"updatedAt":thread["updatedAt"],"status":thread["status"],"conflict":matches!(owner,Err(ResolveError::AmbiguousOwners))});
+                row.as_object_mut().unwrap().extend(crate::permissions::thread_metadata(thread).as_object().unwrap().clone());
+                data.push(row);
             }
         }
         data.sort_by(|a, b| b["updatedAt"].as_i64().cmp(&a["updatedAt"].as_i64()));
@@ -2158,6 +2464,207 @@ fn validate_approval(event: &Value, response: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn settings_replacement_rejects_old_response_and_wrong_thread_metadata() {
+        let (_dir, b) = fixture().await;
+        let mut old = peer(&b, "r", "cli").await;
+        let old_task = tokio::spawn({
+            let b = b.clone();
+            async move {
+                b.request(
+                    "phone",
+                    "thread/settings/read",
+                    json!({"runtimeId":"r","threadId":"t"}),
+                )
+                .await
+            }
+        });
+        let old_read = old.recv().await;
+        old.offline();
+        let mut current = peer(&b, "r", "cli").await;
+        old.reply(&old_read, json!({"thread":{"id":"t","model":"old"}}))
+            .await;
+        assert!(finish(old_task).await.is_err());
+        let task = tokio::spawn({
+            let b = b.clone();
+            async move {
+                b.request(
+                    "phone",
+                    "thread/settings/read",
+                    json!({"runtimeId":"r","threadId":"t"}),
+                )
+                .await
+            }
+        });
+        let read = current.recv().await;
+        current
+            .reply(&read, json!({"thread":{"id":"other","model":"wrong"}}))
+            .await;
+        assert!(finish(task).await.is_err());
+        let s = b.state.lock().await;
+        assert_eq!(s.runtimes["r"].settings.read("t")["known"], false);
+        assert_eq!(s.runtimes["r"].settings.read("other")["known"], false);
+    }
+    #[tokio::test]
+    async fn settings_helper_reads_historical_metadata_without_loading_thread() {
+        for source in ["cli", "desktop"] {
+            let (_dir, b) = fixture().await;
+            let mut native = peer(&b, "r", source).await;
+            let task = tokio::spawn({
+                let b = b.clone();
+                async move {
+                    b.request(
+                        "phone",
+                        "thread/settings/read",
+                        json!({"runtimeId":"r","threadId":"history"}),
+                    )
+                    .await
+                }
+            });
+            if source == "desktop" {
+                let request = native.recv().await;
+                assert_eq!(request["method"], "pocket/threadSettings");
+                assert_eq!(request["params"], json!({"threadId":"history"}));
+                native
+                    .reply(
+                        &request,
+                        json!({"threadId":"history","known":false,"settings":{}}),
+                    )
+                    .await;
+            }
+            let request = native.recv().await;
+            assert_eq!(request["method"], "thread/read");
+            assert_eq!(
+                request["params"],
+                json!({"threadId":"history","includeTurns":false})
+            );
+            native.reply(&request, json!({"thread":{"id":"history","model":"persisted","reasoningEffort":null,"cwd":"private","turns":[{"model":"content"}]},"config":{"apiKey":"private"}})).await;
+            assert_eq!(
+                finish(task).await.unwrap(),
+                json!({"runtimeId":"r","threadId":"history","known":true,"settings":{"model":"persisted","effort":null}})
+            );
+            assert!(
+                !b.state.lock().await.runtimes["r"]
+                    .loaded
+                    .contains("history")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn settings_late_read_cannot_replace_new_event_or_another_runtime() {
+        let (_dir, b) = fixture().await;
+        let mut native = peer(&b, "a", "cli").await;
+        let _other = peer(&b, "b", "cli").await;
+        let task = tokio::spawn({
+            let b = b.clone();
+            async move {
+                b.request(
+                    "phone",
+                    "thread/settings/read",
+                    json!({"runtimeId":"a","threadId":"t"}),
+                )
+                .await
+            }
+        });
+        let read = native.recv().await;
+        native.send(json!({"method":"thread/settings/updated","params":{"threadId":"t","threadSettings":{"model":"new","effort":"ultra","collaborationMode":{"mode":"plan","settings":{"model":"new","reasoning_effort":"ultra","developer_instructions":"private"}},"permissions":"all","cwd":"private"}}})).await;
+        native
+            .reply(
+                &read,
+                json!({"thread":{"id":"t","model":"old","reasoningEffort":"low"}}),
+            )
+            .await;
+        let value = finish(task).await.unwrap();
+        assert_eq!(
+            value["settings"],
+            json!({"model":"new","effort":"ultra","collaborationMode":{"mode":"plan","settings":{"model":"new","reasoning_effort":"ultra"}}})
+        );
+        let s = b.state.lock().await;
+        assert_eq!(s.runtimes["b"].settings.read("t")["known"], false);
+        assert_eq!(s.runtimes["a"].settings.read("other")["known"], false);
+        let cursor = s.runtimes["a"].journal.cursor();
+        if let Replay::Events(events) = s.runtimes["a"].journal.replay(&Cursor {
+            sequence: 0,
+            ..cursor
+        }) {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.native_thread_id.as_deref(), Some("t"));
+            assert_eq!(
+                events[0].event.payload["params"]["threadSettings"],
+                value["settings"]
+            );
+        } else {
+            panic!("retained settings notification");
+        }
+    }
+    #[tokio::test]
+    async fn settings_bridge_cache_recovers_plan_on_reconnect() {
+        let (_dir, b) = fixture().await;
+        let mut native = peer(&b, "r", "desktop").await;
+        for effort in ["high", "ultra"] {
+            let task = tokio::spawn({
+                let b = b.clone();
+                async move {
+                    b.request(
+                        "phone",
+                        "thread/settings/read",
+                        json!({"runtimeId":"r","threadId":"t"}),
+                    )
+                    .await
+                }
+            });
+            let read = native.recv().await;
+            assert_eq!(read["method"], "pocket/threadSettings");
+            native.reply(&read, json!({"threadId":"t","known":true,"settings":{"model":"model","effort":effort,"collaborationMode":{"mode":"plan","settings":{"model":"model","reasoning_effort":effort,"developer_instructions":"private"}},"sandboxPolicy":{"type":"dangerFullAccess"}}})).await;
+            let result = finish(task).await.unwrap();
+            assert_eq!(
+                result["settings"],
+                json!({"model":"model","effort":effort,"collaborationMode":{"mode":"plan","settings":{"model":"model","reasoning_effort":effort}},"sandboxPolicy":{"type":"dangerFullAccess","hasAdditionalWritableRoots":false}})
+            );
+        }
+    }
+    #[tokio::test]
+    async fn settings_helper_without_evidence_is_unknown_and_never_starts_native_work() {
+        let (_dir, b) = fixture().await;
+        let _peer = peer(&b, "runtime", "cli").await;
+        b.state
+            .lock()
+            .await
+            .runtimes
+            .get_mut("runtime")
+            .unwrap()
+            .capabilities = Default::default();
+        let result = b
+            .request(
+                "phone",
+                "thread/settings/read",
+                json!({"runtimeId":"runtime","threadId":"history"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"runtimeId":"runtime","threadId":"history","settings":{},"known":false})
+        );
+        assert!(
+            b.request(
+                "absent",
+                "thread/settings/read",
+                json!({"runtimeId":"runtime","threadId":"history"})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            b.request(
+                "phone",
+                "thread/settings/read",
+                json!({"runtimeId":"runtime","threadId":"history","permissions":"all"})
+            )
+            .await
+            .is_err()
+        );
+    }
     use super::*;
     use crate::native::test_peer::{self, Peer};
     #[test]
@@ -2175,10 +2682,20 @@ mod tests {
         assert_eq!(first["pocketOutputTruncated"], true);
         assert_eq!(first["command"], "make");
         assert_eq!(page["data"][0]["items"][1]["aggregatedOutput"], "short");
-        assert!(page["data"][0]["items"][1].get("pocketOutputTruncated").is_none());
+        assert!(
+            page["data"][0]["items"][1]
+                .get("pocketOutputTruncated")
+                .is_none()
+        );
         // Only command output is shortened; prose is never cut.
-        assert_eq!(page["data"][0]["items"][2]["text"].as_str().unwrap().len(), long.len());
-        assert_eq!(read["thread"]["turns"][0]["items"][0]["pocketOutputTruncated"], true);
+        assert_eq!(
+            page["data"][0]["items"][2]["text"].as_str().unwrap().len(),
+            long.len()
+        );
+        assert_eq!(
+            read["thread"]["turns"][0]["items"][0]["pocketOutputTruncated"],
+            true
+        );
     }
     #[tokio::test]
     async fn v02_ping_and_diagnostics_are_authenticated() {
@@ -2260,7 +2777,7 @@ mod tests {
         let skills = native.recv().await;
         assert_eq!(skills["method"], "skills/list");
         assert_eq!(skills["params"]["cwds"], json!([root]));
-        native.reply(&skills,json!({"data":[{"cwd":root,"skills":[{"name":"review","path":"C:/skills/review/SKILL.md","enabled":true},{"name":"disabled","path":"secret","enabled":false}]},{"cwd":"C:/foreign","skills":[{"name":"foreign","path":"private","enabled":true}]}]})).await;
+        native.reply(&skills,json!({"data":[{"cwd":root,"skills":[{"name":"review","path":"C:/skills/review/SKILL.md","description":"Review source changes","enabled":true},{"name":"disabled","path":"secret","enabled":false}]},{"cwd":"C:/foreign","skills":[{"name":"foreign","path":"private","enabled":true}]}]})).await;
         let plugins = native.recv().await;
         assert_eq!(plugins["method"], "plugin/list");
         assert_eq!(plugins["params"]["forceRefetch"], false);
@@ -2269,6 +2786,7 @@ mod tests {
         assert_eq!(result["data"].as_array().unwrap().len(), 2);
         assert_eq!(result["data"][0]["type"], "file");
         assert_eq!(result["data"][1]["name"], "review");
+        assert_eq!(result["data"][1]["description"], "Review source changes");
         assert!(
             result["unsupported"]
                 .as_array()
@@ -2498,7 +3016,109 @@ mod tests {
             .is_err()
         );
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<Broker>) {
+    #[tokio::test]
+    async fn quota_is_authenticated_gated_and_does_not_hold_the_event_lock() {
+        let (_dir, b) = fixture().await;
+        assert_eq!(
+            crate::error::code(
+                &b.request("stranger", "quota/sources", json!({"runtimeId":"a"}))
+                    .await
+                    .unwrap_err()
+            ),
+            Code::Revoked
+        );
+        let mut peer = peer(&b, "a", "cli").await;
+        {
+            let mut state = b.state.lock().await;
+            let c = &mut state.runtimes.get_mut("a").unwrap().capabilities;
+            c.0.insert("account/rateLimits/read".into(), Default::default());
+            c.0.remove("config/read");
+        }
+        let list = b
+            .request("phone", "quota/sources", json!({"runtimeId":"a"}))
+            .await
+            .unwrap();
+        let id = list["sources"][0]["id"].clone();
+        let hello = b.hello().await;
+        for method in ["quota/sources", "quota/read"] {
+            assert!(
+                hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(method))
+            );
+            assert!(
+                hello["runtimes"][0]["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(method))
+            );
+        }
+        let reading = tokio::spawn({
+            let b = b.clone();
+            let id = id.clone();
+            async move {
+                b.request(
+                    "phone",
+                    "quota/read",
+                    json!({"runtimeId":"a","sourceId":id,"refresh":true}),
+                )
+                .await
+            }
+        });
+        let req = peer.recv().await;
+        assert_eq!(req["method"], "account/rateLimits/read");
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                b.request("phone", "ping", json!({}))
+            )
+            .await
+            .unwrap()
+            .unwrap()["ok"],
+            true
+        );
+        let connection = b.state.lock().await.runtimes["a"].connection_id.clone();
+        let mut notifications = b.subscribe();
+        b.native_events.send(NativeEvent::Message{runtime_id:"a".into(),connection_id:connection.clone(),value:json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":17,"resetsAt":1794000000}}}})}).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_millis(200), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["method"], "quota/updated");
+        assert_eq!(event["params"]["items"][0]["usedPercent"], 17.0);
+        peer.send(json!({"id":req["id"],"error":{"message":"must-not-escape"}}))
+            .await;
+        let response = reading.await.unwrap().unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["items"][0]["usedPercent"], 17.0);
+        for m in ["account/rateLimits/read", "config/read"] {
+            assert!(
+                b.request(
+                    "phone",
+                    "codex/request",
+                    json!({"runtimeId":"a","method":m,"params":{}})
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            b.request(
+                "phone",
+                "quota/read",
+                json!({"runtimeId":"a","sourceId":id,"script":"bad"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            b.request("phone", "ping", json!({})).await.unwrap()["ok"],
+            true
+        );
+    }
+
+    pub(super) async fn fixture() -> (tempfile::TempDir, Arc<Broker>) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::create("wss://example.org/pocket".into()).unwrap();
         let (b, rx) = Broker::open(config, dir.path().into()).unwrap();
@@ -2511,7 +3131,7 @@ mod tests {
         tokio::spawn(b.clone().receive_events(rx));
         (dir, b)
     }
-    async fn peer(b: &Broker, id: &str, source: &str) -> Peer {
+    pub(super) async fn peer(b: &Broker, id: &str, source: &str) -> Peer {
         peer_with_process(b, id, source, None).await
     }
     async fn peer_with_process(
@@ -2537,7 +3157,7 @@ mod tests {
         }
         p
     }
-    async fn loaded(p: &mut Peer, ids: &[&str]) {
+    pub(super) async fn loaded(p: &mut Peer, ids: &[&str]) {
         let request = p.recv().await;
         assert_eq!(request["method"], "thread/loaded/list");
         p.reply(&request, json!({"data":ids,"nextCursor":null}))
@@ -2663,7 +3283,7 @@ mod tests {
             b.request("phone", "codex/request", json!({"commandId":"resume","runtimeId":"a","method":"thread/resume","params":{"threadId":"history","excludeTurns":true}})).await
         })
     }
-    async fn finish(task: tokio::task::JoinHandle<Result<Value>>) -> Result<Value> {
+    pub(super) async fn finish(task: tokio::task::JoinHandle<Result<Value>>) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("broker timeout")

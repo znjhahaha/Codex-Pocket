@@ -2,6 +2,28 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub const PERMISSION_PROTOCOL: u64 = 1;
+/// Status belongs to the authenticated bridge connection, not a native version guess.
+pub fn permission_discovery(status: &Value) -> (&'static str, &'static str) {
+    if status["initialized"] != true
+        || status["schemaPending"] == true
+        || status["schemaState"] == "initializing"
+    {
+        ("initializing", "capability_initializing")
+    } else if status["schemaState"] == "error" {
+        ("error", "native_schema_failed")
+    } else if status["permissionProtocol"]
+        .as_u64()
+        .is_none_or(|p| p < PERMISSION_PROTOCOL)
+    {
+        ("update_required", "bridge_update_required")
+    } else if status["schemaState"] != "ready" {
+        ("error", "native_schema_failed")
+    } else {
+        ("ready", "")
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities(pub BTreeMap<String, BTreeSet<String>>);
 impl Capabilities {
@@ -21,16 +43,42 @@ impl Capabilities {
                     .and_then(|s| s.strip_prefix('#'))
                     .and_then(|s| schema.pointer(s))
                     .unwrap_or(raw);
-                if method == "thread/settings/update"
-                    && params["properties"].get("serviceTier").is_none()
-                {
-                    continue;
-                }
+                // New native schemas wrap the quota params in anyOf(object, null).
+                let params = if method == "account/rateLimits/read" {
+                    params["anyOf"]
+                        .as_array()
+                        .and_then(|a| {
+                            a.iter().find_map(|p| {
+                                let resolved = p["$ref"]
+                                    .as_str()
+                                    .and_then(|s| s.strip_prefix('#'))
+                                    .and_then(|s| schema.pointer(s))
+                                    .unwrap_or(p);
+                                (resolved["type"] == "object").then_some(resolved)
+                            })
+                        })
+                        .unwrap_or(params)
+                } else {
+                    params
+                };
+                // Settings capability is independent of model Fast support.
                 if let Some(properties) = params["properties"].as_object() {
-                    result
-                        .0
-                        .insert(method.into(), properties.keys().cloned().collect());
-                } else if params["type"] == "object" {
+                    let mut fields: BTreeSet<String> = properties.keys().cloned().collect();
+                    if method == "thread/settings/update"
+                        && schema_value_contains(
+                            schema,
+                            &params["properties"]["approvalsReviewer"],
+                            "auto_review",
+                            0,
+                        )
+                    {
+                        fields.insert("$autoReview".into());
+                    }
+                    result.0.insert(method.into(), fields);
+                } else if params["type"] == "object"
+                    || (method == "account/rateLimits/read"
+                        && (params["type"] == "null" || raw.is_null()))
+                {
                     result.0.insert(method.into(), BTreeSet::new());
                 }
             }
@@ -41,7 +89,7 @@ impl Capabilities {
         self.0.get(method).is_some_and(|fields| {
             params
                 .as_object()
-                .is_some_and(|p| p.keys().all(|k| fields.contains(k)))
+                .is_some_and(|p| p.keys().all(|k| !k.starts_with('$') && fields.contains(k)))
         })
     }
     pub fn methods(&self) -> Vec<String> {
@@ -49,10 +97,37 @@ impl Capabilities {
     }
 }
 
+fn schema_value_contains(root: &Value, value: &Value, expected: &str, depth: usize) -> bool {
+    if depth > 12 {
+        return false;
+    }
+    if value["enum"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == expected))
+    {
+        return true;
+    }
+    if let Some(target) = value["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix('#'))
+        .and_then(|r| root.pointer(r))
+    {
+        return schema_value_contains(root, target, expected, depth + 1);
+    }
+    ["anyOf", "oneOf", "allOf"].iter().any(|key| {
+        value[*key].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|v| schema_value_contains(root, v, expected, depth + 1))
+        })
+    })
+}
+
 pub fn allowed_method(m: &str) -> bool {
     matches!(
         m,
-        "thread/list"
+        "account/rateLimits/read"
+            | "config/read"
+            | "thread/list"
             | "thread/read"
             | "thread/loaded/list"
             | "thread/queue/list"
@@ -155,6 +230,46 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn v052_discovery_distinguishes_pending_failed_and_old_bridge() {
+        assert_eq!(
+            permission_discovery(&json!({"initialized":true,"schemaPending":true})).0,
+            "initializing"
+        );
+        assert_eq!(
+            permission_discovery(
+                &json!({"initialized":true,"schemaState":"error","permissionProtocol":1})
+            )
+            .0,
+            "error"
+        );
+        assert_eq!(
+            permission_discovery(&json!({"initialized":true,"schemaPending":false})).0,
+            "update_required"
+        );
+        assert_eq!(
+            permission_discovery(
+                &json!({"initialized":true,"schemaState":"ready","permissionProtocol":1})
+            )
+            .0,
+            "ready"
+        );
+    }
+    #[test]
+    fn quota_requires_schema_evidence_and_accepts_nullable_parameter_schemas() {
+        assert!(!Capabilities::default().supports("account/rateLimits/read", &json!({})));
+        for params in [
+            json!({"type":"null"}),
+            json!({"anyOf":[{"$ref":"#/definitions/Quota"},{"type":"null"}]}),
+        ] {
+            let schema = json!({"oneOf":[{"properties":{"method":{"enum":["account/rateLimits/read"]},"params":params}}],"definitions":{"Quota":{"type":"object","properties":{"excludeResetCreditDetails":{"type":"boolean"}}}}});
+            let c = Capabilities::from_schema(&schema);
+            assert!(c.supports("account/rateLimits/read", &json!({})));
+            assert!(!c.supports("account/rateLimits/read", &json!({"apiKey":"secret"})));
+        }
+        assert!(!allowed_method("account/logout"));
+        assert!(!allowed_method("config/value/write"));
+    }
+    #[test]
     fn v02_schema_evidence_requires_each_actual_method_and_field() {
         let schema: Value =
             serde_json::from_str(include_str!("../tests/fixtures/ClientRequest.json")).unwrap();
@@ -185,6 +300,22 @@ mod tests {
         let c = Capabilities::from_schema(
             &json!({"oneOf":[{"properties":{"method":{"enum":["thread/settings/update"]},"params":{"type":"object","properties":{"threadId":{"type":"string"}}}}}]}),
         );
-        assert!(!c.methods().contains(&"thread/settings/update".to_owned()));
+        assert!(c.methods().contains(&"thread/settings/update".to_owned()));
+        assert!(!c.supports(
+            "thread/settings/update",
+            &json!({"threadId":"t","serviceTier":"fast"})
+        ));
+    }
+    #[test]
+    fn v051_auto_reviewer_requires_exported_value_not_just_field() {
+        for offered in [true, false] {
+            let schema = json!({"oneOf":[{"properties":{"method":{"enum":["thread/settings/update"]},"params":{"properties":{"threadId":{},"approvalPolicy":{},"sandboxPolicy":{},"approvalsReviewer":{"anyOf":[{"$ref":"#/definitions/Reviewer"},{"type":"null"}]}}}}}],"definitions":{"Reviewer":{"enum":if offered{json!(["user","auto_review"])}else{json!(["user"])}}}});
+            let c = Capabilities::from_schema(&schema);
+            assert_eq!(
+                c.0["thread/settings/update"].contains("$autoReview"),
+                offered
+            );
+            assert!(c.supports("thread/settings/update",&json!({"threadId":"t","approvalPolicy":"never","approvalsReviewer":"user","sandboxPolicy":{"type":"dangerFullAccess"}})));
+        }
     }
 }

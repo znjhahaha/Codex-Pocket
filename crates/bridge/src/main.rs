@@ -204,12 +204,10 @@ async fn run() -> Result<i32> {
     let mut router = Router::default();
     // Probe asynchronously so the original desktop's initialize is never delayed.
     let schema_binary = original.clone();
-    let schema_task = tokio::spawn(async move {
-        pocket_bridge::capabilities::discover(&schema_binary)
-            .await
-            .unwrap_or_default()
-    });
+    let schema_task =
+        tokio::spawn(async move { pocket_bridge::capabilities::discover(&schema_binary).await });
     let mut schema_task = Some(schema_task);
+    let mut schema_state = "initializing";
     let mut remotes = HashMap::<String, Peer>::new();
     let mut desktop = tokio::io::stdout();
     let mut native_eof = false;
@@ -218,7 +216,15 @@ async fn run() -> Result<i32> {
         if schema_task.as_ref().is_some_and(|t| t.is_finished())
             && let Some(task) = schema_task.take()
         {
-            router.capabilities = task.await.unwrap_or_default();
+            match task.await {
+                Ok(Ok(capabilities)) => {
+                    router.capabilities = capabilities;
+                    schema_state = "ready";
+                }
+                _ => {
+                    schema_state = "error";
+                }
+            }
         }
         let routes = match input {
             Input::Message(c, v) => {
@@ -230,7 +236,7 @@ async fn run() -> Result<i32> {
                 if matches!(c, Client::Remote(_)) && v["method"] == "pocket/status" {
                     vec![Route::Client(
                         c,
-                        json!({"id":v["id"],"result":{"runtimeId":runtime_id,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_task.is_some()}}),
+                        json!({"id":v["id"],"result":{"runtimeId":runtime_id,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_task.is_some(),"schemaState":schema_state,"bridgeVersion":env!("CARGO_PKG_VERSION"),"permissionProtocol":pocket_bridge::capabilities::PERMISSION_PROTOCOL}}),
                     )]
                 } else {
                     router.from_client(c, v)

@@ -17,9 +17,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.text.withStyle
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -30,8 +32,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -56,17 +62,19 @@ internal fun DetailScreen(item: TimelineItem, onBack: () -> Unit, onSource: (Str
     val clipboard = LocalClipboardManager.current
     val review by produceState<ReviewContent?>(null, item) {
         value = withContext(Dispatchers.Default) {
-            val files = if (ConversationPresentation.visible(item)) diffFiles(item) else emptyList()
+            val files = if (ConversationPresentation.visible(item)) reviewActivityFiles(item) else emptyList()
             val fallback = ConversationPresentation.detail(item)
             ReviewContent(files, fallback, if (files.isEmpty()) fallback else files.joinToString("\n\n") { it.path + "\n" + it.diff })
         }
     }
     var selectedId by rememberSaveable(item.key) { mutableStateOf<String?>(null) }
     var contentScrolled by remember(item.key, selectedId) { mutableStateOf(false) }
+    val readingPages = rememberSaveableStateHolder()
     val fileListState = rememberLazyListState()
     val fileListScrolled by remember { derivedStateOf { fileListState.firstVisibleItemIndex > 0 || fileListState.firstVisibleItemScrollOffset > 0 } }
     val data = review
     val files = data?.files.orEmpty()
+    val countedFiles = remember(files) { files.filter { inlineDiffFallback(it.diff) == null } }
     val selected = if (files.size == 1) files.first() else files.firstOrNull { it.id == selectedId }
     val listing = files.size > 1 && selected == null
     fun back() { if (files.size > 1 && selected != null) selectedId = null else onBack() }
@@ -79,7 +87,7 @@ internal fun DetailScreen(item: TimelineItem, onBack: () -> Unit, onSource: (Str
             onBack = ::back,
             scrolled = if (listing) fileListScrolled else contentScrolled,
             subtitle = when {
-                listing -> "+${files.sumOf { it.additions }}  −${files.sumOf { it.deletions }}"
+                listing -> "+${countedFiles.sumOf { it.additions }}  −${countedFiles.sumOf { it.deletions }}"
                 selected != null -> selectedFolder
                 else -> null
             },
@@ -97,12 +105,12 @@ internal fun DetailScreen(item: TimelineItem, onBack: () -> Unit, onSource: (Str
                         file.path.ifBlank { context.getString(R.string.delivery_unnamed_file) }) { selectedId = file.id }
                 }
             }
-            else -> key(selected?.id ?: item.key) {
+            else -> readingPages.SaveableStateProvider(selected?.id ?: item.key) {
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     DiffLines(selected?.diff ?: data.fallback, selected != null, Modifier.weight(1f).fillMaxWidth(), selected?.path, onComment, onScrolled = { contentScrolled = it }, onDraftComment = onDraftComment,
                         leading = selected?.let { file -> {
                             val (add, remove) = pocketDiffColors()
-                            Text(androidx.compose.ui.text.buildAnnotatedString {
+                            if (inlineDiffFallback(file.diff) == null) Text(androidx.compose.ui.text.buildAnnotatedString {
                                 withStyle(androidx.compose.ui.text.SpanStyle(color = add)) { append("+${file.additions}") }
                                 append("  ")
                                 withStyle(androidx.compose.ui.text.SpanStyle(color = remove)) { append("−${file.deletions}") }
@@ -126,18 +134,37 @@ internal fun DiffLines(
     onScrolled: (Boolean) -> Unit = {},
     onDraftComment: ((FileCommentDraft) -> Unit)? = null,
     leading: (@Composable RowScope.() -> Unit)? = null,
+    readingState: DiffReadingState = rememberDiffReadingState(path ?: "review"),
+    showControls: Boolean = true,
+    commentsEnabled: Boolean = true,
 ) {
-    val parsed by produceState<List<ReviewLine>?>(null, content, isDiff) {
-        value = null
-        value = withContext(Dispatchers.Default) { parseReviewLines(content, isDiff) }
+    val cached = readingState.document?.takeIf { it.content == content && it.diff == isDiff }
+    val document by produceState(cached, content, isDiff, readingState) {
+        value = cached
+        if (cached == null) {
+            value = withContext(Dispatchers.Default) {
+                val lines = parseReviewLines(content, isDiff)
+                val columns = lines.maxOfOrNull { row ->
+                    reviewCode(row, isDiff).fold(0) { count, char -> count + when { char == '\t' -> 4; char.code >= 0x2e80 -> 2; else -> 1 } }
+                } ?: 1
+                val digits = (lines.maxOfOrNull { maxOf(it.oldLine ?: 0, it.newLine ?: 0) } ?: 0).toString().length
+                DiffReadingDocument(content, isDiff, lines, columns, digits)
+            }
+            readingState.document = value
+        }
     }
-    var expanded by remember(path, content) { mutableStateOf(emptySet<Int>()) }
+    val parsed = document?.lines
+    var expanded by remember(readingState) { readingState::contexts }
     val rows = remember(parsed, expanded) { foldReviewLines(parsed.orEmpty(), expanded) }
     val hunks = remember(rows) { rows.indices.filter { rows[it].row.hunk } }
     // Highlight all code lines in one pass (stable token context), then slice per line.
     val renderer = LocalMarkdownCache.current
     val language = remember(path) { path?.let(::sourceLanguage) }
-    val highlighted by produceState<List<AnnotatedString>?>(null, parsed, language, renderer) {
+    val highlightKey = Triple(content, language, renderer)
+    val cachedHighlight = readingState.highlighted.takeIf { readingState.highlightKey == highlightKey }
+    val highlighted by produceState(cachedHighlight, parsed, language, renderer, readingState) {
+        value = cachedHighlight
+        if (cachedHighlight != null) return@produceState
         val lines = parsed ?: return@produceState
         if (renderer == null || language == null) return@produceState
         val joined = lines.joinToString("\n") { if (it.hunk) "" else reviewCode(it, isDiff) }
@@ -148,32 +175,45 @@ internal fun DiffLines(
             val length = if (line.hunk) 0 else reviewCode(line, isDiff).length
             annotated.subSequence(start, start + length).also { start += length + 1 }
         }
+        readingState.highlightKey = highlightKey
+        readingState.highlighted = value
     }
     val (addColor, removeColor) = pocketDiffColors()
     var target by remember(path, content) { mutableStateOf<ReviewLine?>(null) }
-    var wrap by rememberSaveable(path, isDiff) { mutableStateOf(true) }
-    val state = rememberLazyListState()
-    val horizontal = rememberScrollState()
+    var wrap by remember(readingState) { readingState::wrap }
+    val state = readingState.list
+    val horizontal = readingState.horizontal
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val digitWidth = remember(measurer, density) { with(density) { measurer.measure("0", TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)).size.width.toDp() } }
+    val numberWidth = remember(measurer, density) { with(density) { measurer.measure("0", TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp)).size.width.toDp() } }
+    val columns = document?.columns ?: 1
+    val binary = remember(content, isDiff) { isDiff && inlineDiffFallback(content) == InlineDiffFallback.Binary }
     val scope = rememberCoroutineScope()
     val scrolled by remember { derivedStateOf { state.firstVisibleItemIndex > 0 || state.firstVisibleItemScrollOffset > 0 } }
     val report by rememberUpdatedState(onScrolled)
     LaunchedEffect(scrolled) { report(scrolled) }
     val currentHunk by remember(hunks) { derivedStateOf { hunks.indexOfLast { it <= state.firstVisibleItemIndex } } }
     Column(modifier) {
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (showControls) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             leading?.invoke(this)
             ViewerToggle("自动换行", PocketIcons.WrapText, wrap, { wrap = !wrap })
             if (expanded.isNotEmpty()) ViewerToggle("折叠上下文", PocketIcons.FoldVertical, false, { expanded = emptySet() })
         }
-        if (path != null) Text("点按行号添加草稿评论 · 旧侧 / 新侧", Modifier.padding(horizontal = 16.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (showControls && commentsEnabled && path != null && !binary) Text("点按行号添加草稿评论 · 旧侧 / 新侧", Modifier.padding(horizontal = 16.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Box(Modifier.weight(1f).fillMaxWidth()) {
         when {
+            binary -> DiffFallbackNotice(InlineDiffFallback.Binary, Modifier.fillMaxSize())
             parsed == null -> ReviewLoading(Modifier.fillMaxSize())
             content.isBlank() -> Text(stringResource(R.string.delivery_diff_empty), Modifier.padding(24.dp))
             else -> BoxWithConstraints(Modifier.fillMaxSize()) {
                 val viewport = maxWidth
+                val gutterWidth = (numberWidth * ((document?.numberDigits ?: 1) * if (isDiff) 2 else 1) + 28.dp)
+                    .coerceAtLeast(if (isDiff) 92.dp else 56.dp)
+                val codeViewport = (viewport - gutterWidth - if (isDiff) 14.dp else 0.dp).coerceAtLeast(1.dp)
+                val codeWidth = (digitWidth * columns + 16.dp).coerceAtLeast(codeViewport)
                 SelectionContainer {
-                    LazyColumn(Modifier.fillMaxSize().then(if (wrap) Modifier else Modifier.horizontalScroll(horizontal)), state = state, contentPadding = PaddingValues(bottom = 24.dp)) {
+                    LazyColumn(Modifier.fillMaxSize().testTag("diff-lines"), state = state, contentPadding = PaddingValues(bottom = if (showControls) 24.dp else 4.dp)) {
                         items(rows, key = { it.row.index }, contentType = { if (it.hiddenCount > 0) "fold" else "line" }) { visible ->
                             val row = visible.row
                             if (visible.hiddenCount > 0) {
@@ -199,21 +239,28 @@ internal fun DiffLines(
                                         if (context.isNotBlank()) Text(context, Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
-                                } else Row(Modifier.widthIn(min = viewport).then(if (wrap) Modifier.fillMaxWidth() else Modifier).background(background)
+                                } else Row(Modifier.fillMaxWidth().background(background)
                                     .drawBehind { if (added || removed) drawRect(if (added) addColor else removeColor, size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height)) }
-                                    .padding(end = 12.dp)) {
-                                    Box(Modifier.width(if (isDiff) 92.dp else 56.dp).heightIn(min = if (number != null) 28.dp else 24.dp)
-                                        .clickable(enabled = !path.isNullOrBlank() && number != null && number > 0) { target = row }
+                                    ) {
+                                    Box(Modifier.width(gutterWidth).testTag("diff-gutter:${row.index}").heightIn(min = if (number != null) 28.dp else 24.dp)
+                                        .clickable(enabled = commentsEnabled && !path.isNullOrBlank() && number != null && number > 0) { target = row }
                                         .padding(horizontal = 8.dp, vertical = 3.dp), contentAlignment = Alignment.TopEnd) {
                                         Text(if (isDiff) "${row.oldLine ?: "·"}  ${row.newLine ?: "·"}" else number?.toString().orEmpty(), fontFamily = FontFamily.Monospace, fontSize = 11.sp, textAlign = TextAlign.End,
+                                            maxLines = 1, softWrap = false,
                                             color = when { added -> addColor; removed -> removeColor; else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .7f) })
                                     }
                                     if (isDiff) Text(if (added) "+" else if (removed) "−" else " ", Modifier.width(14.dp).padding(vertical = 3.dp), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
                                         color = if (added) addColor else removeColor)
                                     val plain = reviewCode(row, isDiff)
                                     val code = highlighted?.getOrNull(row.index)?.takeIf { it.text == plain && plain.isNotEmpty() }
-                                    Text(code ?: AnnotatedString(plain.ifEmpty { " " }), Modifier.then(if (wrap) Modifier.weight(1f) else Modifier).padding(vertical = 3.dp),
-                                        fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp, softWrap = wrap)
+                                    // Only the code pane scrolls. Every visible row shares the same width/range;
+                                    // the old/new coordinates and +/- column stay fixed at the viewport edge.
+                                    Box(Modifier.weight(1f).clipToBounds().testTag("diff-code:${row.index}")
+                                        .then(if (wrap) Modifier else Modifier.horizontalScroll(horizontal))) {
+                                        Text(code ?: AnnotatedString(plain.ifEmpty { " " }),
+                                            Modifier.then(if (wrap) Modifier.fillMaxWidth() else Modifier.width(codeWidth)).padding(top = 3.dp, bottom = 3.dp, end = 12.dp),
+                                            fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp, softWrap = wrap)
+                                    }
                                 }
                             }
                         }
@@ -222,7 +269,7 @@ internal fun DiffLines(
             }
         }
         // Floating change navigator, like the next/previous-change control in a code review tool.
-        androidx.compose.animation.AnimatedVisibility(hunks.size > 1, Modifier.align(Alignment.BottomEnd).padding(16.dp).navigationBarsPadding(),
+        androidx.compose.animation.AnimatedVisibility(showControls && hunks.size > 1, Modifier.align(Alignment.BottomEnd).padding(16.dp).navigationBarsPadding(),
             enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(initialScale = .8f),
             exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut(targetScale = .8f)) {
             ChangeNavigator(currentHunk.coerceAtLeast(0), hunks.size,
@@ -233,7 +280,7 @@ internal fun DiffLines(
     }
     target?.let { row ->
         val number = row.newLine ?: row.oldLine
-        if (path != null && number != null) ReadingCommentDialog(path, number, if (row.newLine == null) ReviewSide.OLD else ReviewSide.NEW, { target = null }) { deliverReadingDraft(it, onDraftComment, onComment) }
+        if (commentsEnabled && path != null && number != null) ReadingCommentDialog(path, number, if (row.newLine == null) ReviewSide.OLD else ReviewSide.NEW, { target = null }) { deliverReadingDraft(it, onDraftComment, onComment) }
     }
 }
 
@@ -257,12 +304,15 @@ private fun ChangedFileRow(file: DiffFile, kind: String?, label: String, onClick
             if (meta.isNotBlank()) Text(meta, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.StartEllipsis)
         }
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (inlineDiffFallback(file.diff) == InlineDiffFallback.Binary) Text("二进制", style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
+            else {
             Text(androidx.compose.ui.text.buildAnnotatedString {
                 withStyle(androidx.compose.ui.text.SpanStyle(color = add)) { append("+${file.additions}") }
                 append(" ")
                 withStyle(androidx.compose.ui.text.SpanStyle(color = remove)) { append("−${file.deletions}") }
             }, style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace)
             DiffStatBar(file.additions, file.deletions)
+            }
         }
         Icon(PocketIcons.ChevronRight, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
     }

@@ -38,6 +38,13 @@ class LiveConnectionTest {
                 stage="synchronization"
                 client.request("sync",buildJsonObject{put("cursors",buildJsonObject{})})
                 facts["synchronized"]=JsonPrimitive(true)
+                if (InstrumentationRegistry.getArguments().getString("readDirectory") == "true") {
+                    stage="directory"
+                    val directory=client.request("threads/list",buildJsonObject { put("limit",60); put("archived",false); put("search","") }).asObject()
+                    facts["directoryCount"]=JsonPrimitive(directory.array("data").size)
+                    facts["runtimeIds"]=JsonArray(hello.array("runtimes").map { JsonPrimitive(it.asObject().string("id")) })
+                    facts["directoryOwners"]=JsonArray(directory.array("data").map { JsonPrimitive(it.asObject().string("runtimeId")) }.distinct())
+                }
                 stage="complete"
             } }
         }catch(e:Exception){

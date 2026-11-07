@@ -45,6 +45,12 @@ Native timeline: thread/read includeTurns for initial supported versions; pagina
 
 ## Ownership and approval recovery
 
+Version 0.5.1 adds `thread/context/read {runtimeId,threadId}` with numeric-only `{status,source,updatedAt,turnId,usage}`. The helper may recover the most recent token counters from a bounded tail of an exact-ID native history file inside the verified configuration store. Callers cannot supply paths. Missing history data does not erase a valid cached usage snapshot.
+
+`thread/permissions/read {runtimeId,threadId}` returns `{status,revision,currentPresetId,presets}`. `thread/permissions/update {runtimeId,threadId,presetId,expectedRevision,commandId}` accepts only a published preset and matching opaque revision. Exact built-in presets and existing named native profiles are translated on the computer; generic native requests still cannot inject permission/configuration overrides. Updates affect subsequent turns of this thread only. Native schema support, ownership, current policy and command ledger checks apply; unknown outcomes are not replayed.
+
+Thread directory rows may include `isSubagent`, `parentThreadId`, and `nativeSource`. These fields classify presentation without replacing native identity. Child readers retain their parent selection and use the shared event journal; closing a reader never unsubscribes or stops a native task globally.
+
 Disconnected engines keep their known ownership claims in durable `ownership.json`. A new helper/runtime cannot take over a live but unreachable owner. On Windows, the authenticated native engine PID and process creation FILETIME establish process identity. Confirmed termination or PID reuse can release its claim; missing descriptors, missing identity, access denial and query failure cannot. Other platforms retain uncertainty. A complete current-generation native inventory can reconcile claims. Failed persistence blocks ownership-dependent dispatch.
 
 Inactive resume and rename/archive/unarchive require an exact-ID native `thread/read`, a fresh ownership check and a one-use bridge proof. Proofs are scoped to the helper connection and cannot authorize permission, sandbox or configuration overrides. Duplicate live owners remain a conflict.

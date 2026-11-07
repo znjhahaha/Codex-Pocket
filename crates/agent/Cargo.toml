@@ -26,6 +26,9 @@ qrcode = {version="0.14",default-features=false,features=["svg"]}
 png = "0.17"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rquickjs = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
 pocket-core = {path="../core"}
 codex-cli-adapter = {path="../cli-adapter"}
 pocket-tunnel = {path="../tunnel"}

@@ -44,6 +44,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
+import kotlinx.coroutines.launch
 
 @Composable
 fun PocketRoot(s: PocketState, repo: PocketRepository) { CompositionLocalProvider(LocalPocketGlass provides s.glassEffects,
@@ -72,11 +73,16 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var projectFiles by rememberSaveable { mutableStateOf(false) }
     var conversationMenu by rememberSaveable { mutableStateOf(false) }
     var conversationMenuAnchor by remember { mutableStateOf<Rect?>(null) }
+    var conversationInitialEditor by remember { mutableStateOf(ConversationEditor.None) }
+    var confirmCompact by remember { mutableStateOf(false) }
     var readingHistory by remember { mutableStateOf(false) }
     var homeScrolled by remember { mutableStateOf(false) }
     var rename by rememberSaveable { mutableStateOf(false) }
     var detail by remember { mutableStateOf<TimelineItem?>(null) }
     var previousSelection by remember { mutableStateOf(s.selected?.key) }
+    LaunchedEffect(home) { if (home) repo.closeAgentReader() }
+    val backToParent: () -> Unit = { repo.closeAgentReader(); home = true }
+    val openAgent: (String) -> Unit = { id -> repo.openAgentReader(id); detail = null }
     val holder = rememberSaveableStateHolder()
     val homeHolder = rememberSaveableStateHolder()
     val conversation = !home && s.selected != null && !settings
@@ -97,13 +103,14 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
         if (s.selected?.key != previousSelection) {
             modelSheet = false
             projectFiles = false
+            conversationMenu = false
             detail = null
             if (s.selected != null) home = false
         }
         previousSelection = s.selected?.key
     }
     BackHandler(repairPairing || !home || settings || projectFiles || detail != null || s.advanced.sourcePreview != null) {
-        when { repairPairing -> repairPairing = false; s.advanced.sourcePreview != null -> repo.clearSourcePreview(); projectFiles -> { repo.clearSourcePreview(); projectFiles = false }; detail != null -> { repo.clearSourcePreview(); detail = null }; settings -> settings = false; else -> home = true }
+        when { repairPairing -> repairPairing = false; s.advanced.sourcePreview != null -> repo.clearSourcePreview(); projectFiles -> { repo.clearSourcePreview(); projectFiles = false }; detail != null -> { repo.clearSourcePreview(); detail = null }; settings -> settings = false; else -> backToParent() }
     }
     run {
         when {
@@ -113,10 +120,8 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 canList = canListFiles, canRead = canReadFiles) }
             detail != null -> PocketPageEntrance("detail:${detail!!.key}") { DetailScreen(detail!!, { repo.clearSourcePreview(); detail = null }, onSource = openSource,
                 onComment = repo::commentOnFile, onDraftComment = draftComment, canRead = canReadFiles,
-                availableAgentIds = s.chats.filter { child -> s.selected?.let { parent -> child.runtimeId == parent.runtimeId &&
-                    child.key.computerId == parent.key.computerId && child.key.configStoreId == parent.key.configStoreId && !child.conflict } == true }.map { it.key.nativeId }.toSet(),
-                onAgent = { id -> s.selected?.let { parent -> s.chats.firstOrNull { child -> child.key.nativeId == id && child.runtimeId == parent.runtimeId &&
-                    child.key.computerId == parent.key.computerId && child.key.configStoreId == parent.key.configStoreId && !child.conflict } }?.let { child -> detail = null; repo.select(child) } }) }
+                availableAgentIds = if (s.online) NativeActivityPresentation.describe(detail!!).agents.map { it.threadId }.toSet() else emptySet(),
+                onAgent = openAgent) }
             s.initialized && s.paired && !settings && !conversation -> PocketPageEntrance("home", back = true) { PocketHomeFrame(s, tab,
                 s.approvals.count { !it.submitted && !ConversationPresentation.hookType(it.method) } + s.pendingQuestions.values.sumOf { values -> values.count { !it.flag("submitted") } },
                 homeScrolled && tab == HomeTab.Chats, hostSheet, { hostSheet = true }, { newChat = true },
@@ -160,12 +165,22 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                         conversation -> holder.SaveableStateProvider(s.selected!!.key.encoded) {
                             PocketPageEntrance(s.selected!!.key.encoded) {
                                 CompositionLocalProvider(LocalComposerMenuBinding provides ComposerMenuBinding(
-                                    expanded = modelSheet, onAnchor = { modelAnchor = it },
-                                )) {
-                                    ChatScreen(s, repo, { modelSheet = true }, { detail = it }, { referenceSheet = true }, onReadingHistory = { readingHistory = it }) {
-                                        ConversationHeader(s, { home = true }, { hostSheet = true }, { modelSheet = true }, compact = readingHistory) {
-                                            Box(Modifier.onGloballyPositioned { conversationMenuAnchor = it.boundsInRoot() }) {
-                                                CircleAction(PocketIcons.MoreHoriz, stringResource(R.string.chat_actions)) { conversationMenu = true }
+                                    expanded = modelSheet, onAnchor = { if (!modelSheet) modelAnchor = it },
+                                ), LocalNativeAgentNames provides s.agentChats.associate { it.key.nativeId to it.title }, LocalNativeAgentReader provides openAgent,
+                                    LocalInlineDiffComment provides draftComment) {
+                                    ChatScreen(s, repo, { modelSheet = true }, { detail = it }, { referenceSheet = true }, onReadingHistory = { readingHistory = it }, onAgent = openAgent,
+                                        onComposerAction = { action -> when(action) {
+                                            ComposerAction.Goal, ComposerAction.Rename -> {
+                                                conversationInitialEditor = if (action == ComposerAction.Goal) ConversationEditor.Goal else ConversationEditor.Rename
+                                                conversationMenu = true
+                                            }
+                                            ComposerAction.Compact -> confirmCompact = true
+                                            else -> Unit
+                                        } }) {
+                                        ConversationHeader(s, backToParent, { hostSheet = true }, { modelSheet = true }, compact = readingHistory) {
+                                            ContextIndicator(s, repo::compact, { repo.refreshContext() })
+                                            Box(Modifier.onGloballyPositioned { if (!conversationMenu) conversationMenuAnchor = it.boundsInRoot() }) {
+                                                CircleAction(PocketIcons.MoreHoriz, stringResource(R.string.chat_actions)) { conversationInitialEditor = ConversationEditor.None; conversationMenu = true }
                                             }
                                         }
                                     }
@@ -175,6 +190,13 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                     }
                 }
             }
+        }
+    }
+    s.agentReader?.takeIf { conversation && it.parent == s.selected?.key }?.let { reader ->
+        CompositionLocalProvider(LocalNativeAgentNames provides s.agentChats.associate { it.key.nativeId to it.title }) {
+        AgentReaderPanel(reader, s.currentAgents(), s.agentChats.associate { it.key.nativeId to it.title }, s.online,
+            onOpen = { repo.openAgentReader(it) }, onList = repo::agentReaderList, onClose = repo::closeAgentReader,
+            onFullscreen = repo::agentReaderFullscreen, onOlder = { repo.olderAgent() }, onRetry = { repo.retryAgent() })
         }
     }
     // Keep DetailScreen/ProjectFilesScreen mounted underneath: returning restores their exact selection and scroll.
@@ -187,7 +209,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     if (newChat) NewChatDialog(s, { newChat = false }) { runtime, cwd -> newChat = false; home = false; repo.create(runtime, cwd) }
     if (modelSheet && s.paired && s.selected != null) {
         LaunchedEffect(s.selected?.key) { repo.refreshModels() }
-        PocketAnchoredMenu("模型", { modelSheet = false }, modelAnchor, widthDp = 264f) {
+        PocketAnchoredMenu("模型", { modelSheet = false }, modelAnchor, widthDp = 320f) {
             ModelSheet(s, { model, effort ->
                 if (s.online && s.modelCatalogState == ModelCatalogState.Ready && model in s.models) {
                     repo.chooseModel(model, effort)
@@ -214,12 +236,12 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     if (usageSheet) UsageSheet(s) { usageSheet = false }
     if (referenceSheet) ReferenceSheet(s, repo) { referenceSheet = false }
     }
-    if (conversationMenu) ConversationActionsMenu(s, conversationMenuAnchor, { conversationMenu = false },
-        onFiles = if (canListFiles) { { projectFiles = true; repo.browseProjectFiles() } } else null,
-        onRename = { rename = true }, onFork = { repo.fork() }, onSideChat = { repo.fork(sideChat = true) },
-        onGoal = { goalSheet = true }, onUsage = { usageSheet = true }, onCompact = repo::compact,
-        onFast = { repo.setFastMode(!s.advanced.fastMode) }, onResume = repo::resume,
-        onPin = { s.selected?.let(repo::pin) }, onArchive = { s.selected?.let(repo::archive) })
+    if (conversationMenu) ConversationPanel(s, repo, conversationMenuAnchor, { conversationMenu = false },
+        onFiles = if (canListFiles) ({ projectFiles = true; repo.browseProjectFiles() }) else null, initialEditor = conversationInitialEditor)
+    if (confirmCompact) PocketDialog({ confirmCompact = false }, title = { Text("压缩上下文") },
+        text = { Text("压缩当前会话后继续工作。已有草稿会保留。") },
+        confirmButton = { PocketButton("压缩", { confirmCompact = false; repo.compact() }, enabled = canMutate(s, "thread/compact/start")) },
+        dismissButton = { PocketButton("取消", { confirmCompact = false }, secondary = true) })
     if (rename) {
         var text by remember { mutableStateOf(s.selected?.title.orEmpty()) }
         PocketDialog(onDismissRequest = { rename = false }, title = { Text(stringResource(R.string.rename_chat)) },
@@ -240,7 +262,8 @@ internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -
                 AnimatedVisibility(!compact) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     Box(Modifier.size(5.dp).background(if (s.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
-                    Text(s.computerName, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(s.computerName, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    TaskElapsedLabel(s.timeline.activeTurn?.let { s.timeline.turns[it] })
                 }
                 }
             }

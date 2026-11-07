@@ -48,11 +48,11 @@ class NativeActivityUiTest {
         waitText("lookup")
         // Codex style: the collapsed line names the command; cwd and output wait for an explicit expand.
         compose.onNodeWithText("./check").assertExists()
-        compose.onNodeWithText(compose.activity.getString(R.string.v04_trace_running)).assertExists()
+        compose.onNodeWithText("正在运行").assertExists()
         compose.onNodeWithText("/work", substring = true).assertDoesNotExist()
         compose.onNodeWithText("first output").assertDoesNotExist()
         compose.onNodeWithTag("activity-toggle:${command.key}").performClick()
-        compose.onNodeWithText("./check").assertExists()
+        compose.onNodeWithText("$ ./check").assertExists()
         compose.onNodeWithText("/work", substring = true).assertExists()
         compose.onNodeWithText("first output").assertExists()
         compose.onNodeWithText("lookup", substring = true).assertExists()
@@ -71,7 +71,7 @@ class NativeActivityUiTest {
         compose.onNodeWithText("streaming output", substring = true).assertDoesNotExist()
     }
 
-    @Test fun completedTraceNamesWorkAndFileEntryPassesOriginalNativeItem() {
+    @Test fun completedTraceNamesWorkAndFileEntryOpensSelectedInlineDiff() {
         val command = item("""{"id":"c","type":"commandExecution","command":"./check","status":"completed","exitCode":0}""", true)
         val file = item("""{"id":"f","type":"fileChange","status":"completed","changes":[{"path":"src/a.kt","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new"}]}""", true)
         val row = ConversationPresentation.rows(NativeTimeline(listOf(command, file).associateBy { it.key }, completedTurns = setOf("turn"))).single()
@@ -80,16 +80,17 @@ class NativeActivityUiTest {
             var expanded by remember { mutableStateOf(false) }
             TranscriptRowView(row, "test", expanded, { expanded = !expanded }, { detailed = it })
         }
-        val commandsLabel = compose.activity.getString(R.string.v04_trace_sum_commands, 1)
+        val commandsLabel = "编辑了文件运行了命令"
         waitText(commandsLabel)
-        compose.onNodeWithText(compose.activity.getString(R.string.v04_trace_sum_files, 1), substring = true).assertExists()
+        compose.onNodeWithText(commandsLabel).assertExists()
         compose.onNodeWithText("./check").assertDoesNotExist()
         compose.onNodeWithText(commandsLabel, substring = true).performClick()
         waitText("a.kt")
         compose.onNodeWithText("+1  −1", substring = true).assertExists()
-        compose.onNodeWithText(compose.activity.getString(R.string.v04_trace_ran)).assertExists()
+        compose.onNodeWithText("已运行").assertExists()
         compose.onNodeWithText("a.kt").performClick()
-        compose.runOnIdle { assertSame(file, detailed) }
+        compose.onNodeWithTag("inline-diff:file:0").assertExists()
+        compose.runOnIdle { assertNull(detailed) }
     }
 
     @Test @Config(qualifiers = "w360dp-h800dp-xxhdpi")
@@ -102,22 +103,20 @@ class NativeActivityUiTest {
         } }
         waitText("Run tests")
         compose.onNodeWithText(compose.activity.getString(R.string.v03_exit_code, 9), substring = true).assertIsDisplayed()
-        compose.onNodeWithText(compose.activity.getString(R.string.delivery_plan_progress, 1, 2), substring = true).assertIsDisplayed()
+        compose.onNodeWithText("1/2").assertIsDisplayed()
         compose.onNodeWithTag("activity-toggle:${failed.key}").performClick()
         compose.onNodeWithText("permission denied").assertIsDisplayed()
     }
 
-    @Test fun wrappedShellCommandShowsScriptAndDurationNotLauncher() {
+    @Test fun wrappedShellCommandKeepsCompactExecutableAndFullInvocationInDetails() {
         val command = item("""{"id":"c","type":"commandExecution","command":"\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command 'Get-Content README.md'","status":"completed","exitCode":0,"durationMs":3200}""", true)
         // A completed group is folded; `expanded = true` is the group's persisted open state.
         content { TranscriptRowView(TranscriptRow("activity:${command.key}", TranscriptKind.Activity, listOf(command)), "test", true, {}, {}) }
         waitText("Get-Content README.md")
-        compose.onNodeWithText(compose.activity.getString(R.string.v04_trace_ran_in, "3s")).assertExists()
-        compose.onNodeWithText("powershell.exe", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Get-Content README.md", substring = true).assertExists()
         compose.onNodeWithTag("activity-toggle:${command.key}").performClick()
-        // The detail shows the whole script as a prompt line; the shell launcher stays hidden.
-        compose.onNodeWithText("$ Get-Content README.md").assertExists()
-        compose.onNodeWithText("powershell.exe", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("$ " + command.raw.string("command")).assertExists()
+        compose.onNodeWithText("3s", substring = true).assertExists()
     }
 
     @Test fun userBubbleShowsRequestAndFileChipsInsteadOfCodexWrapper() {
@@ -201,7 +200,7 @@ class NativeActivityUiTest {
         compose.onNodeWithText("visible output").assertDoesNotExist()
         compose.onNodeWithTag("activity-toggle:${original.key}").performClick()
         waitText("visible output")
-        compose.onNodeWithText("./check").assertExists()
+        compose.onNodeWithText("$ ./check").assertExists()
     }
 
     @Test fun hereStringCommandShowsItsFirstMeaningfulLine() {

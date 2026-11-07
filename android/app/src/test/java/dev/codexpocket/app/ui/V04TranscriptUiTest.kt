@@ -5,6 +5,8 @@ import android.view.ViewGroup
 import android.widget.TextView
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -15,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -56,7 +59,32 @@ class V04TranscriptUiTest {
         }
     }
 
-    @Test fun commentaryIsNormalMarkdownAndReasoningUsesTheSameRenderer() {
+    @Test fun proposalHeadingsAndListsHaveSeparateVerticalBoundsInsideThePlanBox() {
+        val source = "# 第一章：权限闭环\n\n解释一段内容。\n\n## 第二章：对话阅读\n\n- 保留草稿\n- 保留原生身份\n\n## 第三章：验收\n\n最后一段说明。"
+        val proposal = TimelineItem("turn", "proposal-flow", "plan", source, complete = true)
+        content { Column(Modifier.verticalScroll(rememberScrollState())) {
+            NativeActivityCard(proposal, "flow-plan", true, {}, {})
+        } }
+        waitMarkdown("最后一段说明。")
+        fun views(view: View): List<TextView> = when(view) {
+            is TextView -> listOf(view)
+            is ViewGroup -> (0 until view.childCount).flatMap { views(view.getChildAt(it)) }
+            else -> emptyList()
+        }
+        compose.runOnIdle {
+            val blocks = views(compose.activity.window.decorView).filter { view ->
+                listOf("第一章", "第二章", "第三章").any { view.text.startsWith(it) }
+            }
+            assertEquals(3, blocks.size)
+            blocks.zipWithNext().forEach { (before, after) ->
+                val a = IntArray(2); val b = IntArray(2)
+                before.getLocationInWindow(a); after.getLocationInWindow(b)
+                assertTrue("Markdown blocks overlap: ${before.text.take(8)}", a[1] + before.height <= b[1])
+            }
+        }
+    }
+
+    @Test fun commentaryUsesMarkdownAndReasoningIsReadOnlyNativeProse() {
         val prose = TimelineItem("t", "comment", "agentMessage", "Checking **sources** before continuing.", raw = buildJsonObject { put("phase", "commentary") })
         val reasoning = TimelineItem("t", "reasoning", "reasoning", "**Compare options** then inspect the result.", liveStarted = true)
         content { Column {
@@ -65,8 +93,14 @@ class V04TranscriptUiTest {
         } }
         waitMarkdown("Checking sources before continuing.")
         compose.onNodeWithText(compose.activity.getString(R.string.v02_commentary)).assertDoesNotExist()
-        compose.onNodeWithTag("activity-toggle:${reasoning.key}").performClick()
-        waitMarkdown("Compare options then inspect the result.")
+        compose.onNodeWithTag("activity-toggle:${reasoning.key}").assertDoesNotExist()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("Compare options then inspect the result.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Compare options then inspect the result.").assertIsDisplayed()
+            .assert(SemanticsMatcher.keyNotDefined(SemanticsActions.SetText))
+            .assert(SemanticsMatcher.keyNotDefined(SemanticsActions.OnClick))
+        compose.onNodeWithText(compose.activity.getString(R.string.v04_trace_thought)).assertDoesNotExist()
         compose.onNodeWithText("**Compare options**", substring = true).assertDoesNotExist()
     }
 

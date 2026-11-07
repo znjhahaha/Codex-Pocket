@@ -9,6 +9,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import dev.codexpocket.app.MainActivity
@@ -84,7 +85,9 @@ class V02UiTest {
         assertEquals(1, queue); assertEquals(0, steer)
         compose.onNodeWithTag("composer-steer").performClick()
         assertEquals(1, queue); assertEquals(1, steer)
-        compose.onNodeWithContentDescription("展开输入框").performClick()
+        compose.onNodeWithContentDescription(compose.activity.getString(dev.codexpocket.app.R.string.v02_references)).performClick()
+        compose.onNodeWithText("展开输入框").performScrollTo().assertIsDisplayed().performClick()
+        compose.onNodeWithTag("composer-expanded-input").assertTextEquals("direction")
         compose.onNodeWithContentDescription("收起输入框").assertExists()
         screenshot("composer-running-expanded")
     }
@@ -95,7 +98,7 @@ class V02UiTest {
         compose.onNodeWithText("MUST_NOT_RENDER", substring = true).assertDoesNotExist()
         screenshot("approval-light")
         content { PocketTheme("dark") { Surface { ApprovalCard(request.copy(submitted = true), true) { _, _ -> } } } }
-        compose.onNodeWithText("仅允许这一次").assertIsNotEnabled()
+        compose.onNodeWithText("允许一次").assertIsNotEnabled()
     }
     @Test fun attentionAndDevicesPreviewsRender() {
         content { AttentionPreview() }; screenshot("attention-light")
@@ -146,16 +149,20 @@ class V02UiTest {
         compose.onNodeWithText("取消置顶").performClick()
         assertTrue(pinned); assertFalse(forked)
     }
-    @Test fun readingModeRestoresControlsWhenInputReceivesFocus() {
+    @Test fun readingModeRestoresControlsWhenPreviewIsTapped() {
         content { PocketTheme("light") { Surface {
             var draft by remember { mutableStateOf("") }
             PocketComposer(draft, "Codex", "高", false, ComposerAvailability(true, false, true, false), { draft = it }, {}, {}, {}, {}, {}, {}, true, readingHistory = true)
         } } }
-        // While reading, the model capsule above the box slides away; using the input brings it back.
+        // Reading uses a readonly preview; tapping it restores the multiline editor and model capsule.
         compose.onNodeWithTag("composer-model").assertDoesNotExist()
+        compose.onNodeWithTag("composer-input").assertDoesNotExist()
         compose.onNodeWithText("中文草稿").assertDoesNotExist()
-        compose.onNodeWithTag("composer-input").performClick().performTextInput("中文草稿")
+        compose.onNodeWithTag("composer-history-preview")
+            .assert(SemanticsMatcher.keyNotDefined(SemanticsActions.SetText)).performClick()
+        compose.onNodeWithTag("composer-input").assertIsFocused().performTextInput("中文草稿")
         compose.onNodeWithTag("composer-model").assertExists()
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
         compose.onNodeWithTag("composer-input").assertTextEquals("中文草稿")
     }
     @Test @Config(qualifiers = "w360dp-h800dp-xxhdpi")

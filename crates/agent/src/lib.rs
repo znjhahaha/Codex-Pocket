@@ -5,12 +5,20 @@ pub mod broker;
 #[path = "../../bridge/src/capabilities.rs"]
 pub mod capabilities;
 pub mod config;
+pub mod context_usage;
+pub mod permissions;
+#[path = "../../bridge/src/permission_policy.rs"]
+pub mod permission_policy;
 pub mod connection;
 pub mod error;
 pub mod local;
 pub mod native;
 pub mod push;
 pub mod session;
+#[path = "../../bridge/src/settings.rs"]
+pub mod settings;
 pub mod storage;
 pub mod transport;
 pub mod workspace;
+
+pub mod quota;

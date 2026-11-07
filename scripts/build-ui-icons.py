@@ -3,7 +3,12 @@
 24-unit grid, 1.65-unit rounded strokes, quiet corners, shared geometry.
 """
 from pathlib import Path
-import json, re
+import argparse, json, re
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--android-only", action="store_true", help="Generate Compose/design assets only; never rewrite caller UI files")
+parser.add_argument("--trace-only", action="store_true", help="Update only trace glyphs, preserving other generated Compose edits")
+args = parser.parse_args()
 
 ROOT=Path(__file__).resolve().parent.parent
 OUT=ROOT/'design/icons'
@@ -67,10 +72,81 @@ P={
 'Wifi':['M3 8a14 14 0 0 1 18 0M6 12a9 9 0 0 1 12 0M9 16a4 4 0 0 1 6 0M12 20h.01'],
 'Unplug':['M5 10l9 9M6.5 11.5l-1 1a4 4 0 0 0 6 6l1-1M11 6l1-1a4 4 0 0 1 6 6l-1 1M15 3l2 2M19 7l2 2M3 21l3-3M8 8l2-2M16 16l2-2M3 3l18 18'],
 'LoaderCircle':['M20 12a8 8 0 1 1-8-8'],
+'RobotOutline':['M12 1.5v3M9.5 2.5h2.5','M8 4.5h8a3 3 0 0 1 3 3v3a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3v-3a3 3 0 0 1 3-3z','M9 8h.01M15 8h.01M9 11h6M4.5 22a7.5 6 0 0 1 15 0M9.5 17l2.5 2 2.5-2'],
+'AgentFlower':['M12 12C5 8 8 2 12 2s7 6 0 10C16 5 22 8 22 12s-6 7-10 0C19 16 16 22 12 22s-7-6 0-10C8 19 2 16 2 12s6-7 10 0z'],
+'AgentOrbit':['M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z','M18.5 12a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0z','M15.5 12a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0zM12 3v5.5M21 12h-5.5M12 21v-5.5M3 12h5.5'],
+'AgentWave':['M20 18a9 9 0 1 0-16 0M18 20a7 7 0 1 0-12 0M16 21a5 5 0 1 0-8 0M14 22a3 3 0 1 0-4 0'],
 }
+# Trace glyphs and existing reader glyphs are kept in the generator, not patched into generated output.
+P.update({
+  "FoldVertical": [
+    "M12 22v-6M12 8V2M4 12h2M10 12h4M18 12h2M15 19l-3-3-3 3M15 5l-3 3-3-3"
+  ],
+  "BookOpen": [
+    "M12 7v14",
+    "M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"
+  ],
+  "Wrench": [
+    "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
+  ],
+  "Globe": [
+    "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+    "M12 3a14.5 14.5 0 0 0 0 18 14.5 14.5 0 0 0 0-18M3 12h18"
+  ],
+  "Folder": [
+    "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"
+  ],
+  "FilePen": [
+    "M12.5 22H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v9.5",
+    "M14 2v4a2 2 0 0 0 2 2h4M13.38 15.62a2.12 2.12 0 0 0-3-3L5 18l-.75 3.75L8 21z"
+  ],
+  "Sparkle": [
+    "M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.13-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.13a.5.5 0 0 1 .96 0L14.06 8.5a2 2 0 0 0 1.44 1.44l6.13 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.13a.5.5 0 0 1-.96 0z"
+  ],
+  "Users": [
+    "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0z",
+    "M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"
+  ],
+  "WrapText": [
+    "M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7"
+  ],
+  "ListTree": [
+    "M21 12h-8M21 6H8M21 18h-8M3 6v4c0 1.1.9 2 2 2h3M3 10v6c0 1.1.9 2 2 2h3"
+  ],
+  "ChevronLeft": [
+    "M15 5.5L8.5 12l6.5 6.5"
+  ],
+  "Edit": [
+    "M15 4.5l4.5 4.5M4.5 15.5l12-12a2.5 2.5 0 0 1 3.5 3.5l-12 12-4.5 1z"
+  ],
+  "Terminal": [
+    "M5.5 4.5h13a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z",
+    "M7 9l3 3-3 3M13 15h4"
+  ],
+  "Image": [
+    "M5.5 4.5h13a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z",
+    "M3.5 16l5-5 5 5 3-3 4 4M15.5 8.5h.01"
+  ],
+  "RobotOutline": [
+    "M12 2v3M9.5 3h2.5",
+    "M8 5h8a3 3 0 0 1 3 3v3a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3V8a3 3 0 0 1 3-3z",
+    "M9 8.5h.01M15 8.5h.01M9.5 11.5h5M4.5 21.5a7.5 5.5 0 0 1 15 0M9.5 17l2.5 2 2.5-2"
+  ],
+  "Cube": [
+    "M12 2.5l9 5v9l-9 5-9-5v-9z",
+    "M3 7.5l9 5 9-5M12 12.5v9"
+  ]
+})
+TRACE_GLYPHS = {"Edit", "Terminal", "Command", "RobotOutline", "Wrench", "Image", "Cube"}
 aliases={'KeyboardArrowDown':'ExpandMore','Command':'Terminal','Monitor':'Computer','Smartphone':'PhoneAndroid','Plus':'Add','X':'Close','Link2':'Link','RefreshCw':'Refresh'}
 for name,source in aliases.items(): P[name]=P[source]
-(OUT/'paths.json').write_text(json.dumps(P,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+if args.trace_only and (OUT/'paths.json').exists():
+    existing_paths = json.loads((OUT/'paths.json').read_text(encoding='utf-8'))
+    existing_paths.update({name: P[name] for name in TRACE_GLYPHS})
+    design_paths = existing_paths
+else:
+    design_paths = P
+(OUT/'paths.json').write_text(json.dumps(design_paths,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 header='''package dev.codexpocket.app.ui
 
 import androidx.compose.ui.graphics.Color
@@ -93,20 +169,27 @@ internal object PocketIcons {
 for name,paths in P.items():header+=f'    val {name}: ImageVector by lazy {{ icon("{name}", '+', '.join(json.dumps(p) for p in paths)+') }\n'
 header+='}\n'
 ui=ROOT/'android/app/src/main/java/dev/codexpocket/app/ui'
-(ui/'PocketIcons.kt').write_text(header,encoding='utf-8')
-for file in ui.glob('*.kt'):
-    if file.name=='PocketIcons.kt': continue
-    text=file.read_text(encoding='utf-8')
-    text=re.sub(r'Icons\.(?:AutoMirrored\.)?Outlined\.([A-Za-z0-9]+)',lambda m:'PocketIcons.'+m[1],text)
-    text=re.sub(r'^import androidx\.compose\.material\.icons\..*\n','',text,flags=re.M)
-    file.write_text(text,encoding='utf-8')
+if args.trace_only:
+    target = ui/'PocketIcons.kt'
+    source = target.read_text(encoding='utf-8')
+    for name in sorted(TRACE_GLYPHS):
+        line = next(line for line in header.splitlines() if line.startswith(f'    val {name}:'))
+        pattern = rf'^    val {name}:.*$'
+        if re.search(pattern, source, re.M):
+            source = re.sub(pattern, lambda match: line, source, flags=re.M)
+        else:
+            source = source.rstrip().removesuffix('}') + line + '\n}\n'
+    target.write_text(source, encoding='utf-8')
+else:
+    (ui/'PocketIcons.kt').write_text(header,encoding='utf-8')
+# Icon generation does not perform call-site migrations.
 ts='''import {forwardRef,type ComponentType,type SVGProps} from 'react';
 export type PocketIcon = ComponentType<SVGProps<SVGSVGElement> & {size?:number}>;
 function icon(paths:string[]):PocketIcon{return forwardRef<SVGSVGElement,SVGProps<SVGSVGElement>&{size?:number}>(({size=24,strokeWidth=1.65,...props},ref)=><svg ref={ref} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{paths.map((d,i)=><path key={i} d={d}/>)}</svg>)}
 '''
 for name,paths in P.items():ts+=f'export const {name}=icon({json.dumps(paths)});\n'
-(ROOT/'desktop/src/PocketIcons.tsx').write_text(ts,encoding='utf-8')
-app=ROOT/'desktop/src/App.tsx';text=app.read_text(encoding='utf-8').replace("from 'lucide-react'","from './PocketIcons'").replace('LucideIcon','PocketIcon');app.write_text(text,encoding='utf-8')
+if not (args.android_only or args.trace_only):
+    (ROOT/'desktop/src/PocketIcons.tsx').write_text(ts,encoding='utf-8')
 def svg(paths): return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">'+''.join(f'<path d="{p}"/>' for p in paths)+'</svg>'
 names=['ChatBubbleOutline','NotificationsNone','Devices','Search','Edit','Settings','Add','ArrowUpward','StopCircle','PlaylistAdd','CallSplit','ContentCopy','PhotoCamera','Image','Description','FolderOpen','AutoAwesome','Checklist','Terminal','Code','Tune','MoreHoriz','Link','Refresh']
 labels=['Chats','Attention','Devices','Search','New chat','Settings','Attach','Send','Stop','Queue','Branch','Copy','Camera','Photos','File','Folder','Model','Plan','Terminal','Code','Options','More','Link','Reconnect']
@@ -114,3 +197,6 @@ cards=''.join(f'<div class="cell">{svg(P[n])}<span>{l}</span></div>' for n,l in 
 html='''<!doctype html><meta charset="utf-8"><style>*{box-sizing:border-box}body{margin:0;background:#f7f7f6;color:#202123;font:14px "Segoe UI",sans-serif;padding:56px}h1{font-size:34px;letter-spacing:-1px;margin:0 0 8px;font-weight:600}p{color:#727272;margin:0 0 40px}.grid{display:grid;grid-template-columns:repeat(8,1fr);gap:10px}.cell{display:flex;flex-direction:column;align-items:center;gap:18px;padding:25px 8px;border-radius:16px;background:#fff}.cell svg{width:28px;height:28px}.cell span{font-size:12px;color:#777}.bar{margin-top:34px;padding:24px 32px;border-radius:22px;background:#202123;color:white;display:flex;gap:44px;align-items:center}.bar svg{width:24px;height:24px}.bar .selected{padding:12px;background:#414143;border-radius:14px}.bar b{margin-right:auto;font-weight:500}.sizes{margin-top:26px;display:flex;align-items:center;gap:22px;color:#686868}.sizes svg{width:100%;height:100%}</style><h1>Pocket Outline</h1><p>Original in-app icons · 24-unit grid · 1.65 stroke · shared across Android and desktop</p><div class="grid">'''+cards+'</div><div class="bar"><b>Codex Pocket</b><div class="selected">'+svg(P['ChatBubbleOutline'])+'</div>'+svg(P['NotificationsNone'])+svg(P['Devices'])+svg(P['Settings'])+'</div><div class="sizes">'+''.join(f'<span style="width:{s}px;height:{s}px;display:block">'+svg(P['Terminal'])+'</span>' for s in [16,20,24,32])+'<span>16 / 20 / 24 / 32 px</span></div>'
 (OUT/'preview.html').write_text(html,encoding='utf-8')
 print(f'Generated {len(P)} original vector icons for Compose/React and preview.')
+
+trace_cards = ''.join(f'<div class="trace"><span class="glyph">{svg(P[name])}</span><span>{name}</span></div>' for name in ['Edit','Terminal','RobotOutline','Wrench','Image','Cube'])
+(OUT/'trace-preview.html').write_text('<!doctype html><meta charset="utf-8"><title>Pocket trace icons</title><style>body{font:14px "Segoe UI",sans-serif;color:#747474;background:#fff}.trace{display:flex;align-items:center;gap:6px;min-height:32px}.glyph{display:block;width:16px;height:16px}.glyph svg{width:100%;height:100%}</style>'+trace_cards,encoding='utf-8')

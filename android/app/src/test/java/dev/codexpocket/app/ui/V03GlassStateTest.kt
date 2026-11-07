@@ -44,9 +44,8 @@ class V03GlassStateTest {
         compose.onNodeWithText("电脑离线，连接后可重新读取模型").assertExists()
         compose.onNodeWithText("Cached default").assertDoesNotExist()
         compose.runOnIdle { status = ModelCatalogState.Ready }
-        // Ready: the effort card names the current model; its chevron opens the list where a model is picked.
+        // Ready opens directly on the model list.
         compose.onNodeWithText("Cached default").assertExists()
-        compose.onNodeWithTag("model-picker-entry").performClick()
         compose.onNodeWithText("Cached default").performClick()
         assertEquals(1, selections)
     }
