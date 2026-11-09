@@ -83,7 +83,8 @@ fn v02_cli_devices_revoke_and_pair_contract() {
     for key in ["qrPath", "pngPath", "payloadPath"] {
         assert!(std::path::Path::new(pair[key].as_str().unwrap()).is_file());
     }
-    assert_eq!(pair["payloadPath"].as_str(),dir.path().join("pairing-qr.json").to_str());
+    let expected_payload = dunce::canonicalize(dir.path().join("pairing-qr.json")).unwrap();
+    assert_eq!(pair["payloadPath"].as_str(), expected_payload.to_str());
 }
 #[test]
 fn v02_cli_invalid_parameters_are_nonzero_redacted_json() {

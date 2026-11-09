@@ -224,12 +224,24 @@ class PocketRepositoryTest {
         assertEquals(key, repo.state.value.selected?.key)
     }
     @Test fun metadataRefreshRebindsAStoppedChildRuntime() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child") {
+                entered.complete(Unit); release.await()
+            }
+            null
+        }
         childLink()
+        withTimeout(5_000) { entered.await() }
         val parent = repo.state.value.selected!!
         val childKey = key.copy(nativeId = "child")
-        db.dao().putChat(parent.copy(key = childKey, runtimeId = "stopped-runtime", isSubagent = true, parentThreadId = key.nativeId))
-        await { it.agentChats.any { c -> c.key == childKey && c.runtimeId == "stopped-runtime" } }
-        repo.refreshAgentNames().join()
+        try {
+            db.dao().putChat(parent.copy(key = childKey, runtimeId = "stopped-runtime", isSubagent = true, parentThreadId = key.nativeId))
+            await { it.agentChats.any { c -> c.key == childKey && c.runtimeId == "stopped-runtime" } }
+        } finally { release.complete(Unit) }
+        // The collaboration event owns this in-flight refresh. Await its commit,
+        // not a second request that is intentionally coalesced or throttled.
+        await { it.agentChats.any { c -> c.key == childKey && c.runtimeId == parent.runtimeId } }
         assertEquals(parent.runtimeId, db.dao().chat(childKey)?.runtimeId)
     }
     @Test fun nativeChildMissingFromDirectoryOpensReadOnlyAndReturnsToParentDraft() = runBlocking<Unit> {
@@ -249,17 +261,16 @@ class PocketRepositoryTest {
         val before = server.calls.size
         repo.openAgent("invented").join()
         assertEquals(before, server.calls.size)
-        childLink()
         server.intercept = { method, params, _ ->
             if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child")
                 buildJsonObject { put("thread", server.thread("wrong-id")) } else null
         }
+        childLink()
         repo.openAgent("child").join()
         assertEquals(key, repo.state.value.selected?.key)
         assertTrue(repo.state.value.online)
     }
     @Test fun lateChildReadCannotOverrideNewSelection() = runBlocking<Unit> {
-        childLink()
         val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
         server.intercept = { method, params, _ ->
             if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child") {
@@ -267,6 +278,7 @@ class PocketRepositoryTest {
             }
             null
         }
+        childLink()
         val opening = repo.openAgent("child")
         withTimeout(5_000) { entered.await() }
         repo.select(repo.state.value.chats.first { it.key == otherKey }).join()

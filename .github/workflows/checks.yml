@@ -23,7 +23,7 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install 1.93.1 --profile minimal
       - name: Native tests
-        run: cargo +1.93.1 test --locked --workspace
+        run: cargo +1.93.1 test --locked --workspace --no-fail-fast
       - name: Desktop runtime tests
         run: cargo +1.93.1 test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop-runtime
       - name: Frontend dependencies
@@ -75,7 +75,7 @@ jobs:
         with:
           cache-read-only: ${{ github.event_name == 'pull_request' }}
       - name: Host tests and lint
-        run: bash android/gradlew -p android :wire:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon
+        run: bash android/gradlew -p android :wire:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --continue
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
