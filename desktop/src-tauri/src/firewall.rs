@@ -24,14 +24,14 @@ try {
  $name='CodexPocket-LAN-__ID__'
  $rule=Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction SilentlyContinue
  if ($rule -and (@($rule).Count -ne 1 -or $rule.Group -ne 'Codex Pocket LAN')) { throw 'Foreign firewall rule' }
- $parameters=@{Profile='Private';Direction='Inbound';Action='Allow';Enabled='True';Protocol='TCP';LocalAddress='__IP__';LocalPort=__PORT__;RemoteAddress='LocalSubnet';Program=$program;EdgeTraversalPolicy='Block'}
+ $parameters=@{Profile='Private';Direction='Inbound';Action='Allow';Enabled='True';Protocol='TCP';LocalAddress='Any';LocalPort=__PORT__;RemoteAddress='LocalSubnet';Program=$program;EdgeTraversalPolicy='Block'}
  if ($rule) { $rule | Set-NetFirewallRule @parameters | Out-Null }
  else { New-NetFirewallRule -PolicyStore PersistentStore -Name $name -DisplayName 'Codex Pocket - private LAN only' -Group 'Codex Pocket LAN' @parameters | Out-Null }
  $rule=Get-NetFirewallRule -PolicyStore PersistentStore -Name $name
  $app=$rule | Get-NetFirewallApplicationFilter
  $port=$rule | Get-NetFirewallPortFilter
  $address=$rule | Get-NetFirewallAddressFilter
- if ([string]$rule.Profile -ne 'Private' -or [string]$rule.Direction -ne 'Inbound' -or [string]$rule.Action -ne 'Allow' -or [string]$rule.Enabled -ne 'True' -or $app.Program -ne $program -or [string]$port.Protocol -notin @('TCP','6') -or [string]$port.LocalPort -ne '__PORT__' -or [string]$address.LocalAddress -ne '__IP__' -or [string]$address.RemoteAddress -ne 'LocalSubnet') { throw 'Firewall verification failed' }
+ if ([string]$rule.Profile -ne 'Private' -or [string]$rule.Direction -ne 'Inbound' -or [string]$rule.Action -ne 'Allow' -or [string]$rule.Enabled -ne 'True' -or $app.Program -ne $program -or [string]$port.Protocol -notin @('TCP','6') -or [string]$port.LocalPort -ne '__PORT__' -or [string]$address.LocalAddress -ne 'Any' -or [string]$address.RemoteAddress -ne 'LocalSubnet') { throw 'Firewall verification failed' }
  exit 0
 } catch { exit 1 }
 "#;
@@ -65,7 +65,7 @@ pub async fn allow_lan_firewall(context:State<'_,Context>)->Result<Value,Operati
     #[test]fn rule_is_limited_to_verified_program_port_address_and_private_subnet(){
         let script=rule_script(Path::new("C:/Pocket O'Brien/pocket-agent.exe"),&"a".repeat(64),"192.168.1.7:17891","fixture-computer").unwrap();
         assert!(script.contains("'C:/Pocket O''Brien/pocket-agent.exe'"));
-        for bound in ["Profile='Private'","RemoteAddress='LocalSubnet'","LocalPort=17891","LocalAddress='192.168.1.7'","Program=$program","Protocol='TCP'","Get-FileHash","Get-NetFirewallApplicationFilter"]{assert!(script.contains(bound),"{bound}");}
+        for bound in ["Profile='Private'","RemoteAddress='LocalSubnet'","LocalPort=17891","LocalAddress='Any'","Program=$program","Protocol='TCP'","Get-FileHash","Get-NetFirewallApplicationFilter"]{assert!(script.contains(bound),"{bound}");}
         assert!(!script.contains("Profile='Public'"));assert!(!script.contains("Program='Any'"));
     }
     #[test]fn unsafe_or_missing_listener_cannot_generate_an_elevated_rule(){

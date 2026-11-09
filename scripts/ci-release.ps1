@@ -23,6 +23,8 @@ try {
         & ./android/gradlew.bat -p android :wire:test :app:testDebugUnitTest :app:lintDebug --no-daemon
         if ($LASTEXITCODE -ne 0) { throw 'Android host checks failed.' }
         & ./scripts/build-release.ps1 -SigningDirectory $signing -OutputDirectory $OutputDirectory
+        & cargo test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop
+        if ($LASTEXITCODE -ne 0) { throw 'Desktop native command checks failed.' }
         $manifest=Get-Content -LiteralPath (Join-Path $OutputDirectory 'release-manifest.json') -Raw | ConvertFrom-Json
         if ($manifest.build.apkSignerSha256 -ne $env:POCKET_EXPECTED_SIGNER.ToLowerInvariant()) { throw 'APK signer differs from the approved original certificate.' }
         & ./scripts/build-windows-installer.ps1 -ReleaseDirectory $OutputDirectory -OutputDirectory $OutputDirectory

@@ -20,13 +20,16 @@ pub struct Server {
     address: SocketAddr,
     health: Arc<Connection>,
     mdns: bool,
+    generation: u64,
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
-        self.health.route_phase("lan", "stopped", false, None);
+        self.health
+            .route_phase_at(self.generation, "lan", "stopped", false, None);
         if self.mdns {
-            self.health.route_phase("mdns", "stopped", false, None);
+            self.health
+                .route_phase_at(self.generation, "mdns", "stopped", false, None);
         }
     }
 }
@@ -38,6 +41,28 @@ impl Server {
         health: Arc<Connection>,
         computer_id: String,
     ) -> Result<Self> {
+        let generation = health.generation();
+        Self::start_at(
+            settings,
+            identity,
+            sessions,
+            health,
+            computer_id,
+            generation,
+        )
+        .await
+    }
+    pub async fn start_at(
+        settings: LanConfig,
+        identity: Arc<ServerIdentity>,
+        sessions: mpsc::Sender<TlsSession>,
+        health: Arc<Connection>,
+        computer_id: String,
+        generation: u64,
+    ) -> Result<Self> {
+        if health.generation() != generation {
+            bail!("LAN configuration changed");
+        }
         if !super::private_ip(settings.bind.ip()) {
             bail!("LAN listener requires a specific private bind");
         }
@@ -47,39 +72,52 @@ impl Server {
         let mdns = if settings.mdns {
             match Advertisement::start(address, &computer_id).await {
                 Ok(a) => {
-                    health.route_phase("mdns", "advertising", true, None);
+                    health.route_phase_at(generation, "mdns", "advertising", true, None);
                     Some(a)
                 }
                 Err(_) => {
-                    health.route_phase("mdns", "failed", false, None);
+                    health.route_phase_at(generation, "mdns", "failed", false, None);
                     None
                 }
             }
         } else {
             None
         };
-        health.route_phase("lan", "listening", true, Some(format!("tls://{address}")));
+        if health.generation() != generation {
+            bail!("LAN configuration changed");
+        }
+        health.route_phase_at(
+            generation,
+            "lan",
+            "listening",
+            true,
+            Some(format!("tls://{address}")),
+        );
         let observed = health.clone();
         let task = tokio::spawn(async move {
             let _mdns = mdns;
             let permits = Arc::new(Semaphore::new(8));
             let mut workers = JoinSet::new();
             loop {
+                if observed.generation() != generation {
+                    break;
+                }
                 tokio::select! {
                     _=sessions.closed()=>break,
                     Some(_)=workers.join_next(),if !workers.is_empty()=>{},
                     incoming=listener.accept()=>{
-                        let Ok((stream,peer))=incoming else {observed.route_phase("lan","failed",false,None);break;};
+                        let Ok((stream,peer))=incoming else {observed.route_phase_at(generation,"lan","failed",false,None);break;};
+                        if observed.generation()!=generation{break;}
                         if !super::private_ip(peer.ip()) {continue;}
                         let Ok(permit)=permits.clone().try_acquire_owned() else {continue;};
                         let identity=identity.clone();let sessions=sessions.clone();let health=observed.clone();
-                        workers.spawn(async move {let _permit=permit;let _=serve_stream(stream,identity,sessions,health,"lan").await;});
+                        workers.spawn(async move {let _permit=permit;let _=serve_stream_at(stream,identity,sessions,health,"lan",generation).await;});
                     }
                 }
             }
-            observed.route_phase("lan", "stopped", false, None);
+            observed.route_phase_at(generation, "lan", "stopped", false, None);
             if settings.mdns {
-                observed.route_phase("mdns", "stopped", false, None);
+                observed.route_phase_at(generation, "mdns", "stopped", false, None);
             }
         });
         Ok(Self {
@@ -87,6 +125,7 @@ impl Server {
             address,
             health,
             mdns: settings.mdns,
+            generation,
         })
     }
     pub fn local_addr(&self) -> SocketAddr {
@@ -104,13 +143,17 @@ pub(crate) struct SessionGuard {
     generation: u64,
 }
 impl SessionGuard {
-    pub(crate) fn new(health: Arc<Connection>, id: &'static str) -> Self {
-        let generation = health.session_open(id);
-        Self {
+    pub(crate) fn new_at(
+        health: Arc<Connection>,
+        id: &'static str,
+        generation: u64,
+    ) -> Option<Self> {
+        let generation = health.session_open_at(generation, id)?;
+        Some(Self {
             health,
             id,
             generation,
-        }
+        })
     }
 }
 impl Drop for SessionGuard {
@@ -121,22 +164,34 @@ impl Drop for SessionGuard {
 }
 
 /// Shared TLS ingress; no authentication is bypassed, session::serve still requires pair/hello.
-pub(crate) async fn serve_stream<S>(
+pub(crate) async fn serve_stream_at<S>(
     mut stream: S,
     identity: Arc<ServerIdentity>,
     sessions: mpsc::Sender<TlsSession>,
     health: Arc<Connection>,
     id: &'static str,
+    generation: u64,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if health.generation() != generation {
+        bail!("Route configuration changed");
+    }
     let (inner, mut proxy) = tokio::io::duplex(131072);
     let tls = async {
         let tls = identity.accept_tls(inner).await?;
-        let _guard = SessionGuard::new(health, id);
+        if !health.inner_handshake_at(generation, id) {
+            bail!("Route configuration changed");
+        }
+        let _guard = SessionGuard::new_at(health.clone(), id, generation)
+            .ok_or_else(|| anyhow::anyhow!("Route configuration changed"))?;
         // A full queue must not strand a ninth handshaken peer indefinitely.
-        tokio::time::timeout(Duration::from_secs(5), sessions.send(tls)).await??;
+        let permit = tokio::time::timeout(Duration::from_secs(5), sessions.reserve()).await??;
+        if health.generation() != generation {
+            bail!("Route configuration changed");
+        }
+        permit.send(tls);
         sessions.closed().await;
         Ok::<(), anyhow::Error>(())
     };

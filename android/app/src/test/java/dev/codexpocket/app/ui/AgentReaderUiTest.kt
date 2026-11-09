@@ -65,6 +65,15 @@ class AgentReaderUiTest {
         "turn-$index", "answer-$index", "agentMessage", text,
         raw = buildJsonObject { put("phase", "final_answer") }, complete = true)
 
+    /** Dispatcher.Default projection readiness is separate from Compose being idle. */
+    private fun waitForReaderRow(key: String, displayed: Boolean = false) {
+        val tag = "agent-reader-row:$key"
+        compose.waitUntil(10_000) {
+            if (displayed) compose.onNodeWithTag(tag).isDisplayed()
+            else compose.onAllNodesWithTag(tag).fetchSemanticsNodes().size == 1
+        }
+    }
+
     @Test fun delegatedChipShowsReaderAndRefreshesWithoutAnchoredRoster() {
         var shows = 0
         var refreshes = 0
@@ -202,9 +211,11 @@ class AgentReaderUiTest {
         var state by mutableStateOf(AgentReaderState(parent, child = child,
             timeline = NativeTimeline(items = linkedMapOf(first.key to first)), updatedAt = 1))
         content { AgentReaderPanel(state, listOf(current), emptyMap(), true, {}, {}, {}, {}, {}, {}) }
+        waitForReaderRow(first.key, displayed = true)
         compose.onNodeWithTag("agent-reader-row:${first.key}").assertIsDisplayed()
         compose.runOnIdle { state = state.copy(timeline = state.timeline.copy(items =
             linkedMapOf(first.key to first, second.key to second)), updatedAt = 2) }
+        waitForReaderRow(second.key, displayed = true)
         compose.onNodeWithTag("agent-reader-row:${second.key}").assertIsDisplayed()
         compose.onNodeWithTag("pocket-composer").assertDoesNotExist()
         compose.onAllNodes(hasSetTextAction()).assertCountEquals(0)
@@ -223,11 +234,14 @@ class AgentReaderUiTest {
         var state by mutableStateOf(AgentReaderState(parent, child = child, timeline = timeline))
         content { AgentReaderPanel(state, listOf(current), emptyMap(), true, {}, {}, {},
             { state = state.copy(fullScreen = it) }, {}, {}) }
+        waitForReaderRow("process:done")
         compose.onNodeWithTag("agent-reader-row:${commentary.key}").assertDoesNotExist()
         compose.onNodeWithText("上 1 条消息").performScrollTo().performClick()
+        waitForReaderRow(commentary.key)
         compose.onNodeWithTag("agent-reader-row:${commentary.key}").assertExists()
         compose.onNodeWithContentDescription("放大子代理阅读").performClick()
         compose.onNodeWithContentDescription("缩小子代理阅读").performClick()
+        waitForReaderRow(commentary.key)
         compose.onNodeWithTag("agent-reader-row:${commentary.key}").assertExists()
     }
 

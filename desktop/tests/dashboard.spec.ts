@@ -42,7 +42,7 @@ test('pairing failure remains actionable after a healthy dashboard refresh', asy
   await page.addInitScript(()=>{
     (window as any).__TAURI_INTERNALS__={invoke:async(cmd:string)=>{
       if(cmd==='detect_lan')return [];
-      if(cmd==='dashboard')return {computerName:'Fixture',desired:true,supervisor:{phase:'running',updatedAt:Date.now()/1000,failures:0},relay:{state:'connected',host:'fixture.invalid'},devices:[],processes:[],version:'0.3.0',startup:true,installation:{consistent:true},connection:{phase:'connected',connected:true,helperUpdatedAt:Date.now()/1000},issues:[]};
+      if(cmd==='dashboard')return {computerName:'Fixture',desired:true,supervisor:{phase:'running',updatedAt:Date.now()/1000,failures:0},relay:{state:'connected',host:'fixture.invalid'},devices:[{id:'old',name:'已配对手机'}],processes:[],version:'0.3.0',startup:true,installation:{consistent:true},connection:{phase:'connected',connected:true,helperUpdatedAt:Date.now()/1000},issues:[]};
       if(cmd==='pair_device')throw {code:'pairing_payload_invalid',stage:'pairing_payload',message:'配对码未能读取或已经过期，请重新生成配对码。',retryable:true,operationId:'fixture-operation'};
       throw new Error('Unexpected command');
     }};
@@ -64,7 +64,7 @@ test('missing helper evidence cannot show online after a connected snapshot',asy
     (window as any).__TAURI_INTERNALS__={invoke:async(cmd:string)=>{
       if(cmd==='detect_lan')return [];
       if(cmd!=='dashboard')throw new Error('Unexpected command');
-      return {computerName:'Fixture',desired:true,supervisor:{phase:'running',updatedAt:Date.now()/1000,failures:0},relay:{state:'connected',host:'fixture.invalid'},devices:[],processes:[],version:'0.3.0',startup:true,installation:{consistent:true},issues:[],...((window as any).fixtureHelperPresent?{connection:{phase:'connected',connected:true,helperUpdatedAt:Date.now()/1000}}:{})};
+      return {computerName:'Fixture',desired:true,supervisor:{phase:'running',updatedAt:Date.now()/1000,failures:0},relay:{state:'connected',host:'fixture.invalid'},devices:[{id:'old',name:'已配对手机'}],processes:[],version:'0.3.0',startup:true,installation:{consistent:true},issues:[],...((window as any).fixtureHelperPresent?{connection:{phase:'connected',connected:true,helperUpdatedAt:Date.now()/1000}}:{})};
     }};
   });
   await page.goto('/',{waitUntil:'domcontentloaded'});
@@ -114,6 +114,7 @@ async function lanFixture(page:import('@playwright/test').Page,{saved=true,rejec
   }};
  },{saved,reject});
  await page.goto('/',{waitUntil:'domcontentloaded'});
+ await page.getByText('高级连接设置',{exact:true}).click();
 }
 
 test('firewall requires an explicit click and does not accept frontend program or port arguments',async({page})=>{
@@ -130,12 +131,12 @@ test('firewall requires an explicit click and does not accept frontend program o
 test('first-run LAN detection preserves mDNS and requires saving before firewall authorization',async({page})=>{
  await lanFixture(page,{saved:false});
  await expect(page.getByRole('heading',{name:'把电脑上的工作，带到手机。'})).toBeVisible();
- await expect(page.getByPlaceholder('192.168.1.10:17891')).toHaveValue('192.168.1.20:17891');
+ await expect(page.getByPlaceholder('192.168.1.10:17891')).toHaveValue('192.168.1.20:43821');
  const firewall=page.getByRole('button',{name:'允许局域网通过防火墙',exact:true});
  await expect(firewall).toBeDisabled();
  await page.getByRole('button',{name:'保存线路',exact:true}).click();
  await expect(firewall).toBeEnabled();
- expect(await page.evaluate(()=>(window as any).savedPreferences.lan)).toEqual({bind:'192.168.1.20:17891',mdns:true});
+ expect(await page.evaluate(()=>(window as any).savedPreferences.lan)).toEqual({bind:'192.168.1.20:43821',mdns:true});
  expect(await page.evaluate(()=>(window as any).firewallCalls)).toEqual([]);
 });
 
@@ -145,4 +146,11 @@ test('cancelled firewall authorization remains actionable without claiming succe
  await expect(page.getByRole('alert')).toContainText('授权已取消');
  await expect(page.getByText(/已允许 192/)).toHaveCount(0);
  await expect(page.getByRole('button',{name:'允许局域网通过防火墙',exact:true})).toBeEnabled();
+});
+
+test('advanced manual network changes keep routes and disable automatic rebinding',async({page})=>{
+ await lanFixture(page);
+ await page.getByPlaceholder('192.168.1.10:17891').fill('10.0.0.20:43821');
+ await page.getByRole('button',{name:'保存线路',exact:true}).click();
+ expect(await page.evaluate(()=>(window as any).savedPreferences)).toMatchObject({policy:'automatic',autoLan:false,lan:{bind:'10.0.0.20:43821',mdns:true}});
 });

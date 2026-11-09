@@ -36,6 +36,7 @@ impl Config {
             .unwrap_or_else(|| user.join(".local/share"));
         let route_preferences = if relay_url.is_empty() {
             let mut p = RoutePreferences::default();
+            p.auto_lan = true;
             // UDP connect selects the current interface without sending any packet.
             // Disconnected/non-private networks keep identity initialization available.
             p.lan = routes::default_lan_bind().map(|bind| routes::LanConfig { bind, mdns: true });

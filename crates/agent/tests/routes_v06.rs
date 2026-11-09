@@ -32,6 +32,97 @@ fn fixture() -> (
     health.set("stopped");
     (dir, c, identity, health)
 }
+
+#[test]
+fn automatic_lan_advertisement_survives_expired_or_stale_explicit_routes() {
+    let mut prefs: RoutePreferences = serde_json::from_value(json!({
+        "routes":[{"id":"lan","kind":"lan","url":"tls://192.168.1.2:43821","priority":0,"expiresAt":50}],
+        "lan":{"bind":"192.168.1.3:43821","mdns":false}
+    })).unwrap();
+    let active=prefs.advertised_routes(100);
+    assert_eq!(active.len(),1);
+    assert_eq!(active[0].url,"tls://192.168.1.3:43821");
+    prefs.routes[0].expires_at=None;
+    let active=prefs.advertised_routes(100);
+    assert_eq!(active.len(),2);
+    assert_ne!(active[0].id,active[1].id);
+    assert!(active.iter().any(|r|r.url=="tls://192.168.1.3:43821"));
+    prefs.routes[0].url="tls://192.168.1.3:43821/".into();
+    assert_eq!(prefs.advertised_routes(100)[0].url,"tls://192.168.1.3:43821");
+}
+
+#[tokio::test]
+async fn automatic_lan_recovers_missing_network_and_preserves_identity_and_public_routes() {
+    let (d,mut c,_,health)=fixture();
+    c.route_preferences=Some(serde_json::from_value(json!({"autoLan":true,"policy":"automatic","routes":[
+        {"id":"existing","kind":"relay","url":format!("wss://example.test/v1/tunnel/{}/phone",c.room),"priority":30}
+    ]})).unwrap());
+    c.save(d.path()).unwrap();
+    let controller=routes::Controller::open(d.path().into(),c.clone(),health);
+    assert!(!controller.refresh_auto_lan(None).await.unwrap());
+    assert!(controller.refresh_auto_lan(Some("192.168.5.7:43821".parse().unwrap())).await.unwrap());
+    let loaded=Config::load(d.path()).unwrap();
+    assert_eq!(loaded.computer_id,c.computer_id);
+    assert_eq!(loaded.room,c.room);
+    assert_eq!(loaded.phone_token,c.phone_token);
+    assert_eq!(loaded.preferences().routes,c.preferences().routes);
+    assert_eq!(loaded.preferences().lan.unwrap().bind,"192.168.5.7:43821".parse().unwrap());
+    assert!(!controller.refresh_auto_lan(Some("192.168.5.7:43821".parse().unwrap())).await.unwrap());
+    let mut preferences=loaded.preferences();
+    preferences.lan.as_mut().unwrap().bind.set_port(17891);
+    preferences.lan.as_mut().unwrap().mdns=false;
+    controller.configure(preferences).await.unwrap();
+    assert!(controller.refresh_auto_lan(Some("192.168.8.9:43821".parse().unwrap())).await.unwrap());
+    let next=Config::load(d.path()).unwrap().preferences();
+    assert_eq!(next.lan.as_ref().unwrap().bind,"192.168.8.9:17891".parse().unwrap());
+    assert!(!next.lan.as_ref().unwrap().mdns);
+    assert!(!controller.refresh_auto_lan(Some("8.8.8.8:43821".parse().unwrap())).await.unwrap());
+    let mut manual=next.clone();manual.auto_lan=false;
+    controller.configure(manual.clone()).await.unwrap();
+    assert!(!controller.refresh_auto_lan(Some("192.168.9.10:43821".parse().unwrap())).await.unwrap());
+    assert_eq!(Config::load(d.path()).unwrap().preferences(),manual);
+}
+
+#[tokio::test]
+async fn unchanged_configuration_keeps_workers_and_old_relay_generation_cannot_claim_new_address(){
+    let (d,mut c,_,health)=fixture();
+    let prefs:RoutePreferences=serde_json::from_value(json!({"routes":[{"id":"relay","kind":"relay","url":format!("wss://first.example/v1/tunnel/{}/phone",c.room),"priority":30}]})).unwrap();
+    c.route_preferences=Some(prefs.clone());c.save(d.path()).unwrap();
+    let controller=routes::Controller::open(d.path().into(),c,health.clone());
+    let mut changes=controller.subscribe();
+    let generation=changes.borrow_and_update().1;
+    health.relay_evidence_at(generation,"relay",&prefs.routes[0].url,&json!({"state":"connected","connected":true}));
+    controller.configure(prefs.clone()).await.unwrap();
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(health.route_snapshot()[0]["outerConnected"],true);
+    let mut updated=prefs.clone();updated.routes[0].url=updated.routes[0].url.replace("first.example","second.example");
+    controller.configure(updated).await.unwrap();
+    assert!(changes.has_changed().unwrap());
+    health.relay_evidence_at(generation,"relay",&prefs.routes[0].url,&json!({"state":"connected","connected":true}));
+    health.route_phase_at(generation,"relay","connected",true,Some(prefs.routes[0].url.clone()));
+    assert_eq!(health.route_snapshot()[0]["outerConnected"],false);
+    assert_eq!(health.route_snapshot()[0]["phase"],"configured");
+}
+
+#[tokio::test]
+async fn expiry_retires_health_but_cannot_replace_a_newer_configuration(){
+    let (d,mut c,_,health)=fixture();
+    let prefs:RoutePreferences=serde_json::from_value(json!({"routes":[{"id":"relay","kind":"relay","url":format!("wss://first.example/v1/tunnel/{}/phone",c.room),"priority":30,"expiresAt":1}]})).unwrap();
+    c.route_preferences=Some(prefs.clone());c.save(d.path()).unwrap();
+    let controller=routes::Controller::open(d.path().into(),c,health.clone());
+    let mut changes=controller.subscribe();
+    let generation=changes.borrow_and_update().1;
+    health.relay_evidence_at(generation,"relay",&prefs.routes[0].url,&json!({"state":"connected","connected":true}));
+    controller.refresh_expired(generation).await;
+    assert!(health.route_snapshot().as_array().unwrap().is_empty());
+    let next_generation=changes.borrow_and_update().1;
+    assert_ne!(generation,next_generation);
+    let mut newer=prefs;newer.routes[0].expires_at=None;
+    controller.configure(newer).await.unwrap();
+    let configured_generation=changes.borrow_and_update().1;
+    controller.refresh_expired(next_generation).await;
+    assert_eq!(changes.borrow().1,configured_generation);
+}
 async fn phone(
     address: std::net::SocketAddr,
     identity: &pocket_tunnel::ServerIdentity,

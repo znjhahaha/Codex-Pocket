@@ -42,6 +42,9 @@ fn startup_enabled(c:&Context)->Result<bool,OperationError>{
     let enabled=startup(c,"Status").map_err(|e|fail("startup",e))?["enabled"].as_bool().unwrap_or(false);
     if let Ok(mut cache)=c.startup_cache.lock(){*cache=Some((Instant::now(),enabled));}Ok(enabled)
 }
+fn connectivity_status(c:&Context)->Value {
+    pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map(|m|json!(m.status())).unwrap_or(Value::Null)
+}
 fn snapshot(c:&Context)->Value{
     let mut issues=Vec::<OperationError>::new();
     let consistent=match preflight(c){Ok(())=>true,Err(e)=>{issues.push(e);false}};
@@ -56,19 +59,27 @@ fn snapshot(c:&Context)->Value{
         match startup_enabled(c){Ok(v)=>startup_on=v,Err(e)=>issues.push(e)}
     }
     let routes=if consistent {process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).unwrap_or(Value::Null)}else{Value::Null};
-    let connectivity=if consistent {pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map(|m|json!(m.status())).unwrap_or(Value::Null)}else{Value::Null};
+    let connectivity=if consistent {connectivity_status(c)}else{Value::Null};
+    // Route catalog and readiness must come from the same response: a network
+    // refresh can change a same-ID endpoint between status and routes/read.
+    let readiness=connection::route_readiness(&routes,&connectivity,storage::now());
+    if status.is_object(){
+        status["usableRoutes"]=json!(readiness.ready_ids.len());
+        if routes["routes"].is_array(){status["routes"]=routes["routes"].clone();}
+    }
+    let available=desired.enabled&&supervisor["phase"]=="running"&&connection::fresh(supervisor["updatedAt"].as_u64().unwrap_or(0),storage::now())&&connection::fresh(status["updatedAt"].as_u64().unwrap_or(0),storage::now())&&!readiness.ready_ids.is_empty();
     let phase=connection::phase(&desired,consistent,&supervisor,&status,storage::now());
     let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"state":if r["online"]==true{"在线"}else{"离线"},"version":r["version"],"bridgeVersion":r["bridgeVersion"],"helperVersion":r["helperVersion"],"bridgeUpdatePending":r["bridgeUpdatePending"]})).collect();
     let relay=config["relayUrl"].as_str().or(config["relay_url"].as_str()).unwrap_or("");
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
     json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
-        "installation":{"consistent":consistent},"connection":{"phase":phase,"connected":phase=="connected","available":status["available"],"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
+        "installation":{"consistent":consistent},"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
         "issues":issues,"discoveryErrors":status["discoveryErrors"],"routes":routes,"cloudflareReceipt":if consistent {storage::read::<Value>(&storage::control(&c.state).join("connectivity/fixed-tunnel.json")).unwrap_or(Value::Null)}else{Value::Null},"connectivity":connectivity,"helperVersion":status["helperVersion"],"sessionPreferences":if consistent&&desired.enabled {process::local_control(&c.state,"session/preferences/read",json!({})).unwrap_or(Value::Null)}else{Value::Null}})
 }
 pub fn tray_status(c:&Context)->String{
     let report=snapshot(c);
-    let label=match report["connection"]["phase"].as_str(){Some("connected")=>"中转已连接",Some("stopped")=>"远程连接已暂停",Some("failed")=>"连接需要检查",Some("starting")=>"正在启动助手",_=>"正在恢复连接"};
+    let label=match report["connection"]["phase"].as_str(){Some("connected")=>"连接线路已就绪",Some("ready")=>"可以扫码配对",Some("setup_required")=>"请选择连接方式",Some("stopped")=>"远程连接已暂停",Some("failed")=>"连接需要检查",Some("starting")=>"正在启动助手",_=>"正在准备连接"};
     format!("Codex Pocket · {label}")
 }
 #[tauri::command]
@@ -103,7 +114,9 @@ pub async fn pair_device(context:State<'_,Context>)->Result<Value,OperationError
         let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;
         preflight(&c)?;
         let status=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"status",&[]).map_err(|e|fail("helper_control",e))?;
-        if status["connected"]!=true && status["routes"].as_array().is_none_or(|r|r.is_empty()){return Err(OperationError::new("helper_control","helper_unavailable",true))}
+        let desired=storage::read::<storage::Desired>(&storage::control(&c.state).join("desired.json")).map_err(|e|fail("state_access",e))?;
+        let supervisor=storage::read::<Value>(&storage::control(&c.state).join("supervisor.json")).map_err(|e|fail("supervisor",e))?;
+        connection::ensure_pairable(&desired,&supervisor,&status,&connectivity_status(&c),storage::now())?;
         let baseline=devices(&c).map_err(|e|fail("devices",e))?.iter().map(|v|v["id"].clone()).collect::<Vec<_>>();
         let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"pair",&[]).map_err(|e|fail("pairing",e))?;
         let payload=pairing::read_payload(&c.state,&result,storage::now()).map_err(|e|fail("pairing_payload",e))?;
@@ -133,16 +146,41 @@ pub async fn export_diagnostics(context:State<'_,Context>)->Result<String,Operat
     let c=context.inner().clone();
     tauri::async_runtime::spawn_blocking(move||{
         let report=snapshot(&c);
-        let clean=json!({"schema":2,"version":env!("CARGO_PKG_VERSION"),"exportedAt":storage::now(),"remoteEnabled":report["desired"],"supervisor":report["supervisor"],"connection":report["connection"],"installation":report["installation"],"issues":report["issues"],"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"]});
+        let clean=diagnostics(&report,storage::now());
         let root=storage::local_app_data().map_err(|e|fail("export",e))?.join("CodexPocketDiagnostics");
         storage::private_dir(&root).map_err(|e|fail("export",e))?;
         let path=root.join(format!("diagnostics-{}.json",storage::now()));storage::atomic(&path,&clean).map_err(|e|fail("export",e))?;Ok(path.display().to_string())
     }).await.map_err(join_error)?
 }
 
+fn diagnostics(report:&Value,now:u64)->Value {
+    // Export readiness, never URLs, device/route IDs, rooms, tokens or SSH data.
+    let mut connection=report["connection"].clone();
+    if let Some(object)=connection.as_object_mut(){object.remove("readyRouteIds");}
+    let choices=|value:&Value,allowed:&[&str]|value.as_str().filter(|s|allowed.contains(s)).unwrap_or("unknown").to_owned();
+    let routes:Vec<_>=report["routes"]["routeStatus"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().take(34).map(|r|json!({
+        "kind":if r["id"]=="gateway"{"gateway".into()}else if r["id"]=="mdns"{"discovery".into()}else{choices(&r["kind"],&["lan","cloudflare","relay"])},
+        "phase":choices(&r["phase"],&["configured","connecting","connected","reconnecting","ready","listening","failed","stopped"]),
+        "listenerReady":r["listenerReady"]==true,"outerConnected":r["outerConnected"]==true,"innerHandshake":r["innerHandshake"]==true,
+        "activeSessions":r["activeSessions"].as_u64().unwrap_or(0)})).collect();
+    json!({"schema":3,"version":env!("CARGO_PKG_VERSION"),"exportedAt":now,"remoteEnabled":report["desired"],"supervisor":report["supervisor"],"connection":connection,"installation":report["installation"],"issues":report["issues"],"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"],"routeStatus":routes,
+        "routePolicy":choices(&report["routes"]["policy"],&["automatic","lan","public"]),
+        "tunnel":{"phase":choices(&report["connectivity"]["phase"],&["starting","stopped","stopping","failed","waiting_network","tunnel_connected"]),"enabled":report["connectivity"]["enabled"]==true,"mode":choices(&report["connectivity"]["mode"],&["off","quick","fixed"]),"hasPublicAddress":report["connectivity"]["publicUrl"].as_str().is_some_and(|s|!s.is_empty()),"updatedAt":report["connectivity"]["updatedAt"].as_u64()}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_keep_readiness_without_route_secrets_or_addresses(){
+        let report=json!({"connection":{"phase":"setup_required","configuredRoutes":0,"usableRoutes":0,"readyRouteIds":["secret-id"]},"routes":{"policy":"automatic","routeStatus":[{"id":"secret-id","kind":"relay","phase":"connecting","endpoint":"wss://secret-host/private","listenerReady":false}]},"connectivity":{"phase":"starting","mode":"quick","enabled":true,"publicUrl":"wss://secret-host","token":"secret-token"}});
+        let safe=diagnostics(&report,100);
+        assert_eq!(safe["connection"]["phase"],"setup_required");
+        assert_eq!(safe["routeStatus"][0]["phase"],"connecting");
+        assert_eq!(safe["tunnel"]["hasPublicAddress"],true);
+        assert!(!safe.to_string().contains("secret-"));
+    }
 
     #[test]
     fn disable_persists_without_querying_unavailable_startup() {
@@ -240,6 +278,21 @@ pub async fn configure_routes(context:State<'_,Context>,preferences:Value)->Resu
  }).await.map_err(join_error)?
 }
 #[tauri::command]
+pub async fn configure_relay(context:State<'_,Context>,url:String)->Result<Value,OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+  let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;
+  let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("routes",e))?;
+  let _routes=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("routes",e))?;
+  let config:Value=storage::read(&c.state.join("config.json")).map_err(|e|fail("state_access",e))?;
+  let report=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).map_err(|e|fail("routes",e))?;
+  let preferences=connection::relay_preferences(&report["routePreferences"],&url,config["room"].as_str().unwrap_or(""))?;
+  let file=dir.join(format!("relay-request-{}-{}.json",std::process::id(),storage::now()));
+  storage::atomic(&file,&preferences).map_err(|e|fail("routes",e))?;
+  let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/configure",&["--config",&file.to_string_lossy()]).map_err(|e|fail("routes",e));
+  let _=std::fs::remove_file(file);result
+ }).await.map_err(join_error)?
+}
+#[tauri::command]
 pub async fn open_codex(context:State<'_,Context>)->Result<(),OperationError>{
  let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
   preflight(&c)?;let root=storage::local_app_data().map_err(|e|fail("installation",e))?.join("CodexPocket");
@@ -268,7 +321,7 @@ pub async fn setup_fixed(context:State<'_,Context>,request:pocket_desktop_runtim
 pub async fn detect_lan()->Result<Value,OperationError>{
  tauri::async_runtime::spawn_blocking(move||{
   let mut command=Command::new(storage::powershell());
-  command.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); @(Get-NetIPConfiguration | Where-Object {$_.NetAdapter.Status -eq 'Up'} | Sort-Object @{Expression={if($_.IPv4DefaultGateway){0}else{1}}} | ForEach-Object {$n=$_.InterfaceAlias; $_.IPv4Address | ForEach-Object {@{address=$_.IPAddress;name=$n}}}) | ConvertTo-Json -Compress"#]);
+  command.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ConvertTo-Json -Compress -InputObject @(Get-NetIPConfiguration | Where-Object {$_.NetAdapter.Status -eq 'Up'} | Sort-Object @{Expression={if($_.IPv4DefaultGateway){0}else{1}}} | ForEach-Object {$n=$_.InterfaceAlias; $_.IPv4Address | ForEach-Object {@{address=$_.IPAddress;name=$n}}})"#]);
   let bytes=process::run_bounded(command,12).map_err(|e|fail("network",e))?;
   let parsed:Value=serde_json::from_slice(&bytes).map_err(|e|fail("network",e.into()))?;
   let rows=parsed.as_array().cloned().unwrap_or_else(||vec![parsed]);

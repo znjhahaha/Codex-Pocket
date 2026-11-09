@@ -60,6 +60,8 @@ pub struct GatewayConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutePreferences {
     #[serde(default)]
+    pub auto_lan: bool,
+    #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
     pub policy: RoutePolicy,
@@ -177,11 +179,15 @@ impl RoutePreferences {
             .iter()
             .filter(|r| r.expires_at.is_none_or(|expiry| expiry > now))
             .cloned()
+            .map(|mut route|{if route.kind==RouteKind::Lan{route.url=route.url.trim_end_matches('/').to_owned();}route})
             .collect();
         if let Some(lan) = &self.lan {
-            if lan.bind.port() != 0 && !self.routes.iter().any(|r| r.kind == RouteKind::Lan) {
+            let endpoint=format!("tls://{}",lan.bind);
+            if lan.bind.port() != 0 && !routes.iter().any(|r| r.kind == RouteKind::Lan && r.url.trim_end_matches('/')==endpoint) {
+                let mut id="lan".to_owned();
+                while routes.iter().any(|r|r.id==id){id.push_str("-local");}
                 routes.push(Route {
-                    id: "lan".into(),
+                    id,
                     kind: RouteKind::Lan,
                     url: format!("tls://{}", lan.bind),
                     priority: 0,
@@ -203,12 +209,13 @@ pub fn snapshot(config: &Config, state_dir: &Path) -> Value {
 pub struct Controller {
     state: PathBuf,
     config: Mutex<Config>,
-    changes: watch::Sender<Config>,
+    changes: watch::Sender<(Config,u64)>,
     pub health: Arc<Connection>,
 }
 impl Controller {
     pub fn open(state: PathBuf, config: Config, health: Arc<Connection>) -> Arc<Self> {
-        let (changes, _) = watch::channel(config.clone());
+        let generation=health.reset_routes(&config.routes());
+        let (changes, _) = watch::channel((config.clone(),generation));
         Arc::new(Self {
             state,
             config: Mutex::new(config),
@@ -240,28 +247,58 @@ impl Controller {
         let mut config = self.config.lock().await;
         preferences.validate(&config.room)?;
         let mut next = Config::load(&self.state)?;
+        if config.preferences()==preferences&&next.preferences()==preferences {
+            drop(config);
+            return Ok(self.read().await);
+        }
         next.route_preferences = Some(preferences);
         next.save(&self.state)?;
         *config = next.clone();
         // The reply exposes pending application; an old listener cannot prove new readiness.
-        self.health.reset_routes(&next.routes());
-        self.changes.send_replace(next);
+        let generation=self.health.reset_routes(&next.routes());
+        self.changes.send_replace((next,generation));
         drop(config);
         Ok(self.read().await)
     }
-    pub fn subscribe(&self) -> watch::Receiver<Config> {
+    /// Network probing supplies only a private address; identity and public routes
+    /// come from the current on-disk configuration, never from the probe.
+    pub async fn refresh_auto_lan(&self,discovered:Option<SocketAddr>)->Result<bool>{
+        let Some(discovered)=discovered.filter(|a|private_ip(a.ip())&&!a.ip().is_loopback()) else{return Ok(false)};
+        let mut config=self.config.lock().await;
+        let mut next=Config::load(&self.state)?;
+        let mut prefs=next.preferences();
+        if !prefs.auto_lan{return Ok(false)}
+        let port=prefs.lan.as_ref().map(|c|c.bind.port()).filter(|p|*p>0).unwrap_or(43821);
+        let lan=LanConfig{bind:SocketAddr::new(discovered.ip(),port),mdns:prefs.lan.as_ref().is_none_or(|c|c.mdns)};
+        if prefs.lan.as_ref()==Some(&lan){return Ok(false)}
+        prefs.lan=Some(lan);prefs.validate(&next.room)?;
+        next.route_preferences=Some(prefs);next.save(&self.state)?;
+        *config=next.clone();
+        let generation=self.health.reset_routes(&next.routes());
+        self.changes.send_replace((next,generation));
+        Ok(true)
+    }
+    pub fn subscribe(&self) -> watch::Receiver<(Config,u64)> {
         self.changes.subscribe()
+    }
+    pub async fn refresh_expired(&self,expected_generation:u64){
+        let config=self.config.lock().await;
+        if self.changes.borrow().1!=expected_generation{return}
+        let generation=self.health.reset_routes(&config.routes());
+        self.changes.send_replace((config.clone(),generation));
     }
 }
 
 /// Cancelling this owner closes listeners, proxy workers, and outbound relay channels.
 pub struct Runtime {
     task: tokio::task::JoinHandle<()>,
+    network_task: tokio::task::JoinHandle<()>,
     health: Arc<Connection>,
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.task.abort();
+        self.network_task.abort();
         self.health.stop_routes();
     }
 }
@@ -272,22 +309,28 @@ impl Runtime {
         sessions: mpsc::Sender<transport::TlsSession>,
     ) -> Self {
         let health = controller.health.clone();
+        let network=controller.clone();
+        let network_task=tokio::spawn(async move {
+            let mut interval=tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {interval.tick().await;let _=network.refresh_auto_lan(default_lan_bind()).await;}
+        });
         let task = tokio::spawn(async move {
             let mut changes = controller.subscribe();
             loop {
-                let config = changes.borrow_and_update().clone();
+                let (config,generation) = changes.borrow_and_update().clone();
                 let prefs = config.preferences();
                 controller.health.set("idle");
-                controller.health.reset_routes(&config.routes());
                 let mut workers = JoinSet::new();
                 let mut lan = None;
                 if let Some(settings) = &prefs.lan {
-                    match lan::Server::start(
+                    match lan::Server::start_at(
                         settings.clone(),
                         identity.clone(),
                         sessions.clone(),
                         controller.health.clone(),
                         config.computer_id.clone(),
+                        generation,
                     )
                     .await
                     {
@@ -296,7 +339,8 @@ impl Runtime {
                             for r in config.routes().into_iter().filter(|r| {
                                 r.kind == RouteKind::Lan && r.url.trim_end_matches('/') == endpoint
                             }) {
-                                controller.health.route_phase(
+                                controller.health.route_phase_at(
+                                    generation,
                                     &r.id,
                                     "listening",
                                     true,
@@ -305,24 +349,25 @@ impl Runtime {
                             }
                             lan = Some(server);
                         }
-                        Err(_) => controller.health.route_phase("lan", "failed", false, None),
+                        Err(_) => controller.health.route_phase_at(generation,"lan", "failed", false, None),
                     }
                 }
                 let mut gateway = None;
                 if let Some(settings) = &prefs.gateway {
-                    match gateway::Server::start(
+                    match gateway::Server::start_at(
                         settings.clone(),
                         &config,
                         identity.clone(),
                         sessions.clone(),
                         controller.health.clone(),
+                        generation,
                     )
                     .await
                     {
                         Ok(server) => gateway = Some(server),
                         Err(_) => controller
                             .health
-                            .route_phase("gateway", "failed", false, None),
+                            .route_phase_at(generation,"gateway", "failed", false, None),
                     }
                 }
                 for route in config
@@ -333,6 +378,7 @@ impl Runtime {
                     let mut relay = config.clone();
                     let suffix = format!("/v1/tunnel/{}/phone", config.room);
                     relay.relay_url = route.url.strip_suffix(&suffix).unwrap_or("").to_owned();
+                    let endpoint=route.url;
                     let id = route.id;
                     let identity = identity.clone();
                     let sessions = sessions.clone();
@@ -340,7 +386,7 @@ impl Runtime {
                     workers.spawn(async move {
                         let monitored = Arc::new(Connection::default());
                         loop {
-                            health.route_phase(&id, "connecting", false, None);
+                            health.route_phase_at(generation,&id, "connecting", false, Some(endpoint.clone()));
                             let (accepted,mut incoming)=mpsc::channel(8);
                             let run = transport::run_monitored(
                                 relay.clone(),
@@ -355,13 +401,13 @@ impl Runtime {
                                     _=&mut run=>break,
                                     session=incoming.recv()=>{
                                         let Some(session)=session else{break;};
-                                        health.inner_handshake(&id);
+                                        if !health.inner_handshake_at(generation,&id){break;}
                                         if !matches!(tokio::time::timeout(Duration::from_secs(5),sessions.send(session)).await,Ok(Ok(()))){break;}
                                     },
-                                    _=tick.tick()=>health.relay_evidence(&id,&monitored.snapshot()),
+                                    _=tick.tick()=>health.relay_evidence_at(generation,&id,&endpoint,&monitored.snapshot()),
                                 }
                             }
-                            health.route_phase(&id, "reconnecting", false, None);
+                            health.route_phase_at(generation,&id, "reconnecting", false, Some(endpoint.clone()));
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     });
@@ -378,7 +424,7 @@ impl Runtime {
                     .unwrap_or(Duration::from_secs(86400));
                 tokio::select! {
                     changed=changes.changed()=>{if changed.is_err(){break;}},
-                    _=tokio::time::sleep(delay)=>{},
+                    _=tokio::time::sleep(delay)=>{controller.refresh_expired(generation).await;},
                     _=sessions.closed()=>break,
                 }
                 drop(lan);
@@ -386,10 +432,11 @@ impl Runtime {
                 workers.abort_all();
             }
         });
-        Self { task, health }
+        Self { task, network_task, health }
     }
     pub async fn shutdown(mut self) {
         self.task.abort();
+        self.network_task.abort();
         let _ = (&mut self.task).await;
     }
 }

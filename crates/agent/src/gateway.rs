@@ -26,11 +26,13 @@ pub struct Server {
     task: tokio::task::JoinHandle<()>,
     address: SocketAddr,
     health: Arc<Connection>,
+    generation: u64,
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
-        self.health.route_phase("gateway", "stopped", false, None);
+        self.health
+            .route_phase_at(self.generation, "gateway", "stopped", false, None);
     }
 }
 impl Server {
@@ -41,6 +43,20 @@ impl Server {
         sessions: mpsc::Sender<TlsSession>,
         health: Arc<Connection>,
     ) -> Result<Self> {
+        let generation = health.generation();
+        Self::start_at(settings, config, identity, sessions, health, generation).await
+    }
+    pub async fn start_at(
+        settings: GatewayConfig,
+        config: &Config,
+        identity: Arc<ServerIdentity>,
+        sessions: mpsc::Sender<TlsSession>,
+        health: Arc<Connection>,
+        generation: u64,
+    ) -> Result<Self> {
+        if health.generation() != generation {
+            bail!("Gateway configuration changed");
+        }
         if !settings.bind.ip().is_loopback() {
             bail!("Gateway must bind loopback");
         }
@@ -52,17 +68,30 @@ impl Server {
         let address = listener.local_addr()?;
         let path = format!("/v1/tunnel/{}/phone", config.room);
         let token = config.phone_token.clone();
-        health.route_phase("gateway", "ready", true, Some(format!("http://{address}")));
+        if health.generation() != generation {
+            bail!("Gateway configuration changed");
+        }
+        health.route_phase_at(
+            generation,
+            "gateway",
+            "ready",
+            true,
+            Some(format!("http://{address}")),
+        );
         let observed = health.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(8));
             let mut workers = JoinSet::new();
             loop {
+                if observed.generation() != generation {
+                    break;
+                }
                 tokio::select! {
                     _=sessions.closed()=>break,
                     Some(_)=workers.join_next(),if !workers.is_empty()=>{},
                     incoming=listener.accept()=>{
-                        let Ok((stream,peer))=incoming else {observed.route_phase("gateway","failed",false,None);break;};
+                        let Ok((stream,peer))=incoming else {observed.route_phase_at(generation,"gateway","failed",false,None);break;};
+                        if observed.generation()!=generation{break;}
                         if !peer.ip().is_loopback(){continue;}
                         let Ok(permit)=permits.clone().try_acquire_owned() else{continue;};
                         let path=path.clone();let token=token.clone();let identity=identity.clone();let sessions=sessions.clone();let health=observed.clone();
@@ -73,9 +102,10 @@ impl Server {
                             settings.max_message_size=Some(65536);settings.max_frame_size=Some(65536);
                             settings.read_buffer_size=4096;settings.write_buffer_size=0;settings.max_write_buffer_size=131072;
                             if let Ok(Ok(websocket))=tokio::time::timeout(Duration::from_secs(5),accept_hdr_async_with_config(stream,callback,Some(settings))).await {
+                                if health.generation()!=generation{return;}
                                 let (inner,wire)=tokio::io::duplex(131072);
                                 // A WebSocket upgrade alone is readiness, never remote or innerTLS health.
-                                let tls=lan::serve_stream(inner,identity,sessions,health,"gateway");
+                                let tls=lan::serve_stream_at(inner,identity,sessions,health,"gateway",generation);
                                 let copying=proxy(websocket,wire);
                                 tokio::pin!(tls);tokio::pin!(copying);
                                 tokio::select! {_=&mut tls=>{},_=&mut copying=>{}}
@@ -84,12 +114,13 @@ impl Server {
                     }
                 }
             }
-            observed.route_phase("gateway", "stopped", false, None);
+            observed.route_phase_at(generation, "gateway", "stopped", false, None);
         });
         Ok(Self {
             task,
             address,
             health,
+            generation,
         })
     }
     pub fn local_addr(&self) -> SocketAddr {

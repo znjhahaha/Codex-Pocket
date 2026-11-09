@@ -41,6 +41,9 @@ pub async fn activate_relay(context:State<'_,Context>,operation_id:String)->Resu
   let mut prefs=report["routePreferences"].clone();
   let routes=prefs["routes"].as_array_mut().ok_or_else(||OperationError::new("routes","invalid_params",false))?;
   routes.retain(|r|r["id"]!="pocket-ssh-relay");routes.push(json!({"id":"pocket-ssh-relay","kind":"relay","url":format!("wss://{}/v1/tunnel/{room}/phone",receipt.hostname),"priority":30}));
+  // Explicitly selecting this relay must also make it eligible when the previous
+  // connection wizard selected LAN-only mode. Existing routes remain available.
+  prefs["policy"]=json!("automatic");
   let file=dir.join(format!("relay-request-{}.json",std::process::id()));storage::atomic(&file,&prefs).map_err(|e|fail("routes",e))?;
   let result=pocket_desktop_runtime::process::agent(&agent,&c.state,"routes/configure",&["--config",&file.to_string_lossy()]).map_err(|e|fail("routes",e));let _=std::fs::remove_file(file);result
  }).await.map_err(join_error)?

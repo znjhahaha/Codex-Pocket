@@ -54,6 +54,9 @@ impl Default for Connection {
     }
 }
 impl Connection {
+    pub fn generation(&self) -> u64 {
+        self.3.load(Ordering::Acquire)
+    }
     pub fn set(&self, state: &'static str) {
         self.0.lock().unwrap().state = state;
     }
@@ -87,7 +90,7 @@ impl Connection {
         self.2.fetch_add(1, Ordering::AcqRel);
         AuthenticatedPhone(self.clone())
     }
-    pub fn reset_routes(&self, routes: &[crate::config::routes::Route]) {
+    pub fn reset_routes(&self, routes: &[crate::config::routes::Route]) -> u64 {
         let mut map = self.1.lock().unwrap();
         let generation = self.3.fetch_add(1, Ordering::AcqRel) + 1;
         map.clear();
@@ -106,9 +109,23 @@ impl Connection {
                 },
             );
         }
+        generation
     }
     pub fn route_phase(&self, id: &str, phase: &str, ready: bool, endpoint: Option<String>) {
+        self.route_phase_at(self.3.load(Ordering::Acquire), id, phase, ready, endpoint);
+    }
+    pub fn route_phase_at(
+        &self,
+        generation: u64,
+        id: &str,
+        phase: &str,
+        ready: bool,
+        endpoint: Option<String>,
+    ) {
         let mut map = self.1.lock().unwrap();
+        if generation != self.3.load(Ordering::Acquire) {
+            return;
+        }
         let r = map.entry(id.into()).or_insert_with(|| RouteHealth {
             generation: self.3.load(Ordering::Acquire),
             kind: if id == "lan" { "lan" } else { "cloudflare" }.into(),
@@ -123,26 +140,61 @@ impl Connection {
         }
     }
     pub fn relay_evidence(&self, id: &str, evidence: &Value) {
+        self.relay_evidence_at(self.3.load(Ordering::Acquire), id, "", evidence);
+    }
+    pub fn relay_evidence_at(&self, generation: u64, id: &str, endpoint: &str, evidence: &Value) {
         let mut map = self.1.lock().unwrap();
+        if generation != self.3.load(Ordering::Acquire) {
+            return;
+        }
         let r = map.entry(id.into()).or_default();
+        r.endpoint = Some(endpoint.into());
         r.kind = "relay".into();
         r.phase = evidence["state"].as_str().unwrap_or("reconnecting").into();
         r.outer_connected = evidence["connected"] == true;
         r.last_activity = evidence["lastActivityAt"].as_u64();
     }
     pub fn inner_handshake(&self, id: &str) {
+        self.inner_handshake_at(self.generation(), id);
+    }
+    pub fn inner_handshake_at(&self, generation: u64, id: &str) -> bool {
         let mut map = self.1.lock().unwrap();
-        let r = map.entry(id.into()).or_default();
+        if generation != self.generation() {
+            return false;
+        }
+        let r = map.entry(id.into()).or_insert_with(|| RouteHealth {
+            generation,
+            ..Default::default()
+        });
         r.inner_handshake = true;
         r.last_activity = Some(now());
+        true
     }
     pub fn session_open(&self, id: &str) -> u64 {
         let mut map = self.1.lock().unwrap();
-        let r = map.entry(id.into()).or_default();
+        let generation = self.generation();
+        let r = map.entry(id.into()).or_insert_with(|| RouteHealth {
+            generation,
+            ..Default::default()
+        });
         r.inner_handshake = true;
         r.active_sessions += 1;
         r.last_activity = Some(now());
         r.generation
+    }
+    pub fn session_open_at(&self, generation: u64, id: &str) -> Option<u64> {
+        let mut map = self.1.lock().unwrap();
+        if generation != self.generation() {
+            return None;
+        }
+        let r = map.entry(id.into()).or_insert_with(|| RouteHealth {
+            generation,
+            ..Default::default()
+        });
+        r.inner_handshake = true;
+        r.active_sessions += 1;
+        r.last_activity = Some(now());
+        Some(generation)
     }
     pub fn session_close(&self, id: &str) {
         if let Some(r) = self.1.lock().unwrap().get_mut(id) {
@@ -168,12 +220,17 @@ impl Connection {
             .and_then(|r| r.endpoint.clone())
     }
     pub fn stop_routes(&self) {
-        for r in self.1.lock().unwrap().values_mut() {
-            r.phase = "stopped".into();
-            r.listener_ready = false;
-            r.outer_connected = false;
-            r.active_sessions = 0;
-            r.endpoint = None;
+        {
+            let mut map = self.1.lock().unwrap();
+            let generation = self.3.fetch_add(1, Ordering::AcqRel) + 1;
+            for r in map.values_mut() {
+                r.generation = generation;
+                r.phase = "stopped".into();
+                r.listener_ready = false;
+                r.outer_connected = false;
+                r.active_sessions = 0;
+                r.endpoint = None;
+            }
         }
         self.set("stopped");
     }
@@ -187,6 +244,90 @@ impl Drop for AuthenticatedPhone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retired_ingress_cannot_change_new_generation_or_session_counts() {
+        let c = Connection::default();
+        let old = c.reset_routes(&[]);
+        c.route_phase_at(
+            old,
+            "lan",
+            "listening",
+            true,
+            Some("tls://192.168.1.2:43821".into()),
+        );
+        assert!(c.inner_handshake_at(old, "lan"));
+        let old_session = c.session_open_at(old, "lan").unwrap();
+        let current = c.reset_routes(&[]);
+        c.route_phase_at(
+            current,
+            "lan",
+            "listening",
+            true,
+            Some("tls://192.168.1.3:43821".into()),
+        );
+        assert!(c.inner_handshake_at(current, "lan"));
+        assert_eq!(c.session_open_at(current, "lan"), Some(current));
+        let before = c.route_snapshot();
+
+        c.route_phase_at(old, "lan", "stopped", false, None);
+        c.relay_evidence_at(
+            old,
+            "retired-relay",
+            "wss://old.example",
+            &json!({"state":"connected","connected":true}),
+        );
+        assert!(!c.inner_handshake_at(old, "lan"));
+        assert!(!c.inner_handshake_at(old, "retired-gateway"));
+        assert_eq!(c.session_open_at(old, "lan"), None);
+        assert_eq!(c.session_open_at(old, "retired-gateway"), None);
+        c.session_close_generation("lan", old_session);
+        assert_eq!(c.route_snapshot(), before);
+
+        c.session_close_generation("lan", current);
+        assert_eq!(c.route_snapshot()[0]["activeSessions"], 0);
+    }
+
+    #[test]
+    fn legacy_ingress_wrappers_record_current_generation_for_new_rows() {
+        let c = Connection::default();
+        let current = c.reset_routes(&[]);
+        c.inner_handshake("gateway");
+        let session = c.session_open("gateway");
+        assert_eq!(session, current);
+        assert_eq!(c.generation(), current);
+        assert_eq!(c.route_snapshot()[0]["activeSessions"], 1);
+        c.session_close_generation("gateway", session);
+        assert_eq!(c.route_snapshot()[0]["activeSessions"], 0);
+    }
+
+    #[test]
+    fn stopping_routes_invalidates_pending_ingress_generation() {
+        let c = Connection::default();
+        let old = c.reset_routes(&[]);
+        c.route_phase_at(
+            old,
+            "gateway",
+            "ready",
+            true,
+            Some("http://127.0.0.1:17892".into()),
+        );
+        c.stop_routes();
+        assert!(c.generation() > old);
+        let before = c.snapshot();
+
+        c.route_phase_at(
+            old,
+            "gateway",
+            "ready",
+            true,
+            Some("http://127.0.0.1:17892".into()),
+        );
+        assert!(!c.inner_handshake_at(old, "gateway"));
+        assert_eq!(c.session_open_at(old, "gateway"), None);
+        assert_eq!(c.snapshot(), before);
+        assert_eq!(before["state"], "stopped");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn v02_transport_freshness_expires_even_without_disconnect() {
         let c = Connection::default();
