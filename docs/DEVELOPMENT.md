@@ -41,8 +41,8 @@ Set-Location ..
 在 Git 忽略的 `.local/signing/` 下准备自己的 `release.jks` 和 `password.txt`，密钥别名为 `codex-pocket`。脚本读取已有身份，不自动生成或替换签名。后续升级须使用同一把密钥。
 
 ```powershell
-.\scripts\build-release.ps1 -OutputDirectory .\dist\codex-pocket-0.5.2
-.\scripts\windows-verify-release.ps1 -ReleaseDirectory .\dist\codex-pocket-0.5.2
+.\scripts\build-release.ps1 -OutputDirectory .\dist\codex-pocket-0.6.0
+.\scripts\windows-verify-release.ps1 -ReleaseDirectory .\dist\codex-pocket-0.6.0
 ```
 
 输出包括签名 APK、Windows ZIP、Windows 文件目录与 SHA-256 清单。每次选择一个不存在的输出目录，旧交付会保留。源码快照可用 `scripts/package-source.ps1 -OutputDirectory <新目录>` 单独生成。
