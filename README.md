@@ -14,9 +14,9 @@
 - **Android APK**：安装到手机；升级直接覆盖，保留配对和草稿。
 - Windows ZIP 是便携交付，源码和 SHA-256 清单也随版本提供。
 
-当前开发版本为 **0.6.1 / Android versionCode 11**。0.6 的发布流程先生成草稿，正式发布前请以 Releases 中已公开的版本为准。Windows 安装器暂未签署 Authenticode，系统可能显示未知发布者。
+当前开发版本为 **0.6.2 / Android versionCode 12**。0.6 的发布流程先生成草稿，正式发布前请以 Releases 中已公开的版本为准。Windows 安装器暂未签署 Authenticode，系统可能显示未知发布者。
 
-0.6.1 修复手机遗漏上下文压缩状态的问题；构建与验证进度见 [修复记录](docs/V061-ACCEPTANCE.md)。
+0.6.2 修复手机遗漏上下文压缩状态及旧缓存误报完成的问题；构建与验证进度见 [修复记录](docs/V061-ACCEPTANCE.md)。
 
 ## 三步连接
 

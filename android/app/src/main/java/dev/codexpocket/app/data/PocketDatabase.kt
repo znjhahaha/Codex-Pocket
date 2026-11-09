@@ -21,10 +21,33 @@ data class ChatEntity(@PrimaryKey val key: ThreadKey, val runtimeId: String, val
 @Entity(tableName = "context_usage")
 data class ContextEntity(@PrimaryKey val chatKey: ThreadKey, val snapshot: String)
 
+private const val COMPACTION_COMPLETION_CACHE_KEY = "_pocketCompactionCompletionVersion"
+private const val COMPACTION_COMPLETION_CACHE_VERSION = 1
+
 @Entity(tableName = "items", primaryKeys = ["chatKey", "itemKey"], indices = [Index("chatKey")])
 data class ItemEntity(val chatKey: ThreadKey, val itemKey: String, val turnId: String, val itemId: String, val type: String, val text: String, val status: String, val raw: JsonElement, val complete: Boolean, val ordinal: Long) {
-    fun item() = TimelineItem(turnId, itemId, type, text, status, raw.asObject(), complete)
-    companion object { fun from(chat: ThreadKey, i: TimelineItem, order: Long) = ItemEntity(chat, i.key, i.turnId, i.itemId, i.type, i.text, i.status, i.raw, i.complete, order) }
+    fun item(): TimelineItem {
+        val cached = raw.asObject()
+        val native = if (type == "contextCompaction") JsonObject(cached - COMPACTION_COMPLETION_CACHE_KEY) else cached
+        val item = TimelineItem(turnId, itemId, type, text, status, native, complete)
+        if (type != "contextCompaction") return item
+        val version = (cached[COMPACTION_COMPLETION_CACHE_KEY] as? JsonPrimitive)?.takeUnless { it.isString }?.intOrNull
+        if (version == COMPACTION_COMPLETION_CACHE_VERSION) return item
+        // Older snapshots inferred complete from the containing turn. Only native item evidence can restore it.
+        val timestamp = (native["completedAtMs"] as? JsonPrimitive)?.takeUnless { it.isString }?.longOrNull?.takeIf { it >= 0 }
+        val nativeStatus = NativeActivityPresentation.status(status.ifBlank { native.string("status") })
+        val success = (timestamp != null || nativeStatus == ActivityStatus.Completed) &&
+            NativeActivityPresentation.state(item.copy(complete = true)) == ActivityStatus.Completed
+        return item.copy(complete = success)
+    }
+    companion object {
+        fun from(chat: ThreadKey, i: TimelineItem, order: Long): ItemEntity {
+            // Local cache proof only: no Room column/migration, and item() strips it from the native payload.
+            val cached = if (i.type == "contextCompaction") JsonObject(i.raw +
+                (COMPACTION_COMPLETION_CACHE_KEY to JsonPrimitive(COMPACTION_COMPLETION_CACHE_VERSION))) else i.raw
+            return ItemEntity(chat, i.key, i.turnId, i.itemId, i.type, i.text, i.status, cached, i.complete, order)
+        }
+    }
 }
 
 data class CachedItemHeader(val chatKey: ThreadKey, val itemKey: String, val turnId: String, val itemId: String,

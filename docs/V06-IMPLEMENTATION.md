@@ -14,7 +14,7 @@ plain-language documentation with real screenshots.
 - Unknown mutation results are reconciled, never silently resent.
 - Secrets stay out of Git, diagnostics, screenshots and distributed artifacts.
 - Default is desktop follow; CLI requires an explicit choice. No silent CLI fallback.
-- Initial target was 0.6.0 / Android versionCode 10. The compaction repair advances to 0.6.1 / code 11 without moving the existing tag; original Android signing identity.
+- Initial target was 0.6.0 / Android versionCode 10. Compaction and legacy-cache repairs advance to 0.6.2 / code 12 without moving existing tags; original Android signing identity.
 - Commit/push/CI are authorized after checks; publication stops at a Release draft.
 
 ## Work packages

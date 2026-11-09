@@ -169,4 +169,80 @@ class CompactionLifecycleTest {
             assertEquals("上下文已压缩", ConversationPresentation.compactionLabel(compact(history), history))
         }
     }
+
+    private fun legacyCache(item: TimelineItem, completed: Boolean = true) = ItemEntity(
+        ThreadKey("computer", "store", "thread"), item.key, item.turnId, item.itemId, item.type,
+        item.text, item.status, item.raw, completed, 0)
+
+    @Test fun currentLocalCacheProofPreservesCompletedLiveCompactionAfterLaterTurnFailure() {
+        val done = event(started(), "item/completed", """{"turnId":"turn","item":{"id":"compact","type":"contextCompaction"}}""")
+        listOf("failed", "interrupted").forEach { status ->
+            val later = event(done, "turn/completed", """{"turn":{"id":"turn","status":"$status"}}""")
+            val item = compact(later).withTurnCache(later.turns["turn"])
+            val stored = ItemEntity.from(ThreadKey("computer", "store", "thread"), item, 0)
+            assertEquals(1L, stored.raw.asObject().number("_pocketCompactionCompletionVersion"))
+            assertFalse("Local proof must not alter native payload", "_pocketCompactionCompletionVersion" in item.raw)
+            val restored = stored.item()
+            val timeline = NativeTimeline(items = mapOf(restored.key to restored)).withCachedTurns()
+            assertTrue(restored.complete)
+            assertEquals(item.raw, restored.raw)
+            assertEquals(status, timeline.turns["turn"]?.status)
+            assertEquals("上下文已压缩", ConversationPresentation.compactionLabel(restored, timeline))
+        }
+    }
+
+    @Test fun legacyInferredCompletionIsNotTrustedOnFailedInterruptedOrSuccessfulTurns() {
+        mapOf("failed" to "上下文压缩失败", "interrupted" to "上下文压缩已中断", "completed" to "上下文压缩状态未知").forEach { (status, label) ->
+            // The old snapshot persisted complete=true for every item in any terminal turn.
+            val item = TimelineItem("turn", "compact", "contextCompaction", raw = json("""{"id":"compact","type":"contextCompaction","startedAtMs":100}"""))
+                .withTurnCache(NativeTurnInfo("turn", status = status, completedAtMs = 500))
+            val legacy = legacyCache(item)
+            val restored = legacy.item()
+            assertFalse(restored.complete)
+            assertEquals(item.raw, restored.raw)
+            assertEquals(item.key, restored.key)
+            val timeline = NativeTimeline(items = mapOf(restored.key to restored)).withCachedTurns()
+            assertEquals(label, ConversationPresentation.compactionLabel(restored, timeline))
+            // Re-saving normalized legacy data must not turn its inferred success into current proof.
+            val resaved = ItemEntity.from(legacy.chatKey, restored, legacy.ordinal).item()
+            assertFalse(resaved.complete)
+            assertEquals(label, ConversationPresentation.compactionLabel(resaved, timeline))
+        }
+    }
+
+    @Test fun legacyNativeItemTimestampOrSuccessfulStatusStillProvesCompletion() {
+        listOf("""{"id":"compact","type":"contextCompaction","completedAtMs":200}""",
+            """{"id":"compact","type":"contextCompaction","status":"completed"}""").forEach { payload ->
+            val item = TimelineItem.from("turn", json(payload), complete = false)
+                .withTurnCache(NativeTurnInfo("turn", status = "failed"))
+            listOf(false, true).forEach { inferred ->
+                val restored = legacyCache(item, inferred).item()
+                assertTrue(restored.complete)
+                val timeline = NativeTimeline(items = mapOf(restored.key to restored)).withCachedTurns()
+                assertEquals("上下文已压缩", ConversationPresentation.compactionLabel(restored, timeline))
+            }
+        }
+        val failed = TimelineItem.from("turn", json("""{"id":"compact","type":"contextCompaction","status":"failed","completedAtMs":200}"""))
+        assertFalse(legacyCache(failed).item().complete)
+        assertEquals("上下文压缩失败", ConversationPresentation.compactionLabel(legacyCache(failed).item()))
+    }
+
+    @Test fun unsupportedLocalProofVersionsFallBackToNativeEvidence() {
+        listOf(JsonNull, JsonPrimitive(0), JsonPrimitive(2), JsonPrimitive("1")).forEach { version ->
+            val item = TimelineItem("turn", "compact", "contextCompaction", raw = buildJsonObject {
+                put("id", "compact"); put("type", "contextCompaction"); put("_pocketCompactionCompletionVersion", version)
+            })
+            val restored = legacyCache(item).item()
+            assertFalse(restored.complete)
+            assertFalse("Cache metadata stays local", "_pocketCompactionCompletionVersion" in restored.raw)
+            assertEquals("上下文压缩状态未知", ConversationPresentation.compactionLabel(restored))
+        }
+    }
+
+    @Test fun localCompactionProofDoesNotChangeOtherCachedItemTypes() {
+        val item = TimelineItem("turn", "tool", "commandExecution", "check", raw = json("""{"command":"check"}"""), complete = true)
+        val stored = ItemEntity.from(ThreadKey("computer", "store", "thread"), item, 0)
+        assertEquals(item.raw, stored.raw)
+        assertEquals(item, stored.item())
+    }
 }
