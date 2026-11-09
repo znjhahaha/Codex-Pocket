@@ -39,4 +39,14 @@
 
 产品提交 `40e3008` 已推送 main。Checks 42617620363 的 Android 与 relay 通过；Windows 前端交互通过，新增的原生命令测试因临时目录使用 8.3 别名而失败。测试改用已有的物理路径／当前用户所有者夹具，原安全校验不变；9 项本地重跑通过。安装脚本 23 项、签名解析 10 项通过。
 
-GitHub CI 与 Release 草稿最终结果待补充。保留旧标签和旧交付目录，不替换失败标签，不正式发布草稿。
+修正提交 `850704c` 的 Checks **42618990866** 全部通过。不可变标签 `v0.6.3` 指向该提交；Release draft **42620476488** 成功，草稿保留未发布状态，附件 9 个。云端产物下载到 `dist/codex-pocket-0.6.3-github-draft`，所有哈希、Windows 清单及 APK 原签名再次核验通过。
+
+| 云端草稿产物 | SHA-256 |
+| --- | --- |
+| Android APK | `04926782f2a84d99a07301e530e6d4478dd93f926c6ba470aa434642614b5055` |
+| Windows Setup | `ce858041c6d0ee1bb1ceb10b96137e13f1302658a707da169cff06948420cc5e` |
+| Windows ZIP | `bb45b5cf86f9ae969d0e4a541737410f02be5bef00ec4ec01ef2b380f4e5e4f7` |
+| 源码 ZIP | `81a2bd5d13bf3f23dbf88c41eb64250da4e5acb16a9f604919e5f8cf50910fde` |
+| 中转镜像归档 | `f65dc5d88036ad54ed01951b8e373fff540e0b0853cdd1608d4f8e600fd49eea` |
+
+本地与云端各自独立构建，哈希分别记录，不互相冒充同一二进制。原签名证书 SHA-256 为 `2d53a8ae9d77804fdcb1174cfcd81548ea97ae6a664ce6f1407fd6c1f5a57a8a`。保留旧标签和旧交付目录，不替换失败标签，不正式发布草稿。
