@@ -105,7 +105,11 @@ class NativeActivityUiTest {
             NativeActivityCard(plan, "plan", false, {}, {})
         } }
         waitText("Run tests")
-        compose.onNodeWithText(compose.activity.getString(R.string.v03_exit_code, 9), substring = true).assertIsDisplayed()
+        // Plan rows render synchronously; tool descriptors arrive independently on Dispatchers.Default.
+        // Waiting for the plan does not establish that the command's exit result has been published.
+        val exitCode = compose.activity.getString(R.string.v03_exit_code, 9)
+        waitText(exitCode)
+        compose.onNodeWithText(exitCode, substring = true).assertIsDisplayed()
         compose.onNodeWithText("1/2").assertIsDisplayed()
         compose.onNodeWithTag("activity-toggle:${failed.key}").performClick()
         compose.onNodeWithText("permission denied").assertIsDisplayed()

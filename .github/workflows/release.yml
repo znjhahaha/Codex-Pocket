@@ -65,6 +65,17 @@ jobs:
           POCKET_SIGNING_PASSWORD: ${{ secrets.POCKET_SIGNING_PASSWORD }}
           POCKET_EXPECTED_SIGNER: ${{ vars.POCKET_EXPECTED_SIGNER }}
         run: ./scripts/ci-release.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'pocket-release')
+      - name: Preserve failed host test reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-host-failure-reports
+          path: |
+            android/app/build/reports/tests
+            android/app/build/test-results
+            android/wire/build/reports/tests
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: desktop-android-release
