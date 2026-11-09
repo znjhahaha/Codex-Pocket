@@ -60,7 +60,7 @@ pub fn local_control(state:&std::path::Path,method:&str,params:serde_json::Value
 #[cfg(test)]mod control_tests{
  use super::*;use serde_json::json;use std::io::Write;
  #[test]fn local_preferences_use_authenticated_bounded_broker_protocol(){
-  let state=tempfile::tempdir().unwrap();let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let state=crate::test_support::tempdir();let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
   crate::storage::atomic(&state.path().join("control.json"),&json!({"protocol":1,"port":listener.local_addr().unwrap().port(),"token":"fixture-secret"})).unwrap();
   let worker=thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();let mut n=[0;4];socket.read_exact(&mut n).unwrap();let mut bytes=vec![0;u32::from_be_bytes(n) as usize];socket.read_exact(&mut bytes).unwrap();let request:serde_json::Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(request["token"],"fixture-secret");assert_eq!(request["method"],"session/preferences/update");assert_eq!(request["params"]["knownRevision"],3);let reply=serde_json::to_vec(&json!({"result":{"defaultMode":"desktop","revision":4}})).unwrap();socket.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();socket.write_all(&reply).unwrap();});
   let result=local_control(state.path(),"session/preferences/update",json!({"mode":"desktop","knownRevision":3,"commandId":"fixture-operation"})).unwrap();assert_eq!(result["revision"],4);worker.join().unwrap();

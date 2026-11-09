@@ -1,11 +1,13 @@
 use pocket_desktop_runtime::{launcher, process, storage};
+#[path = "../test_support/mod.rs"]
+mod test_support;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path, process::{Child, Command, Stdio}, thread, time::{Duration, Instant}};
 
 #[test]
 fn launcher_resolves_new_generation_and_refuses_tampered_payloads() {
-    let dir=tempfile::tempdir().unwrap(); let root=dir.path();
+    let dir=test_support::tempdir(); let root=dir.path();
     for number in [1,2] {
         let bytes=format!("fixture executable {number}").into_bytes();
         let manifest=serde_json::to_vec(&json!({"files":[{"path":"pocket-desktop.exe","sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}]})).unwrap();
@@ -21,7 +23,7 @@ fn launcher_resolves_new_generation_and_refuses_tampered_payloads() {
 }
 #[test]
 fn locks_prevent_duplicate_ownership_and_persist_explicit_stop() {
-    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("lock");
+    let dir=test_support::tempdir();let path=dir.path().join("lock");
     let first=storage::Lock::acquire(&path).unwrap();assert!(storage::Lock::acquire(&path).is_err());drop(first);assert!(storage::Lock::acquire(&path).is_ok());
     storage::set_desired(dir.path(),true).unwrap();assert!(storage::desired(dir.path()));
     storage::set_desired(dir.path(),false).unwrap();assert!(!storage::desired(dir.path()));
@@ -30,7 +32,7 @@ fn locks_prevent_duplicate_ownership_and_persist_explicit_stop() {
 #[test]
 fn atomic_status_survives_a_short_reader_without_delete_sharing() {
     use std::os::windows::fs::OpenOptionsExt;
-    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("status.json");
+    let dir=test_support::tempdir();let path=dir.path().join("status.json");
     storage::atomic(&path,&json!({"sequence":1})).unwrap();
     let reader=fs::OpenOptions::new().read(true).share_mode(3).open(&path).unwrap();
     let release=thread::spawn(move||{thread::sleep(Duration::from_millis(180));drop(reader)});
@@ -45,7 +47,7 @@ fn refuses_path_aliases_and_parent_traversal() {
 }
 #[test]
 fn physical_file_checks_cover_each_state_file_and_missing_children() {
-    let dir=tempfile::tempdir().unwrap();
+    let dir=test_support::tempdir();
     let file=dir.path().join("state.json");fs::write(&file,"{}").unwrap();
     storage::unredirected(&file).unwrap();
     storage::unredirected(Path::new(&file.to_string_lossy().replace('\\',"/"))).unwrap();
@@ -66,7 +68,7 @@ fn wait_for(mut predicate:impl FnMut()->bool) {let until=Instant::now()+Duration
 #[cfg(windows)]
 #[test]
 fn real_supervisor_backoff_duplicate_lock_and_stop_survive_relaunch() {
-    let dir=tempfile::tempdir().unwrap();let state=dir.path().join("state");fs::create_dir(&state).unwrap();fs::write(state.join("config.json"),"{}").unwrap();storage::set_desired(&state,true).unwrap();
+    let dir=test_support::tempdir();let state=dir.path().join("state");fs::create_dir(&state).unwrap();fs::write(state.join("config.json"),"{}").unwrap();storage::set_desired(&state,true).unwrap();
     // cmd.exe exits on the helper's arguments. Only this fixture's child is supervised.
     let spawn=||{let mut c=Command::new(env!("CARGO_BIN_EXE_pocket-supervisor"));c.arg("--state").arg(&state).arg("--agent").arg(std::env::var("COMSPEC").unwrap()).arg("--owner-directory").arg(dir.path().join("owner")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());process::hidden(&mut c);Owned(c.spawn().unwrap())};
     let mut first=spawn();let heartbeat=storage::control(&state).join("supervisor.json");

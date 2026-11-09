@@ -7,3 +7,6 @@ pub mod pairing;
 pub mod connection;
 
 pub mod connectivity;
+#[cfg(test)]
+#[path = "../test_support/mod.rs"]
+mod test_support;
