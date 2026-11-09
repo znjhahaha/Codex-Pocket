@@ -201,6 +201,13 @@ class PocketRepositoryTest {
         assertEquals("preserve parent draft", repo.state.value.draft?.text)
     }
     @Test fun staleChildCannotStealALiveOwnerOrCommitMismatchedIdentity() = runBlocking<Unit> {
+        // Install the identity mismatch before publishing the collaboration event:
+        // that event also schedules a metadata read. An earlier successful reply
+        // would legitimately rebind the stopped owner during the second phase.
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child")
+                buildJsonObject { put("thread", server.thread("wrong-child")) } else null
+        }
         childLink()
         val parent = repo.state.value.selected!!
         val childKey = key.copy(nativeId = "child")
@@ -211,10 +218,6 @@ class PocketRepositoryTest {
         assertNotNull(repo.state.value.agentReader?.error)
         assertEquals("other-runtime", db.dao().chat(childKey)?.runtimeId)
         update { it.copy(runtimes = it.runtimes.filterNot { r -> r.id == "other-runtime" }) }
-        server.intercept = { method, params, _ ->
-            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child")
-                buildJsonObject { put("thread", server.thread("wrong-child")) } else null
-        }
         repo.openAgentReader("child").join()
         assertNotNull(repo.state.value.agentReader?.error)
         assertEquals("other-runtime", db.dao().chat(childKey)?.runtimeId)
