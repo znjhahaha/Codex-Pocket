@@ -29,4 +29,14 @@
 
 ## 交付
 
-构建、签名、哈希、提交及 CI／Release 草稿结果将在最终核验后补充。保留旧标签和旧交付目录，不替换失败标签，不正式发布草稿。
+本地最终产品包：`dist/codex-pocket-0.6.3-20261109-auto-final`。原签名 APK（code 13）、Setup、便携 ZIP、源码与 SHA256SUMS 已生成；Windows 清单 20 个文件校验通过。未替换当前正在执行任务的 Codex／桥接。
+
+| 本地产物 | SHA-256 |
+| --- | --- |
+| Android APK | `9a5dc702d40d0e423fa2f956d9e8968c370124486ce03ed821cc4ff814b038d0` |
+| Windows Setup | `2740d56fce87407bbbee74541606b4b41fdce235007f7deb54704fe777d44b3c` |
+| Windows ZIP | `e728e81bdce436d02516b936171843de7075e79e25ff2babb456794bb7daf7be` |
+
+产品提交 `40e3008` 已推送 main。Checks 42617620363 的 Android 与 relay 通过；Windows 前端交互通过，新增的原生命令测试因临时目录使用 8.3 别名而失败。测试改用已有的物理路径／当前用户所有者夹具，原安全校验不变；9 项本地重跑通过。安装脚本 23 项、签名解析 10 项通过。
+
+GitHub CI 与 Release 草稿最终结果待补充。保留旧标签和旧交付目录，不替换失败标签，不正式发布草稿。

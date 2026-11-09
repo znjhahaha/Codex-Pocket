@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn disable_persists_without_querying_unavailable_startup() {
-        let state=tempfile::tempdir().unwrap();
+        let state=crate::test_support::tempdir();
         storage::set_desired(state.path(),true).unwrap();
         let mut calls=Vec::new();
         let result=set_remote_desired(state.path(),false,|action|{
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn enable_status_failure_preserves_desired_file() {
-        let state=tempfile::tempdir().unwrap();
+        let state=crate::test_support::tempdir();
         storage::set_desired(state.path(),false).unwrap();
         let path=storage::control(state.path()).join("desired.json");
         let before=std::fs::read(&path).unwrap();
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn enable_start_failure_restores_previous_desired_value() {
         for previous in [false,true] {
-            let state=tempfile::tempdir().unwrap();
+            let state=crate::test_support::tempdir();
             storage::set_desired(state.path(),previous).unwrap();
             let mut calls=Vec::new();
             let error=set_remote_desired(state.path(),true,|action|{
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn repeated_enable_keeps_desired_enabled() {
-        let state=tempfile::tempdir().unwrap();
+        let state=crate::test_support::tempdir();
         storage::set_desired(state.path(),false).unwrap();
         for _ in 0..2 {
             let mut calls=Vec::new();
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn repeated_enable_does_not_reset_startup_deadline() {
-        let state=tempfile::tempdir().unwrap();
+        let state=crate::test_support::tempdir();
         storage::set_desired(state.path(),true).unwrap();
         let path=storage::control(state.path()).join("desired.json");
         storage::atomic(&path,&storage::Desired{enabled:true,changed_at:100}).unwrap();

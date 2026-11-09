@@ -22,6 +22,9 @@ base64 = "0.22"
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
 [[bin]]
 name = "pocket-desktop"
 path = "src/main.rs"

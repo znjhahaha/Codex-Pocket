@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod commands;
+#[cfg(test)]
+#[path = "../../runtime/test_support/mod.rs"]
+mod test_support;
 mod deployment;
 mod firewall;
 use tauri::{Manager,Emitter,menu::{Menu,MenuItem},tray::{TrayIconBuilder,TrayIconEvent,MouseButton}};
