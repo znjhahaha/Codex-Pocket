@@ -69,11 +69,11 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
         with:
           cache-read-only: ${{ github.event_name == 'pull_request' }}
-      - name: SDK
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: Host tests and lint
         run: bash android/gradlew -p android :wire:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
