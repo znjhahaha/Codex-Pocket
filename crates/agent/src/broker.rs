@@ -4443,6 +4443,7 @@ mod tests {
             .await;
         let skills = native.recv().await;
         assert_eq!(skills["method"], "skills/list");
+        let root = dunce::canonicalize(root).unwrap();
         assert_eq!(skills["params"]["cwds"], json!([root]));
         native.reply(&skills,json!({"data":[{"cwd":root,"skills":[{"name":"review","path":"C:/skills/review/SKILL.md","description":"Review source changes","enabled":true},{"name":"disabled","path":"secret","enabled":false}]},{"cwd":"C:/foreign","skills":[{"name":"foreign","path":"private","enabled":true}]}]})).await;
         let plugins = native.recv().await;

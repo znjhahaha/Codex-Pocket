@@ -36,6 +36,7 @@ class V054MinimapUiTest {
     private lateinit var list: LazyListState
     private lateinit var state: ConversationMinimapState
     private lateinit var map: ConversationMinimapMap
+    private lateinit var projection: TranscriptProjectionMemory
     private var projected = emptyList<TranscriptRow>()
     private var timeline by mutableStateOf(fixture())
     private var expansions by mutableStateOf(emptySet<String>())
@@ -62,7 +63,8 @@ class V054MinimapUiTest {
                     density = LocalDensity.current.density
                     list = rememberLazyListState()
                     state = rememberConversationMinimapState(list, scope)
-                    val rows = rememberTranscriptRows(scope, timeline, expansions)
+                    projection = remember(scope) { TranscriptProjectionMemory() }
+                    val rows = rememberTranscriptRows(scope, timeline, expansions, retained = projection)
                     projected = rows
                     val keys = listOf("history") + rows.map { it.key } + "end"
                     map = remember(rows, keys) { ConversationMinimapMap(rows, keys) }
@@ -105,9 +107,11 @@ class V054MinimapUiTest {
         content()
         commit(hidden(6))
         compose.waitUntil(3_000) { requestedOwners.isNotEmpty() }
-        compose.runOnIdle { scope = "chat-b" }
-        compose.waitForIdle()
-        compose.runOnIdle { expansions = setOf("process:t6"); androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications() }
+        compose.runOnIdle { androidx.compose.runtime.snapshots.Snapshot.withMutableSnapshot { scope = "chat-b" } }
+        // UI idleness does not include the Default-dispatcher projection. Wait
+        // for the new native scope before publishing its delayed expansion.
+        compose.waitUntil(3_000) { projection.scope == "chat-b" && projected.isNotEmpty() }
+        compose.runOnIdle { androidx.compose.runtime.snapshots.Snapshot.withMutableSnapshot { expansions = setOf("process:t6") } }
         compose.waitUntil(3_000) { map.listIndex(hidden(6)) != null }
         compose.runOnIdle { assertFalse(state.isInteracting); assertFalse(visible(hidden(6))) }
     }

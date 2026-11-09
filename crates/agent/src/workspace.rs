@@ -12,6 +12,7 @@ pub const MAX_IMAGE: u64 = 24 * 1024 * 1024;
 pub const IMAGE_CHUNK: usize = 192 * 1024;
 pub struct Workspace {
     roots: Vec<PathBuf>,
+    root_aliases: Vec<PathBuf>,
 }
 impl Workspace {
     pub fn new(roots: Vec<PathBuf>) -> Result<Self> {
@@ -19,6 +20,7 @@ impl Workspace {
             bail!("Invalid workspace roots");
         }
         let mut canonical = Vec::new();
+        let mut root_aliases = Vec::new();
         for root in roots {
             lexical(&root.to_string_lossy())?;
             if !root.is_absolute() {
@@ -28,12 +30,16 @@ impl Workspace {
             if !root.is_dir() {
                 bail!("Native root is not a directory");
             }
+            root_aliases.push(root.clone());
             let root = dunce::canonicalize(root)?;
             if !canonical.contains(&root) {
                 canonical.push(root);
             }
         }
-        Ok(Self { roots: canonical })
+        Ok(Self {
+            roots: canonical,
+            root_aliases,
+        })
     }
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
@@ -49,7 +55,15 @@ impl Workspace {
         } else {
             self.roots[0].join(raw)
         };
-        if !self.roots.iter().any(|r| joined.starts_with(r)) {
+        // Native Windows paths may use a validated 8.3 spelling or different
+        // casing. Accept only those proven aliases at the lexical boundary;
+        // the pinned canonical containment check below remains authoritative.
+        if !self
+            .roots
+            .iter()
+            .chain(&self.root_aliases)
+            .any(|r| joined.starts_with(r))
+        {
             bail!("Outside workspace");
         }
         let held = guard(&joined)?;
@@ -95,11 +109,16 @@ impl Workspace {
             {
                 continue;
             }
-            if let Ok(root) = dunce::canonicalize(root)
-                && !self.roots.contains(&root)
-                && self.roots.len() < 32
-            {
-                self.roots.push(root);
+            if let Ok(canonical) = dunce::canonicalize(&root) {
+                if !self.roots.contains(&canonical) {
+                    if self.roots.len() >= 32 {
+                        continue;
+                    }
+                    self.roots.push(canonical);
+                }
+                if self.root_aliases.len() < 64 && !self.root_aliases.contains(&root) {
+                    self.root_aliases.push(root);
+                }
             }
         }
         self
@@ -296,6 +315,29 @@ fn guard(path: &Path) -> Result<Vec<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn native_path_alias_keeps_canonical_containment() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("hello.txt"), "hello").unwrap();
+        fs::write(temp.path().join("secret.txt"), "outside").unwrap();
+        let alias = PathBuf::from(root.to_str().unwrap().to_ascii_uppercase());
+        let workspace = Workspace::new(vec![alias.clone()]).unwrap();
+        assert_eq!(workspace.roots(), &[dunce::canonicalize(&root).unwrap()]);
+        assert_eq!(
+            workspace
+                .read(alias.join("hello.txt").to_str().unwrap())
+                .unwrap()["text"],
+            "hello"
+        );
+        assert!(
+            workspace
+                .read(alias.parent().unwrap().join("secret.txt").to_str().unwrap())
+                .is_err()
+        );
+    }
     #[test]
     fn v02_workspace_bounds_text_and_listing() {
         let temp = tempfile::tempdir().unwrap();
