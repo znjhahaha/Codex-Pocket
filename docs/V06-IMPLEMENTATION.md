@@ -27,7 +27,7 @@ plain-language documentation with real screenshots.
 | LAN and public transports | implemented, live network switching pending | Pinned local TCP/TLS, route failover and cancellation fixtures |
 | Windows onboarding, tray, installer | implemented, real install/login pending | Runtime and installer fixtures, NSIS Setup build |
 | Cloudflare and SSH deployment | implemented, public integration pending | Locked cloudflared, DPAPI and bounded owned deployment helpers; no live deployment this round |
-| CI, release and README | pushed; first GitHub checks in progress, draft packaging pending | Main includes `cca5087` and SDK bootstrap fix `6bd4e5d`; relay build passed; Windows elevated-runner fixture corrected without bypassing production checks; tag-triggered publication stops at draft |
+| CI, release and README | pushed; Windows, Android and relay CI passed; draft packaging next | `be30bff`, GitHub Checks run `42570430157`; original signing configured; tag-triggered publication stops at draft |
 
 This file is an implementation ledger, not an acceptance claim. Live server setup,
 Windows login, phone hardware and 24-hour stability require separate evidence.
