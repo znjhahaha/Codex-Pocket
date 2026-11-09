@@ -18,7 +18,7 @@ import dev.codexpocket.app.data.*
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.*
 
-internal fun canMutate(s: PocketState, method: String) = s.online && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false && s.selected?.isSubagent == false && s.supports(method)
+internal fun canMutate(s: PocketState, method: String) = s.online && s.accessAllowsSending() && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false && s.selected?.isSubagent == false && s.supports(method)
 
 @Composable
 internal fun AsyncQuestionForm(question: JsonObject, s: PocketState, onAnswer: (String, JsonObject) -> Any) {

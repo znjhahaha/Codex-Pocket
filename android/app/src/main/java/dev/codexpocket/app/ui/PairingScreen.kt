@@ -37,6 +37,7 @@ import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -63,14 +64,12 @@ import java.io.ByteArrayOutputStream
 
 @Composable
 internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> Any, phase: PairingPhase,
-    error: String?, onDismiss: (() -> Unit)?) {
+    error: String?, onDismiss: (() -> Unit)?, scanner: PairingScannerState = remember { PairingScannerState() }) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val scope = rememberCoroutineScope()
-    val gate = remember { PairingScanGate() }
     // Deliberately not saveable: scanner/manual secrets never enter saved instance state.
     var payload by remember { mutableStateOf("") }
-    var reviewed by remember { mutableStateOf(false) }
     var manual by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable { mutableStateOf(Build.MODEL) }
     var paused by remember { mutableStateOf(false) }
@@ -82,7 +81,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
     var foreground by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
     val phaseBusy = phase in setOf(PairingPhase.Validating, PairingPhase.Connecting, PairingPhase.Authenticating, PairingPhase.Synchronizing)
     val working = busy || submitting || decoding || phaseBusy
-    val active = scannerShouldRun(permission, foreground, paused, manual, working)
+    val active = scannerShouldRun(permission, foreground, paused || scanner.paused, manual, working)
     val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         permission = it
         issue = if (it) null else "未获得相机权限，可以从相册选择或手动粘贴"
@@ -96,20 +95,23 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
+    DisposableEffect(scanner) {
+        onDispose { scanner.cancel() }
+    }
     LaunchedEffect(busy, phase) {
         if (!busy && (phase == PairingPhase.Failed || phase == PairingPhase.Idle)) submitting = false
     }
     fun received(value: String) {
+        if (busy || submitting || phaseBusy || scanner.computerName != null) return
         paused = true
         torch = false
-        when (gate.accept(value)) {
-            ScanDecision.Accepted -> { payload = value; reviewed = true; issue = null }
-            ScanDecision.Expired -> { payload = ""; issue = "配对码已过期，请在电脑上生成新的配对码" }
-            ScanDecision.Invalid -> { payload = ""; issue = "不是有效的 Codex Pocket 配对码" }
+        when (scanner.receive(value)) {
+            ScanDecision.Accepted -> { payload = ""; manual = false; issue = null }
+            ScanDecision.Expired, ScanDecision.Invalid -> { payload = ""; issue = null }
             ScanDecision.Duplicate -> Unit
         }
     }
-    fun retry() { payload = ""; reviewed = false; issue = null; gate.retry(); paused = false; torch = false }
+    fun retry() { payload = ""; issue = null; scanner.cancel(); paused = false; torch = false }
     val album = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri == null) { if (payload.isEmpty() && issue == null) paused = false }
         else scope.launch {
@@ -138,8 +140,9 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 onError = { paused = true; torch = false; issue = "相机暂不可用，请重试、选择相册或手动粘贴" })
             if (!active) Column(Modifier.padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(if (payload.isNotBlank()) PocketIcons.CheckCircle else PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
+                Icon(if (scanner.computerName != null || payload.isNotBlank()) PocketIcons.CheckCircle else PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
                 Text(when {
+                    scanner.computerName != null -> "已读取配对内容"
                     payload.isNotBlank() -> "已读取配对内容"
                     manual -> "正在手动配对"
                     !permission -> "允许相机权限后开始扫描"
@@ -162,7 +165,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
             PocketTextButton({ torch = !torch }, enabled = active && context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {
                 Icon(PocketIcons.Sun, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(if (torch) "关闭补光" else "补光灯")
             }
-            PocketTextButton({ payload = ""; reviewed = false; issue = null; paused = true; torch = false; gate.retry(); album.launch("image/*") }, enabled = !working) {
+            PocketTextButton({ retry(); paused = true; album.launch("image/*") }, enabled = !working) {
                 Icon(PocketIcons.Image, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("相册")
             }
             PocketTextButton({ manual = !manual; torch = false }, enabled = !working, modifier = Modifier.testTag("pair-manual-toggle")) {
@@ -178,6 +181,13 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
             }
         }
         issue?.let { Text(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error) }
+        scanner.feedback?.let { decision ->
+            val message = when (decision) {
+                ScanDecision.Expired -> "配对码已过期，请在电脑上生成新的配对码"
+                else -> "不是有效的 Codex Pocket 配对码"
+            }
+            Text(message, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error)
+        }
         if (phase == PairingPhase.Failed) Text(error ?: "连接失败，请检查电脑后重试", color = MaterialTheme.colorScheme.error)
         if (working) {
             PocketProgressStatus(when {
@@ -189,13 +199,14 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 else -> "正在验证配对内容"
             })
         }
-        if (manual) PocketTextField(payload, { payload = it.take(65_536); reviewed = false; issue = null; gate.retry() },
+        if (manual) PocketTextField(payload, { payload = it.take(65_536); issue = null; scanner.cancel() },
             label = stringResource(R.string.paste_pairing), modifier = Modifier.testTag("pair-payload"), minLines = 2, maxLines = 4,
             visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), enabled = !working)
-        if (!manual && payload.isNotBlank()) Text(if (reviewed) stringResource(R.string.pair_ready) else "配对内容待验证")
+        if (!manual && payload.isNotBlank()) Text("配对内容待验证")
         if (manual || payload.isNotBlank()) {
             PocketTextField(name, { name = it.take(80) }, label = stringResource(R.string.device_name), singleLine = true, enabled = !working)
             PocketButton(stringResource(R.string.pair_securely), onClick = {
+                if (working || payload.isBlank() || name.isBlank()) return@PocketButton
                 // Revalidate at confirmation: a reviewed QR can expire while the user reads it.
                 when (validatePairingScan(payload)) {
                     ScanDecision.Accepted -> {
@@ -210,6 +221,37 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
         }
         Text(stringResource(R.string.pair_privacy), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+    scanner.computerName?.let { computerName ->
+        PairingConfirmationDialog(computerName, name, { name = it.take(80) },
+            enabled = !working && foreground,
+            onCancel = { retry(); manual = false },
+            onConnect = {
+                if (!working && foreground && name.isNotBlank()) {
+                    scanner.confirm(name) { value, deviceName ->
+                        payload = ""; paused = true; submitting = true; torch = false
+                        onPair(value, deviceName)
+                    }
+                }
+            })
+    }
+}
+
+@Composable
+internal fun PairingConfirmationDialog(computerName: String, deviceName: String, onNameChange: (String) -> Unit,
+    enabled: Boolean, onCancel: () -> Unit, onConnect: () -> Unit) {
+    PocketDialog(onDismissRequest = onCancel,
+        title = { Text("连接电脑", Modifier.testTag("pair-confirm-title")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(computerName, Modifier.testTag("pair-confirm-computer"), style = MaterialTheme.typography.titleMedium,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis)
+                PocketTextField(deviceName, onNameChange, label = stringResource(R.string.device_name),
+                    singleLine = true, enabled = enabled, modifier = Modifier.testTag("pair-confirm-name"))
+            }
+        },
+        confirmButton = { PocketButton("连接", onConnect, enabled = enabled && deviceName.isNotBlank(),
+            modifier = Modifier.testTag("pair-confirm-connect")) },
+        dismissButton = { PocketTextButton(onCancel, modifier = Modifier.testTag("pair-confirm-cancel")) { Text("取消") } })
 }
 
 private fun Context.cameraGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED

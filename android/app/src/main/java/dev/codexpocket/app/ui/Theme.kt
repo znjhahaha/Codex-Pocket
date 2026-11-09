@@ -39,16 +39,16 @@ fun PocketTheme(theme: String, content: @Composable () -> Unit) {
     val dark = theme == "dark" || (theme == "system" && isSystemInDarkTheme())
     val colors = if (dark) Dark else Light
     MaterialTheme(colorScheme = colors, typography = Typography(
-        headlineLarge = TextStyle(fontSize = 30.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.6).sp),
-        headlineMedium = TextStyle(fontSize = 26.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.4).sp),
-        titleLarge = TextStyle(fontSize = 21.sp, lineHeight = 29.sp, fontWeight = FontWeight.Medium),
-        titleMedium = TextStyle(fontSize = 17.sp, lineHeight = 25.sp, fontWeight = FontWeight.Medium),
-        titleSmall = TextStyle(fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
-        bodyLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 16.sp, lineHeight = 27.sp),
-        bodyMedium = TextStyle(fontSize = 16.sp, lineHeight = 25.sp),
-        bodySmall = TextStyle(fontSize = 13.sp, lineHeight = 21.sp),
-        labelLarge = TextStyle(fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
-        labelMedium = TextStyle(fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
-        labelSmall = TextStyle(fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Normal),
+        headlineLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 30.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.6).sp),
+        headlineMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 26.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.4).sp),
+        titleLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 21.sp, lineHeight = 29.sp, fontWeight = FontWeight.Medium),
+        titleMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 17.sp, lineHeight = 25.sp, fontWeight = FontWeight.Medium),
+        titleSmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
+        bodyLarge = TextStyle(fontFamily = PocketReadingFont,  fontSize = 16.sp, lineHeight = 26.sp),
+        bodyMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 16.sp, lineHeight = 26.sp),
+        bodySmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 21.sp),
+        labelLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
+        labelMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
+        labelSmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Normal),
     )) { CompositionLocalProvider(LocalContentColor provides colors.onSurface, content = content) }
 }

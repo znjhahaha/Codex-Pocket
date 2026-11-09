@@ -10,12 +10,12 @@ internal interface TransportListener { fun onOpen(); fun onBinary(bytes: ByteArr
 internal fun interface TransportConnector { fun open(config: ConnectionConfig, listener: TransportListener): BinaryTransport }
 
 /** Outer TLS uses platform trust and hostname verification, independently of the inner pin. */
-internal class WssConnector : TransportConnector {
+internal class WssConnector(private val endpoint: String? = null) : TransportConnector {
     override fun open(config: ConnectionConfig, listener: TransportListener): BinaryTransport {
         val client = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
             .retryOnConnectionFailure(false).connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(45, TimeUnit.SECONDS).build()
-        val request = Request.Builder().url(config.phoneUrl()).header("Authorization", "Bearer ${config.phoneToken}").build()
+        val request = Request.Builder().url(endpoint ?: config.phoneUrl()).header("Authorization", "Bearer ${config.phoneToken}").build()
         val socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) { listener.onOpen() }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {

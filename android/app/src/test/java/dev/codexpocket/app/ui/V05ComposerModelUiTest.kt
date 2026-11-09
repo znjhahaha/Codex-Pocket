@@ -58,7 +58,8 @@ class V05ComposerModelUiTest {
         return PocketState(paired = true, online = true,
             selected = ChatEntity(key, "runtime", "desktop", "Chat", "", "", 0, "", false),
             runtimes = listOf(RuntimeInfo("runtime", "desktop", "v", "store", true, emptySet(),
-                setOf("collaborationMode/list", "thread/settings/update"))),
+                setOf("collaborationMode/list", "thread/settings/update"),
+                capabilityFields = mapOf("thread/settings/update" to setOf("threadId", "serviceTier")))),
             models = models, model = models.first().model, effort = effort, modelCatalogState = ModelCatalogState.Ready)
     }
 
@@ -182,7 +183,7 @@ class V05ComposerModelUiTest {
     }
 
     @Test fun planAndFastHonorRuntimeOwnershipAndRunningTurnGates() {
-        val model = NativeModel("a", "astra", "Astra", "", emptyList(), "", false, true)
+        val model = NativeModel("a", "astra", "Astra", "", emptyList(), "", false, true, serviceTiers = setOf("fast"))
         var state by mutableStateOf(ready(listOf(model)).copy(modes = listOf(NativeMode("Plan", "plan", null, null))))
         var plans = 0
         var fast = 0
@@ -195,15 +196,15 @@ class V05ComposerModelUiTest {
         compose.onNodeWithTag("composer-plan").assertIsNotEnabled()
         compose.onNodeWithTag("composer-fast").assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(timeline = NativeTimeline(), runtimes = state.runtimes.map { it.copy(online = false) }) }
-        // Offline runtimes cannot advertise usable capabilities, so these controls disappear.
+        // Plan hides without catalog capability; Fast keeps its disabled explanatory icon.
         compose.onNodeWithTag("composer-plan").assertDoesNotExist()
-        compose.onNodeWithTag("composer-fast").assertDoesNotExist()
+        compose.onNodeWithTag("composer-fast").assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(paired = false, runtimes = state.runtimes.map { it.copy(online = true) }) }
         compose.onNodeWithTag("composer-plan").assertIsNotEnabled()
         compose.onNodeWithTag("composer-fast").assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(runtimes = state.runtimes.map { it.copy(online = true, capabilities = emptySet()) }) }
         compose.onNodeWithTag("composer-plan").assertDoesNotExist()
-        compose.onNodeWithTag("composer-fast").assertDoesNotExist()
+        compose.onNodeWithTag("composer-fast").assertIsNotEnabled()
         assertEquals(1, plans)
         assertEquals(1, fast)
     }

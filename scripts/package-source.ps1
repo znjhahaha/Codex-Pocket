@@ -1,6 +1,6 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$OutputDirectory)
+param([Parameter(Mandatory)][string]$OutputDirectory, [string]$Version)
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -12,7 +12,7 @@ if ($files | Where-Object { $_ -match $forbidden -or $_.Contains('..') }) { thro
 [void][IO.Directory]::CreateDirectory($OutputDirectory)
 Add-Type -AssemblyName System.IO.Compression
 $versionMatch = [regex]::Match([IO.File]::ReadAllText((Join-Path $root 'Cargo.toml')),'(?m)^version\s*=\s*"([^"]+)"')
-$version = $versionMatch.Groups[1].Value
+if (-not $Version) { $Version = $versionMatch.Groups[1].Value }
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid source version.' }
 $zipPath = Join-Path $OutputDirectory ('codex-pocket-' + $version + '-source.zip')
 $stream = [IO.File]::Open($zipPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)

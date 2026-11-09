@@ -28,6 +28,7 @@ data class PresentedActivity(
     val files: List<ActivityFile> = emptyList(),
     val agents: List<ActivityAgent> = emptyList(),
     val webAction: WebAction = WebAction.Other,
+    val outputBlocks: List<ToolOutputBlock> = emptyList(),
 )
 data class ActivitySummary(val commands: Int = 0, val files: Int = 0, val tools: Int = 0, val agents: Int = 0, val commentary: Int = 0, val reasoning: Int = 0, val failed: Int = 0,
     val web: Int = 0, val images: Int = 0, val reads: Int = 0, val searches: Int = 0, val lists: Int = 0, val skills: Int = 0)
@@ -107,31 +108,36 @@ object NativeActivityPresentation {
             }
             "fileChange", "turn/diff/updated" -> PresentedActivity(item.key, ActivityKind.Files, state, files = activityFiles(item))
             "mcpToolCall", "dynamicToolCall", "functionCallOutput" -> {
+                val blocks = toolOutputBlocks(item)
                 val text = sequence {
                     yield(raw.obj("error").string("message"))
-                    when (item.type) {
-                        "mcpToolCall" -> {
-                            val content = textContent(raw.obj("result")["content"])
-                            if (content.any(String::isNotBlank)) yieldAll(content)
-                            else {
-                                val structured = raw.obj("result").obj("structuredContent")
-                                // No generic tree walk: keys, argument blobs and metadata are not prose.
-                                yieldAll(sequenceOf("title", "summary", "message", "text").map { structured.string(it) })
+                    if (blocks.isNotEmpty()) {
+                        yieldAll(blocks.filterIsInstance<ToolOutputBlock.Text>().map { it.text })
+                    } else {
+                        when (item.type) {
+                            "mcpToolCall" -> {
+                                val content = textContent(raw.obj("result")["content"])
+                                if (content.any(String::isNotBlank)) yieldAll(content)
+                                else {
+                                    val structured = raw.obj("result").obj("structuredContent")
+                                    // No generic tree walk: keys, argument blobs and metadata are not prose.
+                                    yieldAll(sequenceOf("title", "summary", "message", "text").map { structured.string(it) })
+                                }
                             }
-                        }
-                        "dynamicToolCall" -> yieldAll(textContent(raw["contentItems"]))
-                        else -> {
-                            val output = raw["output"]
-                            if (output is JsonPrimitive && output.isString) yield(output.content)
-                            else yieldAll(textContent(output))
+                            "dynamicToolCall" -> yieldAll(textContent(raw["contentItems"]))
+                            else -> {
+                                val output = raw["output"]
+                                if (output is JsonPrimitive && output.isString) yield(output.content)
+                                else yieldAll(textContent(output))
+                            }
                         }
                     }
                     // Legacy cache and incremental plain text remain human text, never raw.toString().
-                    if (item.text.isNotBlank() && item.type != "functionCallOutput") yield(item.text)
+                    if (item.text.isNotBlank() && item.type != "functionCallOutput" && blocks.isEmpty()) yield(item.text)
                 }
                 PresentedActivity(item.key, ActivityKind.Tool, state,
                     raw.obj("appContext").string("actionName").ifBlank { raw.string("tool", raw.string("name")) },
-                    raw.obj("appContext").string("appName").ifBlank { raw.string("server", raw.string("namespace")) }, bounded(text))
+                    raw.obj("appContext").string("appName").ifBlank { raw.string("server", raw.string("namespace")) }, bounded(text), outputBlocks = blocks)
             }
             "webSearch" -> {
                 val action = raw.obj("action")

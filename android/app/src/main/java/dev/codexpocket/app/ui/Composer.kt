@@ -68,7 +68,8 @@ internal fun composerShouldReleaseFocus(focused: Boolean, keyboardVisible: Boole
     (historyFocusBlocked || (readingHistory && (transcriptScrolling || historyGestureSeen)) || (keyboardWasVisible && !keyboardVisible))
 internal fun composerAvailability(s: PocketState): ComposerAvailability {
     val chat = s.selected
-    val ready = chat != null && !chat.isSubagent && s.online && s.activeRuntime?.online == true && !s.busy && !s.sendBusy && !s.uncertainSend && !chat.conflict && !chat.archived
+    val ready = chat != null && !chat.isSubagent && s.online && s.activeRuntime?.online == true &&
+        (s.accessAllowsSending() || s.accessAllowsSendPreparation()) && !s.busy && !s.sendBusy && !s.uncertainSend && !chat.conflict && !chat.archived
     val content = s.draft?.text?.isNotBlank() == true || s.attachments.isNotEmpty()
     val running = s.timeline.activeTurn != null
     return ComposerAvailability(
@@ -595,7 +596,7 @@ internal fun NativeQueue(s: PocketState, onEdit: (String, String) -> Unit, onDel
     val entries = s.nativeQueue.filter { it.string("id").isNotBlank() }.distinctBy { it.string("id") }
     if (entries.isEmpty()) return
     val ids = entries.map { it.string("id") }
-    val enabled = s.online && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false
+    val enabled = s.online && s.accessAllowsSending() && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false
     val canSteer = onSteer != null && enabled && s.timeline.activeTurn != null && s.supports("turn/steer")
     val c = MaterialTheme.colorScheme
     val shown = if (expanded || entries.size <= QUEUE_VISIBLE + 1) entries else entries.take(QUEUE_VISIBLE)

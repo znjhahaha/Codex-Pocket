@@ -117,6 +117,7 @@ internal enum class ConversationEditor { None, Rename, Goal, Fork, SideChat }
 
 @Composable
 internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: Rect?, onDismiss: () -> Unit, onFiles: (() -> Unit)?, initialEditor: ConversationEditor = ConversationEditor.None) {
+    var showAccess by rememberSaveable(s.selected?.key?.encoded) { mutableStateOf(false) }
     var editor by rememberSaveable(s.selected?.key?.encoded, initialEditor) { mutableStateOf(initialEditor) }
     var text by rememberSaveable(editor, s.selected?.key?.encoded) { mutableStateOf(when (editor) {
         ConversationEditor.Rename -> s.selected?.title.orEmpty()
@@ -146,7 +147,10 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
     }
     PocketAnchoredMenu("会话操作", onDismiss, anchor, widthDp = 320f, below = true) {
         Column(Modifier.verticalScroll(scroll).padding(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (editor != ConversationEditor.None) {
+            if (showAccess) {
+                PocketMenuItem("返回会话操作", PocketIcons.ArrowBack, { showAccess = false })
+                ThreadOwnership(s, repo)
+            } else if (editor != ConversationEditor.None) {
                 PocketMenuItem("返回会话操作", PocketIcons.ArrowBack, { editor = ConversationEditor.None }, enabled = !submitting)
                 val title = when (editor) { ConversationEditor.Rename -> "重命名"; ConversationEditor.Goal -> "目标"; ConversationEditor.Fork -> "分支聊天"; else -> "旁支讨论" }
                 Text(title, Modifier.padding(horizontal = 10.dp), style = MaterialTheme.typography.titleMedium)
@@ -176,6 +180,10 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
                     PocketMenuItem("清除目标", PocketIcons.DeleteOutline, { repo.setGoal(null); onDismiss() }, enabled = !submitting && canMutate(s, "thread/goal/clear"))
                 }
             } else {
+                val access = s.accessFor()
+                PocketMenuItem(access?.let { "${it.mode.label} · ${it.phase.label}" } ?: "会话接手", PocketIcons.Computer,
+                    { showAccess = true; repo.refreshThreadAccess() },
+                    hint = if (!s.supports(BrokerCapability.AccessRead)) "电脑助手待更新" else null)
                 PocketMenuItem(if (s.selected?.pinned == true) "取消置顶" else "置顶", PocketIcons.PushPin, { s.selected?.let(repo::pin) })
                 PocketMenuItem("项目文件", PocketIcons.FolderOpen, { onDismiss(); onFiles?.invoke() }, enabled = onFiles != null)
                 listOf(Triple("重命名", "thread/name/set", ConversationEditor.Rename), Triple("分支聊天", "thread/fork", ConversationEditor.Fork),

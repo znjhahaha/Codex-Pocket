@@ -224,7 +224,7 @@ class AgentReaderUiTest {
         content { AgentReaderPanel(state, listOf(current), emptyMap(), true, {}, {}, {},
             { state = state.copy(fullScreen = it) }, {}, {}) }
         compose.onNodeWithTag("agent-reader-row:${commentary.key}").assertDoesNotExist()
-        compose.onNodeWithText("查看过程 · 1 项").performScrollTo().performClick()
+        compose.onNodeWithText("上 1 条消息").performScrollTo().performClick()
         compose.onNodeWithTag("agent-reader-row:${commentary.key}").assertExists()
         compose.onNodeWithContentDescription("放大子代理阅读").performClick()
         compose.onNodeWithContentDescription("缩小子代理阅读").performClick()
@@ -248,7 +248,7 @@ class AgentReaderUiTest {
             completedTurns = setOf("done"), turns = mapOf("done" to NativeTurnInfo("done", status = "completed")))
         content { AgentReaderPanel(AgentReaderState(parent, child = child, timeline = timeline),
             listOf(current), emptyMap(), true, {}, {}, {}, {}, {}, {}) }
-        compose.onNodeWithText("查看过程 · 1 项").performScrollTo().performClick()
+        compose.onNodeWithText("上 1 条消息").performScrollTo().performClick()
         compose.onNodeWithTag("activity-toggle:${tool.key}").performScrollTo().performClick()
         compose.onNodeWithText(compose.activity.getString(R.string.full_details)).performScrollTo().performClick()
         compose.onNodeWithTag("agent-reader-detail:${tool.key}").performScrollTo().assertIsDisplayed()

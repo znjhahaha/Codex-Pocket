@@ -47,12 +47,20 @@ import com.kyant.backdrop.backdrops.layerBackdrop
 internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> Unit, onDetail: (TimelineItem) -> Unit, onReferences: () -> Unit, onReadingHistory: (Boolean) -> Unit = {}, onAgent: (String) -> Unit = {}, onComposerAction: (ComposerAction) -> Unit = {}, header: @Composable () -> Unit = {}) {
     val context = LocalContext.current
     val chat = s.selected ?: return
+    ObserveThreadHandoff(s, repo)
     key(chat.key.encoded) {
         var composerFocusRequest by remember { mutableIntStateOf(0) }
         val proposedPlan = remember(s.timeline, s.resolvedPlans) { PlanPresentation.latest(s.timeline)?.takeUnless { it.revision in s.resolvedPlans } }
+        val dockPlan = proposedPlan?.takeUnless { it.revision in s.dismissedPlans || s.messageEdit != null }
+        val planFeedback = dockPlan?.let { plan -> s.planFeedback?.takeIf { it.matches(chat.key, chat.runtimeId, plan) } }
+        val composerState = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
         val expansions = remember(s.draft?.expansions) { runCatching { pocketJson.parseToJsonElement(s.draft?.expansions ?: "[]").jsonArray.map { it.jsonPrimitive.content }.toSet() }.getOrDefault(emptySet()) }
-        val blockedTurns = remember(s.approvals, s.timeline.activeTurn) { s.approvals.filter { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId }.mapNotNull { it.params.string("turnId").takeIf(String::isNotBlank) ?: s.timeline.activeTurn }.toSet() }
-        val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns)
+        val blockedTurns = remember(s.approvals, s.timeline.activeTurn) { s.approvals.filter { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method) }.mapNotNull { it.params.string("turnId").takeIf(String::isNotBlank) ?: s.timeline.activeTurn }.toSet() }
+        val agentLiveStatuses = remember(s.agentStatuses, chat.key) {
+            s.agentStatuses.filterKeys { it.computerId == chat.key.computerId && it.configStoreId == chat.key.configStoreId }.mapKeys { it.key.nativeId }
+        }
+        val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns,
+            resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses)
         val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty())
         val live = s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
         val reasoning = remember(s.timeline) { ConversationPresentation.liveReasoning(s.timeline) }
@@ -68,6 +76,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         var anchorKey by rememberSaveable { mutableStateOf(s.draft?.scrollItemKey) }
         var anchorOffset by rememberSaveable { mutableIntStateOf(s.draft?.scrollOffset ?: 0) }
         val list = rememberLazyListState(TranscriptAnchor(anchorKey).resolve(keys, s.draft?.scrollIndex ?: 0), anchorOffset)
+        val minimapState = rememberConversationMinimapState(list, chat.key.encoded)
+        val minimapShown = rememberConversationMinimapVisibility(chat.key.encoded, rows, list)
         var following by rememberSaveable { mutableStateOf(s.draft?.followEnd ?: true) }
         var restoredAnchor by remember { mutableStateOf(false) }
         val reportReading by rememberUpdatedState(onReadingHistory)
@@ -130,8 +140,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 else if (items > 1 || pixels >= enterDistance) readingHistory = true
             }
         }
+        ObserveTranscriptDrag(list) { following = it }
         LaunchedEffect(list) {
-            snapshotFlow { list.isScrollInProgress to list.canScrollForward }.distinctUntilChanged().collect { (scrolling, canForward) -> if (scrolling) following = !canForward }
+            snapshotFlow { list.isScrollInProgress to list.canScrollForward }.distinctUntilChanged().collect { (scrolling, canForward) ->
+                if (!scrolling && !canForward && !minimapState.isInteracting) following = true
+            }
         }
         LaunchedEffect(list, restoredAnchor) {
             if (!restoredAnchor) return@LaunchedEffect
@@ -157,17 +170,13 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 restoredAnchor = true
             }
         }
-        LaunchedEffect(rows.lastOrNull(), following) { if (following && rows.isNotEmpty() && !list.isScrollInProgress) list.scrollToItem(keys.lastIndex) }
-        LaunchedEffect(list, following) {
-            snapshotFlow { list.layoutInfo.visibleItemsInfo.lastOrNull()?.let { Triple(it.key, it.offset, it.size) } }.distinctUntilChanged().collect {
-                if (following && !list.isScrollInProgress && list.layoutInfo.totalItemsCount > 1) list.scrollToItem(list.layoutInfo.totalItemsCount - 1)
-            }
-        }
+        FollowTranscriptEnd(list, following, minimapState.expanded || minimapState.isInteracting)
         Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))) {
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                val transcriptInset = maxOf(28.dp, (maxWidth - 720.dp) / 2)
+                val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
+                val transcriptInset = maxOf(16.dp, (maxWidth - gutter - 720.dp) / 2)
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
-                LazyColumn(state = list, modifier = Modifier.fillMaxSize().layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter).testTag("chat-transcript").layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item(key = "history-control") {
                         ConversationReadStatus(read.copy(failed = false, refreshing = false), null, onRetry = {})
                         if (rows.isNotEmpty() && s.online && s.supports("thread/turns/list") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -182,11 +191,14 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                             TranscriptKind.Answer -> 10.dp
                             else -> 2.dp
                         })) {
-                            TranscriptRowView(row, chat.key.encoded, row.key in expansions, { repo.toggleExpansion(row.key) }, onDetail,
+                            TranscriptRowView(row, chat.key.encoded, row.kind == TranscriptKind.User || row.key in expansions, { repo.toggleExpansion(row.key) }, onDetail,
                                 // No one-tap fork under answers: it silently moved the chat to a new desktop thread.
                                 // Branch/side chat stay in the "…" menu, where the choice is explicit.
                                 {}, false,
-                                onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline)
+                                onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline,
+                                onReopenPlan = proposedPlan?.takeIf { plan -> row.items.any { it.itemId == plan.itemId && it.turnId == plan.turnId } && PlanPresentation.unavailable(s, plan) == null }
+                                    ?.let { plan -> { repo.reopenPlan(plan); following = true } },
+                                onEdit = { repo.beginMessageEdit(it); following = true })
                         }
                     }
                     if (live != null) item(key = "live-status", contentType = "live-status") {
@@ -200,15 +212,18 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                         EmptyState(stringResource(R.string.what_working), stringResource(R.string.continue_chat))
                     }
                 }
-                if (rows.size > 2) ConversationMinimap(rows, keys, list,
-                    Modifier.align(Alignment.CenterStart).padding(top = topInset + 8.dp, bottom = bottomInset + 8.dp),
-                    backdrop = transcriptBackdrop, onSeek = { following = false })
+                if (minimapShown) ConversationMinimap(rows, keys, list,
+                    Modifier.align(Alignment.CenterStart).width(gutter).padding(top = topInset + 8.dp, bottom = bottomInset + 8.dp),
+                    backdrop = transcriptBackdrop, onSeek = { following = false }, state = minimapState,
+                    scope = chat.key.encoded, navigationEpoch = s.historyLoading to s.nextTurns?.toString(), onExpandProcess = repo::expandProcess)
             CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
+                CompositionLocalProvider(LocalPocketClearGlass provides true) {
                 header()
                 AgentRosterChip(agents, s.online, s.busy, onAgent,
                     Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp, vertical = 2.dp),
                     names = agentNames, onShow = repo::showAgentReader)
+                }
                 Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth().padding(horizontal = 16.dp)) {
                     ConversationReadStatus(read.copy(skeleton = false), s.conversationLoadError, onRetry = { repo.reloadConversation() })
                 }
@@ -220,7 +235,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 if (s.uncertainSend) UnknownCommandNotice(s, repo)
                 }
             }
-            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().onSizeChanged { composerHeight = it.height }) {
+            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().testTag("chat-bottom-dock").onSizeChanged { composerHeight = it.height }) {
             // One chrome row: "jump to latest" on the start edge, queue/attention on the end edge.
             // Separate floating layers overlapped each other above the composer.
             Row(Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp).widthIn(max = 720.dp).fillMaxWidth(),
@@ -242,10 +257,12 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             }
             QuestionDock(s, repo::respond, { repo.answerAsyncBatch(it) },
                 Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
-            if (proposedPlan != null && !readingHistory) PlanConfirmation(proposedPlan, PlanPresentation.unavailable(s, proposedPlan),
-                onImplement = { repo.implementPlan(proposedPlan) }, onModify = {
-                    if (repo.beginPlanFeedback(proposedPlan)) composerFocusRequest++
-                }, modifier = Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+            if (dockPlan != null) PlanConfirmation(dockPlan, PlanPresentation.unavailable(s, dockPlan),
+                onImplement = { repo.implementPlan(dockPlan) }, onModify = { repo.beginPlanFeedback(dockPlan) },
+                feedback = planFeedback?.text, onFeedbackChange = { repo.editPlanFeedback(dockPlan, it) },
+                onSubmitFeedback = { repo.submitPlanFeedback(dockPlan) }, onCancelFeedback = { repo.cancelPlanFeedback(dockPlan) },
+                onDismiss = { repo.dismissPlan(dockPlan) },
+                modifier = Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
             // Queued messages: inline rows directly above the input, never a separate screen.
             androidx.compose.animation.AnimatedVisibility(s.nativeQueue.isNotEmpty(), Modifier.align(Alignment.CenterHorizontally),
                 enter = fadeIn(tween(pocketMotionMillis(160))) + androidx.compose.animation.expandVertically(tween(pocketMotionMillis(200)), expandFrom = Alignment.Bottom),
@@ -253,7 +270,13 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 NativeQueue(s, { id, text -> repo.queueEdit(id, text) }, { repo.queueDelete(it) }, { id, before -> repo.queueMove(id, before) },
                     onSteer = { repo.queueSteer(it) }, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp).widthIn(max = 720.dp))
             }
-            PocketComposer(s.draft?.text.orEmpty(), s.modelSelectionLabel,
+            s.messageEdit?.takeIf { it.key == chat.key }?.let { edit ->
+                MessageEditDock(edit, s.online, s.timeline.activeTurn != null, repo::changeMessageEdit,
+                    { repo.submitMessageEdit() }, repo::cancelMessageEdit, { repo.checkMessageEdit() },
+                    { repo.prepareMessageEditAgain() }, { repo.stop() },
+                    Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+            }
+            if (dockPlan == null && s.messageEdit == null) composerState.SaveableStateProvider("normal-composer") { PocketComposer(s.draft?.text.orEmpty(), s.modelSelectionLabel,
                 listOfNotNull(s.effort?.let(context::effortLabel), s.mode?.takeUnless { it == "default" }?.let { context.modeLabel(it, it) }).filter(String::isNotBlank).joinToString(" · "),
                 s.timeline.activeTurn != null, composerAvailability(s), repo::editDraft, onModels,
                 { attachmentSheet = true }, onReferences,
@@ -276,7 +299,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     if (s.advanced.uploadProgress.values.any { it < 1f }) PocketProgressStatus("正在上传附件", Modifier.padding(vertical = 4.dp))
                 }, readingHistory = readingHistory, transcriptScrolling = list.isScrollInProgress, focusRequest = composerFocusRequest,
                 referenceSpans = remember(s.draft?.text, s.draft?.references) { restoreReferenceDraft(s.draft?.text.orEmpty(), s.draft?.references ?: "[]").spans },
-                onTextEdit = { before, after, edit -> repo.editDraft(before, after, edit, s.selected?.key) })
+                onTextEdit = { before, after, edit -> repo.editDraft(before, after, edit, s.selected?.key) }) }
             }
             }
             }

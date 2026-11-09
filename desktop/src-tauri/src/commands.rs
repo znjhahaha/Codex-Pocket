@@ -11,10 +11,10 @@ pub struct Context {
 impl Context {
     pub fn new(state:PathBuf,bin:PathBuf)->Self{Self{state,bin,operation:Arc::new(Mutex::new(())),startup_cache:Arc::new(Mutex::new(None))}}
 }
-fn fail(stage:&str,error:anyhow::Error)->OperationError{OperationError::from_error(stage,&error)}
-fn join_error(_:impl std::fmt::Display)->OperationError{OperationError::new("desktop","unavailable",true)}
+pub(crate) fn fail(stage:&str,error:anyhow::Error)->OperationError{OperationError::from_error(stage,&error)}
+pub(crate) fn join_error(_:impl std::fmt::Display)->OperationError{OperationError::new("desktop","unavailable",true)}
 
-fn preflight(c:&Context)->Result<(),OperationError>{
+pub(crate) fn preflight(c:&Context)->Result<(),OperationError>{
     let root=storage::local_app_data().map_err(|e|fail("installation",e))?.join("CodexPocket");
     let (bin,state)=launcher::resolve_release(&root).map_err(|e|fail("installation",e))?;
     if bin!=c.bin||state!=c.state{return Err(OperationError::new("installation","installation_changed",false))}
@@ -55,14 +55,16 @@ fn snapshot(c:&Context)->Value{
         match devices(c){Ok(v)=>paired=v,Err(e)=>issues.push(fail("devices",e))}
         match startup_enabled(c){Ok(v)=>startup_on=v,Err(e)=>issues.push(e)}
     }
+    let routes=if consistent {process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).unwrap_or(Value::Null)}else{Value::Null};
+    let connectivity=if consistent {pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map(|m|json!(m.status())).unwrap_or(Value::Null)}else{Value::Null};
     let phase=connection::phase(&desired,consistent,&supervisor,&status,storage::now());
-    let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"state":if r["online"]==true{"在线"}else{"离线"},"version":r["version"]})).collect();
+    let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"state":if r["online"]==true{"在线"}else{"离线"},"version":r["version"],"bridgeVersion":r["bridgeVersion"],"helperVersion":r["helperVersion"],"bridgeUpdatePending":r["bridgeUpdatePending"]})).collect();
     let relay=config["relayUrl"].as_str().or(config["relay_url"].as_str()).unwrap_or("");
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
     json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
-        "installation":{"consistent":consistent},"connection":{"phase":phase,"connected":phase=="connected","helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
-        "issues":issues,"discoveryErrors":status["discoveryErrors"]})
+        "installation":{"consistent":consistent},"connection":{"phase":phase,"connected":phase=="connected","available":status["available"],"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
+        "issues":issues,"discoveryErrors":status["discoveryErrors"],"routes":routes,"cloudflareReceipt":if consistent {storage::read::<Value>(&storage::control(&c.state).join("connectivity/fixed-tunnel.json")).unwrap_or(Value::Null)}else{Value::Null},"connectivity":connectivity,"helperVersion":status["helperVersion"],"sessionPreferences":if consistent&&desired.enabled {process::local_control(&c.state,"session/preferences/read",json!({})).unwrap_or(Value::Null)}else{Value::Null}})
 }
 pub fn tray_status(c:&Context)->String{
     let report=snapshot(c);
@@ -101,7 +103,7 @@ pub async fn pair_device(context:State<'_,Context>)->Result<Value,OperationError
         let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;
         preflight(&c)?;
         let status=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"status",&[]).map_err(|e|fail("helper_control",e))?;
-        if status["connected"]!=true{return Err(OperationError::new("helper_control","helper_unavailable",true))}
+        if status["connected"]!=true && status["routes"].as_array().is_none_or(|r|r.is_empty()){return Err(OperationError::new("helper_control","helper_unavailable",true))}
         let baseline=devices(&c).map_err(|e|fail("devices",e))?.iter().map(|v|v["id"].clone()).collect::<Vec<_>>();
         let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"pair",&[]).map_err(|e|fail("pairing",e))?;
         let payload=pairing::read_payload(&c.state,&result,storage::now()).map_err(|e|fail("pairing_payload",e))?;
@@ -223,4 +225,75 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(),before,"repeated enable must not extend the original startup deadline");
         }
     }
+}
+
+#[tauri::command]
+pub async fn configure_routes(context:State<'_,Context>,preferences:Value)->Result<Value,OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+  let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;
+  let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("routes",e))?;
+  let _route_guard=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("routes",e))?;
+  let file=dir.join(format!("route-request-{}-{}.json",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+  storage::atomic(&file,&preferences).map_err(|e|fail("routes",e))?;
+  let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/configure",&["--config",&file.to_string_lossy()]).map_err(|e|fail("routes",e));
+  let _=std::fs::remove_file(&file);result
+ }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn open_codex(context:State<'_,Context>)->Result<(),OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+  preflight(&c)?;let root=storage::local_app_data().map_err(|e|fail("installation",e))?.join("CodexPocket");
+  let mut command=Command::new(root.join("pocket-launcher.exe"));command.arg("--pocket-desktop");process::hidden(&mut command);command.spawn().map_err(|e|fail("runtime",e.into()))?;Ok(())
+ }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn configure_connectivity(context:State<'_,Context>,request:pocket_desktop_runtime::connectivity::ConnectivityRequest)->Result<Value,OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+  let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;
+  let manager=pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map_err(|e|fail("connectivity",e))?;
+  if request.enabled {ensure_gateway(&c,&request.gateway_url)?;}
+  manager.configure(request).map_err(|e|fail("connectivity",e))?;Ok(json!(manager.status()))
+ }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn cloudflare_accounts(token:String)->Result<Value,OperationError>{tauri::async_runtime::spawn_blocking(move||pocket_desktop_runtime::connectivity::cloudflare::cloudflare_accounts(&token).map(|v|json!(v)).map_err(|e|fail("cloudflare",e))).await.map_err(join_error)?}
+#[tauri::command]
+pub async fn cloudflare_zones(token:String,account_id:String)->Result<Value,OperationError>{tauri::async_runtime::spawn_blocking(move||pocket_desktop_runtime::connectivity::cloudflare::cloudflare_zones(&token,&account_id).map(|v|json!(v)).map_err(|e|fail("cloudflare",e))).await.map_err(join_error)?}
+#[tauri::command]
+pub async fn setup_fixed(context:State<'_,Context>,request:pocket_desktop_runtime::connectivity::cloudflare::FixedTunnelRequest)->Result<Value,OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;ensure_gateway(&c,&request.gateway_url)?;pocket_desktop_runtime::connectivity::cloudflare::setup_fixed(&storage::control(&c.state).join("connectivity"),request).map(|v|json!(v)).map_err(|e|fail("cloudflare",e))}).await.map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn detect_lan()->Result<Value,OperationError>{
+ tauri::async_runtime::spawn_blocking(move||{
+  let mut command=Command::new(storage::powershell());
+  command.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); @(Get-NetIPConfiguration | Where-Object {$_.NetAdapter.Status -eq 'Up'} | Sort-Object @{Expression={if($_.IPv4DefaultGateway){0}else{1}}} | ForEach-Object {$n=$_.InterfaceAlias; $_.IPv4Address | ForEach-Object {@{address=$_.IPAddress;name=$n}}}) | ConvertTo-Json -Compress"#]);
+  let bytes=process::run_bounded(command,12).map_err(|e|fail("network",e))?;
+  let parsed:Value=serde_json::from_slice(&bytes).map_err(|e|fail("network",e.into()))?;
+  let rows=parsed.as_array().cloned().unwrap_or_else(||vec![parsed]);
+  Ok(Value::Array(rows.into_iter().filter(|v|v["address"].as_str().and_then(|s|s.parse::<std::net::Ipv4Addr>().ok()).is_some_and(|ip|ip.is_private())).collect()))
+ }).await.map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn session_preferences_update(context:State<'_,Context>,mode:String,known_revision:u64,command_id:String)->Result<Value,OperationError>{
+ let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+  let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;
+  if !["desktop","cli"].contains(&mode.as_str())||command_id.is_empty()||command_id.len()>128{return Err(OperationError::new("session","invalid_params",false))}
+  process::local_control(&c.state,"session/preferences/update",json!({"mode":mode,"knownRevision":known_revision,"commandId":command_id})).map_err(|e|fail("session",e))
+ }).await.map_err(join_error)?
+}
+
+fn ensure_gateway(c:&Context,url:&str)->Result<(),OperationError>{
+ let gateway=pocket_desktop_runtime::connectivity::gateway(url).map_err(|e|fail("routes",e))?;
+ let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("routes",e))?;
+ let _guard=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("routes",e))?;
+ let report=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).map_err(|e|fail("routes",e))?;
+ let mut prefs=report["routePreferences"].clone();
+ let bind=format!("{}:{}",gateway.host_str().unwrap_or("127.0.0.1"),gateway.port().unwrap_or(17892));
+ if prefs["gateway"]["bind"]==bind{return Ok(())}
+ prefs["gateway"]=json!({"bind":bind});
+ let file=dir.join(format!("gateway-request-{}.json",std::process::id()));storage::atomic(&file,&prefs).map_err(|e|fail("routes",e))?;
+ let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/configure",&["--config",&file.to_string_lossy()]).map_err(|e|fail("routes",e));let _=std::fs::remove_file(file);result.map(|_|())
 }

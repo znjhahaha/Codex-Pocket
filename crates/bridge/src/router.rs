@@ -20,6 +20,7 @@ struct Pending {
     original_id: Value,
     method: String,
     requested_thread: Option<String>,
+    include_turns: bool,
     settings: Option<crate::settings::Observation>,
 }
 struct ServerPending {
@@ -50,6 +51,10 @@ pub struct Router {
     verified_history: HashMap<Client, VecDeque<String>>,
     verified_cwds: HashMap<Client, VecDeque<String>>,
     verified_profiles: HashMap<Client, std::collections::BTreeSet<String>>,
+    extension_keys: HashMap<Client, HashMap<String, String>>,
+    skill_paths: HashMap<Client, HashSet<String>>,
+    edit_turns: HashMap<Client, HashMap<String, HashSet<String>>>,
+    active: HashSet<String>,
     pub loaded: HashSet<String>,
     pub initialized: bool,
     pub native_version: Option<String>,
@@ -68,6 +73,10 @@ impl Default for Router {
             verified_history: HashMap::new(),
             verified_cwds: HashMap::new(),
             verified_profiles: HashMap::new(),
+            extension_keys: HashMap::new(),
+            skill_paths: HashMap::new(),
+            edit_turns: HashMap::new(),
+            active: HashSet::new(),
             loaded: HashSet::new(),
             initialized: false,
             native_version: None,
@@ -77,12 +86,31 @@ impl Default for Router {
 }
 
 impl Router {
+    fn management_busy(&self) -> bool {
+        !self.active.is_empty()
+            || !self.server.is_empty()
+            || self.pending.values().any(|p| {
+                matches!(
+                    p.method.as_str(),
+                    "turn/start" | "turn/steer" | "thread/compact/start" | "mcpServer/tool/call"
+                )
+            })
+    }
     pub fn from_client(&mut self, client: Client, mut value: Value) -> Vec<Route> {
         if let Some(method) = value
             .get("method")
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            if matches!(client, Client::Remote(_)) && method == "pocket/managementStatus" {
+                if value["params"].as_object().is_none_or(|p| !p.is_empty()) {
+                    return Self::reject(client, &value, "Management status takes no parameters");
+                }
+                return vec![Route::Client(
+                    client,
+                    json!({"id":value["id"],"result":{"protocol":1,"initialized":self.initialized,"busy":self.management_busy()}}),
+                )];
+            }
             if matches!(client, Client::Remote(_)) && method == "pocket/threadSettings" {
                 if !value["params"].as_object().is_some_and(|p| {
                     p.len() == 1
@@ -122,10 +150,71 @@ impl Router {
                 )];
             }
             if client != Client::Desktop {
+                let restricted = matches!(
+                    method.as_str(),
+                    "config/value/write" | "skills/config/write" | "config/mcpServer/reload"
+                );
+                if restricted {
+                    let p = &value["params"];
+                    let safe = if !self.capabilities.supports(&method, p) || self.management_busy()
+                    {
+                        false
+                    } else {
+                        match method.as_str() {
+                            "config/value/write" => {
+                                p.as_object().is_some_and(|o| {
+                                    o.len() == 4
+                                        && o.keys().all(|k| {
+                                            ["keyPath", "value", "mergeStrategy", "expectedVersion"]
+                                                .contains(&k.as_str())
+                                        })
+                                }) && p["value"].is_boolean()
+                                    && p["mergeStrategy"] == "replace"
+                                    && p["keyPath"].as_str().is_some_and(|key| {
+                                        self.extension_keys
+                                            .get(&client)
+                                            .and_then(|m| m.get(key))
+                                            .is_some_and(|v| p["expectedVersion"] == *v)
+                                    })
+                            }
+                            "skills/config/write" => {
+                                p.as_object().is_some_and(|o| {
+                                    o.len() == 2 && o.keys().all(|k| k == "path" || k == "enabled")
+                                }) && p["enabled"].is_boolean()
+                                    && p["path"].as_str().is_some_and(|path| {
+                                        self.skill_paths
+                                            .get(&client)
+                                            .is_some_and(|paths| paths.contains(path))
+                                    })
+                            }
+                            _ => p.is_null(),
+                        }
+                    };
+                    if !safe {
+                        return Self::reject(
+                            client,
+                            &value,
+                            "Management requires idle runtime and known native configuration",
+                        );
+                    }
+                    if method == "config/value/write" {
+                        if let Some(m) = self.extension_keys.get_mut(&client) {
+                            m.remove(p["keyPath"].as_str().unwrap());
+                        }
+                    }
+                    if method == "skills/config/write" {
+                        if let Some(m) = self.skill_paths.get_mut(&client) {
+                            m.remove(p["path"].as_str().unwrap());
+                        }
+                    }
+                }
                 let quota_read =
                     matches!(method.as_str(), "account/rateLimits/read" | "config/read");
                 if quota_read
                     && (!(value["params"].as_object().is_some_and(|p| p.is_empty())
+                        || (method == "config/read"
+                            && value["params"].as_object().is_some_and(|p| p.len() == 1)
+                            && value["params"]["includeLayers"] == true)
                         || (method == "config/read"
                             && value["params"].as_object().is_some_and(|p| p.len() == 2)
                             && value["params"]["includeLayers"] == false
@@ -173,8 +262,12 @@ impl Router {
                         | "thread/settings/update"
                         | "skills/list"
                         | "plugin/list"
+                        | "plugin/installed"
+                        | "app/installed"
+                        | "mcpServerStatus/list"
+                        | "thread/revert"
                 );
-                if !permitted && !quota_read {
+                if !permitted && !quota_read && !restricted {
                     return Self::reject(
                         client,
                         &value,
@@ -196,6 +289,42 @@ impl Router {
                         &value,
                         "Native schema does not support this operation",
                     );
+                }
+                if matches!(method.as_str(), "plugin/installed" | "mcpServerStatus/list")
+                    && (value["params"].as_object().is_none_or(|p| !p.is_empty())
+                        || !self.capabilities.supports(&method, &value["params"]))
+                {
+                    return Self::reject(
+                        client,
+                        &value,
+                        "Inventory accepts no arbitrary selectors",
+                    );
+                }
+                if method == "app/installed"
+                    && (value["params"].as_object().is_none_or(|p| p.len() != 1 || !p.contains_key("forceRefresh"))
+                        || value["params"]["forceRefresh"] != false
+                        || !self.capabilities.supports(&method, &value["params"]))
+                {
+                    return Self::reject(client, &value, "App inventory requires an evidenced cached read without selectors");
+                }
+                if method == "thread/revert" {
+                    let thread = value["params"]["threadId"].as_str().unwrap_or_default();
+                    let turn = value["params"]["beforeTurnId"].as_str().unwrap_or_default();
+                    let proof = self
+                        .edit_turns
+                        .get_mut(&client)
+                        .and_then(|m| m.get_mut(thread))
+                        .is_some_and(|turns| turns.remove(turn));
+                    if !proof
+                        || self.active.contains(thread)
+                        || self.server.values().any(|p| p.thread == thread)
+                    {
+                        return Self::reject(
+                            client,
+                            &value,
+                            "Revert requires an idle first-user-turn read on this connection",
+                        );
+                    }
                 }
                 if method == "thread/resume"
                     && !value["params"].as_object().is_some_and(|p| {
@@ -289,13 +418,12 @@ impl Router {
                         client,
                         original_id: id,
                         settings: self.settings.prepare(&method, &value["params"]),
-                        requested_thread: if method == "thread/read"
-                            && value["params"]["includeTurns"] == false
-                        {
+                        requested_thread: if method == "thread/read" {
                             value["params"]["threadId"].as_str().map(str::to_owned)
                         } else {
                             None
                         },
+                        include_turns: value["params"]["includeTurns"] == true,
                         method,
                     },
                 );
@@ -371,6 +499,25 @@ impl Router {
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            if method == "turn/started"
+                || (method == "thread/status/changed"
+                    && value["params"]["status"]["type"] == "active")
+            {
+                if let Some(thread) = value["params"]["threadId"].as_str() {
+                    self.active.insert(thread.into());
+                    for m in self.edit_turns.values_mut() {
+                        m.remove(thread);
+                    }
+                }
+            }
+            if method == "turn/completed"
+                || (method == "thread/status/changed"
+                    && value["params"]["status"]["type"] == "idle")
+            {
+                if let Some(thread) = value["params"]["threadId"].as_str() {
+                    self.active.remove(thread);
+                }
+            }
             if let Some(id) = value.get("id").cloned() {
                 let shareable = matches!(
                     method.as_str(),
@@ -496,12 +643,16 @@ impl Router {
                     && thread.len() <= 128
                     && value["result"]["thread"]["id"].as_str() == Some(thread)
                 {
-                    let history = self.verified_history.entry(p.client.clone()).or_default();
-                    history.retain(|id| id != thread);
-                    if history.len() == 64 {
-                        history.pop_front();
+                    // Loading transcript contents must not grant a separate acquire/resume
+                    // capability. Handoff performs its own metadata-only identity proof.
+                    if !p.include_turns {
+                        let history = self.verified_history.entry(p.client.clone()).or_default();
+                        history.retain(|id| id != thread);
+                        if history.len() == 64 {
+                            history.pop_front();
+                        }
+                        history.push_back(thread.to_owned());
                     }
-                    history.push_back(thread.to_owned());
                     if let Some(cwd) = value["result"]["thread"]["cwd"]
                         .as_str()
                         .filter(|cwd| crate::settings::valid_thread(cwd))
@@ -515,10 +666,65 @@ impl Router {
                     }
                 }
                 if p.method == "config/read" && matches!(p.client, Client::Remote(_)) {
+                    self.extension_keys
+                        .insert(p.client.clone(), known_extension_keys(&value["result"]));
                     self.verified_profiles.insert(
                         p.client.clone(),
                         crate::permission_policy::configured_profiles(&value["result"]),
                     );
+                }
+                if p.method == "skills/list" && matches!(p.client, Client::Remote(_)) {
+                    self.skill_paths.insert(
+                        p.client.clone(),
+                        value["result"]["data"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|d| d["skills"].as_array().into_iter().flatten())
+                            .filter_map(|s| {
+                                s["path"]
+                                    .as_str()
+                                    .filter(|s| crate::settings::valid_thread(s))
+                                    .map(str::to_owned)
+                            })
+                            .take(4096)
+                            .collect(),
+                    );
+                }
+                if p.method == "thread/read" && matches!(p.client, Client::Remote(_)) {
+                    if let Some(thread) = p
+                        .requested_thread
+                        .as_deref()
+                        .filter(|t| value["result"]["thread"]["id"] == *t)
+                    {
+                        let native = &value["result"]["thread"];
+                        if native["status"]["type"] == "active" {
+                            self.active.insert(thread.into());
+                        } else if native["status"]["type"] == "idle" {
+                            self.active.remove(thread);
+                        }
+                        if p.include_turns {
+                            let turns = native["turns"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|t| {
+                                    native["status"]["type"] == "idle"
+                                        && t["status"] != "inProgress"
+                                        && t.get("itemsView").is_none_or(|v| v == "full")
+                                        && t["items"]
+                                            .as_array()
+                                            .and_then(|i| i.first())
+                                            .is_some_and(|i| i["type"] == "userMessage")
+                                })
+                                .filter_map(|t| t["id"].as_str().map(str::to_owned))
+                                .collect();
+                            self.edit_turns
+                                .entry(p.client.clone())
+                                .or_default()
+                                .insert(thread.into(), turns);
+                        }
+                    }
                 }
                 if p.method == "initialize" {
                     self.initialized = true;
@@ -594,6 +800,9 @@ impl Router {
         self.verified_history.remove(client);
         self.verified_cwds.remove(client);
         self.verified_profiles.remove(client);
+        self.extension_keys.remove(client);
+        self.skill_paths.remove(client);
+        self.edit_turns.remove(client);
         for completed in &mut self.completed {
             if completed
                 .winner
@@ -605,11 +814,44 @@ impl Router {
         }
     }
 }
+fn known_extension_keys(read: &Value) -> HashMap<String, String> {
+    let mut known = HashMap::new();
+    for layer in read["layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["name"]["type"] == "user" && l["disabledReason"].is_null())
+    {
+        let Some(version) = layer["version"]
+            .as_str()
+            .filter(|v| crate::settings::valid_thread(v))
+        else {
+            continue;
+        };
+        for table in ["mcp_servers", "plugins"] {
+            for (key, entry) in layer["config"][table].as_object().into_iter().flatten() {
+                if key.len() <= 128
+                    && !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    && entry.is_object()
+                    && (entry["enabled"].is_boolean()
+                        || (table == "mcp_servers" && entry.get("enabled").is_none()))
+                {
+                    known.insert(format!("{table}.{key}.enabled"), version.into());
+                }
+            }
+        }
+    }
+    known
+}
 fn safe_advanced(method: &str, params: &Value) -> bool {
     if method == "thread/settings/update" && crate::permission_policy::valid_update(params) {
         return true;
     }
     let allowed: &[&str] = match method {
+        "thread/revert" => &["threadId", "beforeTurnId"],
         "thread/queue/add" => &["threadId", "clientUserMessageId", "input"],
         "thread/queue/update" => &["threadId", "queuedSubmissionId", "input"],
         "thread/queue/delete" | "thread/queue/start" => &["threadId", "queuedSubmissionId"],
@@ -635,6 +877,160 @@ fn safe_advanced(method: &str, params: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v054_app_inventory_requires_exact_cached_read_and_native_evidence() {
+        let mut router = Router::default();
+        let helper = Client::Remote("helper".into());
+        let request = json!({"id":1,"method":"app/installed","params":{"forceRefresh":false}});
+        assert!(!router.from_client(helper.clone(), request.clone()).iter().any(|r| matches!(r, Route::Runtime(_))));
+        router.capabilities.0.insert("app/installed".into(), ["forceRefresh", "threadId"].into_iter().map(str::to_owned).collect());
+        assert!(router.from_client(helper.clone(), request).iter().any(|r| matches!(r, Route::Runtime(v) if v["params"] == json!({"forceRefresh":false}))));
+        for params in [Value::Null, json!({}), json!({"forceRefresh":true}), json!({"forceRefresh":null}), json!({"forceRefresh":"false"}), json!({"forceRefresh":false,"threadId":"unverified"}), json!({"forceRefresh":false,"threadId":null}), json!({"forceRefresh":false,"path":"C:/private"})] {
+            assert!(!router.from_client(helper.clone(), json!({"id":2,"method":"app/installed","params":params})).iter().any(|r| matches!(r, Route::Runtime(_))));
+        }
+        assert!(!router.from_client(helper, json!({"id":3,"method":"app/installed"})).iter().any(|r| matches!(r, Route::Runtime(_))));
+    }
+    #[test]
+    fn v054_reload_refuses_pending_generation_before_started_event() {
+        let mut r = Router::default();
+        r.loaded.insert("t".into());
+        r.capabilities
+            .0
+            .insert("config/mcpServer/reload".into(), Default::default());
+        assert!(
+            r.from_client(
+                Client::Desktop,
+                json!({"id":1,"method":"turn/start","params":{"threadId":"t","input":[]}})
+            )
+            .iter()
+            .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(
+                Client::Remote("helper".into()),
+                json!({"id":2,"method":"config/mcpServer/reload","params":null})
+            )
+            .iter()
+            .any(|v| matches!(v, Route::Runtime(_)))
+        );
+    }
+    #[test]
+    fn v054_boolean_config_requires_known_version_and_idle_runtime() {
+        let mut r = Router::default();
+        let helper = Client::Remote("helper".into());
+        for (method, fields) in [
+            ("config/read", vec!["includeLayers"]),
+            (
+                "config/value/write",
+                vec!["keyPath", "value", "mergeStrategy", "expectedVersion"],
+            ),
+            ("config/mcpServer/reload", vec![]),
+        ] {
+            r.capabilities.0.insert(
+                method.into(),
+                fields.into_iter().map(str::to_owned).collect(),
+            );
+        }
+        let write = json!({"id":2,"method":"config/value/write","params":{"keyPath":"mcp_servers.known.enabled","value":false,"mergeStrategy":"replace","expectedVersion":"v1"}});
+        assert!(
+            !r.from_client(helper.clone(), write.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        let routes = r.from_client(
+            helper.clone(),
+            json!({"id":1,"method":"config/read","params":{"includeLayers":true}}),
+        );
+        let Route::Runtime(sent) = &routes[0] else {
+            panic!("read")
+        };
+        r.from_runtime(json!({"id":sent["id"],"result":{"layers":[{"name":{"type":"user","file":"C:/private"},"version":"v1","config":{"mcp_servers":{"known":{"enabled":true,"env":{"TOKEN":"secret"}}}}}]}}));
+        for (key, value) in [
+            ("keyPath", json!("model_provider")),
+            ("keyPath", json!("mcp_servers.new.enabled")),
+            ("expectedVersion", json!("old")),
+            ("value", json!({"url":"private"})),
+            ("filePath", json!("C:/private")),
+        ] {
+            let mut bad = write.clone();
+            bad["params"][key] = value;
+            assert!(
+                !r.from_client(helper.clone(), bad)
+                    .iter()
+                    .any(|v| matches!(v, Route::Runtime(_)))
+            );
+        }
+        r.from_runtime(
+            json!({"method":"turn/started","params":{"threadId":"t","turn":{"id":"u"}}}),
+        );
+        assert!(
+            !r.from_client(helper.clone(), write.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(
+                helper.clone(),
+                json!({"id":3,"method":"config/mcpServer/reload","params":null})
+            )
+            .iter()
+            .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        r.from_runtime(json!({"method":"turn/completed","params":{"threadId":"t"}}));
+        assert!(
+            r.from_client(helper.clone(), write.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(helper, write)
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+    }
+    #[test]
+    fn v054_revert_requires_this_clients_first_user_turn_proof() {
+        let mut r = Router::default();
+        let helper = Client::Remote("helper".into());
+        r.loaded.insert("t".into());
+        r.capabilities.0.insert(
+            "thread/revert".into(),
+            ["threadId", "beforeTurnId"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        let revert =
+            json!({"id":2,"method":"thread/revert","params":{"threadId":"t","beforeTurnId":"u"}});
+        assert!(
+            !r.from_client(helper.clone(), revert.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        let routes = r.from_client(
+            helper.clone(),
+            json!({"id":1,"method":"thread/read","params":{"threadId":"t","includeTurns":true}}),
+        );
+        let Route::Runtime(sent) = &routes[0] else {
+            panic!("read")
+        };
+        r.from_runtime(json!({"id":sent["id"],"result":{"thread":{"id":"t","status":{"type":"idle"},"turns":[{"id":"u","status":"completed","items":[{"type":"userMessage","id":"i"}]}]}}}));
+        assert!(
+            !r.from_client(Client::Remote("other".into()), revert.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        assert!(
+            r.from_client(helper.clone(), revert.clone())
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+        assert!(
+            !r.from_client(helper, revert)
+                .iter()
+                .any(|v| matches!(v, Route::Runtime(_)))
+        );
+    }
     #[test]
     fn v052_presets_and_profiles_require_exact_schema_and_config_evidence() {
         let mut r = Router::default();
@@ -903,6 +1299,18 @@ mod tests {
                 json!({"accountId":"other"}),
                 json!({"apiKey":"secret"}),
             ] {
+                if method == "config/read" && params == json!({"includeLayers":true}) {
+                    assert!(
+                        router
+                            .from_client(
+                                helper.clone(),
+                                json!({"id":"management-read","method":method,"params":params})
+                            )
+                            .iter()
+                            .any(|r| matches!(r, Route::Runtime(_)))
+                    );
+                    continue;
+                }
                 let routes = router.from_client(
                     helper.clone(),
                     json!({"id":"bad","method":method,"params":params}),

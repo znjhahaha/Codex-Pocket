@@ -123,7 +123,7 @@ private fun ColumnScope.HomeProjectSessions(
         approvals + if (s.pendingQuestions.isNotEmpty()) questions else s.advanced.asyncQuestions.filter { !it.flag("submitted") }.distinctBy { it.string("id") }.size
     }
     val runtimes = remember(s.runtimes) { s.runtimes.associateBy { it.id } }
-    val canCreate = s.online && s.runtimes.any { (runtimeFilter == null || it.id == runtimeFilter) && s.supports("thread/start", it) }
+    val canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { (runtimeFilter == null || it.id == runtimeFilter) && s.supports("thread/start", it) })
     val listState = rememberLazyListState()
     val density = LocalDensity.current
     val enterScrollThreshold = with(density) { 48.dp.roundToPx() }
@@ -172,13 +172,13 @@ private fun ColumnScope.HomeProjectSessions(
         Modifier.weight(1f).fillMaxWidth().testTag("chats-home"), state = listState,
         contentPadding = PaddingValues(top = 2.dp, bottom = LocalHomeContentPadding.current.calculateBottomPadding() + 24.dp),
     ) {
-        if (!s.online || s.busy || s.error != null) item(key = "home-state", contentType = "state") {
+        if (!s.online || s.directoryLoading || s.error != null) item(key = "home-state", contentType = "state") {
             HomeSyncState(s, onRetry = { onRefresh(search, archived, false) })
         }
         if (attentionCount > 0 && !archived && search.isBlank()) item(key = "home-attention", contentType = "attention") {
             HomeAttentionEntry(attentionCount, onAttention)
         }
-        if (chats.isEmpty() && !s.busy) item(key = "home-empty", contentType = "empty") {
+        if (chats.isEmpty() && !s.directoryLoading) item(key = "home-empty", contentType = "empty") {
             HomeEmptyState(search, project?.cwd, archived, s.online, canCreate,
                 onClearFilters = { search = ""; onClearProject() }, onShowRecent = { archived = false }, onNew = onNew)
         }
@@ -198,7 +198,7 @@ private fun ColumnScope.HomeProjectSessions(
         }
         if (s.nextThreads != null && s.online) item(key = "home-load-more", contentType = "footer") {
             Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), contentAlignment = Alignment.Center) {
-                PocketButton(stringResource(R.string.load_more), { onRefresh(search, archived, true) }, secondary = true, enabled = !s.busy)
+                PocketButton(stringResource(R.string.load_more), { onRefresh(search, archived, true) }, secondary = true, enabled = !s.directoryLoading)
             }
         }
     }
@@ -208,12 +208,12 @@ private fun ColumnScope.HomeProjectSessions(
 private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (s.busy) PocketLoader()
+        if (s.directoryLoading) PocketLoader()
         else Icon(if (s.error != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
             tint = if (s.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
         Text(when { s.error != null -> stringResource(R.string.v03_home_sync_error); !s.online -> stringResource(R.string.v03_home_cached); else -> stringResource(R.string.v03_home_loading) },
             Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (s.online && s.error != null) PocketTextButton(onRetry, enabled = !s.busy) { Text(stringResource(R.string.v03_home_retry)) }
+        if (s.online && s.error != null) PocketTextButton(onRetry, enabled = !s.directoryLoading) { Text(stringResource(R.string.v03_home_retry)) }
     }
 }
 @Composable

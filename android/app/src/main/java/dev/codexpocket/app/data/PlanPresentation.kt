@@ -8,6 +8,8 @@ data class ProposedPlan(val turnId: String, val itemId: String, val content: Str
         .digest("$turnId\u0000$itemId\u0000$content".toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it) }
     val prompt: String get() = "PLEASE IMPLEMENT THIS PLAN:\n$content"
+    val markdownText: String get() = content
+    val markdownFilename: String get() = "plan-${revision.take(12)}.md"
 }
 
 object PlanPresentation {
@@ -32,6 +34,7 @@ object PlanPresentation {
 
     fun unavailable(s: PocketState, plan: ProposedPlan): String? = when {
         s.selected == null || s.selected.isSubagent -> "此方案仅供阅读"
+        s.selected.archived -> "已归档会话仅供阅读"
         latest(s.timeline)?.revision != plan.revision || plan.revision in s.resolvedPlans -> "此方案已处理或已更新"
         !s.online || s.activeRuntime?.online != true -> "连接电脑后可实施计划"
         s.conversationLoadState != ConversationLoadState.Ready -> "正在核对最新计划"

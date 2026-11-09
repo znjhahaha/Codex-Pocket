@@ -20,6 +20,10 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.PlainTooltip
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -35,6 +39,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
@@ -188,18 +195,18 @@ internal fun ModelSheet(s: PocketState, onSelect: (NativeModel, String?) -> Unit
     val scroll = rememberScrollState()
     var browseModels by rememberSaveable(s.selected?.key?.encoded) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().verticalScroll(scroll).testTag("model-sheet")) {
-        if (model != null && !browseModels) EffortCard(s, model, onEffort) { browseModels = true }
+        if (model != null && !browseModels) EffortCard(s, model, onEffort, onFast) { browseModels = true }
         else {
             if (model != null) PocketMenuItem("返回强度", PocketIcons.ChevronLeft, { browseModels = false })
-            ModelsPage(s, onSelect, onRetry, model)
+            ModelsPage(s, onSelect, onRetry, model, onFast)
         }
-        ModeToggles(s, onMode, onFast)
+        ModeToggles(s, onMode)
     }
 }
 
 /** Null is Default. An unsupported explicit effort has no selected pill. */
 @Composable
-private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeModel, String?) -> Unit)?, onModels: () -> Unit) {
+private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeModel, String?) -> Unit)?, onFast: ((Boolean) -> Unit)?, onModels: () -> Unit) {
     val context = LocalContext.current
     val c = MaterialTheme.colorScheme
     val explicitEffort = s.effort
@@ -212,7 +219,8 @@ private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeMod
         else -> "请选择强度"
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(PocketCapsule).clickable(onClick = onModels)
+        Box(Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = if (onFast != null) 40.dp else 0.dp).heightIn(min = 48.dp).clip(PocketCapsule).clickable(onClick = onModels)
             .testTag("model-picker-open").padding(vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text(if(model.efforts.isEmpty()) "模型" else shown, Modifier.testTag("effort-title"), style = MaterialTheme.typography.labelLarge, color = effortAccent())
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -221,6 +229,8 @@ private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeMod
                 Icon(PocketIcons.ChevronRight, null, Modifier.size(14.dp), tint = c.onSurfaceVariant)
             }
         }
+        if (onFast != null) Box(Modifier.align(Alignment.TopEnd)) { FastLightning(s, onFast) }
+        }
         EffortTrack(choices, effective, selectionKnown, onEffort != null && effortEnabled(s), shown) { value ->
             onEffort?.invoke(model, value)
         }
@@ -228,22 +238,53 @@ private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeMod
 }
 
 @Composable
-private fun ModeToggles(s: PocketState, onMode: (String?) -> Unit, onFast: ((Boolean) -> Unit)?) {
+private fun ModeToggles(s: PocketState, onMode: (String?) -> Unit) {
     val c = MaterialTheme.colorScheme
     val plan = s.modes.firstOrNull { it.mode == "plan" }.takeIf { s.supports("collaborationMode/list") }
-    val hasFast = onFast != null && s.supports("thread/settings/update")
-    if (plan == null && !hasFast) return
+    if (plan == null) return
     HorizontalDivider(Modifier.padding(horizontal = 10.dp, vertical = 2.dp), color = c.outlineVariant.copy(alpha = .5f))
     if (plan != null) {
         val enabled = nativeComposerControlsEnabled(s, "collaborationMode/list")
         ModeRow("Plan 模式", PocketIcons.Checklist, s.mode == "plan", enabled, Modifier.testTag("composer-plan")) { onMode(if (s.mode == "plan") null else "plan") }
     }
-    if (hasFast) {
-        val enabled = nativeComposerControlsEnabled(s, "thread/settings/update")
-        ModeRow("Fast", PocketIcons.PlayCircle, s.advanced.fastMode, enabled, Modifier.testTag("composer-fast")) { onFast?.invoke(!s.advanced.fastMode) }
+}
+
+internal fun fastUnavailableReason(s: PocketState): String? = when {
+    s.selected?.key in s.fastPending -> "正在切换 Fast"
+    s.selected == null || s.selected.isSubagent || s.selected.archived -> "此会话仅供阅读"
+    !s.paired || !s.online || s.activeRuntime?.online != true -> "连接电脑后可切换 Fast"
+    !s.supports("thread/settings/update") -> "当前运行时不支持 Fast"
+    !s.accessAllowsSending() -> "请先确认会话归属"
+    s.fastCapabilityFailure() != null -> s.fastCapabilityFailure()!!.label
+    s.selected.conflict -> "请先确认会话归属"
+    s.uncertainSend -> "请先核对上一次提交结果"
+    s.timeline.activeTurn != null -> "任务完成后可切换 Fast"
+    s.busy || s.sendBusy -> "当前操作完成后可切换 Fast"
+    else -> null
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+internal fun FastLightning(s: PocketState, onFast: (Boolean) -> Unit) {
+    val reason = fastUnavailableReason(s)
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) .94f else 1f, pocketPressSpring(), label = "fast-press")
+    val c = MaterialTheme.colorScheme
+    val on = s.advanced.fastMode
+    TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+        tooltip = { PlainTooltip { Text(reason ?: if (on) "关闭 Fast" else "开启 Fast") } }, state = rememberTooltipState()) {
+        Box(Modifier.size(48.dp).testTag("composer-fast")
+            .graphicsLayer { scaleX = scale; scaleY = scale; alpha = if (reason == null) 1f else .45f }
+            .semantics { stateDescription = reason ?: if (on) "已开启" else "已关闭"; toggleableState = if (on) ToggleableState.On else ToggleableState.Off }
+            .clickable(interactionSource = interaction, indication = null, enabled = reason == null, role = Role.Switch) { onFast(!on) },
+            contentAlignment = Alignment.Center) {
+            androidx.compose.animation.Crossfade(on, animationSpec = androidx.compose.animation.core.tween(pocketMotionMillis(120)), label = "fast-glyph") { selected ->
+                Icon(if (selected) PocketIcons.LightningFilled else PocketIcons.Lightning, "Fast", Modifier.size(21.dp),
+                    tint = if (selected) effortAccent() else c.onSurfaceVariant)
+            }
+        }
     }
-    if (s.timeline.activeTurn != null) Text("本轮结束后可切换", Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-        style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
 /** A 40dp toggle line: smaller than a menu item, still a full-width touch target. */
@@ -267,12 +308,13 @@ private fun effortEnabled(s: PocketState) = s.paired && s.online && s.activeRunt
     s.selected?.conflict == false && s.selected?.archived == false
 
 @Composable
-private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit, onRetry: () -> Unit, selected: NativeModel?) {
+private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit, onRetry: () -> Unit, selected: NativeModel?, onFast: ((Boolean) -> Unit)?) {
     val c = MaterialTheme.colorScheme
     // A single model-first page: no second confirmation or effort-first drill-down.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
         .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("选择模型", style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant)
+        Text("选择模型", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant)
+        if (onFast != null) FastLightning(s, onFast)
     }
     val ready = s.online && s.modelCatalogState == ModelCatalogState.Ready && s.models.isNotEmpty()
     var query by rememberSaveable(s.selected?.key?.encoded) { mutableStateOf("") }

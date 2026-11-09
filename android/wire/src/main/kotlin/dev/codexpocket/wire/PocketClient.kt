@@ -14,6 +14,9 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     override val state: StateFlow<LinkState> = mutableState.asStateFlow()
     @Volatile override var failureCode: String? = null
         private set
+    /** Fixed local source for diagnostics; error mapping still uses "backpressure". */
+    @Volatile var backpressureSource: String? = null
+        private set
     private val notices = Channel<JsonObject>(64)
     /** One ordered consumer; overflow disconnects and closes the flow with an error. */
     override val notifications: Flow<JsonObject> = notices.receiveAsFlow()
@@ -33,6 +36,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
         val result = CompletableDeferred<JsonElement>()
         var sent = false
     }
+    private class BackpressureFailure(val source: String) : Exception("Local queue stalled")
     private sealed interface Event {
         data class Start(val config: ConnectionConfig) : Event
         data object Open : Event
@@ -50,7 +54,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                     is Event.Start -> {
                         tls = TlsPump(pinnedEngine(event.config.certificateSha256), { bytes ->
                             val transport = synchronized(gate) { socket }
-                            if (transport?.send(bytes) != true) throw WireException("backpressure", "Transport send failed")
+                            if (transport?.send(bytes) != true) throw BackpressureFailure("transport_send")
                         }, { bytes -> frames.feed(bytes).forEach(::receiveMessage) }, {
                             synchronized(gate) {
                                 if (!terminated && !closing) { mutableState.value = LinkState.ONLINE; ready.complete(Unit) }
@@ -66,7 +70,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                                 // an ordinary burst of history fragments as a lost connection.
                                 if (!events.trySend(Event.Bytes(bytes)).isSuccess) {
                                     try { runBlocking { withTimeout(5_000) { events.send(Event.Bytes(bytes)) } } }
-                                    catch (_: Exception) { terminate("backpressure") }
+                                    catch (_: Exception) { terminate("backpressure", source = "transport_input") }
                                 }
                             }
                             override fun onFailure() { terminate("disconnected") }
@@ -85,7 +89,8 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                     Event.Close -> { tls?.close(); terminate("closed", graceful = true) }
                 }
             } catch (failure: Exception) {
-                terminate((failure as? WireException)?.code?.takeIf { it in setOf("backpressure", "invalid_frame", "invalid_reply", "invalid_notification", "invalid_transport", "disconnected") } ?: "transport_failed")
+                if (failure is BackpressureFailure) terminate("backpressure", source = failure.source)
+                else terminate((failure as? WireException)?.code?.takeIf { it in setOf("backpressure", "invalid_frame", "invalid_reply", "invalid_notification", "invalid_transport", "disconnected") } ?: "transport_failed")
             }
         }
     }
@@ -121,7 +126,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             pending[item.id] = item; queuedBytes += bytes.size
             if (!events.trySend(Event.Send(item, bytes)).isSuccess) {
                 pending.remove(item.id); queuedBytes -= bytes.size
-                terminate("backpressure")
+                terminate("backpressure", source = "transport_requests")
                 throw WireException("backpressure", "Transport capacity exceeded")
             }
         }
@@ -177,18 +182,26 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             val method = message["method"] as? JsonPrimitive
             if (method == null || !method.isString || message["params"] !is JsonObject)
                 throw WireException("invalid_notification", "Invalid notification")
-            if (!notices.trySend(message).isSuccess) throw WireException("backpressure", "Notification capacity exceeded")
+            if (!notices.trySend(message).isSuccess) {
+                // The TLS owner holds no gate here. A short repository/Room lock stall must
+                // propagate pressure to the reader, without dropping a cursor or growing queues.
+                // A sync reply behind this burst also waits; the deadline breaks that cycle
+                // by failing closed, rather than waiting indefinitely for the reply's consumer.
+                try { runBlocking { withTimeout(5_000) { notices.send(message) } } }
+                catch (_: TimeoutCancellationException) { throw BackpressureFailure("wire_notifications") }
+            }
         }
     }
 
     private fun offer(event: Event) {
-        if (!events.trySend(event).isSuccess) terminate("backpressure")
+        if (!events.trySend(event).isSuccess) terminate("backpressure", source = "transport_events")
     }
 
-    private fun terminate(code: String, graceful: Boolean = false) {
+    private fun terminate(code: String, graceful: Boolean = false, source: String? = null) {
         val transport = synchronized(gate) {
             if (terminated) return
             failureCode = code
+            backpressureSource = source
             terminated = true; mutableState.value = LinkState.OFFLINE
             ready.completeExceptionally(WireException(code, "Tunnel unavailable"))
             pending.values.toList().forEach { it.result.completeExceptionally(failed(it, code)) }
@@ -211,11 +224,13 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private companion object {
         /** An actively streaming reply may take this many quiet windows in total. */
         const val QUIET_TIMEOUT_CAP = 6L
-        val MUTATIONS = setOf("approvals/respond", "attachment/upload", "devices/revoke", "push/register", "push/unregister")
+        val MUTATIONS = setOf("approvals/respond", "attachment/upload", "devices/revoke", "push/register", "push/unregister", "extensions/update", "thread/edit/revert",
+            "session/preferences/update", "runtime/ensure", "thread/access/update", "thread/access/cancel", "thread/permissions/update")
         val NATIVE_READS = setOf("thread/read", "thread/list", "thread/loaded/list", "thread/turns/list", "thread/queue/list", "thread/items/list", "thread/goal/get", "model/list", "collaborationMode/list", "skills/list", "plugin/list")
         val DEFINITE_REJECTIONS = setOf("rejected", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
-            "revoked", "expired", "conflict", "busy", "offline", "protocol_mismatch", "already_paired", "device_revoked", "authentication_failed", "unsupported_method", "method_not_found", "-32601")
-        val SAFE_ERROR_CODES = setOf("payload_too_large", "unknown", "rejected", "not_found", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
+            "revoked", "expired", "conflict", "busy", "offline", "protocol_mismatch", "already_paired", "device_revoked", "authentication_failed", "unsupported_method", "method_not_found", "-32601",
+            "runtime_offline", "runtime_unavailable", "thread_owned_elsewhere", "version_conflict", "operation_in_progress")
+        val SAFE_ERROR_CODES = DEFINITE_REJECTIONS + setOf("request_timeout", "payload_too_large", "unknown", "rejected", "not_found", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
             "revoked", "expired", "conflict", "busy", "offline", "internal_error", "protocol_mismatch", "already_paired", "device_revoked", "authentication_failed", "unsupported_method", "method_not_found", "-32601")
     }
 }

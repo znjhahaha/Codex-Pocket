@@ -36,7 +36,7 @@ pub fn launch()->Result<i32>{
     if ["--pocket-ui","--pocket-supervise"].contains(&mode){
         let name=if mode=="--pocket-ui"{"pocket-desktop.exe"}else{"pocket-supervisor.exe"};
         verified_exe(&bin,"pocket-agent.exe")?;
-        let mut command=Command::new(verified_exe(&bin,name)?);command.arg("--state").arg(state);process::hidden(&mut command);
+        let mut command=Command::new(verified_exe(&bin,name)?);command.arg("--state").arg(&state);process::hidden(&mut command);
         if mode=="--pocket-ui"{command.spawn()?;return Ok(0)}
         #[cfg(windows)]let job=process::ChildJob::new()?;
         let mut child=command.spawn()?;

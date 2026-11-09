@@ -1,6 +1,5 @@
 package dev.codexpocket.app.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -17,27 +16,28 @@ import dev.codexpocket.app.data.*
 /** Native proposals and execution checklists are separate presentations. */
 @Composable
 internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded: Boolean, onExpand: () -> Unit,
-    onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null) {
+    onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null, onReopenPlan: (() -> Unit)? = null) {
+    if (item.type == "plan") {
+        PlanProposalCard(ProposedPlan(item.turnId, item.itemId, item.text), messageKey, onReopenPlan)
+        return
+    }
     val plan = remember(item.raw, item.type) { nativePlan(item) }
-    val proposal = item.type == "plan"
-    var proposalOpen by androidx.compose.runtime.saveable.rememberSaveable(messageKey) { mutableStateOf(true) }
-    val open = if (proposal) proposalOpen else expanded
+    val open = expanded
     val c = MaterialTheme.colorScheme
-    Column(Modifier.fillMaxWidth().testTag(if (proposal) "proposed-plan" else "execution-plan")) {
+    Column(Modifier.fillMaxWidth().testTag("execution-plan")) {
         Row(Modifier.fillMaxWidth().heightIn(min = 32.dp)
             .semantics { stateDescription = if (open) "已展开" else "已收起" }
-            .clickable { if (proposal) proposalOpen = !proposalOpen else onExpand() }
+            .then(planPress(onExpand))
             .padding(horizontal = 4.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Icon(PocketIcons.Checklist, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
-            Text(if (proposal) "计划" else plan?.activeStep?.text ?: "执行计划", Modifier.weight(1f, fill = false),
+            Text(plan?.activeStep?.text ?: "执行计划", Modifier.weight(1f, fill = false),
                 fontSize = 14.sp, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             plan?.let { Text("${it.completed}/${it.steps.size}", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
             ActivityExpansionIcon(open)
         }
         if (open) {
-            if (proposal) Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp)) { MarkdownText(item.text, messageKey) }
-            else if (plan != null) Column(Modifier.padding(start = 26.dp, bottom = 8.dp)) {
+            if (plan != null) Column(Modifier.padding(start = 26.dp, bottom = 8.dp)) {
                 if (plan.explanation.isNotBlank()) MarkdownText(plan.explanation, "$messageKey/explanation")
                 plan.steps.forEach { step ->
                     val status = NativeActivityPresentation.status(step.status)

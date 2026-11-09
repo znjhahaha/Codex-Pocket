@@ -2,15 +2,19 @@
 <# Dry-run by default. Does not start or stop the desktop, tray, helper or CLI. #>
 [CmdletBinding()]
 param(
+    [switch]$CheckWebViewOnly,
     [string]$SourceDirectory,
     [string]$StateDirectory,
     [string]$ExistingStateDirectory,
     [switch]$Apply,
     [switch]$Uninstall,
     [switch]$Rollback,
+    [switch]$Initialize,
     [ValidateSet('Preserve','Enable','Disable')][string]$UiStartup='Preserve'
 )
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
+# Read-only Setup probe, before identity creation or OS integration.
+if ($CheckWebViewOnly) { if (Test-PocketWebView2) { exit 0 }; exit 42 }
 
 function Get-PocketIdentityAcl([string]$Path,[bool]$IsDirectory) {
     Assert-PocketPlainPath $Path
@@ -84,6 +88,10 @@ function Assert-PocketInitializedState([string]$Directory) {
     foreach ($name in @('certificate.der','private-key.der','identity.lock')) {
         Get-PocketIdentityAcl (Join-Path $Directory ('identity\' + $name)) $false | Out-Null
     }
+}
+function Initialize-PocketPrivateState([string]$Agent,[string]$Directory) {
+    & $Agent init --state $Directory --gateway-bind '127.0.0.1:17892' --json | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Fresh private state initialization failed; staged state retained.' }
 }
 function Copy-PocketState([string]$Source, [string]$Destination) {
     # Never merge identities. Lock the source helper's durable state while copying.
@@ -255,7 +263,7 @@ function Restore-PocketTransaction($Journal,[string]$Manifest,[string[]]$Links,[
 }
 function Invoke-PocketWindowsInstall {
     [CmdletBinding()]
-    param([string]$SourceDirectory,[string]$StateDirectory,[string]$ExistingStateDirectory,[switch]$Apply,[switch]$Uninstall,[switch]$Rollback,[hashtable]$Context,
+    param([string]$SourceDirectory,[string]$StateDirectory,[string]$ExistingStateDirectory,[switch]$Apply,[switch]$Uninstall,[switch]$Rollback,[switch]$Initialize,[hashtable]$Context,
         [ValidateSet('Preserve','Enable','Disable')][string]$UiStartup='Preserve')
     $ErrorActionPreference='Stop'
     if ($Uninstall -and $Rollback) { throw 'Choose uninstall or rollback.' }
@@ -314,7 +322,10 @@ function Invoke-PocketWindowsInstall {
             Assert-PocketLocalPath $StateDirectory
             if ($saved -and $StateDirectory -ne $saved.stateDirectory) { throw 'Restore the existing installation before changing its state directory.' }
             $migrate=-not [IO.File]::Exists((Join-Path $StateDirectory 'config.json'))
-            if ($migrate) {
+            $fresh=$migrate -and $Initialize -and -not $ExistingStateDirectory
+            if ($fresh) {
+                if ($saved -or (Test-Path -LiteralPath $StateDirectory)) { throw 'Fresh initialization requires an absent state directory and no existing installation.' }
+            } elseif ($migrate) {
                 if (-not $ExistingStateDirectory) { throw 'An initialized state directory with its existing identity is required.' }
                 $ExistingStateDirectory=Get-PocketDirectoryPath $ExistingStateDirectory
                 Assert-PocketLocalPath $ExistingStateDirectory
@@ -337,7 +348,13 @@ function Invoke-PocketWindowsInstall {
             $after=@{manifest=$before.manifest;cli=$saved.previousCliPath;cliKind=(Get-PocketProperty $saved 'previousCliKind' 'String');task=$(if($saved.version -eq 3){$saved.previousTask}else{$null});links=@()}
             foreach($entry in $saved.shortcuts) { $after.links+=@{path=$entry.path;bytes=$entry.original;hash=$entry.originalHash} }
         } else {
-            if ($migrate) { Copy-PocketState $ExistingStateDirectory $StateDirectory }
+            if ($fresh) {
+                $freshStage=$StateDirectory+'.staging-'+[guid]::NewGuid().ToString('N')
+                Initialize-PocketPrivateState (Join-Path $SourceDirectory 'pocket-agent.exe') $freshStage
+                $plan.processesStarted=1
+                Assert-PocketInitializedState $freshStage
+                Move-PocketStagedDirectory $freshStage $StateDirectory
+            } elseif ($migrate) { Copy-PocketState $ExistingStateDirectory $StateDirectory }
             Assert-PocketPlainPath $bin
             if (-not [IO.Directory]::Exists($bin)) {
                 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($bin))
@@ -353,8 +370,9 @@ function Invoke-PocketWindowsInstall {
             if (-not [IO.File]::Exists($launcher)) { Write-PocketAtomic $launcher ([IO.File]::ReadAllBytes((Join-Path $bin 'pocket-launcher.exe'))) }
             elseif (-not $saved -and (Get-PocketFileHash $launcher) -ne (Get-PocketFileHash (Join-Path $bin 'pocket-launcher.exe'))) { throw 'Unmanaged stable launcher exists.' }
             $savedUi=$saved -and $saved.version -eq 3 -and $null -ne $saved.shortcuts[2].installed
-            $uiEnabled=if($UiStartup -eq 'Preserve'){$savedUi}else{$UiStartup -eq 'Enable'}
-            $unchanged=$saved -and $saved.version -eq 3 -and $saved.generation -eq $generation -and $savedUi -eq $uiEnabled -and ([Convert]::FromBase64String($before.manifest.bytes)).Length -lt 1MB
+            $uiEnabled=$false # The scheduled supervisor now also owns background tray startup.
+            $startupUnchanged=$UiStartup -eq 'Preserve' -or ((Test-PocketTaskLogon $before.task) -eq ($UiStartup -eq 'Enable'))
+            $unchanged=$startupUnchanged -and $saved -and $saved.version -eq 3 -and $saved.generation -eq $generation -and $savedUi -eq $uiEnabled -and ([Convert]::FromBase64String($before.manifest.bytes)).Length -lt 1MB
             if ($unchanged) { $candidate=$saved }
             else {
                 $entries=@()
@@ -373,8 +391,8 @@ function Invoke-PocketWindowsInstall {
             $recordBytes=[Text.UTF8Encoding]::new($false).GetBytes(($candidate|ConvertTo-Json -Depth 30))
             # Preserve the exact record on an idempotent apply.
             $recordBackup=if($unchanged){$before.manifest}else{@{path=$manifestPath;bytes=[Convert]::ToBase64String($recordBytes);hash=(Get-PocketBytesHash $recordBytes)}}
-            $logon=if($null -ne $before.task){Test-PocketTaskLogon $before.task}else{$true}
-            $after=@{manifest=$recordBackup;cli=$launcher;cliKind='String';task=$(if($null -ne $before.task){$before.task}else{New-PocketTaskXml $launcher $logon});links=@()}
+            $logon=if($UiStartup -eq 'Enable'){$true}elseif($UiStartup -eq 'Disable'){$false}elseif($null -ne $before.task){Test-PocketTaskLogon $before.task}else{$true}
+            $after=@{manifest=$recordBackup;cli=$launcher;cliKind='String';task=$(if($null -ne $before.task -and (Test-PocketTaskLogon $before.task) -eq $logon){$before.task}else{New-PocketTaskXml $launcher $logon});links=@()}
             foreach($entry in $candidate.shortcuts) { $after.links+=@{path=$entry.path;bytes=$entry.installed;hash=$entry.installedHash} }
         }
         $journal=@{before=$before;after=$after}
@@ -399,5 +417,5 @@ function Invoke-PocketWindowsInstall {
 }
 if ($MyInvocation.InvocationName -ne '.') {
     if (-not $SourceDirectory) { $SourceDirectory=if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'windows-manifest.json')){$PSScriptRoot}else{Join-Path $PSScriptRoot '..\dist\windows'} }
-    Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -UiStartup $UiStartup
+    Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -Initialize:$Initialize -UiStartup $UiStartup
 }

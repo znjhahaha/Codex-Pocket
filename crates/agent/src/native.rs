@@ -72,6 +72,7 @@ pub enum NativeEvent {
     },
 }
 pub struct Connected {
+    pub bridge_version: Option<String>,
     pub capabilities: crate::capabilities::Capabilities,
     pub rpc: Rpc,
     pub native_process: Option<NativeProcess>,
@@ -242,6 +243,7 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         .unwrap_or("unknown")
         .to_owned();
     Ok(Connected {
+        bridge_version: status["bridgeVersion"].as_str().map(str::to_owned),
         capabilities,
         rpc,
         native_process,
@@ -310,6 +312,7 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
     );
     rpc.capability_failed = capability_failed;
     Ok(Connected {
+        bridge_version: None,
         capabilities,
         rpc,
         native_process,
@@ -390,6 +393,7 @@ pub(crate) mod test_peer {
         let (read, write) = server.into_split();
         (
             Connected {
+                bridge_version: Some(env!("CARGO_PKG_VERSION").into()),
                 capabilities: crate::capabilities::Capabilities::from_schema(
                     &serde_json::from_str(include_str!(
                         "../../bridge/tests/fixtures/ClientRequest.json"

@@ -40,7 +40,7 @@ class V05TimelineTest {
           {"id":"t2","rootTurnId":"t1","status":"completed","durationMs":3000,"items":[{"id":"u2","type":"userMessage","content":[{"type":"text","text":"extra"}]},{"id":"a","type":"agentMessage","phase":"final_answer","text":"result one"},{"id":"b","type":"agentMessage","phase":"final_answer","text":"result two"}]}]}""").jsonObject)
         val rows = ConversationPresentation.rows(timeline)
         assertEquals(listOf("User", "Process", "Answer", "Answer"), rows.map { it.kind.name })
-        assertTrue(rows[1].processLabel!!.contains("5 秒"))
+        assertTrue(rows[1].processDetail!!.contains("5 秒"))
         val key = ThreadKey("c", "s", "t")
         val cached = timeline.items.values.mapIndexed { index, item -> ItemEntity.from(key, item.withTurnCache(timeline.turns[item.turnId]), index.toLong()).item() }
         val restored = NativeTimeline(items = cached.associateBy { it.key }).withCachedTurns()
@@ -51,7 +51,8 @@ class V05TimelineTest {
         val state = NativeReducer.snapshot(pocketJson.parseToJsonElement("""{"turns":[{"id":"a","status":"completed","items":[{"id":"c","type":"agentMessage","phase":"commentary","text":"work"},{"id":"f","type":"agentMessage","text":"done"}]},{"id":"b","status":"completed","items":[{"id":"u","type":"userMessage","content":[{"type":"text","text":"continue"}]},{"id":"f","type":"agentMessage","text":"next"}]}]}""").jsonObject)
         assertNull(state.turns["a"]!!.elapsedMs)
         val rows = ConversationPresentation.rows(state)
-        assertEquals("查看过程 · 1 项", rows.first().processLabel)
+        assertEquals(TaskFoldReason.MissingInitialUser, rows.first().foldReason)
+        assertNull(rows.first().processDetail)
         assertTrue(rows.any { it.kind == TranscriptKind.User && it.items.first().turnId == "b" })
     }
     @Test fun snapshotKeepsObservedClockAndConfirmedSteerWithoutReplacingNativeStatus() {
@@ -84,15 +85,16 @@ class V05TimelineTest {
 
     private fun message(id: String, phase: String = "", turn: String = "t") = TimelineItem(
         turn, id, "agentMessage", id, complete = true, raw = buildJsonObject { if (phase.isNotBlank()) put("phase", phase) })
+    private fun initial(turn: String = "t") = TimelineItem(turn, "initial", "userMessage", "Start", complete = true)
 
     @Test fun legacyProtocolKeepsOnlyLastOfThreeUnphasedRepliesOutsideProcess() {
-        val rows = ConversationPresentation.rows(completed(message("one"), message("two"), message("three")))
+        val rows = ConversationPresentation.rows(completed(initial(), message("one"), message("two"), message("three")))
         assertEquals(listOf("three"), rows.filter { it.kind == TranscriptKind.Answer }.flatMap { it.items }.map { it.itemId })
         assertEquals(listOf("one", "two"), rows.single { it.kind == TranscriptKind.Process }.items.map { it.itemId })
     }
 
     @Test fun finalLinkedTurnPreservesAllExplicitFinalFragmentsAndEarlierAnswersStayInProcess() {
-        val state = completed(message("work", "commentary", "root"), message("one", "final_answer", "root"),
+        val state = completed(initial("root"), message("work", "commentary", "root"), message("one", "final_answer", "root"),
             message("two", "final_answer", "child"), message("three", turn = "child"), message("four", "final", "child"))
             .withConfirmedSteer("root", "child")
         val rows = ConversationPresentation.rows(state)
@@ -100,13 +102,10 @@ class V05TimelineTest {
         assertEquals(listOf("work", "one", "three"), rows.single { it.kind == TranscriptKind.Process }.items.map { it.itemId })
     }
 
-    @Test fun attentionStatesAndNativeErrorResultsNeverBecomeHiddenProcessItems() {
+    @Test fun unresolvedDecisionsNeverBecomeHiddenProcessItems() {
         val work = TimelineItem("t", "tool", "commandExecution", complete = true)
         val boundaries = listOf(
-            work.copy(status = "waitingOnApproval"), work.copy(status = "cancelled"), work.copy(status = "errored"),
-            work.copy(raw = buildJsonObject { put("exitCode", 1) }),
-            work.copy(type = "dynamicToolCall", raw = buildJsonObject { put("success", false) }),
-            work.copy(type = "mcpToolCall", raw = buildJsonObject { put("result", buildJsonObject { put("isError", true) }) }),
+            work.copy(status = "waitingOnApproval"),
             work.copy(raw = buildJsonObject { put("questions", buildJsonArray { add(buildJsonObject { put("question", "Choose") }) }) }),
             work.copy(type = "item/commandExecution/requestApproval"))
         boundaries.forEach { boundary ->
@@ -128,7 +127,9 @@ class V05TimelineTest {
         val child = NativeTurnInfo("child", rootId = "root", status = "completed")
         val state = completed(message("work", "commentary", "child"), message("final", turn = "child"), turns = mapOf("child" to child))
         assertFalse(ConversationPresentation.rows(state).any { it.kind == TranscriptKind.Process })
-        val loaded = state.copy(turns = state.turns + ("root" to NativeTurnInfo("root", status = "completed")))
+        val rootUser = initial("root")
+        val loaded = state.copy(items = linkedMapOf(rootUser.key to rootUser).apply { putAll(state.items) },
+            turns = state.turns + ("root" to NativeTurnInfo("root", status = "completed")))
         assertTrue(ConversationPresentation.rows(loaded).any { it.kind == TranscriptKind.Process })
     }
 
@@ -223,20 +224,21 @@ class V05TimelineTest {
         assertEquals(42L, refreshed.turns.getValue("t").elapsedMs)
     }
 
-    @Test fun completedParentDoesNotHideFailedWaitingOrStoppedChildAgent() {
+    @Test fun completedParentCanFoldHistoricalFailureButNeverPendingChildDecision() {
         listOf("failed", "waitingOnUserInput", "shutdown").forEach { status ->
             val tool = TimelineItem("t", "agents", "collabAgentToolCall", complete = true, raw = buildJsonObject {
                 put("status", "completed"); put("agentsStates", buildJsonObject {
                     put("child", buildJsonObject { put("status", status); put("message", "needs attention") })
                 })
             })
-            assertFalse("Child $status", ConversationPresentation.rows(completed(tool, message("final"))).any { it.kind == TranscriptKind.Process })
+            val rows = ConversationPresentation.rows(completed(initial(), tool, message("final")))
+            assertEquals("Child $status", status != "waitingOnUserInput", rows.any { it.kind == TranscriptKind.Process })
         }
     }
 
-    @Test fun completedTurnWithUnfinishedProcessItemRemainsUnfolded() {
+    @Test fun successfulTurnFinalClosesStaleProcessPresentation() {
         val tool = TimelineItem("t", "tool", "commandExecution", status = "inProgress", liveStarted = true)
-        assertFalse(ConversationPresentation.rows(completed(tool, message("final"))).any { it.kind == TranscriptKind.Process })
+        assertTrue(ConversationPresentation.rows(completed(initial(), tool, message("final"))).any { it.kind == TranscriptKind.Process })
     }
 
     @Test fun invalidSummaryIndexNeverAppendsToAnUnrelatedSegment() {
@@ -256,8 +258,8 @@ class V05TimelineTest {
     }
 
     @Test fun nativeRootTakesPrecedenceOverConfirmedSteerAndCyclesDoNotMergeTurns() {
-        val state = completed(message("work", "commentary", "a"), message("final", turn = "a"),
-            message("work", "commentary", "b"), message("final", turn = "b"))
+        val state = completed(initial("a"), message("work", "commentary", "a"), message("final", turn = "a"),
+            initial("b"), message("work", "commentary", "b"), message("final", turn = "b"))
         val native = state.copy(turns = state.turns + ("b" to state.turns.getValue("b").copy(rootId = "b")))
             .withConfirmedSteer("a", "b")
         assertEquals(2, ConversationPresentation.rows(native).count { it.kind == TranscriptKind.Process })
@@ -280,10 +282,10 @@ class V05TimelineTest {
     }
 
     @Test fun overflowingTaskDurationsNeverDisplayAWrappedClock() {
-        val state = completed(message("work", "commentary", "root"), message("final", turn = "child"), turns = mapOf(
+        val state = completed(initial("root"), message("work", "commentary", "root"), message("final", turn = "child"), turns = mapOf(
             "root" to NativeTurnInfo("root", status = "completed", durationMs = Long.MAX_VALUE),
             "child" to NativeTurnInfo("child", rootId = "root", status = "completed", durationMs = 1)))
-        assertEquals("查看过程 · 1 项", ConversationPresentation.rows(state).single { it.kind == TranscriptKind.Process }.processLabel)
+        assertEquals("上 1 条消息", ConversationPresentation.rows(state).single { it.kind == TranscriptKind.Process }.processLabel)
     }
 
     @Test fun resolvedAsyncQuestionBelongsToProcessWhilePendingQuestionStaysUnfolded() {
@@ -328,7 +330,7 @@ class V05TimelineTest {
     @Test fun latestCompletedChildAllowsFoldingAfterHistoricalRunningSpawn() {
         val spawn = collab("spawn", "spawnAgent", "running")
         val wait = collab("wait", "wait", "completed")
-        val rows = ConversationPresentation.rows(completed(spawn, wait, message("final")))
+        val rows = ConversationPresentation.rows(completed(initial(), spawn, wait, message("final")))
         assertEquals(listOf("spawn", "wait"), rows.single { it.kind == TranscriptKind.Process }.items.map { it.itemId })
         assertEquals("final", rows.last().items.single().itemId)
     }
@@ -336,7 +338,8 @@ class V05TimelineTest {
     @Test fun successfulCloseAfterCompletedChildDoesNotTurnParentTaskIntoInterruption() {
         val done = collab("wait", "wait", "completed")
         val close = collab("close", "closeAgent", "shutdown")
-        assertTrue(ConversationPresentation.rows(completed(done, close, message("final"))).any { it.kind == TranscriptKind.Process })
-        assertFalse(ConversationPresentation.rows(completed(close, message("final"))).any { it.kind == TranscriptKind.Process })
+        assertTrue(ConversationPresentation.rows(completed(initial(), done, close, message("final"))).any { it.kind == TranscriptKind.Process })
+        val historicalClose = ConversationPresentation.rows(completed(initial(), close, message("final")))
+        assertTrue(historicalClose.any { it.kind == TranscriptKind.Process })
     }
 }

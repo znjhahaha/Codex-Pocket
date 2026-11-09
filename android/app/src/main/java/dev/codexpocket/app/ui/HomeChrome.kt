@@ -52,14 +52,14 @@ internal fun PocketHomeFrame(s: PocketState, tab: HomeTab, attention: Int, compa
     SubcomposeLayout(Modifier.fillMaxSize().background(background).windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).imePadding()) { constraints ->
         val loose = constraints.copy(minHeight = 0)
         val header = subcompose(HomeFrameSlot.Header) {
-            CompositionLocalProvider(LocalPocketBackdrop provides backdrop) {
+            CompositionLocalProvider(LocalPocketBackdrop provides backdrop, LocalPocketClearGlass provides true) {
                 HomeHeader(s, tab, compact, hostExpanded, onHost, onNew, onSettings)
             }
         }.map { it.measure(loose) }
         val dock = subcompose(HomeFrameSlot.Dock) {
             CompositionLocalProvider(LocalPocketBackdrop provides backdrop) {
-                PocketHomeNavigation(tab, attention, onNew = onNew,
-                    canCreate = s.online && s.runtimes.any { it.online && s.supports("thread/start", it) }, onSelect = onTab)
+                PocketHomeNavigation(tab, attention,
+                    canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { it.online && s.supports("thread/start", it) }), onSelect = onTab)
             }
         }.map { it.measure(loose) }
         val top = header.maxOfOrNull { it.height } ?: 0
@@ -92,9 +92,9 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                 // One line: title, then the computer in gray with its connection dot. Less stacked text than before.
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 16.dp, end = 12.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "设备" },
+                    Text(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" },
                         Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                    if (s.busy) PocketActivityIndicator("正在处理")
+                    if (s.directoryLoading) PocketActivityIndicator("正在处理")
                     else Box(Modifier.size(6.dp).background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
                     Text(s.computerName.ifBlank { stringResource(R.string.v03_home_computer) }, Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -105,9 +105,12 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                 .semantics { contentDescription = context.getString(if (search.expanded) R.string.v03_home_hide_search else R.string.v03_home_search) }) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(if (search.expanded) PocketIcons.Close else PocketIcons.Search, null, Modifier.size(21.dp)) }
             }
-            PocketGlassSurface(onClick = onSettings, shape = CircleShape, modifier = Modifier.size(48.dp).testTag("home-settings")
-                .semantics { contentDescription = context.getString(R.string.settings) }) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(PocketIcons.Settings, null, Modifier.size(21.dp)) }
+            val canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { it.online && s.supports("thread/start", it) })
+            PocketGlassSurface(onClick = onNew.takeIf { canCreate }, shape = CircleShape, modifier = Modifier.size(48.dp).testTag("home-new-chat")
+                .semantics { contentDescription = context.getString(R.string.new_chat); if (!canCreate) disabled() }) {
+                Box(Modifier.fillMaxSize().clip(CircleShape).background(Color(0xFF222222)), contentAlignment = Alignment.Center) {
+                    Icon(PocketIcons.Edit, null, Modifier.size(21.dp), tint = Color.White.copy(alpha = if (canCreate) 1f else .4f))
+                }
             }
         }
     }
@@ -116,7 +119,7 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
 /** Navigation holds its geometry while icons respond to selection; motion never changes hit targets. */
 @Composable
 internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Unit)? = null, canCreate: Boolean = true, onSelect: (HomeTab) -> Unit) {
-    Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 18.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 18.dp, end = 88.dp, top = 10.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
     // Dense: list text scrolls right under the dock and showed through its rounded end as a gray patch.
     PocketGlassSurface(modifier = Modifier.weight(1f).testTag("home-navigation"), shape = PocketOval, dense = true) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(6.dp)) {
@@ -138,7 +141,7 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
                     val offset by animateDpAsState(if (selected) (-1).dp else 0.dp, tween(pocketMotionMillis(220)), label = "nav-icon-lift")
                     val tint by animateColorAsState(if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
                         tween(pocketMotionMillis(180)), label = "nav-icon-tint")
-                    val label = when(item) { HomeTab.Chats -> "会话"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "设备" }
+                    val label = when(item) { HomeTab.Chats -> "会话"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" }
                     Column(Modifier.weight(1f).fillMaxHeight().heightIn(min = 58.dp).clip(PocketOval)
                         .selectable(selected, interactionSource = interaction, indication = null, role = Role.Tab, onClick = { onSelect(item) })
                         .semantics { if (item == HomeTab.Attention && attention > 0) stateDescription = "$attention 项待处理" }

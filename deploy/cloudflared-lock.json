@@ -1,0 +1,8 @@
+{
+  "version": "2026.10.7",
+  "windows-x86_64": {
+    "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-windows-amd64.exe",
+    "sha256": "2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343"
+  },
+  "licenseUrl": "https://raw.githubusercontent.com/cloudflare/cloudflared/2026.10.7/LICENSE"
+}

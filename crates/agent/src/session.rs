@@ -23,16 +23,25 @@ where
             }
         }
     });
+    struct ReaderCleanup(tokio::task::AbortHandle);
+    impl Drop for ReaderCleanup {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _reader_cleanup = ReaderCleanup(reader_task.abort_handle());
     let result=async{
   let mut events=broker.subscribe();let (finished,mut replies)=mpsc::channel(32);let permits=Arc::new(Semaphore::new(16));
-  let mut device:Option<String>=None;let deadline=tokio::time::Instant::now()+Duration::from_secs(30);let mut attempts=0;
+  let mut device:Option<String>=None;
+  let mut _authenticated_phone=None;
+  let deadline=tokio::time::Instant::now()+Duration::from_secs(30);let mut attempts=0;
   let mut tick=tokio::time::interval(Duration::from_secs(1));
   loop{tokio::select!{
    request=requests.recv()=>{
     let Some(v)=request else{break};let id=v["id"].clone();let method=v["method"].as_str().unwrap_or_default().to_owned();let p=v.get("params").cloned().unwrap_or_else(||json!({}));
     if id.as_str().is_none_or(|s|s.is_empty()||s.len()>128)||!p.is_object(){bail!("Malformed request")}
     if device.is_none(){attempts+=1;if attempts>3{bail!("Authentication retry limit")}
-     let result=match method.as_str(){"pair"=>broker.pair(&p).await,"hello"=>match broker.authenticate(&p).await{Ok(d)=>{device=Some(d);Ok(broker.hello().await)},Err(e)=>Err(e)},_=>Err(classify(anyhow::anyhow!("Pair or authenticate this device first"),Code::Unauthorized))};
+     let result=match method.as_str(){"pair"=>broker.pair(&p).await,"hello"=>match broker.authenticate(&p).await{Ok(d)=>{device=Some(d);_authenticated_phone=Some(broker.connection.authenticated_phone());Ok(broker.hello().await)},Err(e)=>Err(e)},_=>Err(classify(anyhow::anyhow!("Pair or authenticate this device first"),Code::Unauthorized))};
      write_json(&mut writer,&reply(id,result)).await?;continue
     }
     let permit=permits.clone().try_acquire_owned();let Ok(permit)=permit else{write_json(&mut writer,&json!({"id":id,"error":{"code":"busy","message":"Too many pending requests"}})).await?;continue};
@@ -241,7 +250,7 @@ mod tests {
             (
                 "codex/request",
                 json!({"commandId":"offline","runtimeId":"absent","method":"thread/start","params":{}}),
-                "rejected",
+                "runtime_offline",
             ),
         ] {
             assert_eq!(

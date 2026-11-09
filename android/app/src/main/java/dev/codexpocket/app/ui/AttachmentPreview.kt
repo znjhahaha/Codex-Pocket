@@ -40,11 +40,45 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import dev.codexpocket.app.data.*
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.nio.ByteBuffer
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+
+/** Ordered tool output: only adjacent image blocks form a gallery; prose retains its place. */
+@Composable
+internal fun ToolOutputContent(blocks: List<ToolOutputBlock>) {
+    Column(Modifier.fillMaxWidth().testTag("tool-output-blocks"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        var index = 0
+        while (index < blocks.size) {
+            when (val block = blocks[index]) {
+                is ToolOutputBlock.Text -> { SelectionContainer { Text(block.text, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant) }; index++ }
+                is ToolOutputBlock.Image -> {
+                    val media = mutableListOf<ToolMediaRef>()
+                    while (index < blocks.size && blocks[index] is ToolOutputBlock.Image) { media.add((blocks[index] as ToolOutputBlock.Image).media); index++ }
+                    ToolMediaGrid(media)
+                }
+            }
+        }
+    }
+}
+
+/** Root binds this to the existing SourceScreen read-only preview action, respecting its read capability. */
+internal val LocalAttachmentFilePreview = staticCompositionLocalOf<((String) -> Unit)?> { null }
+
+internal fun attachmentTypeIcon(file: MentionedFile) = when {
+    looksLikeImage(file) -> PocketIcons.Image
+    file.name.ifBlank { file.path }.substringAfterLast('.', "").lowercase() in setOf("kt", "kts", "rs", "py", "js", "ts", "tsx", "java", "c", "cpp", "h", "json", "yaml", "toml", "xml", "sh", "ps1") -> PocketIcons.Code
+    else -> PocketIcons.Description
+}
 
 @Composable
 internal fun AttachmentStrip(attachments: List<LocalAttachment>, fileFor: (LocalAttachment) -> File, onRemove: ((LocalAttachment) -> Unit)? = null) {
@@ -115,7 +149,8 @@ private val transcriptImageClient by lazy { OkHttpClient.Builder().connectTimeou
 }).build() }
 internal fun transcriptImageSources(item: TimelineItem): List<String> = if (!ConversationPresentation.visible(item)) emptyList() else {
     val content = item.raw.array("content").map(JsonElement::asObject)
-    content.filter { it.string("type") == "image" }.map { it.string("url", it.string("imageUrl", it.obj("image_url").string("url"))) }.filter(String::isNotBlank)
+    content.filter { it.string("type") in setOf("image", "input_image", "image_url") && !it.containsKey("mediaId") && !it.containsKey("status") }
+        .map { it.string("url", it.string("imageUrl", (it["image_url"] as? JsonPrimitive)?.contentOrNull ?: it.obj("image_url").string("url"))) }.filter(String::isNotBlank)
 }
 
 private fun localImagePaths(item: TimelineItem): List<String> = if (!ConversationPresentation.visible(item)) emptyList() else
@@ -128,6 +163,7 @@ private fun baseName(path: String) = path.substringAfterLast('/').substringAfter
  * `localImage` parts. The two sources spell the same path differently, so match by file name.
  */
 internal fun userAttachments(item: TimelineItem, files: List<MentionedFile>): List<MentionedFile> {
+    if (userMessageMedia(item).isNotEmpty()) return files.filterNot { it.image || looksLikeImage(it) }
     val seen = files.map { it.name.ifBlank { baseName(it.path) }.lowercase() }.toMutableSet()
     val extra = localImagePaths(item).filter { seen.add(baseName(it).lowercase()) }.map { MentionedFile(baseName(it), it, image = true) }
     return files + extra
@@ -164,13 +200,16 @@ internal fun chipName(name: String, budget: Int = 30): String {
 }
 
 /** Up to two chips inline; more fold into one expandable summary so the request stays readable. */
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 internal fun AttachmentChips(key: String, files: List<MentionedFile>, alignEnd: Boolean) {
     val c = MaterialTheme.colorScheme
     val fallback = LocalContext.current.getString(R.string.v02_image)
     val grouped = files.size > 2
     var open by rememberSaveable(key) { mutableStateOf(false) }
+    var detailsPath by rememberSaveable(key) { mutableStateOf<String?>(null) }
+    val onPreview = LocalAttachmentFilePreview.current
+    val clipboard = LocalClipboardManager.current
     val chevron by animateFloatAsState(if (open) 180f else 0f, tween(pocketMotionMillis(160)), label = "attachments-chevron")
     val arrangement = if (alignEnd) Arrangement.spacedBy(6.dp, Alignment.End) else Arrangement.spacedBy(6.dp)
     Column(Modifier.animateContentSize(spring(dampingRatio = .86f, stiffness = 520f)),
@@ -187,9 +226,13 @@ internal fun AttachmentChips(key: String, files: List<MentionedFile>, alignEnd: 
         }
         if (!grouped || open) FlowRow(horizontalArrangement = arrangement, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             files.forEach { file -> key(file.path.ifBlank { file.name }) {
-                Row(Modifier.widthIn(max = 240.dp).clip(PocketOval).background(c.surfaceContainer)
+                Row(Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(10.dp)).background(c.surfaceContainer.copy(alpha = .7f))
+                    .combinedClickable(role = Role.Button, onClickLabel = "只读预览", onLongClickLabel = "文件路径详情",
+                        onClick = { if (onPreview != null && file.path.isNotBlank()) onPreview(file.path) else detailsPath = file.path.ifBlank { file.name } },
+                        onLongClick = { detailsPath = file.path.ifBlank { file.name } })
+                    .testTag("attachment-chip:${file.path.ifBlank { file.name }}")
                     .padding(start = 10.dp, end = 12.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Icon(if (file.image) PocketIcons.Image else PocketIcons.Description, null, Modifier.size(15.dp), tint = c.onSurfaceVariant)
+                    Icon(attachmentTypeIcon(file), null, Modifier.size(15.dp), tint = c.onSurfaceVariant)
                     // Long names keep their extension visible so report.docx and report.pdf stay distinguishable.
                     val name = file.name.ifBlank { baseName(file.path) }.ifBlank { fallback }
                     Text(remember(name) { chipName(name) }, Modifier.weight(1f, fill = false),
@@ -198,6 +241,10 @@ internal fun AttachmentChips(key: String, files: List<MentionedFile>, alignEnd: 
             } }
         }
     }
+    detailsPath?.let { path -> AlertDialog(onDismissRequest = { detailsPath = null }, title = { Text(baseName(path)) },
+        text = { SelectionContainer { Text(path, Modifier.testTag("attachment-full-path"), style = MaterialTheme.typography.bodySmall) } },
+        confirmButton = { TextButton(onClick = { clipboard.setText(AnnotatedString(path)); detailsPath = null }) { Text("复制完整路径") } },
+        dismissButton = { TextButton(enabled = onPreview != null && files.any { it.path == path }, onClick = { detailsPath = null; onPreview?.invoke(path) }) { Text("只读预览") } }) }
 }
 
 /** Bounded native image decoding. No arbitrary desktop file paths or authenticated fetches. */

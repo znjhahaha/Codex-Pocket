@@ -30,6 +30,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.TransformOrigin
@@ -53,6 +54,8 @@ import kotlinx.coroutines.flow.collect
 
 internal val LocalPocketBackdrop = staticCompositionLocalOf<Backdrop?> { null }
 internal val LocalPocketGlass = staticCompositionLocalOf { true }
+/** Clearer optics for floating top controls; reading/editor surfaces keep their denser material. */
+internal val LocalPocketClearGlass = staticCompositionLocalOf { false }
 internal val LocalPocketGlassPreferences = staticCompositionLocalOf<PocketGlassPreferences?> { null }
 
 /** A separate optical background. Text and controls are never blurred or captured into themselves. */
@@ -69,6 +72,7 @@ internal fun PocketGlassSurface(
     val view = LocalView.current
     val preferences = rememberPocketGlassPreferences()
     val colors = MaterialTheme.colorScheme
+    val clear = LocalPocketClearGlass.current
     val dark = colors.background.luminance() < .3f
     val glass = LocalPocketGlass.current && !preferences.highContrast && !preferences.batterySaver && view.isHardwareAccelerated
     val optics = glass && Build.VERSION.SDK_INT >= 31 && backdrop != null
@@ -121,7 +125,8 @@ internal fun PocketGlassSurface(
 
     // A stable tint keeps the background from showing through more strongly during a press.
     val tint = if (dark) Color(0xFF232325) else Color.White
-    val fill = if (optics) tint.copy(alpha = if (dense) (if (dark) .80f else .78f) else if (dark) .70f else .66f) else colors.surface
+    val fill = if (optics) tint.copy(alpha = if (clear) (if (dark) .26f else .20f)
+        else if (dense) (if (dark) .66f else .68f) else if (dark) .44f else .40f) else colors.surface
     // The lens SDF only understands corner-based shapes. Ovals refract as a capsule; the outer
     // clipPath below still trims every pixel to the oval outline.
     val lensShape = shape as? androidx.compose.foundation.shape.CornerBasedShape ?: RoundedCornerShape(50)
@@ -129,8 +134,9 @@ internal fun PocketGlassSurface(
         backdrop = backdrop!!,
         shape = { lensShape },
         effects = {
-            // A wider blur turns text under a pill into an even haze instead of readable gray strokes.
-            blur(11.dp.toPx())
+            // Background motion and edges remain visible through the material. Editors retain
+            // enough diffusion for text contrast; floating controls use the clearer lens.
+            blur((if (clear) 2.5.dp else if (dense) 8.dp else 5.dp).toPx())
             if (Build.VERSION.SDK_INT >= 33) lens(
                 refractionHeight = minOf(8.dp.toPx(), size.minDimension / 4f),
                 // Mild bend: at the oval ends a strong lens pulled dark transcript text into a gray smudge.
@@ -177,26 +183,33 @@ internal fun PocketGlassSurface(
         .then(layer)
         .drawWithCache {
             val outline = shape.createOutline(size, layoutDirection, this)
-            val focus = touchPosition.glassFocus(size)
-            val corner = minOf(32.dp.toPx(), size.minDimension * .48f)
+            // Illuminate the actual contour. A separate fixed-radius arc can cut across
+            // the interior of 12dp preview cards and 22dp model menus.
+            val corner = (outline as? Outline.Rounded)?.roundRect?.topLeftCornerRadius
+            val reachX = (corner?.x ?: size.minDimension / 2f) + 14.dp.toPx()
+            val reachY = (corner?.y ?: size.minDimension / 2f) + 14.dp.toPx()
+            val rim = Brush.linearGradient(
+                0f to Color.White,
+                .35f to Color.White,
+                1f to Color.White.copy(alpha = 0f),
+                start = Offset.Zero, end = Offset(reachX, reachY),
+            )
             onDrawWithContent {
                 val feedback = if (motion) press.value.coerceIn(0f, 1f) else if (pressed) 1f else 0f
                 if (optics) {
-                    // Short optical rim highlights, not a perimeter outline or gradient wash.
-                    // One short top-left highlight. A dark lower rim read as a stray line on large surfaces.
-                    drawArc(Color.White.copy(alpha = if (dark) .16f else .34f), 200f, 54f, false,
-                        Offset(1.dp.toPx(), 1.dp.toPx()), Size(corner * 2, corner * 2), style = Stroke(.9.dp.toPx()))
+                    // A restrained upper-left rim returns the requested glass edge without
+                    // a bright disk following the finger or washing out the icon underneath.
+                    drawOutline(outline, rim, alpha = (if (dark) .16f else .32f) + feedback * .04f,
+                        style = Stroke(1.dp.toPx()))
                 }
                 if (feedback > 0f) {
                     if (glass && motion) {
-                        drawCircle(Color.White.copy(alpha = feedback * .07f), 26.dp.toPx(), focus)
-                        drawCircle(Color.White.copy(alpha = feedback * .08f), 12.dp.toPx(), focus)
-                        drawCircle(Color.White.copy(alpha = feedback * .11f), 3.dp.toPx(), focus)
+                        drawOutline(outline, Color.White.copy(alpha = feedback * if (dark) .045f else .035f))
                     } else {
                         drawOutline(outline, colors.onSurface.copy(alpha = feedback * if (preferences.highContrast) .16f else .08f))
                     }
                 }
-                // All light stays under glyphs and within the surface's clip, including the rim.
+                // All light remains below the glyphs and within the actual component contour.
                 drawContent()
             }
         }

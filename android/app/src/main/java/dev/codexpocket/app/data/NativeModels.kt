@@ -22,15 +22,25 @@ data class ThreadKey(val computerId: String, val configStoreId: String, val nati
     }
 }
 
-data class RuntimeInfo(val id: String, val source: String, val version: String, val configStoreId: String, val online: Boolean, val loadedThreadIds: Set<String>, val capabilities: Set<String>?) {
+data class RuntimeInfo(val id: String, val source: String, val version: String, val configStoreId: String, val online: Boolean, val loadedThreadIds: Set<String>, val capabilities: Set<String>?,
+    val capabilityFields: Map<String, Set<String>> = emptyMap(), val bridgeVersion: String? = null,
+    val helperVersion: String? = null, val bridgeUpdatePending: Boolean = false) {
+    val supportsServiceTier get() = "serviceTier" in capabilityFields["thread/settings/update"].orEmpty()
     companion object {
-        fun from(o: JsonObject) = RuntimeInfo(o.string("id"), o.string("source"), o.string("version"), o.string("configStoreId"), o.flag("online"), o.array("loadedThreadIds").mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.toSet(), (o["capabilities"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet())
+        fun from(o: JsonObject) = RuntimeInfo(o.string("id"), o.string("source"), o.string("version"), o.string("configStoreId"), o.flag("online"), o.array("loadedThreadIds").mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.toSet(), (o["capabilities"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet(),
+            o.obj("capabilityFields").mapValues { (_, value) -> (value as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet().orEmpty() },
+            o.string("bridgeVersion").takeIf(String::isNotBlank), o.string("helperVersion").takeIf(String::isNotBlank), o.flag("bridgeUpdatePending"))
     }
 }
 
-data class NativeModel(val id: String, val model: String, val name: String, val description: String, val efforts: List<String>, val defaultEffort: String, val images: Boolean, val isDefault: Boolean) {
+data class NativeModel(val id: String, val model: String, val name: String, val description: String, val efforts: List<String>, val defaultEffort: String, val images: Boolean, val isDefault: Boolean,
+    val serviceTiers: Set<String> = emptySet(), val additionalSpeedTiers: Set<String> = emptySet()) {
+    val supportsFast get() = "fast" in serviceTiers || "fast" in additionalSpeedTiers
     companion object {
-        fun from(o: JsonObject) = NativeModel(o.string("id"), o.string("model"), o.string("displayName"), o.string("description"), o.array("supportedReasoningEfforts").mapNotNull { it.asObject().string("reasoningEffort").takeIf(String::isNotBlank) }, o.string("defaultReasoningEffort"), o.array("inputModalities").any { it == JsonPrimitive("image") }, o.flag("isDefault"))
+        private fun tiers(o: JsonObject, field: String) = o.array(field).mapNotNull { value ->
+            (value as? JsonPrimitive)?.contentOrNull ?: (value as? JsonObject)?.let { it.string("id", it.string("serviceTier", it.string("speedTier"))) }
+        }.filter(String::isNotBlank).toSet()
+        fun from(o: JsonObject) = NativeModel(o.string("id"), o.string("model"), o.string("displayName"), o.string("description"), o.array("supportedReasoningEfforts").mapNotNull { it.asObject().string("reasoningEffort").takeIf(String::isNotBlank) }, o.string("defaultReasoningEffort"), o.array("inputModalities").any { it == JsonPrimitive("image") }, o.flag("isDefault"), tiers(o, "serviceTiers"), tiers(o, "additionalSpeedTiers"))
     }
 }
 
@@ -133,7 +143,8 @@ object NativeReducer {
             val result = old.copy(activeTurn = if (old.activeTurn == turn) null else old.activeTurn, status = info.status, completedTurns = old.completedTurns + turn, turns = old.turns + (turn to info))
             val message = p.obj("turn").obj("error").string("message")
             if (message.isBlank() && result.status != "failed") return result
-            val failure = TimelineItem(turn, "turn-error:$turn", "error", message, "failed", complete = true)
+            val failure = TimelineItem(turn, "turn-error:$turn", "error", message, "failed",
+                raw = buildJsonObject { put("error", p.obj("turn").obj("error")); put("willRetry", false) }, complete = true)
             return result.copy(items = LinkedHashMap(result.items).apply { put(failure.key, failure) })
         }
         if (method == "thread/status/changed") return old.copy(status = p.obj("status").string("type"), activeFlags = p.obj("status").nativeActiveFlags())
@@ -214,7 +225,8 @@ object NativeReducer {
                 if (ConversationPresentation.visible(value)) items[value.key] = value
             }
             if (turn.string("status") == "failed" || turn.obj("error").string("message").isNotBlank()) {
-                val failure = TimelineItem(turn.string("id"), "turn-error:${turn.string("id")}", "error", turn.obj("error").string("message"), "failed", complete = true)
+                val failure = TimelineItem(turn.string("id"), "turn-error:${turn.string("id")}", "error", turn.obj("error").string("message"), "failed",
+                    raw = buildJsonObject { put("error", turn.obj("error")); put("willRetry", false) }, complete = true)
                 items[failure.key] = failure
             }
         }

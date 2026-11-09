@@ -5,6 +5,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PairingAndFramesTest {
+    @Test fun pairingRejectsUntrustedLanRouteRatherThanIgnoringIt() {
+        val obj = Json.parseToJsonElement(qr()).jsonObject
+        val code = JsonObject(obj + ("routes" to buildJsonArray {
+            add(buildJsonObject {
+                put("id", "lan"); put("kind", "lan"); put("url", "tls://8.8.8.8:1234"); put("priority", 0)
+            })
+        }))
+        assertThrows(IllegalArgumentException::class.java) { PairingCode.parse(code.toString(), 100) }
+    }
     private val pin = "ab".repeat(32)
     private fun qr(url: String = "wss://relay.example/pocket", room: String = "room_123", expiry: Long = 200) =
         buildJsonObject {

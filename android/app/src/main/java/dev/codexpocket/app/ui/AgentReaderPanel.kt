@@ -1,5 +1,7 @@
 package dev.codexpocket.app.ui
 
+import androidx.compose.foundation.horizontalScroll
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -28,6 +30,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.serialization.json.JsonNull
 import java.text.DateFormat
 import java.util.Date
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
 
 internal enum class AgentReaderBack { Preview, Roster, Close }
 
@@ -67,6 +71,7 @@ internal fun AgentReaderPanel(
     onFullscreen: (Boolean) -> Unit,
     onOlder: () -> Unit,
     onRetry: () -> Unit,
+    onSource: ((ThreadKey, String) -> Unit)? = null,
 ) {
     val pages = remember(state.parent.encoded) { mutableMapOf<String, AgentReaderPageMemory>() }
     val transcriptStates = rememberSaveableStateHolder()
@@ -104,7 +109,9 @@ internal fun AgentReaderPanel(
                     }, Modifier.fillMaxWidth().weight(1f))
             } else if (memory != null) {
                 transcriptStates.SaveableStateProvider(child.key.encoded) {
-                    CompositionLocalProvider(LocalInlineDiffComment provides null) {
+                    val preview: ((String) -> Unit)? = if (onSource != null && online && !state.loading &&
+                        state.error == null && state.updatedAt > 0) { path -> onSource(child.key, path) } else null
+                    CompositionLocalProvider(LocalInlineDiffComment provides null, LocalAttachmentFilePreview provides preview) {
                         AgentReaderTranscript(state, online, memory, onOlder, onRetry, Modifier.fillMaxWidth().weight(1f))
                     }
                 }
@@ -171,7 +178,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
     onOlder: () -> Unit, onRetry: () -> Unit, modifier: Modifier) {
     val child = state.child ?: return
     val scope = "agent-reader:${child.key.encoded}:"
-    val rows = rememberTranscriptRows(scope, state.timeline, memory.expansions, retained = memory.projection)
+    val rows = rememberTranscriptRows(scope, state.timeline, memory.expansions, retained = memory.projection, agentLiveStatuses = state.liveStatuses)
     val live = ConversationPresentation.liveStatus(state.timeline)
     val turn = state.timeline.activeTurn
     val reasoning = remember(state.timeline) { ConversationPresentation.liveReasoning(state.timeline) }
@@ -184,10 +191,15 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             listOfNotNull("empty".takeIf { rows.isEmpty() }) + "timeline-end"
     }
     val list = memory.list
+    val minimapState = rememberConversationMinimapState(list, scope)
+    val minimapShown = rememberConversationMinimapVisibility(scope, rows, list)
+    val backdropColor = MaterialTheme.colorScheme.background
+    val backdrop = rememberLayerBackdrop { drawRect(backdropColor); drawContent() }
     val latestKeys by rememberUpdatedState(keys)
+    ObserveTranscriptDrag(list) { memory.following = it }
     LaunchedEffect(memory) {
         snapshotFlow { list.isScrollInProgress to list.canScrollForward }.distinctUntilChanged().collect { (scrolling, forward) ->
-            if (scrolling) memory.following = !forward
+            if (!scrolling && !forward && !minimapState.isInteracting) memory.following = true
         }
     }
     LaunchedEffect(memory) {
@@ -202,16 +214,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             list.scrollToItem(TranscriptAnchor(resolved).resolve(keys, list.firstVisibleItemIndex), 0)
         }
     }
-    LaunchedEffect(memory, memory.following, rows.lastOrNull(), live) {
-        if (memory.following && rows.isNotEmpty() && !list.isScrollInProgress) list.scrollToItem(latestKeys.lastIndex)
-    }
-    LaunchedEffect(memory) {
-        snapshotFlow { list.layoutInfo.visibleItemsInfo.lastOrNull()?.let { Triple(it.key, it.offset, it.size) } }
-            .distinctUntilChanged().collect {
-                if (memory.following && !list.isScrollInProgress && list.layoutInfo.totalItemsCount > 1)
-                    list.scrollToItem(list.layoutInfo.totalItemsCount - 1)
-            }
-    }
+    FollowTranscriptEnd(list, memory.following, minimapState.expanded || minimapState.isInteracting)
     Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).testTag("agent-reader-update"),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -224,7 +227,9 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (state.error != null) AgentReaderNotice(state.error, online, state.loading, onRetry)
-        LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("agent-reader-transcript"), state = list,
+        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+        val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
+        LazyColumn(Modifier.fillMaxSize().padding(start = gutter).testTag("agent-reader-transcript").layerBackdrop(backdrop), state = list,
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item(key = "history-control", contentType = "history") {
@@ -239,14 +244,14 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             rows.forEach { row ->
                 item(key = row.key, contentType = row.kind) {
                     Column(Modifier.fillMaxWidth().testTag("agent-reader-row:${row.key}")) {
-                        TranscriptRowView(row, scope, row.key in memory.expansions, { memory.toggle(row.key) },
+                        TranscriptRowView(row, scope, row.kind == TranscriptKind.User || row.key in memory.expansions, { memory.toggle(row.key) },
                             onDetail = { item ->
                                 memory.following = false
                                 // Files are already shown by the shared inline diff/reader UI.
                                 // Never append a generic raw file detail in the child transcript.
                                 if (item.type == "fileChange" || item.type == "turn/diff/updated") return@TranscriptRowView
                                 // Replace the compact item's detail with the full read-only text below it;
-                                // no third overlay, plan mutation, side chat or source operation is reachable.
+                                // File chips separately open a source preview owned by this child.
                                 memory.expansions = memory.expansions - "activity-item:${item.key}"
                                 memory.detailKey = item.key
                             }, canFork = false, onPlan = null,
@@ -270,6 +275,10 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             }
             item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
         }
+        if (minimapShown) ConversationMinimap(rows, keys, list, Modifier.align(Alignment.CenterStart).width(gutter),
+            backdrop = backdrop, state = minimapState, scope = scope, navigationEpoch = state.loading to state.nextTurns?.toString(),
+            onSeek = { memory.following = false }, onExpandProcess = { memory.expansions = memory.expansions + it })
+        }
     }
 }
 
@@ -277,25 +286,19 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
 @Composable
 private fun AgentReaderToolDetail(item: TimelineItem, onClose: () -> Unit) {
     if (item.type == "fileChange" || item.type == "turn/diff/updated") return
-    val clipboard = LocalClipboardManager.current
     val value = remember(item) { NativeActivityPresentation.describe(item) }
     val text = remember(item) { ConversationPresentation.detail(item) }
     val shown = remember(text) { text.take(65_536) }
-    Column(Modifier.fillMaxWidth().testTag("agent-reader-detail:${item.key}")
-        .background(MaterialTheme.colorScheme.surfaceContainerLow).padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("工具详情 · 只读", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
-            ActionIcon(PocketIcons.ContentCopy, "复制工具详情", enabled = text.isNotBlank(),
-                onClick = { clipboard.setText(AnnotatedString(text)) })
-            ActionIcon(PocketIcons.Close, "收起工具详情", onClick = onClose)
-        }
+    var wrap by rememberSaveable(item.key) { mutableStateOf(true) }
+    ToolResultFrame(if (value.command != null) "Shell · 只读" else "工具详情 · 只读", text, wrap, { wrap = !wrap },
+        Modifier.testTag("agent-reader-detail:${item.key}"), onClose) {
         value.command?.let { command ->
             if (command.cwd.isNotBlank()) Text(command.cwd, style = MaterialTheme.typography.labelSmall)
             command.exitCode?.let { Text("退出码 $it", style = MaterialTheme.typography.labelSmall) }
         }
-        if (shown.isNotBlank()) Box(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
-            SelectionContainer { Text(shown, style = MaterialTheme.typography.bodySmall,
+        if (shown.isNotBlank()) Box(Modifier.fillMaxWidth()) {
+            SelectionContainer { Text(shown, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())),
+                softWrap = wrap, style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace) }
         } else Text("此工具没有可用的文本详情", style = MaterialTheme.typography.bodySmall)
         if (shown.length < text.length) Text("预览显示前 65,536 个字符 · 复制保留全文", style = MaterialTheme.typography.labelSmall)

@@ -2,7 +2,10 @@ package dev.codexpocket.app.data
 
 import kotlinx.serialization.json.JsonObject
 
-data class SourcePreview(val path: String, val text: String, val truncated: Boolean, val workspaceRoot: String? = null)
+data class SourcePreview(
+    val path: String, val text: String, val truncated: Boolean, val workspaceRoot: String? = null,
+    val owner: ThreadKey? = null, val readOnly: Boolean = false,
+)
 
 /** Per-conversation secondary data; never used as authority for native write outcomes. */
 data class AdvancedConversationState(

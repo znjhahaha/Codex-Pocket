@@ -74,6 +74,9 @@ import java.util.concurrent.TimeUnit
 @RunWith(AndroidJUnit4::class)
 class V052ControlsDeviceTest {
     private val compose = createAndroidComposeRule<MainActivity>()
+    // MuMu can route its IME to display 0 while this Activity is on another display.
+    // Explicit false verifies touch/focus/history only; it never counts as system IME coverage.
+    private val verifySystemIme get() = InstrumentationRegistry.getArguments().getString("v052ControlsIme") != "false"
     private var connectionAttempts = 0
     private var pairingWrites = 0
 
@@ -284,6 +287,7 @@ class V052ControlsDeviceTest {
                 put("fileChangeCount", activityFiles(fixture.fileChange).size)
                 put("elapsedMs", SystemClock.elapsedRealtime() - startedAt); put("viewportWidthDp", viewportWidthDp)
                 put("screenshotLimit", screenshotLimit); put("screenshots", JsonArray(screenshots)); put("stages", JsonArray(stages))
+                put("systemImeVerified", verifySystemIme && failure == null)
                 put("decisions", buildJsonArray { fixture.decisions.forEach { (request, result) -> add(buildJsonObject {
                     put("request", request); put("response", result)
                 }) } })
@@ -604,8 +608,9 @@ class V052ControlsDeviceTest {
         record("${v.id}-composer-input-first") {
             waitTag("composer-input")
             // Focus first: setting readingHistory/scrolling before a tap misses the regression.
-            compose.onNodeWithTag("composer-input").performClick()
-            compose.waitUntil(5_000) { fixture.imeBottom > 0 }
+            compose.onNodeWithTag("composer-input").performTouchInput { click() }
+            compose.onNodeWithTag("composer-input").assertIsFocused()
+            if (verifySystemIme) compose.waitUntil(5_000) { fixture.imeBottom > 0 }
             verify("editing-hides-history-preview") {
                 compose.onNodeWithTag("composer-input").assertIsFocused()
                 compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
@@ -624,8 +629,9 @@ class V052ControlsDeviceTest {
         record("${v.id}-composer-refocus-then-ime-dismiss") {
             compose.onNodeWithTag("composer-history-preview").performClick()
             waitTag("composer-input")
-            compose.waitUntil(5_000) { fixture.imeBottom > 0 }
+            if (verifySystemIme) compose.waitUntil(5_000) { fixture.imeBottom > 0 }
             verify("preview-tap-restores-editor") { compose.onNodeWithTag("composer-input").assertIsFocused(); compose.onNodeWithTag("composer-history-preview").assertDoesNotExist() }
+            if (!verifySystemIme) compose.onNodeWithTag("v052-composer-transcript").performTouchInput { swipeUp(durationMillis = 500) }
             hideKeyboard()
             waitTag("composer-history-preview")
             assertCompactComposer()
@@ -633,8 +639,9 @@ class V052ControlsDeviceTest {
         record("${v.id}-composer-explicit-focus-request") {
             compose.runOnIdle { fixture.focusRequest++ }
             waitTag("composer-input")
-            compose.waitUntil(5_000) { fixture.imeBottom > 0 }
+            if (verifySystemIme) compose.waitUntil(5_000) { fixture.imeBottom > 0 }
             verify("trailing-focus-request-restores-same-draft") { compose.onNodeWithTag("composer-input").assertIsFocused().assertTextEquals(fixture.draft) }
+            if (!verifySystemIme) compose.onNodeWithTag("v052-composer-transcript").performTouchInput { swipeUp(durationMillis = 500) }
             hideKeyboard(); waitTag("composer-history-preview"); assertCompactComposer()
         }
     }

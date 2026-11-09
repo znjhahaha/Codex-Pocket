@@ -16,6 +16,13 @@ class PairedComputer(val config: ConnectionConfig, val deviceId: String, val dev
     override fun toString() = "PairedComputer([redacted])"
 }
 
+internal fun PairedComputer.persisted(): JsonObject = buildJsonObject {
+    config.toJson().forEach { (name, value) -> put(name, value) }
+    put("deviceId", deviceId); put("deviceSecret", deviceSecret); put("computerId", computerId); put("computerName", computerName)
+}
+
+internal fun restoredPair(o: JsonObject) = PairedComputer(ConnectionConfig.parse(o), o.string("deviceId"), o.string("deviceSecret"), o.string("computerId"), o.string("computerName"))
+
 interface PairingStorage {
     fun save(pair: PairedComputer)
     fun load(): PairedComputer?
@@ -34,10 +41,7 @@ class PairStore(context: Context) : PairingStorage {
         }.generateKey()
     }
     override fun save(pair: PairedComputer) {
-        val data = buildJsonObject {
-            put("relayUrl", pair.config.relayUrl); put("room", pair.config.room); put("phoneToken", pair.config.phoneToken); put("certificateSha256", pair.config.certificateSha256)
-            put("deviceId", pair.deviceId); put("deviceSecret", pair.deviceSecret); put("computerId", pair.computerId); put("computerName", pair.computerName)
-        }.toString().toByteArray()
+        val data = pair.persisted().toString().toByteArray()
         try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()); updateAAD(aad) }
             val encrypted = cipher.doFinal(data)
@@ -51,7 +55,7 @@ class PairStore(context: Context) : PairingStorage {
         val plain = cipher.doFinal(Base64.decode(value, Base64.NO_WRAP))
         return try {
             val o = pocketJson.parseToJsonElement(plain.toString(Charsets.UTF_8)).jsonObject
-            PairedComputer(ConnectionConfig(o.string("relayUrl"), o.string("room"), o.string("phoneToken"), o.string("certificateSha256")), o.string("deviceId"), o.string("deviceSecret"), o.string("computerId"), o.string("computerName"))
+            restoredPair(o)
         } finally { plain.fill(0) }
     }
     override fun forget() { check(prefs.edit().clear().commit()); KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(alias) } }

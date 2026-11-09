@@ -194,8 +194,11 @@ class HomeInteractionTest {
         compose.onNodeWithText("搜索结果").assertExists()
         val navigation = compose.onNodeWithTag("home-navigation").fetchSemanticsNode().boundsInRoot
         val create = compose.onNodeWithTag("home-new-chat").fetchSemanticsNode().boundsInRoot
-        assertTrue("Independent new-chat control must leave a real gap", navigation.right < create.left)
-        listOf("home-host", "home-header-search", "home-settings", "home-new-chat", "home-tab-chats", "home-tab-attention", "home-tab-devices").forEach { tag ->
+        assertTrue("New chat belongs to the header, away from the bottom navigation", create.bottom < navigation.top)
+        compose.onNodeWithTag("home-settings").assertDoesNotExist()
+        compose.onAllNodesWithTag("home-new-chat").assertCountEquals(1)
+        compose.onNodeWithText("管理").assertExists()
+        listOf("home-host", "home-header-search", "home-new-chat", "home-tab-chats", "home-tab-attention", "home-tab-devices").forEach { tag ->
             compose.onNodeWithTag(tag).assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
         }
         compose.onNodeWithTag("home-new-chat").performClick()
@@ -241,6 +244,8 @@ class HomeInteractionTest {
         compose.onNodeWithTag("home-chat-${row.key.encoded}").performClick()
         compose.runOnIdle { assertEquals(1, opened); assertEquals(1, attention); state = state.copy(chats = emptyList(), busy = true) }
         compose.onNodeWithText(compose.activity.getString(dev.codexpocket.app.R.string.v03_home_loading)).assertDoesNotExist() // Offline remains honest even while an action is busy.
+        compose.onNodeWithText(compose.activity.getString(dev.codexpocket.app.R.string.no_chats)).assertExists()
+        compose.runOnIdle { state = state.copy(directoryLoading = true) }
         compose.onNodeWithText(compose.activity.getString(dev.codexpocket.app.R.string.no_chats)).assertDoesNotExist()
     }
 }

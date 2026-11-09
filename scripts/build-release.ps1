@@ -19,7 +19,8 @@ function New-PocketReleasePackage {
     $files = [ordered]@{}
     if (-not $DesktopBinaryDirectory) { $DesktopBinaryDirectory=Join-Path $Root 'desktop\target\release' }
     foreach ($name in Get-PocketWindowsFiles) {
-        $source = if ($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')) { Join-Path $DesktopBinaryDirectory $name }
+        $source = if ($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')) { Join-Path $Root ('.local\tools\' + $name) }
+            elseif ($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')) { Join-Path $DesktopBinaryDirectory $name }
             elseif ($name -like '*.exe') { Join-Path $BinaryDirectory $name }
             elseif ($name -like '*.md') { Join-Path $Root ('docs\' + $name) }
             else { Join-Path $Root ('scripts\' + $name) }
@@ -119,6 +120,7 @@ function Invoke-PocketReleaseBuild {
     Push-Location $Root
     try {
         # Public entry always builds current sources. No debug/probe/package-only fallback.
+        & (Join-Path $Root 'scripts\fetch-cloudflared.ps1')
         $target = 'x86_64-pc-windows-msvc'
         & cargo build --release --locked --target $target --target-dir (Join-Path $Root 'target') -p pocket-agent -p pocket-bridge
         if ($LASTEXITCODE -ne 0) { throw 'Windows Release build failed; no package published.' }

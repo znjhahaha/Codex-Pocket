@@ -54,6 +54,7 @@ class InlineDiffPreviewUiTest {
     @Test fun horizontalScrollLeavesRealLineNumbersInPlace() {
         lateinit var reading: DiffReadingState
         content { reading = rememberDiffReadingState("fixture"); Column { InlineDiffPreview(file(), readingState = reading) } }
+        compose.runOnIdle { reading.wrap = false } // Explicitly opt out of the new wrapped default.
         waitLines()
         val gutter = compose.onNodeWithTag("diff-gutter:1", useUnmergedTree = true)
         val before = gutter.fetchSemanticsNode().boundsInRoot
@@ -68,6 +69,7 @@ class InlineDiffPreviewUiTest {
     @Test fun enlargeAndReturnRetainReadingPositionAndChildHasNoComments() {
         lateinit var reading: DiffReadingState
         content { reading = rememberDiffReadingState("fixture"); Column { InlineDiffPreview(file(), readingState = reading) } }
+        compose.runOnIdle { reading.wrap = false } // Explicitly opt out of the new wrapped default.
         waitLines()
         compose.onNodeWithTag("diff-lines").performScrollToIndex(30)
         compose.onNodeWithTag("diff-code:31", useUnmergedTree = true).performTouchInput { swipeLeft() }

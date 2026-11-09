@@ -781,6 +781,9 @@ mod tests {
     ) {
         let (dir, b) = fixture().await;
         let native = peer(&b, "r", "cli").await;
+        // Permission controls belong to an explicitly opened phone conversation.
+        // Inventory refresh must never subscribe to every loaded CLI thread.
+        b.watch_cli("r", "t").await;
         {
             let mut s = b.state.lock().await;
             let r = s.runtimes.get_mut("r").unwrap();

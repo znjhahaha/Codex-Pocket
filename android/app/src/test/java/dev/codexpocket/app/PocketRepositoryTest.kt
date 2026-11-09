@@ -156,6 +156,79 @@ class PocketRepositoryTest {
         await { it.agentStatuses[childKey]?.status == ActivityStatus.Completed }
         assertEquals(0, repo.state.value.currentAgents().count { it.status == ActivityStatus.Running })
     }
+    @Test fun historicalChildResumeCountsAgainAndLateOldCompletionCannotHideIt() = runBlocking<Unit> {
+        childLink()
+        val childKey = key.copy(nativeId = "child")
+        until { repo.state.value.agentChats.any { it.key == childKey } }
+        server.emit("turn/completed", buildJsonObject {
+            put("threadId", "child"); put("turn", buildJsonObject { put("id", "old-run"); put("status", "completed") })
+        })
+        await { it.agentStatuses[childKey]?.status == ActivityStatus.Completed }
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "parent-turn")
+            put("item", buildJsonObject { put("id", "resume-old-child"); put("type", "collabAgentToolCall")
+                put("tool", "resumeAgent"); put("status", "completed"); put("receiverThreadIds", buildJsonArray { add("child") })
+                put("agentsStates", buildJsonObject { put("child", buildJsonObject { put("status", "running") }) }) })
+        })
+        await { it.agentStatuses[childKey]?.status == ActivityStatus.Running && (it.agentStatuses[childKey]?.executionGeneration ?: 0) > 0 }
+        assertEquals(1, currentAgentWork(repo.state.value.currentAgents()).running.size)
+        server.emit("turn/completed", buildJsonObject {
+            put("threadId", "child"); put("turn", buildJsonObject { put("id", "old-run"); put("status", "completed") })
+        })
+        server.emit("turn/started", buildJsonObject {
+            put("threadId", "child"); put("turn", buildJsonObject { put("id", "new-run"); put("status", "inProgress") })
+        })
+        await { it.agentStatuses[childKey]?.turnId == "new-run" }
+        assertEquals(1, currentAgentWork(repo.state.value.currentAgents()).running.size)
+        assertEquals(1, repo.state.value.currentAgents().count { it.threadId == "child" })
+        server.emit("turn/completed", buildJsonObject {
+            put("threadId", "child"); put("turn", buildJsonObject { put("id", "new-run"); put("status", "completed") })
+        })
+        await { it.agentStatuses[childKey]?.status == ActivityStatus.Completed }
+        assertEquals(0, currentAgentWork(repo.state.value.currentAgents()).running.size)
+    }
+    @Test fun cachedChildFromStoppedRuntimeRebindsOnlyAfterNativeRead() = runBlocking<Unit> {
+        childLink()
+        val parent = repo.state.value.selected!!
+        val childKey = key.copy(nativeId = "child")
+        db.dao().putChat(parent.copy(key = childKey, runtimeId = "stopped-runtime", isSubagent = true, parentThreadId = key.nativeId))
+        repo.editDraft("preserve parent draft")
+        repo.openAgentReader("child").join()
+        assertEquals(childKey, repo.state.value.agentReader?.child?.key)
+        assertNull(repo.state.value.agentReader?.error)
+        assertEquals(parent.runtimeId, db.dao().chat(childKey)?.runtimeId)
+        assertEquals(key, repo.state.value.selected?.key)
+        assertEquals("preserve parent draft", repo.state.value.draft?.text)
+    }
+    @Test fun staleChildCannotStealALiveOwnerOrCommitMismatchedIdentity() = runBlocking<Unit> {
+        childLink()
+        val parent = repo.state.value.selected!!
+        val childKey = key.copy(nativeId = "child")
+        val child = parent.copy(key = childKey, runtimeId = "other-runtime", isSubagent = true, parentThreadId = key.nativeId)
+        db.dao().putChat(child)
+        update { it.copy(runtimes = it.runtimes + it.activeRuntime!!.copy(id = "other-runtime")) }
+        repo.openAgentReader("child").join()
+        assertNotNull(repo.state.value.agentReader?.error)
+        assertEquals("other-runtime", db.dao().chat(childKey)?.runtimeId)
+        update { it.copy(runtimes = it.runtimes.filterNot { r -> r.id == "other-runtime" }) }
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/read" && params.obj("params").string("threadId") == "child")
+                buildJsonObject { put("thread", server.thread("wrong-child")) } else null
+        }
+        repo.openAgentReader("child").join()
+        assertNotNull(repo.state.value.agentReader?.error)
+        assertEquals("other-runtime", db.dao().chat(childKey)?.runtimeId)
+        assertEquals(key, repo.state.value.selected?.key)
+    }
+    @Test fun metadataRefreshRebindsAStoppedChildRuntime() = runBlocking<Unit> {
+        childLink()
+        val parent = repo.state.value.selected!!
+        val childKey = key.copy(nativeId = "child")
+        db.dao().putChat(parent.copy(key = childKey, runtimeId = "stopped-runtime", isSubagent = true, parentThreadId = key.nativeId))
+        await { it.agentChats.any { c -> c.key == childKey && c.runtimeId == "stopped-runtime" } }
+        repo.refreshAgentNames().join()
+        assertEquals(parent.runtimeId, db.dao().chat(childKey)?.runtimeId)
+    }
     @Test fun nativeChildMissingFromDirectoryOpensReadOnlyAndReturnsToParentDraft() = runBlocking<Unit> {
         childLink()
         repo.editDraft("parent draft")

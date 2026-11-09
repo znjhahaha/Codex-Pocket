@@ -1,6 +1,14 @@
 //! Current-user local CLI control. The daemon lock serializes offline changes;
 //! an authenticated loopback request serializes changes through a live broker.
-use crate::{auth, broker::Broker, config::Config, connection, storage};
+use crate::{
+    auth,
+    broker::Broker,
+    config::{
+        Config,
+        routes::{Controller, RoutePreferences},
+    },
+    connection, storage,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -51,6 +59,18 @@ impl Drop for Server {
 }
 impl Server {
     pub async fn start(state: &Path, broker: Arc<Broker>) -> Result<Self> {
+        let routes = Controller::open(
+            state.into(),
+            broker.config.clone(),
+            broker.connection.clone(),
+        );
+        Self::start_with_routes(state, broker, routes).await
+    }
+    pub async fn start_with_routes(
+        state: &Path,
+        broker: Arc<Broker>,
+        routes: Arc<Controller>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let token = storage::secret();
         let path = state.join("control.json");
@@ -63,13 +83,22 @@ impl Server {
         let expected = token.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(tokio::sync::Semaphore::new(16));
-            while let Ok((mut stream, _)) = listener.accept().await {
+            let mut workers = tokio::task::JoinSet::new();
+            loop {
+                let incoming = tokio::select! {
+                    incoming=listener.accept()=>incoming,
+                    Some(_)=workers.join_next(),if !workers.is_empty()=>continue,
+                };
+                let Ok((mut stream, _)) = incoming else {
+                    break;
+                };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     continue;
                 };
                 let expected = expected.clone();
                 let broker = broker.clone();
-                tokio::spawn(async move {
+                let routes = routes.clone();
+                workers.spawn(async move {
                     let _permit = permit;
                     let _ = tokio::time::timeout(Duration::from_secs(20), async {
                         let request = read(&mut stream).await?;
@@ -84,7 +113,37 @@ impl Server {
                             bail!("Local authentication required");
                         }
                         let result = match request["method"].as_str() {
-                            Some("status") => Ok(broker.diagnostics().await),
+                            Some("status") => {
+                                let mut v = broker.diagnostics().await;
+                                let r = routes.read().await;
+                                for key in [
+                                    "computerId",
+                                    "policy",
+                                    "routes",
+                                    "routeStatus",
+                                    "gatewayEndpoint",
+                                    "initialized",
+                                ] {
+                                    if let Some(value) = r.get(key) {
+                                        v[key] = value.clone();
+                                    }
+                                }
+                                Ok(v)
+                            }
+                            Some("routes/read") => Ok(routes.read().await),
+                            Some(
+                                method @ ("session/preferences"
+                                | "session/preferences/read"
+                                | "session/preferences/update"),
+                            ) => preferences(&broker, method, &request["params"]).await,
+                            Some("routes/configure") => {
+                                match serde_json::from_value::<RoutePreferences>(
+                                    request["params"]["routePreferences"].clone(),
+                                ) {
+                                    Ok(p) => routes.configure(p).await,
+                                    Err(_) => Err(anyhow::anyhow!("Invalid route preferences")),
+                                }
+                            }
                             Some("devices") => Ok(broker.devices().await),
                             Some("pair") => broker.local_pair().await,
                             Some("revoke") => {
@@ -97,7 +156,11 @@ impl Server {
                         };
                         let reply = match result {
                             Ok(v) => json!({"result":v}),
-                            Err(_) => failure("rejected", "Local command could not be completed"),
+                            Err(e) => {
+                                let code = crate::error::classification(&e)
+                                    .unwrap_or(crate::error::Code::Rejected);
+                                failure(code.as_str(), code.message())
+                            }
                         };
                         write(&mut stream, &reply).await
                     })
@@ -110,6 +173,37 @@ impl Server {
 }
 fn valid_device(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+}
+/// Desktop authority comes from the local token/daemon lock, not a synthetic phone device.
+async fn preferences(broker: &Broker, method: &str, params: &Value) -> Result<Value> {
+    use crate::error::{Code, classify};
+    let invalid = || {
+        classify(
+            anyhow::anyhow!("Invalid session preferences"),
+            Code::InvalidParams,
+        )
+    };
+    let object = params.as_object().ok_or_else(invalid)?;
+    if method == "session/preferences/update" {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "mode" | "knownRevision" | "commandId"))
+            || params["knownRevision"].as_u64().is_none()
+            || object.get("commandId").is_some_and(|value| {
+                value.as_str().is_none_or(|s| {
+                    s.is_empty() || s.len() > 128 || s.chars().any(char::is_control)
+                })
+            })
+        {
+            return Err(invalid());
+        }
+        broker.update_access_preferences(params).await
+    } else {
+        if !object.is_empty() {
+            return Err(invalid());
+        }
+        Ok(broker.access_preferences().await)
+    }
 }
 pub fn failure(code: &str, message: &str) -> Value {
     json!({"error":{"code":code,"message":message}})
@@ -136,12 +230,48 @@ async fn write(stream: &mut TcpStream, value: &Value) -> Result<()> {
     Ok(())
 }
 pub async fn execute(state: &Path, method: &str, device: Option<&str>) -> Result<Value> {
+    execute_with_params(state, method, device, json!({})).await
+}
+pub async fn execute_with_params(
+    state: &Path,
+    method: &str,
+    device: Option<&str>,
+    params: Value,
+) -> Result<Value> {
     if method == "revoke" && device.is_none_or(|id| !valid_device(id)) {
         bail!("Invalid device ID");
     }
     if let Some(_lock) = try_lock(state)? {
         return match method {
-            "status" => Ok(stopped()),
+            "status" => {
+                let mut v = stopped();
+                if let Ok(c) = Config::load(state) {
+                    for (key, value) in c.route_snapshot().as_object().unwrap() {
+                        v[key] = value.clone();
+                    }
+                    v["initialized"] = json!(true);
+                } else {
+                    v["initialized"] = json!(false);
+                }
+                Ok(v)
+            }
+            "routes/read" | "routes/configure" => {
+                let c = Config::load(state)?;
+                let health = Arc::new(connection::Connection::default());
+                health.set("stopped");
+                let routes = Controller::open(state.into(), c, health);
+                if method == "routes/configure" {
+                    routes
+                        .configure(serde_json::from_value(params["routePreferences"].clone())?)
+                        .await
+                } else {
+                    Ok(routes.read().await)
+                }
+            }
+            "session/preferences" | "session/preferences/read" | "session/preferences/update" => {
+                let (broker, _) = Broker::open(Config::load(state)?, state.into())?;
+                preferences(&broker, method, &params).await
+            }
             "pair" => pair_files(state),
             "devices" | "revoke" => {
                 let file = state.join("devices.json");
@@ -186,18 +316,26 @@ pub async fn execute(state: &Path, method: &str, device: Option<&str>) -> Result
         let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port as u16)).await?;
         write(
             &mut stream,
-            &json!({"token":token,"method":method,"deviceId":device}),
+            &json!({"token":token,"method":method,"deviceId":device,"params":params}),
         )
         .await?;
         let reply = read(&mut stream).await?;
         if reply.get("error").is_some() {
-            bail!("Local command rejected");
+            use crate::error::{Code, classify};
+            let code = match reply["error"]["code"].as_str() {
+                Some("invalid_params") => Code::InvalidParams,
+                Some("version_conflict") => Code::VersionConflict,
+                Some("unauthorized") => Code::Unauthorized,
+                _ => Code::Rejected,
+            };
+            return Err(classify(anyhow::anyhow!("Local command rejected"), code));
         }
         reply.get("result").cloned().context("Invalid local reply")
     })
     .await;
     match result {
         Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) if crate::error::classification(&e).is_some() => Err(e),
         _ if method == "status" => {
             let mut v = stopped();
             v["state"] = json!("reconnecting");
@@ -214,7 +352,7 @@ pub fn pair_files(state: &Path) -> Result<Value> {
     let identity = pocket_tunnel::ServerIdentity::load_or_create(state.join("identity"))?;
     let token = storage::secret();
     let expires = storage::now() + 300;
-    let qr = json!({"v":1,"relayUrl":c.relay_url,"room":c.room,"phoneToken":c.phone_token,"certificateSha256":identity.certificate_sha256(),"pairingToken":token,"expiresAt":expires,"computerName":c.computer_name});
+    let qr = json!({"v":1,"relayUrl":c.relay_url,"room":c.room,"phoneToken":c.phone_token,"certificateSha256":identity.certificate_sha256(),"pairingToken":token,"expiresAt":expires,"computerName":c.computer_name,"computerId":c.computer_id,"routes":c.routes(),"policy":c.preferences().policy});
     let code = qrcode::QrCode::new(serde_json::to_vec(&qr)?)?;
     let svg = code
         .render::<qrcode::render::svg::Color>()

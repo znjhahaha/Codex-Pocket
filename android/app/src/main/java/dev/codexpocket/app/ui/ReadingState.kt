@@ -10,7 +10,7 @@ import androidx.compose.ui.text.AnnotatedString
 internal data class DiffReadingDocument(val content: String, val diff: Boolean, val lines: List<ReviewLine>, val columns: Int, val numberDigits: Int)
 
 /** Owned by the file, above preview/reader branches, so resizing never creates a new reading session. */
-internal class DiffReadingState(index: Int = 0, offset: Int = 0, x: Int = 0, wrap: Boolean = false, contexts: Set<Int> = emptySet()) {
+internal class DiffReadingState(index: Int = 0, offset: Int = 0, x: Int = 0, wrap: Boolean = true, contexts: Set<Int> = emptySet()) {
     val list = LazyListState(index, offset)
     val horizontal = ScrollState(x)
     var wrap by mutableStateOf(wrap)

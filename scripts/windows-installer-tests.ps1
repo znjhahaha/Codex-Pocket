@@ -76,15 +76,24 @@ Put (Join-Path $binarySource 'private-key.der') 'must never ship'
 $apk = Join-Path $testRoot 'synthetic.apk'
 Put $apk 'unsigned fixture; never install'
 $packageRoot = Join-Path $testRoot 'release'
+$packageInputs=Join-Path $testRoot 'package-inputs'
+foreach($name in Get-PocketWindowsFiles) {
+    if($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')){Put (Join-Path $packageInputs ('.local\tools\'+$name)) ('fixture '+$name)}
+    elseif($name -notlike '*.exe') {
+        $folder=if($name -like '*.md'){'docs'}else{'scripts'}
+        Put (Join-Path $packageInputs ($folder+'\'+$name)) ([IO.File]::ReadAllText((Join-Path $PSScriptRoot ('..\'+$folder+'\'+$name))))
+    }
+}
+
 
 Test 'package allowlist and complete SHA256 inventory' {
-    New-PocketReleasePackage -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -BinaryDirectory $binarySource -DesktopBinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $packageRoot -Version '0.1.0' -BuildEvidence @{builtThisInvocation=$false;apkSignatureVerified=$false;fixture=$true} | Out-Null
+    New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -DesktopBinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $packageRoot -Version '0.1.0' -BuildEvidence @{builtThisInvocation=$false;apkSignatureVerified=$false;fixture=$true} | Out-Null
     $manifest = Test-PocketReleaseDirectory $packageRoot
     Assert ($manifest.build.apkSignatureVerified -eq $false) 'Fixture was incorrectly marked signed'
     Assert (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'windows\private-key.der'))) 'Private data shipped'
     Assert ($manifest.files.Count -ge 13) 'Required delivery artifacts missing'
-    Expect-Failure { New-PocketReleasePackage -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $packageRoot -Version '0.1.0' -BuildEvidence @{fixture=$true} } 'already exists'
-    Expect-Failure { New-PocketReleasePackage -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory (Join-Path $testRoot 'unbuilt') -Version '0.1.0' -BuildEvidence @{} } 'requires a fresh build'
+    Expect-Failure { New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $packageRoot -Version '0.1.0' -BuildEvidence @{fixture=$true} } 'already exists'
+    Expect-Failure { New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory (Join-Path $testRoot 'unbuilt') -Version '0.1.0' -BuildEvidence @{} } 'requires a fresh build'
 }
 
 $source = Join-Path $packageRoot 'windows'
@@ -285,7 +294,7 @@ Test 'delivery upgrade and rollback restore integration byte for byte' {
     $taskBefore=$script:fakeTask
     $upgraded=Join-Path $testRoot 'release-v02'
     Put (Join-Path $binarySource 'pocket-desktop.exe') 'updated desktop fixture'
-    New-PocketReleasePackage -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -BinaryDirectory $binarySource -DesktopBinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $upgraded -Version '0.2.0' -BuildEvidence @{fixture=$true} | Out-Null
+    New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -DesktopBinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $upgraded -Version '0.2.0' -BuildEvidence @{fixture=$true} | Out-Null
     Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $upgraded 'windows') -StateDirectory $state -Context $context -Apply | Out-Null
     Assert ((Get-PocketFileHash (Join-Path $context.InstallRoot 'desktop-install.json')) -ne $recordBefore) 'Upgrade record unchanged'
     Assert ((Get-PocketFileHash $script:installedCliPath) -eq $launcherBefore) 'Stable bootstrap was replaced'
@@ -341,6 +350,7 @@ $global:LASTEXITCODE = 0
     Put $fakeSigner ("Write-Output 'Signer #1 certificate SHA-256 digest: " + ('0' * 64) + "'`n" + '$global:LASTEXITCODE = 0')
     function script:Get-PocketKeytoolPath { return $script:fakeKeytool }
     function script:cargo { $script:cargoArguments = @($args); $global:LASTEXITCODE = $script:cargoExit }
+    Put (Join-Path $buildRoot 'scripts\fetch-cloudflared.ps1') '$global:LASTEXITCODE=0'
     $script:cargoExit = 17
     $script:cargoArguments = @()
     $environment = @{}
@@ -366,7 +376,8 @@ $global:LASTEXITCODE = 0
         $digest=Get-PocketBytesHash ([Text.Encoding]::UTF8.GetBytes('fixture-public-certificate'))
         Put $fakeSigner ("Write-Output 'Signer #1 certificate SHA-256 digest: " + $digest + "'`n" + '$global:LASTEXITCODE = 0')
         foreach($file in Get-PocketWindowsFiles) {
-            if($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}
+            if($file -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$targetFile=Join-Path $buildRoot ('.local\tools\'+$file)}
+            elseif($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}
             elseif($file -like '*.exe'){$targetFile=Join-Path $buildRoot ('target\x86_64-pc-windows-msvc\release\'+$file)}
             elseif($file -like '*.md'){$targetFile=Join-Path $buildRoot ('docs\'+$file)}
             else{$targetFile=Join-Path $buildRoot ('scripts\'+$file)}

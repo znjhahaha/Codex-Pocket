@@ -23,8 +23,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -35,16 +39,22 @@ import kotlinx.coroutines.delay
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit, onSideChat: (TimelineItem) -> Unit = {}, canFork: Boolean = false, onPlan: ((Boolean) -> Unit)? = null,
-    activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null) {
+    activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null, onReopenPlan: (() -> Unit)? = null,
+    onEdit: ((TimelineItem) -> Unit)? = null) {
     val item = row.items.first()
     val clipboard = LocalClipboardManager.current
     when (row.kind) {
         TranscriptKind.Process -> Column(Modifier.fillMaxWidth()) {
-            PocketTextButton(onClick = onExpand, modifier = Modifier.heightIn(min = 48.dp)) {
+            val interaction = remember { MutableInteractionSource() }
+            Row(Modifier.fillMaxWidth().heightIn(min = 40.dp)
+                .clickable(interactionSource = interaction, indication = null, onClick = onExpand),
+                verticalAlignment = Alignment.CenterVertically) {
                 Text(row.processLabel ?: "查看过程", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                val angle by androidx.compose.animation.core.animateFloatAsState(if (expanded) 180f else 0f, pocketPressSpring(), label = "process-chevron")
-                Icon(PocketIcons.ExpandMore, null, Modifier.padding(start = 5.dp).size(16.dp).graphicsLayer { rotationZ = angle }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                val angle by androidx.compose.animation.core.animateFloatAsState(if (expanded) 90f else 0f, pocketPressSpring(), label = "process-chevron")
+                Icon(PocketIcons.ChevronRight, null, Modifier.padding(start = 5.dp).size(14.dp).graphicsLayer { rotationZ = angle }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            row.processDetail?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
         }
         TranscriptKind.User -> Column(Modifier.fillMaxWidth().padding(start = 48.dp), horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -53,7 +63,9 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             val attachments = remember(item.raw, message.files) { userAttachments(item, message.files) }
             // Images show as thumbnails (nine-cell grid like WeChat); other files stay chips.
             val (images, files) = remember(attachments) { attachments.partition(::looksLikeImage) }
-            if (images.isNotEmpty()) ImageGrid(images, alignEnd = true)
+            val nativeImages = remember(item.raw) { userMessageMedia(item) }
+            if (nativeImages.isNotEmpty()) ToolMediaGrid(nativeImages, alignEnd = true)
+            else if (images.isNotEmpty()) ImageGrid(images, alignEnd = true)
             if (files.isNotEmpty()) AttachmentChips(item.key, files, alignEnd = true)
             val replies = remember(message.request) { AsyncQuestions.replies(message.request) }
             val prose = if (replies.isNotEmpty()) replies.joinToString("\n\n") { "${it.string("question")}\n${it.string("answer")}" }
@@ -65,15 +77,29 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                     val implementation = remember(item, timeline) { timeline?.let { PlanPresentation.implementedProposal(item, it) } }
                     if (implementation != null) {
                         var showingPlan by androidx.compose.runtime.saveable.rememberSaveable(messageScope, item.key) { mutableStateOf(false) }
-                        Row(Modifier.heightIn(min = 32.dp).clickable { showingPlan = !showingPlan }, verticalAlignment = Alignment.CenterVertically,
+                        Row(Modifier.heightIn(min = 32.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { showingPlan = !showingPlan }, verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text("是，实施此计划", style = MaterialTheme.typography.bodyLarge)
                             ActivityExpansionIcon(showingPlan)
                         }
-                        if (showingPlan) SelectionContainer { Text(item.text, Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodyMedium) }
+                        if (showingPlan) Box(Modifier.padding(top = 10.dp)) { MarkdownText(implementation.content, "$messageScope/${item.key}/implemented-plan") }
                     } else if (prose.isNotBlank()) SelectionContainer { SentReferenceText(prose, item.raw) }
                     TranscriptImages(item, includeLocal = false)
                 }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                val context = LocalContext.current
+                val timestamp = remember(item.raw, item.key, timeline?.turns, timeline?.items?.keys) { messageTimestamp(item, timeline) }
+                timestamp?.let { time ->
+                    val date = java.util.Date(time.epochMillis)
+                    val label = android.text.format.DateFormat.getTimeFormat(context).format(date)
+                    val full = android.text.format.DateFormat.getMediumDateFormat(context).format(date) + " " + label
+                    Text(label, Modifier.padding(end = 4.dp).testTag("message-time:${item.key}")
+                        .semantics { contentDescription = (if (time.fromTurnStart) "回合开始时间：" else "发送时间：") + full },
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                CopyAction(prose) { clipboard.setText(AnnotatedString(prose)) }
+                if (onEdit != null) QuietAction(PocketIcons.Edit, "编辑此消息") { onEdit(item) }
             }
         }
         TranscriptKind.Answer, TranscriptKind.Commentary -> Column(Modifier.fillMaxWidth()) {
@@ -88,8 +114,10 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                 if (canFork) QuietAction(PocketIcons.CallSplit, stringResource(R.string.v02_sidechat)) { onSideChat(item) }
             }
         }
-        TranscriptKind.Error -> Notice(ConversationPresentation.detail(item).ifBlank { stringResource(R.string.v02_error_detail) }, error = true)
-        TranscriptKind.Plan -> NativeActivityCard(item, messageScope + item.key, expanded, onExpand, { onDetail(item) }, onPlan)
+        TranscriptKind.Error -> ConversationErrorRow(remember(item, timeline?.activeTurn, timeline?.completedTurns, timeline?.items) {
+            ConversationErrorPresentation.from(item, timeline)
+        }, messageScope + item.key)
+        TranscriptKind.Plan -> NativeActivityCard(item, messageScope + item.key, expanded, onExpand, { onDetail(item) }, onPlan, onReopenPlan)
         TranscriptKind.Activity -> NativeActivityTrace(row, messageScope, expanded, onExpand, onDetail, activityExpansions, onActivityExpansion)
     }
 }
@@ -109,7 +137,7 @@ internal fun QuietAction(icon: ImageVector, label: String, onClick: () -> Unit) 
 
 /** Copy morphs into a check for a moment, the way iOS confirms a copy. */
 @Composable
-private fun CopyAction(text: String, onCopy: () -> Unit) {
+internal fun CopyAction(text: String, onCopy: () -> Unit) {
     var copied by remember(text) { mutableStateOf(false) }
     LaunchedEffect(copied) { if (copied) { delay(1_400); copied = false } }
     val label = stringResource(R.string.copy)

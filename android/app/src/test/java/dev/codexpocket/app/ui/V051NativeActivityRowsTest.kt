@@ -101,7 +101,7 @@ class V051NativeActivityRowsTest {
         )
         var opened: String? = null
         content(mapOf("a" to "Hooke", "b" to "Dewey")) { Column { NativeAgentWorkingStrip(entries, onOpen = { opened = it }) } }
-        compose.onNodeWithText("Hooke、Dewey和另外2个子智能体开始工作").assertExists()
+        compose.onNodeWithText("Hooke、Dewey和另外2个子智能体正在工作").assertExists()
         compose.onNodeWithText("Old", substring = true).assertDoesNotExist()
         compose.onNodeWithText("Finished", substring = true).assertDoesNotExist()
         compose.onNodeWithTag("native-agents-working").performClick()

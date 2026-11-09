@@ -36,8 +36,8 @@ internal fun SourceScreen(
     onOpen: (String) -> Unit = {}, onDraftComment: ((FileCommentDraft) -> Unit)? = null,
     canRead: Boolean = true, initialLine: Int? = null,
 ) {
-    // Standalone use does not require a transcript provider; state keys contain only file identity.
-    ProvideMarkdownRendering {
+    // Identical paths in a parent and child must not share reading/comment state.
+    key(source.owner, source.path, source.readOnly) { ProvideMarkdownRendering {
         val clipboard = LocalClipboardManager.current
         var scrolled by remember(source.path) { mutableStateOf(false) }
         val markdown = sourceLanguage(source.path) == "markdown"
@@ -65,7 +65,7 @@ internal fun SourceScreen(
                 }
             }
         }
-    }
+    } }
 }
 
 @Composable
@@ -79,7 +79,7 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
     var query by rememberSaveable(source.path) { mutableStateOf("") }
     var search by rememberSaveable(source.path) { mutableStateOf(false) }
     var jump by rememberSaveable(source.path) { mutableStateOf("") }
-    var wrap by rememberSaveable(source.path) { mutableStateOf(false) }
+    var wrap by rememberSaveable(source.path) { mutableStateOf(true) }
     var commentLine by remember(source.path, source.text) { mutableStateOf<Int?>(null) }
     val matches by produceState(emptyList<Int>(), data, query) { value = withContext(Dispatchers.Default) { data?.matchingLines(query).orEmpty() } }
     val state = rememberLazyListState()
@@ -139,7 +139,9 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
                         Row(Modifier.widthIn(min = width).then(if (wrap) Modifier.fillMaxWidth() else Modifier)
                             .background(if (hit) matchColor.copy(alpha = .25f) else androidx.compose.ui.graphics.Color.Transparent).padding(end = 16.dp)) {
                             // Quiet gutter with a hairline divider, as in VS Code / GitHub blob view.
-                            Text((number + 1).toString(), Modifier.width(56.dp).heightIn(min = 32.dp).clickable { commentLine = number + 1 }.semantics { contentDescription = "第 ${number + 1} 行，添加草稿评论" }
+                            Text((number + 1).toString(), Modifier.width(56.dp).heightIn(min = 32.dp)
+                                .then(if (source.readOnly) Modifier else Modifier.clickable { commentLine = number + 1 })
+                                .semantics { contentDescription = if (source.readOnly) "第 ${number + 1} 行" else "第 ${number + 1} 行，添加草稿评论" }
                                 .drawBehind { drawLine(gutter, androidx.compose.ui.geometry.Offset(size.width - 1f, 0f), androidx.compose.ui.geometry.Offset(size.width - 1f, size.height), 1f) }
                                 .padding(start = 6.dp, end = 10.dp, top = 5.dp, bottom = 5.dp), textAlign = TextAlign.End, fontFamily = FontFamily.Monospace, fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .7f))
@@ -150,7 +152,7 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
             }
         }
     }
-    commentLine?.let { ReadingCommentDialog(source.path, it, ReviewSide.NEW, { commentLine = null }, onDraft) }
+    if (!source.readOnly) commentLine?.let { ReadingCommentDialog(source.path, it, ReviewSide.NEW, { commentLine = null }, onDraft) }
 }
 
 @Composable
@@ -207,8 +209,9 @@ private fun MarkdownFilePreview(source: SourcePreview, modifier: Modifier, onOpe
         // Reading layout: wider margins and paragraph rhythm, like GitHub's rendered README.
         else LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = state, contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 40.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             itemsIndexed(data.parts, key = { i, _ -> i }) { _, part ->
-                if (part.code != null) CodeBlock(part.code, part.language)
-                else MarkdownSpans(part.spans ?: android.text.SpannedString(""), renderer, foreground, linkColor) { href ->
+                if (part.table != null) MarkdownTable(part.table)
+                else if (part.code != null) CodeBlock(part.code, part.language)
+                else MarkdownSpans(part.spans ?: android.text.SpannedString(""), renderer, foreground, linkColor, tableColumns = part.tableColumns) { href ->
                     if (href.startsWith('#')) {
                         val anchor = runCatching { URLDecoder.decode(href.drop(1).replace("+", "%2B"), "UTF-8") }.getOrNull()
                         val target = data.headings.firstOrNull { it.anchor == anchor }

@@ -68,7 +68,10 @@ pub fn validate(method: &str, params: &Value) -> Result<bool, AccessError> {
         "thread/settings/update" => (&["threadId", "serviceTier"], true),
         // Cwds/catalog flags are injected by the broker from native thread proof.
         "skills/list" | "plugin/list" => (&[], false),
-        "thread/turns/list" => (&["threadId", "cursor", "limit", "sortDirection", "itemsView"], false),
+        "thread/turns/list" => (
+            &["threadId", "cursor", "limit", "sortDirection", "itemsView"],
+            false,
+        ),
         "thread/items/list" => (
             &["threadId", "turnId", "cursor", "limit", "sortDirection"],
             false,
@@ -274,6 +277,18 @@ fn required_string(value: &Value, key: &str) -> Result<(), AccessError> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn v054_prepared_input_is_opaque_and_never_accepts_native_write_paths() {
+        assert!(validate("turn/start", &json!({"threadId":"t","preparedInput":"opaque","input":[{"type":"text","text":"edit"}]})).is_err());
+        for method in [
+            "thread/revert",
+            "skills/config/write",
+            "config/value/write",
+            "config/mcpServer/reload",
+        ] {
+            assert_eq!(validate(method, &json!({})), Err(AccessError::Unsupported));
+        }
+    }
     #[test]
     fn rejects_auth_config_and_arbitrary_shell() {
         for m in [

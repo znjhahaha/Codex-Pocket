@@ -5,3 +5,5 @@ pub mod supervisor;
 pub mod launcher;
 pub mod pairing;
 pub mod connection;
+
+pub mod connectivity;

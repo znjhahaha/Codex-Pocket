@@ -76,6 +76,7 @@ impl Capabilities {
                     }
                     result.0.insert(method.into(), fields);
                 } else if params["type"] == "object"
+                    || (method == "config/mcpServer/reload" && params["type"] == "null")
                     || (method == "account/rateLimits/read"
                         && (params["type"] == "null" || raw.is_null()))
                 {
@@ -87,6 +88,9 @@ impl Capabilities {
     }
     pub fn supports(&self, method: &str, params: &Value) -> bool {
         self.0.get(method).is_some_and(|fields| {
+            if method == "config/mcpServer/reload" {
+                return params.is_null() && fields.is_empty();
+            }
             params
                 .as_object()
                 .is_some_and(|p| p.keys().all(|k| !k.starts_with('$') && fields.contains(k)))
@@ -127,9 +131,17 @@ pub fn allowed_method(m: &str) -> bool {
         m,
         "account/rateLimits/read"
             | "config/read"
+            | "config/value/write"
+            | "config/mcpServer/reload"
+            | "mcpServerStatus/list"
+            | "skills/config/write"
+            | "plugin/installed"
+            | "app/installed"
+            | "thread/revert"
             | "thread/list"
             | "thread/read"
             | "thread/loaded/list"
+            | "thread/unsubscribe"
             | "thread/queue/list"
             | "thread/queue/add"
             | "thread/queue/update"
@@ -162,6 +174,7 @@ pub fn advanced(m: &str) -> bool {
     matches!(
         m,
         "thread/queue/add"
+            | "thread/revert"
             | "thread/queue/update"
             | "thread/queue/delete"
             | "thread/queue/reorder"
@@ -230,6 +243,23 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn v054_apps_require_exported_read_capability_without_new_writes() {
+        let c = Capabilities::from_schema(&json!({"oneOf":[{"properties":{"method":{"enum":["app/installed"]},"params":{"type":"object","properties":{"forceRefresh":{"type":"boolean"},"threadId":{"type":["string","null"]}}}}}]}));
+        assert!(c.supports("app/installed", &json!({"forceRefresh":false})));
+        assert!(!Capabilities::default().supports("app/installed", &json!({"forceRefresh":false})));
+        assert!(!allowed_method("app/toggle"));
+        assert!(!allowed_method("app/read"));
+        assert!(!allowed_method("app/list"));
+    }
+    #[test]
+    fn v054_reload_uses_actual_null_native_schema() {
+        let caps = Capabilities::from_schema(
+            &json!({"oneOf":[{"properties":{"method":{"enum":["config/mcpServer/reload"]},"params":{"type":"null"}}}]}),
+        );
+        assert!(caps.supports("config/mcpServer/reload", &Value::Null));
+        assert!(!caps.supports("config/mcpServer/reload", &json!({"path":"private"})));
+    }
+    #[test]
     fn v052_discovery_distinguishes_pending_failed_and_old_bridge() {
         assert_eq!(
             permission_discovery(&json!({"initialized":true,"schemaPending":true})).0,
@@ -267,7 +297,7 @@ mod tests {
             assert!(!c.supports("account/rateLimits/read", &json!({"apiKey":"secret"})));
         }
         assert!(!allowed_method("account/logout"));
-        assert!(!allowed_method("config/value/write"));
+        assert!(allowed_method("config/value/write")); // Internal bridge evidence; paired-device access still denies this method.
     }
     #[test]
     fn v02_schema_evidence_requires_each_actual_method_and_field() {

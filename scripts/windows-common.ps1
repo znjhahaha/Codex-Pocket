@@ -155,7 +155,7 @@ function ConvertTo-PocketArgument([string]$Value) {
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
 function Get-PocketWindowsFiles {
-    return @('pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
+    return @('cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
         'windows-launch-desktop.ps1','windows-tray.ps1','windows-verify-release.ps1',
         'cli-install.ps1','cli-wrapper.mjs','windows-user-guide.md','cli-install-implementation.md',
         'resume-windows-report.md','cli-native-probe-result.md','V02-WINDOWS-INSTALL.md')
@@ -226,20 +226,25 @@ function Get-PocketDesktopPackage {
     if ($packages.Count -ne 1) { throw 'Expected one installed original Codex desktop package.' }
     return $packages[0]
 }
+function Test-PocketWebView2 {
+    param([scriptblock]$ReadVersion={param($Path) (Get-ItemProperty -LiteralPath $Path -Name pv -ErrorAction Stop).pv})
+    # Microsoft's documented Evergreen runtime identity; browser product names are not evidence.
+    foreach($path in @(
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+        'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+        'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+    )) {
+        try { $version=[string](& $ReadVersion $path); if($version -match '^\d+\.\d+\.\d+\.\d+$' -and [version]$version -gt [version]'0.0.0.0'){return $true} } catch { }
+    }
+    return $false
+}
 function Assert-PocketWindowsPrerequisites {
     if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit PowerShell for the Windows x64 delivery.' }
     if (-not [IO.File]::Exists((Join-Path $env:WINDIR 'System32\vcruntime140.dll'))) {
         throw 'Microsoft Visual C++ x64 runtime (VCRUNTIME140.dll) is required before installation.'
     }
-    $webview = @('HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F1E7E5C7-98BB-4AB8-BB01-7A61E3E2E1C9}', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients', 'HKCU:\Software\Microsoft\EdgeUpdate\Clients', 'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients')
-    $found = $false
-    foreach ($key in $webview) {
-        foreach ($item in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
-            $p = Get-ItemProperty -LiteralPath $item.PSPath -ErrorAction SilentlyContinue
-            if ($p -and $p.PSObject.Properties['name'] -and $p.name -like '*WebView2*' -and $p.PSObject.Properties['pv'] -and $p.pv -ne '0.0.0.0') { $found = $true }
-        }
-    }
-    if (-not $found) { throw 'Microsoft Edge WebView2 Evergreen runtime is required. Install it before applying this portable delivery.' }
+    if (-not (Test-PocketWebView2)) { throw 'Microsoft Edge WebView2 Evergreen runtime is required. Open https://developer.microsoft.com/microsoft-edge/webview2/ to install Evergreen x64, then retry Setup.' }
+
 }
 
 function Get-PocketLocalAppData {

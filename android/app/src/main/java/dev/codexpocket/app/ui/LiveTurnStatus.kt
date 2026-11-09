@@ -47,6 +47,11 @@ internal fun elapsedLabel(seconds: Long): String {
 internal fun liveStatusLabel(status: LiveStatus): String =
     if (status == LiveStatus.Compacting) "正在压缩上下文" else ""
 
+/** Missing or mismatched native timing keeps prose readable but supplies no live-motion proof. */
+internal fun nativeSummaryActive(turnId: String, reasoning: TimelineItem?, timing: NativeTurnInfo?): Boolean =
+    reasoning?.type == "reasoning" && reasoning.turnId == turnId &&
+        timing?.id == turnId && timing.status == "inProgress"
+
 /** Native summary prose, without a thought badge, activity spinner or a transcript clock. */
 @Suppress("UNUSED_PARAMETER")
 @Composable
@@ -61,13 +66,15 @@ internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifi
     }
     var expanded by rememberSaveable(turnId) { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
+    val active = nativeSummaryActive(turnId, reasoning, timing)
     Column(modifier.fillMaxWidth().testTag("live-turn-status")) {
         // Tapping replaces the compact prose with its separate paragraphs, in the same location.
         Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-reasoning-toggle")
             .clickable(interactionSource = interaction, indication = null, role = Role.Button) { expanded = !expanded }
             .semantics { stateDescription = if (expanded) "已展开摘要" else "已收起摘要" }
             .padding(vertical = 10.dp)) {
-            if (!expanded) NativeSummaryProse(parts.last(), "live-summary:$turnId:${reasoning?.itemId}:last", maxLines = 2)
+            if (!expanded) NativeSummaryProse(parts.last(), "live-summary:$turnId:${reasoning?.itemId}:last", maxLines = 2,
+                active = active)
             androidx.compose.animation.AnimatedVisibility(expanded,
                 enter = fadeIn(tween(pocketMotionMillis(160))) + expandVertically(tween(pocketMotionMillis(220))),
                 exit = fadeOut(tween(pocketMotionMillis(100))) + shrinkVertically(tween(pocketMotionMillis(180)))) {
@@ -75,7 +82,8 @@ internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifi
                     .testTag("live-reasoning-summary").padding(bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     parts.forEachIndexed { index, part -> key(turnId, reasoning?.itemId, index) {
                         NativeSummaryProse(part, "live-summary:$turnId:${reasoning?.itemId}:$index",
-                            Modifier.testTag("native-summary-paragraph:$index"))
+                            Modifier.testTag("native-summary-paragraph:$index"),
+                            active = active && expanded && index == parts.lastIndex)
                     } }
                 }
             }
@@ -85,11 +93,12 @@ internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifi
 
 /** Markwon parses Markdown off-thread; summary headings and emphasis stay small, muted prose. */
 @Composable
-internal fun NativeSummaryProse(text: String, messageKey: String, modifier: Modifier = Modifier, maxLines: Int = Int.MAX_VALUE) {
+internal fun NativeSummaryProse(text: String, messageKey: String, modifier: Modifier = Modifier, maxLines: Int = Int.MAX_VALUE,
+    active: Boolean = false) {
     val renderer = LocalMarkdownCache.current
     var prose by remember(renderer, messageKey, text) { mutableStateOf<String?>(null) }
     LaunchedEffect(renderer, messageKey, text) { prose = renderer?.render(messageKey, text)?.spans?.toString() }
-    Text(prose ?: remember(text) { markdownPreview(text) }, modifier, style = MaterialTheme.typography.bodySmall,
+    Text(prose ?: remember(text) { markdownPreview(text) }, modifier.reasoningSweep(active && text.isNotBlank()), style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
 }
 

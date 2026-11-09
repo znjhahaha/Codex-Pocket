@@ -24,12 +24,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import dev.codexpocket.app.data.PocketState
+import dev.codexpocket.app.data.*
 
 internal fun actionUnavailableReason(s: PocketState, method: String, idle: Boolean = false): String? = when {
     !s.online -> "连接电脑后可用"
     s.activeRuntime?.online != true -> "等待 Codex 就绪"
     !s.supports(method) -> "当前 Codex 版本未提供此能力"
+    !s.accessAllowsSending() -> "请先确认会话归属"
     s.selected?.conflict == true -> "先在设备页解决会话归属冲突"
     s.selected?.archived == true -> "恢复此会话后可用"
     s.uncertainSend -> "先确认上一条消息的发送结果"
@@ -69,7 +70,7 @@ internal fun ConversationActionsList(s: PocketState, onDismiss: () -> Unit, onFi
         ConversationAction("压缩上下文", PocketIcons.FoldVertical, actionUnavailableReason(s, "thread/compact/start", true), onCompact),
         ConversationAction("在电脑上继续", PocketIcons.Computer, actionUnavailableReason(s, "thread/resume"), onResume),
     )
-    val fastReason = actionUnavailableReason(s, "thread/settings/update")
+    val fastReason = fastUnavailableReason(s)
     val unavailable = actions.filter { it.reason != null } +
         listOfNotNull(fastReason?.let { ConversationAction("快速模式", PocketIcons.AutoAwesome, it) {} })
     Column(Modifier.verticalScroll(rememberScrollState())) {

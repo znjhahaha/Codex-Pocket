@@ -85,7 +85,7 @@ internal fun QuestionDock(
                     entry.approval?.let { approval ->
                         QuestionBatches.blockingResponse(entry.batch, answers)?.let { onRespond(approval, it) }
                     } ?: QuestionBatches.asyncAnswers(entry.batch, answers)?.let(onAsyncAnswers)
-                }, enabled = !s.busy && !s.sendBusy)
+                }, enabled = !s.busy && !s.sendBusy, revealState = memory.reveal(entry.batch))
             } else {
                 // Command/file approval decisions keep their own native allow/decline/cancel interface.
                 Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
@@ -107,6 +107,7 @@ internal fun QuestionCard(
     onSubmit: (List<Pair<String, String>>) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    revealState: QuestionRevealState? = null,
 ) {
     var revision by remember(session) { mutableIntStateOf(0) }
     // The session is plain memory so it can be tested without Compose or a persistence runtime.
@@ -114,55 +115,61 @@ internal fun QuestionCard(
     val phase = session.presentationPhase(availability)
     val interactive = enabled && phase == QuestionPhase.Waiting
     val question = session.currentQuestion
-    Column(modifier.fillMaxWidth().testTag("question-card"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(question?.header?.takeIf { it.isNotBlank() } ?: if (batch.asynchronous) stringResource(R.string.v02_async) else stringResource(R.string.your_answer),
-                Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(if (question == null) "0/0" else "${session.page + 1}/${batch.questions.size}", Modifier.testTag("question-page"),
-                style = MaterialTheme.typography.labelLarge)
-        }
-        QuestionStatus(phase, enabled)
-        if (question != null) {
-            val scroll = key(batch.id, question.id) { rememberScrollState() }
-            Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(question.prompt, style = MaterialTheme.typography.bodyLarge)
-                if (phase != QuestionPhase.Submitted && phase != QuestionPhase.Unsupported) {
-                    question.options.forEachIndexed { index, option ->
-                        QuestionOptionRow(option.label, option.description, option.recommended,
-                            selected = !session.otherSelected(question.id) && session.answer(question.id) == option.value,
-                            enabled = interactive, modifier = Modifier.testTag("question-option:${question.id}:$index")) {
-                            if (session.selectOption(question.id, option.value)) revision++
-                        }
-                    }
-                    if (question.allowsOther) {
-                        if (question.options.isNotEmpty()) QuestionOptionRow(stringResource(R.string.other_answer), "", false,
-                            session.otherSelected(question.id), interactive, Modifier.testTag("question-other:${question.id}")) {
-                            if (session.selectOther(question.id)) revision++
-                        }
-                        if (question.options.isEmpty() || session.otherSelected(question.id)) {
-                            PocketTextField(session.otherText(question.id), { if (session.editOther(question.id, it)) revision++ },
-                                Modifier.fillMaxWidth().testTag("question-answer:${question.id}").semantics { if (question.secret) password() },
-                                label = stringResource(if (question.options.isEmpty()) R.string.your_answer else R.string.other_answer),
-                                enabled = interactive, singleLine = question.secret, maxLines = if (question.secret) 1 else 4,
-                                visualTransformation = if (question.secret) PasswordVisualTransformation() else VisualTransformation.None,
-                                keyboardOptions = if (question.secret) KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false,
-                                    platformImeOptions = PlatformImeOptions(privateImeOptions = "com.google.android.inputmethod.latin.noPersonalizedLearning=true")) else KeyboardOptions.Default)
-                            if (question.secret) Text("敏感回答仅在当前界面内存中保留", style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+    val reveal = revealState ?: remember(session) { QuestionRevealState() }
+    QuestionReveal(question?.id, reveal, modifier.fillMaxWidth().testTag("question-card")) {
+        // Answers belong to the session; focus/IME/scroll nodes belong to this question only.
+        key(batch.id, question?.id) {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(question?.header?.takeIf { it.isNotBlank() } ?: if (batch.asynchronous) stringResource(R.string.v02_async) else stringResource(R.string.your_answer),
+                        Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(if (question == null) "0/0" else "${session.page + 1}/${batch.questions.size}", Modifier.testTag("question-page"),
+                        style = MaterialTheme.typography.labelLarge)
+                }
+                QuestionStatus(phase, enabled)
+                if (question != null) {
+                    val scroll = key(batch.id, question.id) { rememberScrollState() }
+                    Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(question.prompt, style = MaterialTheme.typography.bodyLarge)
+                        if (phase != QuestionPhase.Submitted && phase != QuestionPhase.Unsupported) {
+                            question.options.forEachIndexed { index, option ->
+                                QuestionOptionRow(option.label, option.description, option.recommended,
+                                    selected = !session.otherSelected(question.id) && session.answer(question.id) == option.value,
+                                    enabled = interactive, modifier = Modifier.testTag("question-option:${question.id}:$index")) {
+                                    if (session.selectOption(question.id, option.value)) revision++
+                                }
+                            }
+                            if (question.allowsOther) {
+                                if (question.options.isNotEmpty()) QuestionOptionRow(stringResource(R.string.other_answer), "", false,
+                                    session.otherSelected(question.id), interactive, Modifier.testTag("question-other:${question.id}")) {
+                                    if (session.selectOther(question.id)) revision++
+                                }
+                                if (question.options.isEmpty() || session.otherSelected(question.id)) {
+                                    PocketTextField(session.otherText(question.id), { if (session.editOther(question.id, it)) revision++ },
+                                        Modifier.fillMaxWidth().testTag("question-answer:${question.id}").semantics { if (question.secret) password() },
+                                        label = stringResource(if (question.options.isEmpty()) R.string.your_answer else R.string.other_answer),
+                                        enabled = interactive, singleLine = question.secret, maxLines = if (question.secret) 1 else 4,
+                                        visualTransformation = if (question.secret) PasswordVisualTransformation() else VisualTransformation.None,
+                                        keyboardOptions = if (question.secret) KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false,
+                                            platformImeOptions = PlatformImeOptions(privateImeOptions = "com.google.android.inputmethod.latin.noPersonalizedLearning=true")) else KeyboardOptions.Default)
+                                    if (question.secret) Text("敏感回答仅在当前界面内存中保留", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
-        if (phase != QuestionPhase.Unsupported) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (session.page > 0) PocketButton("上一题", { session.move(-1); revision++ },
-                Modifier.weight(1f).testTag("question-previous"), secondary = true)
-            if (session.page < batch.questions.lastIndex) {
-                PocketButton("下一题", { session.move(1); revision++ }, Modifier.weight(1f).testTag("question-next"))
-            } else {
-                PocketButton(stringResource(R.string.submit_answers), {
-                    session.beginSubmission(phase)?.let { answers -> revision++; onSubmit(answers) }
-                }, Modifier.weight(1f).testTag("question-submit"), enabled = interactive && session.complete)
+                if (phase != QuestionPhase.Unsupported) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (session.page > 0) PocketButton("上一题", { session.move(-1); revision++ },
+                        Modifier.weight(1f).testTag("question-previous"), secondary = true)
+                    if (session.page < batch.questions.lastIndex) {
+                        PocketButton("下一题", { session.move(1); revision++ }, Modifier.weight(1f).testTag("question-next"))
+                    } else {
+                        PocketButton(stringResource(R.string.submit_answers), {
+                            session.beginSubmission(phase)?.let { answers -> revision++; onSubmit(answers) }
+                        }, Modifier.weight(1f).testTag("question-submit"), enabled = interactive && session.complete)
+                    }
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param()
+param([string]$Only)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'windows-install.ps1')
@@ -10,6 +10,7 @@ $testRoot=Join-Path ([IO.Path]::GetTempPath()) ('pocket-v02-'+[guid]::NewGuid().
 $script:passed=0; $script:failed=0
 function Assert($Value,[string]$Message) { if(-not $Value){throw $Message} }
 function Test([string]$Name,[scriptblock]$Body) {
+    if($Only -and $Name -notlike ('*'+$Only+'*')){return}
     try { & $Body; $script:passed++; Write-Output ('PASS '+$Name) }
     catch { $script:failed++; Write-Output ('FAIL '+$Name+': '+$_.Exception.Message) }
 }
@@ -77,7 +78,8 @@ Test 'each desktop failure stops subsequent commands and restores working direct
 $root=Join-Path $testRoot 'package-input'
 Put (Join-Path $testRoot 'native\app\resources\codex.exe') 'never execute'
 foreach($name in Get-PocketWindowsFiles) {
-    if($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$path=Join-Path $root ('desktop\target\release\'+$name)}
+    if($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$path=Join-Path $root ('.local\tools\'+$name)}
+    elseif($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$path=Join-Path $root ('desktop\target\release\'+$name)}
     elseif($name -like '*.exe'){$path=Join-Path $root ('target\release\'+$name)}
     elseif($name -like '*.md'){$path=Join-Path $root ('docs\'+$name)}
     else{$path=Join-Path $root ('scripts\'+$name)}
@@ -125,16 +127,16 @@ Test 'v3 record and supervisor task match native launcher contract without start
     Assert ($task.Principals.Principal.UserId -eq $sid) 'Task is not current-user scoped'
     Assert ($script:starts -eq 0) 'Install started a task'
 }
-Test 'UI startup is independent, optional, idempotent and reversible' {
+Test 'startup unifies supervisor and tray without a second logon shortcut' {
     Invoke-PocketWindowsInstall @installArgs -UiStartup Enable -Apply | Out-Null
-    $link=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $context.Startup 'Codex Pocket.lnk'))
-    Assert ($link.Arguments -eq '--pocket-ui') 'UI startup does not use stable UI mode'
+    Assert (-not [IO.File]::Exists((Join-Path $context.Startup 'Codex Pocket.lnk'))) 'Duplicate startup shortcut exists'
+    Assert (Test-PocketTaskLogon $script:fakeTask) 'Unified startup is not enabled'
     $recordHash=Get-PocketFileHash (Join-Path $context.InstallRoot 'desktop-install.json')
     Invoke-PocketWindowsInstall @installArgs -Apply | Out-Null
     Assert ((Get-PocketFileHash (Join-Path $context.InstallRoot 'desktop-install.json')) -eq $recordHash) 'Default apply lost UI preference'
     $startup=Invoke-PocketStartup -Action Disable -InstallRoot $context.InstallRoot
     Assert (-not $startup.enabled) 'Supervisor logon not disabled'
-    Assert ([IO.File]::Exists((Join-Path $context.Startup 'Codex Pocket.lnk'))) 'Supervisor setting removed UI startup'
+    Assert (-not [IO.File]::Exists((Join-Path $context.Startup 'Codex Pocket.lnk'))) 'Duplicate startup shortcut exists'
     Invoke-PocketWindowsInstall @installArgs -UiStartup Disable -Apply | Out-Null
     Assert (-not [IO.File]::Exists((Join-Path $context.Startup 'Codex Pocket.lnk'))) 'UI startup not removed'
     Assert (-not (Test-PocketTaskLogon $script:fakeTask)) 'Apply reenabled supervisor logon'
@@ -252,7 +254,7 @@ Test 'repeated upgrades keep bootstrap record bounded with exact verified rollba
     $recordPath=Join-Path $small.InstallRoot 'desktop-install.json'
     for($upgrade=0;$upgrade -lt 24;$upgrade++) {
         $previous=Get-PocketFileHash $recordPath
-        Invoke-PocketWindowsInstall @argsBounded -UiStartup $(if($upgrade%2 -eq 0){'Enable'}else{'Disable'}) | Out-Null
+        Invoke-PocketWindowsInstall @argsBounded -UiStartup $(if($upgrade%2 -eq 0){'Disable'}else{'Enable'}) | Out-Null
         Assert ((Get-Item -LiteralPath $recordPath).Length -lt 128KB) 'Repeated integration grew the bootstrap record'
         $record=Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
         $snapshot=Read-PocketRollbackSnapshot $record.rollback $small.InstallRoot
@@ -276,5 +278,27 @@ Test 'repeated upgrades keep bootstrap record bounded with exact verified rollba
     Invoke-PocketWindowsInstall -Context $small -Rollback -Apply | Out-Null
     Assert ((Get-PocketFileHash $recordPath) -eq $legacyHash) 'Rollback failed to restore legacy record exactly'
 }
-Write-Output ("$script:passed passed; $script:failed failed; fixtures: $testRoot")
-if($script:failed){exit 1}
+
+Test 'fresh Setup initializes only an absent private state and preserves it on reapply' {
+    $script:fakeTask=$null; $script:fakeCli='C:\original fixture\codex.exe'; $script:fakeKind='String'
+    $freshContext=@{InstallRoot=(Join-Path $testRoot 'fresh-install');Programs=(Join-Path $testRoot 'fresh-programs');Startup=(Join-Path $testRoot 'fresh-startup')}
+    $freshState=Join-Path $freshContext.InstallRoot 'agent'
+    $script:initializations=0
+    function Initialize-PocketPrivateState([string]$Agent,[string]$Directory) {
+        $script:initializations++
+        Assert ($Directory.StartsWith($freshState+'.staging-')) 'Fresh state escaped its private staging path'
+        Copy-PocketState $state $Directory
+    }
+    Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize | Out-Null
+    Assert ($script:initializations -eq 0) 'Dry-run initialized identity'
+    Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply | Out-Null
+    $identity=Get-PocketFileHash (Join-Path $freshState 'identity/private-key.der')
+    Assert ($script:initializations -eq 1) 'Fresh installation did not initialize exactly once'
+    Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply | Out-Null
+    Assert ($script:initializations -eq 1) 'Reapply replaced identity'
+    Assert ((Get-PocketFileHash (Join-Path $freshState 'identity/private-key.der')) -eq $identity) 'Pairing identity changed'
+    Invoke-PocketWindowsInstall -Context $freshContext -Uninstall -Apply | Out-Null
+    Assert ((Get-PocketFileHash (Join-Path $freshState 'identity/private-key.der')) -eq $identity) 'Uninstall removed identity'
+}
+if($script:failed){throw "$script:failed sandbox tests failed"}
+Write-Output "$script:passed tests passed including v0.6 fresh-state initialization"

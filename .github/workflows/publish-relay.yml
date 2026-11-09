@@ -1,0 +1,34 @@
+name: Publish approved relay
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    if: ${{ !github.event.release.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Load exact reviewed archive and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRE_RELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          version="${RELEASE_TAG#v}"
+          gh release download "$RELEASE_TAG" -p "codex-pocket-$version-relay-amd64.tar.gz" -p relay-SHA256SUMS.txt
+          sha256sum --check relay-SHA256SUMS.txt
+          gzip -dc "codex-pocket-$version-relay-amd64.tar.gz" | docker load
+          image="ghcr.io/${GH_REPO,,}/relay"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag "codex-pocket-relay:$version" "$image:$RELEASE_TAG"
+          docker push "$image:$RELEASE_TAG"
+          if [ "$PRE_RELEASE" = false ]; then
+            docker tag "codex-pocket-relay:$version" "$image:stable"
+            docker push "$image:stable"
+          fi

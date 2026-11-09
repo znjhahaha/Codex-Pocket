@@ -41,7 +41,8 @@ class AgentReaderStateTest {
         }
         assertSame(reader, reader.withLiveStatus(child.nativeId, live(timeline(), 99, "old-epoch")))
         assertSame(reader, reader.withLiveStatus(child.nativeId, AgentLiveStatus("running", "new-turn")))
-        assertSame(reader, reader.withLiveStatus(child.nativeId, AgentLiveStatus("active", cursor = Cursor("e", 22))))
+        assertSame(reader, reader.withLiveStatus(child.nativeId, AgentLiveStatus("active", cursor = Cursor("e", 20))))
+        assertEquals(ActivityStatus.Running, reader.withLiveStatus(child.nativeId, AgentLiveStatus("active", cursor = Cursor("e", 22))).liveStatuses.getValue(child.nativeId).status)
         val idleReader = reader.withLiveStatus(child.nativeId, AgentLiveStatus("idle", cursor = Cursor("e", 22)))
         assertEquals(ActivityStatus.Completed, idleReader.liveStatuses.getValue(child.nativeId).status)
         assertSame(idleReader, idleReader.withLiveStatus(child.nativeId, AgentLiveStatus("notLoaded", "child-turn", Cursor("e", 22))))
@@ -51,7 +52,7 @@ class AgentReaderStateTest {
     }
 
     @Test fun parentTerminalStateIsNotOverriddenByAStaleRunningChildRead() {
-        val reader = AgentReaderState(parent).withLiveStatus(child.nativeId, live(timeline(), 10))
+        val reader = AgentReaderState(parent).withLiveStatus(child.nativeId, AgentLiveStatus("running", "child-turn"))
         listOf("completed", "errored", "interrupted", "shutdown").forEach { terminal ->
             assertEquals(NativeActivityPresentation.status(terminal), agentRoster(parentTimeline(terminal), reader.liveStatuses).single().status)
         }

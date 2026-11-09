@@ -57,13 +57,29 @@ internal fun questionAvailability(s: PocketState, entry: QuestionDockEntry): Que
 /** Kept above the collapsing/paging content. Removed requests and disposed docks release their answers. */
 internal class QuestionDockMemory {
     private val sessions = mutableMapOf<String, QuestionSession>()
+    private val reveals = mutableMapOf<String, QuestionRevealState>()
     private val scopes = mutableMapOf<String, Set<String>>()
     fun session(batch: QuestionBatch) = sessions.getOrPut(batch.id) { QuestionSession(batch) }.also { it.update(batch) }
+    fun reveal(batch: QuestionBatch) = reveals.getOrPut(batch.id) { QuestionRevealState() }
     fun reconcile(scope: String, entries: List<QuestionDockEntry>, fresh: Boolean) {
         val keys = entries.map { it.key }.toSet()
-        if (fresh) (scopes[scope].orEmpty() - keys).forEach { sessions.remove(it)?.clear() }
+        if (fresh) (scopes[scope].orEmpty() - keys).forEach {
+            sessions.remove(it)?.clear()
+            reveals.remove(it)
+        }
         scopes[scope] = if (fresh) keys else scopes[scope].orEmpty() + keys
     }
-    fun clear() { sessions.values.forEach { it.clear() }; sessions.clear(); scopes.clear() }
+    fun clear() { sessions.values.forEach { it.clear() }; sessions.clear(); reveals.clear(); scopes.clear() }
     override fun toString() = "QuestionDockMemory"
+}
+
+/** Identity-only visual memory above collapse/batch paging; never stores or mutates answers. */
+internal class QuestionRevealState {
+    private var lastQuestion: String? = null
+    fun durationFor(questionId: String?): Int = when {
+        questionId.isNullOrBlank() || questionId == lastQuestion -> 0
+        lastQuestion == null -> 320
+        else -> 180
+    }
+    fun markShown(questionId: String?) { if (!questionId.isNullOrBlank()) lastQuestion = questionId }
 }

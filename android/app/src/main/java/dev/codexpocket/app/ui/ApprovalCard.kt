@@ -82,8 +82,8 @@ internal fun ApprovalCard(a: PendingApproval, online: Boolean, onRespond: (Pendi
             if (details) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState())
                 .background(c.surfaceContainerLow, RoundedCornerShape(8.dp)).padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (command.isNotBlank()) SelectionContainer {
-                    Text(command, Modifier.horizontalScroll(rememberScrollState()), fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.bodySmall, softWrap = false)
+                    Text(command, Modifier.fillMaxWidth(), fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall, softWrap = true)
                 }
                 paths.forEach { Text(it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
                 Text("仅批准本次请求公布的操作；不会更改会话权限预设。", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)

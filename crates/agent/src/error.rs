@@ -10,6 +10,12 @@ pub enum Code {
     ProtocolMismatch,
     Rejected,
     Unknown,
+    RuntimeOffline,
+    RuntimeUnavailable,
+    ThreadOwnedElsewhere,
+    VersionConflict,
+    OperationInProgress,
+    RequestTimeout,
 }
 impl Code {
     pub fn as_str(self) -> &'static str {
@@ -23,6 +29,12 @@ impl Code {
             Self::ProtocolMismatch => "protocol_mismatch",
             Self::Rejected => "rejected",
             Self::Unknown => "unknown",
+            Self::RuntimeOffline => "runtime_offline",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::ThreadOwnedElsewhere => "thread_owned_elsewhere",
+            Self::VersionConflict => "version_conflict",
+            Self::OperationInProgress => "operation_in_progress",
+            Self::RequestTimeout => "request_timeout",
         }
     }
     pub fn message(self) -> &'static str {
@@ -36,6 +48,12 @@ impl Code {
             Self::ProtocolMismatch => "Unsupported protocol version",
             Self::Rejected => "Request rejected",
             Self::Unknown => "Command outcome unknown; reconcile before sending another command",
+            Self::RuntimeOffline => "The selected native runtime is offline",
+            Self::RuntimeUnavailable => "The installed native runtime could not be started",
+            Self::ThreadOwnedElsewhere => "This thread is held by another runtime; check ownership before continuing",
+            Self::VersionConflict => "Settings changed; refresh before trying again",
+            Self::OperationInProgress => "A previous operation is still being reconciled",
+            Self::RequestTimeout => "The read operation timed out; the connection may still be available",
         }
     }
 }

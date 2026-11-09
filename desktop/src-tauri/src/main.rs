@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod commands;
-use tauri::{Manager,menu::{Menu,MenuItem},tray::{TrayIconBuilder,TrayIconEvent,MouseButton}};
+mod deployment;
+mod firewall;
+use tauri::{Manager,Emitter,menu::{Menu,MenuItem},tray::{TrayIconBuilder,TrayIconEvent,MouseButton}};
 fn show(app:&tauri::AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();let _=w.set_focus();}}
 fn main(){
     tauri::Builder::default()
-      .plugin(tauri_plugin_single_instance::init(|app,_,_|show(app)))
+      .plugin(tauri_plugin_single_instance::init(|app,args,_|{if !args.iter().any(|a|a=="--background"){show(app)}}))
       .setup(|app|{
         let args:Vec<_>=std::env::args_os().collect();
         let root=pocket_desktop_runtime::storage::local_app_data()?.join("CodexPocket");
@@ -22,14 +24,16 @@ fn main(){
         app.manage(context.clone());
         let open=MenuItem::with_id(app,"open","打开 Codex Pocket",true,None::<&str>)?;
         let quit=MenuItem::with_id(app,"quit","退出界面 · 保持远程连接",true,None::<&str>)?;
-        let menu=Menu::with_items(app,&[&open,&quit])?;
+        let pair=MenuItem::with_id(app,"pair","配对手机",true,None::<&str>)?;
+        let pause=MenuItem::with_id(app,"pause","暂停远程连接…",true,None::<&str>)?;
+        let menu=Menu::with_items(app,&[&open,&pair,&pause,&quit])?;
         let tray=TrayIconBuilder::with_id("pocket-status").icon(app.default_window_icon().unwrap().clone()).tooltip("Codex Pocket · 正在读取状态").menu(&menu).show_menu_on_left_click(false)
-          .on_menu_event(|app,event|match event.id.as_ref(){"open"=>show(app),"quit"=>app.exit(0),_=>{}})
+          .on_menu_event(|app,event|match event.id.as_ref(){"open"=>show(app),"quit"=>app.exit(0),"pair"|"pause"=>{show(app);let _=app.emit("pocket-action",event.id.as_ref());},_=>{}})
           .on_tray_icon_event(|tray,event|if matches!(event,TrayIconEvent::DoubleClick{button:MouseButton::Left,..}){show(tray.app_handle())}).build(app)?;
         std::thread::spawn(move||loop{let _=tray.set_tooltip(Some(commands::tray_status(&context)));std::thread::sleep(std::time::Duration::from_secs(5));});
-        show(app.handle());Ok(())
+        if !args.iter().any(|a|a=="--background"){show(app.handle());}Ok(())
       })
       .on_window_event(|window,event|if let tauri::WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide();})
-      .invoke_handler(tauri::generate_handler![commands::dashboard,commands::set_remote,commands::pair_device,commands::revoke_device,commands::set_startup,commands::export_diagnostics])
+      .invoke_handler(tauri::generate_handler![commands::dashboard,firewall::allow_lan_firewall,commands::set_remote,commands::pair_device,commands::revoke_device,commands::set_startup,commands::export_diagnostics,commands::configure_routes,commands::detect_lan,commands::session_preferences_update,commands::open_codex,commands::configure_connectivity,commands::cloudflare_accounts,commands::cloudflare_zones,commands::setup_fixed,deployment::activate_relay,deployment::inspect_ssh,deployment::preflight_ssh,deployment::deploy_relay,deployment::rollback_relay,deployment::export_relay,deployment::rollback_cloudflare])
       .run(tauri::generate_context!()).expect("Could not start Codex Pocket");
 }

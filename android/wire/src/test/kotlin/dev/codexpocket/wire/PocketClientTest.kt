@@ -4,7 +4,9 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Test
@@ -47,8 +49,9 @@ class PocketClientTest {
             assertTrue((System.nanoTime() - started) / 1_000_000 < 1_500)
         } }
     }
-    private class Relay(val respond: Boolean = true, val disconnect: Boolean = false, val errorCode: String? = null, val replyText: String = "ok",
-        val chunk: Int = 23, val pacingMillis: Long = 0) : TransportConnector, AutoCloseable {
+    internal class Relay(val respond: Boolean = true, val disconnect: Boolean = false, val errorCode: String? = null, val replyText: String = "ok",
+        val chunk: Int = 23, val pacingMillis: Long = 0,
+        val notificationsBeforeReply: List<JsonObject> = emptyList()) : TransportConnector, AutoCloseable {
         val cert = certificate()
         val config = ConnectionConfig("wss://relay.example/prefix", "room", "secret", fingerprint(cert))
         val requests = CopyOnWriteArrayList<JsonObject>()
@@ -79,6 +82,7 @@ class PocketClientTest {
                                 }) else put("result", JsonPrimitive(replyText))
                             }
                             scope.launch { input.send(byteArrayOf()) } // response is sent below on owner
+                            replies.addAll(notificationsBeforeReply)
                             replies.add(reply)
                         }
                     }
@@ -180,17 +184,50 @@ class PocketClientTest {
         } }
     }
 
-    @Test fun notificationOverflowFailsClosedAndRetainsQueuedNotifications() = runBlocking {
-        Relay().use { relay -> PocketClient(relay).use { client ->
+    @Test fun briefNotificationConsumerStallPreservesOrderAndCanPing() = runBlocking {
+        Relay(chunk = 65536).use { relay -> PocketClient(relay).use { client ->
             client.connect(relay.config)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val received = mutableListOf<Int>()
+            val consumer = async(start = CoroutineStart.UNDISPATCHED) {
+                client.notifications.take(96).collect {
+                    if (received.isEmpty()) { entered.complete(Unit); release.await() }
+                    received += it["params"]!!.jsonObject["n"]!!.jsonPrimitive.int
+                }
+            }
+            try {
+                relay.enqueueManyNotifications(96)
+                withTimeout(5000) { entered.await() }
+                // More than the fixed 64 slots arrived while the consumer could not proceed.
+                assertEquals(LinkState.ONLINE, client.state.value)
+                release.complete(Unit)
+                withTimeout(5000) { consumer.await() }
+                assertEquals((0 until 96).toList(), received)
+                client.request("ping", timeoutMillis = 5000)
+                assertEquals(LinkState.ONLINE, client.state.value)
+            } finally { release.complete(Unit); consumer.cancel() }
+        } }
+    }
+
+    @Test fun notificationOverflowFailsClosedAndRetainsQueuedNotifications() = runBlocking {
+        Relay(respond = false).use { relay -> PocketClient(relay).use { client ->
+            client.connect(relay.config)
+            val mutation = async {
+                runCatching { client.request("devices/revoke", commandId = "blocked-command", timeoutMillis = 15000) }.exceptionOrNull()
+            }
+            withTimeout(5000) { while (relay.requests.isEmpty()) delay(5) }
             relay.enqueueManyNotifications(65)
-            withTimeout(5000) { client.state.first { it == LinkState.OFFLINE } }
+            withTimeout(8000) { client.state.first { it == LinkState.OFFLINE } }
             var received = 0
             val failure = try { client.notifications.collect { received++ }; null } catch (e: Exception) { e }
             assertEquals(64, received)
             assertTrue(failure is WireException)
             assertEquals("backpressure", client.failureCode)
+            assertEquals("wire_notifications", client.backpressureSource)
             assertEquals("backpressure", (failure as WireException).code)
+            assertTrue(withTimeout(1000) { mutation.await() } is UnknownOutcomeException)
+            assertEquals(1, relay.requests.size)
         } }
     }
 

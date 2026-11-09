@@ -1,5 +1,7 @@
 package dev.codexpocket.app.ui
 
+import androidx.compose.foundation.horizontalScroll
+
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -297,6 +299,10 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             else if (state == ActivityStatus.Interrupted) Text(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = toneText())
             if (!empty && (value?.kind != ActivityKind.Agents || expanded)) ActivityExpansionIcon(expanded)
         }
+        if (!expanded && value != null) {
+            val media = value.outputBlocks.filterIsInstance<ToolOutputBlock.Image>().map { it.media }
+            if (media.isNotEmpty()) ToolMediaGrid(media, Modifier.padding(start = 26.dp, top = 4.dp, bottom = 8.dp))
+        }
         if (image && value != null) AnimatedVisibility(expanded,
             enter = fadeIn(tween(pocketMotionMillis(160))) + expandVertically(tween(pocketMotionMillis(220), easing = FastOutSlowInEasing), expandFrom = Alignment.Top),
             exit = fadeOut(tween(pocketMotionMillis(100))) + shrinkVertically(tween(pocketMotionMillis(180), easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top)) {
@@ -408,30 +414,31 @@ internal fun commandActionLabel(state: ActivityStatus): String = when (state) {
 
 /** One strip below currently executing content, fed by the parent's authoritative current roster. */
 internal fun activeAgentWorkSummary(agents: List<AgentRosterEntry>, names: Map<String, String>): String {
-    val active = agents.filter { it.isCurrent && it.status == ActivityStatus.Running }.distinctBy { it.threadId }
+    val active = currentAgentWork(agents).running
     if (active.isEmpty()) return ""
     val visibleNames = active.map { nativeAgentDisplayName(it.threadId, it.name, names) }.filter(String::isNotBlank).take(2)
     if (visibleNames.isEmpty()) return "${active.size} 个智能体正在工作"
     val others = active.size - visibleNames.size
-    return visibleNames.joinToString("、") + (if (others > 0) "和另外${others}个子智能体" else "") + "开始工作"
+    return visibleNames.joinToString("、") + (if (others > 0) "和另外${others}个子智能体" else "") + "正在工作"
 }
 
 @Composable
 internal fun NativeAgentWorkingStrip(agents: List<AgentRosterEntry>, modifier: Modifier = Modifier, onOpen: ((String) -> Unit)? = null) {
     val names = LocalNativeAgentNames.current
-    val active = agents.filter { it.isCurrent && it.status == ActivityStatus.Running }.distinctBy { it.threadId }
+    val active = currentAgentWork(agents).running
     val label = activeAgentWorkSummary(active, names)
     if (label.isBlank()) return
     Row(modifier.fillMaxWidth().heightIn(min = 32.dp).testTag("native-agents-working")
         .then(if (onOpen != null) Modifier.clickable(role = Role.Button) { onOpen(active.first().threadId) } else Modifier)
         .padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        val colors = listOf(Color(0xFF6C9EE8), Color(0xFF63B99B), Color(0xFF89CBB7))
-        val glyphs = listOf(PocketIcons.AgentFlower, PocketIcons.AgentOrbit, PocketIcons.AgentWave)
         Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-            active.take(3).forEachIndexed { index, agent -> key(agent.threadId) {
-                Box(Modifier.size(17.dp).background(colors[index].copy(alpha = .18f), CircleShape), contentAlignment = Alignment.Center) {
-                    Icon(glyphs[index], null, Modifier.size(16.dp), tint = colors[index])
+            active.take(3).forEach { agent -> key(agent.threadId) {
+                val (glyph, tint) = when (agentAvatarGlyph(agent.threadId)) {
+                    AgentAvatarGlyph.Rosette -> PocketIcons.AgentFlower to Color(0xFF6C9EE8)
+                    AgentAvatarGlyph.Brain -> PocketIcons.AgentBrain to Color(0xFF63B99B)
+                    AgentAvatarGlyph.Arc -> PocketIcons.AgentWave to Color(0xFF89CBB7)
                 }
+                Icon(glyph, null, Modifier.size(17.dp), tint = tint)
             } }
         }
         Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp,
@@ -496,7 +503,7 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
     val openAgent = LocalNativeAgentReader.current
     val c = MaterialTheme.colorScheme
     val names = LocalNativeAgentNames.current
-    Column(Modifier.fillMaxWidth().padding(start = 26.dp, top = 2.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 4.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (value.kind == ActivityKind.Reasoning) {
             item.summaryParts.filter(String::isNotBlank).forEachIndexed { index, part -> NativeSummaryProse(part, "$scope/${item.key}/reasoning:$index") }
             return@Column
@@ -522,14 +529,18 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
         // Keep the original invocation in details so launchers, quoting and arguments remain inspectable.
         val shownCommand = command?.command?.trim().orEmpty()
         val showCommand = command != null && shownCommand.isNotBlank()
-        val hasOutput = value.output.text.isNotBlank()
-        if (showCommand || (command?.cwd?.isNotBlank() == true) || hasOutput) {
-            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        val hasBlocks = value.outputBlocks.isNotEmpty()
+        val hasOutput = value.output.text.isNotBlank() && !hasBlocks
+        if (showCommand || (command?.cwd?.isNotBlank() == true) || hasOutput || hasBlocks) {
+            var wrap by androidx.compose.runtime.saveable.rememberSaveable(scope, item.key) { mutableStateOf(true) }
+            ToolResultFrame(if (command != null) "Shell" else value.title.ifBlank { "工具输出" },
+                ConversationPresentation.detail(item), wrap, { wrap = !wrap }) {
                     if (showCommand) SelectionContainer {
                         Text(buildAnnotatedString {
                             withStyle(SpanStyle(color = c.onSurfaceVariant)) { append("$ ") }
                             append(shownCommand)
-                        }, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = c.onSurface)
+                        }, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())),
+                            softWrap = wrap, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = c.onSurface)
                     }
                     if (command != null && command.cwd.isNotBlank()) Text(stringResource(R.string.v04_transcript_cwd, command.cwd),
                         fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
@@ -544,15 +555,20 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
                         if (value.kind == ActivityKind.Agents) Text(if (value.title == "spawnAgent") "任务" else "消息",
                             style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
                         if (showCommand || command?.cwd?.isNotBlank() == true) HorizontalDivider(color = c.outlineVariant.copy(alpha = .5f))
-                        Box(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        Box(Modifier.fillMaxWidth()) {
                             SelectionContainer {
-                                Text(value.output.text, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
+                                Text(value.output.text, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())), softWrap = wrap,
+                                    style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
                                     fontFamily = if (value.kind == ActivityKind.Command) FontFamily.Monospace else FontFamily.Default)
                             }
                         }
                     }
+                    if (hasBlocks) {
+                        item.raw.obj("error").string("message").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = c.error) }
+                        ToolOutputContent(value.outputBlocks)
+                    }
             }
-        } else if (value.files.isEmpty() && value.agents.isEmpty()) Text(
+        } else if (!hasBlocks && value.files.isEmpty() && value.agents.isEmpty()) Text(
             stringResource(if (state == ActivityStatus.Running) R.string.v03_output_waiting else R.string.v03_output_unavailable),
             Modifier.padding(start = 8.dp), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
         if (value.output.truncated) Text(stringResource(R.string.v03_output_truncated), style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)

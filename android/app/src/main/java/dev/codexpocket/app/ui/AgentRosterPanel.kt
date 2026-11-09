@@ -25,6 +25,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.ActivityStatus
 import dev.codexpocket.app.data.AgentRosterEntry
+import dev.codexpocket.app.data.currentAgentWork
 
 /** Place beneath the conversation title. The panel stays readable while cached/offline/loading. */
 @Composable
@@ -44,7 +45,7 @@ internal fun AgentRosterChip(
     if (agents.isEmpty()) return
 
     // Count explicit running states in the latest turn; historical states are labelled in the panel.
-    val running = agents.count { it.isCurrent && it.status == ActivityStatus.Running }
+    val running = currentAgentWork(agents).running.size
     val label = "子代理 ${agents.size} · ${running}进行中"
     PocketGlassSurface(
         modifier = modifier.minimumInteractiveComponentSize()

@@ -3,7 +3,10 @@ package dev.codexpocket.app.data
 import kotlinx.serialization.json.*
 
 enum class TranscriptKind { User, Answer, Commentary, Activity, Plan, Error, Process }
-data class TranscriptRow(val key: String, val kind: TranscriptKind, val items: List<TimelineItem>, val completedTurn: Boolean = false, val processLabel: String? = null)
+enum class TaskFoldReason { Unclassified, Successful, Disabled, Active, ActiveAgent, PendingRequest, MissingTurnMetadata,
+    MissingInitialUser, Failed, Interrupted, Unfinished, MissingFinal, IncompleteFinal, NonContiguous }
+data class TranscriptRow(val key: String, val kind: TranscriptKind, val items: List<TimelineItem>, val completedTurn: Boolean = false, val processLabel: String? = null, val processDetail: String? = null,
+    val foldReason: TaskFoldReason = TaskFoldReason.Unclassified)
 data class TranscriptAnchor(val key: String?, val offset: Int = 0) {
     fun resolve(keys: List<String>, fallback: Int): Int = keys.indexOf(key).takeIf { it >= 0 } ?: fallback.coerceIn(0, (keys.size - 1).coerceAtLeast(0))
 }
@@ -13,6 +16,14 @@ object ConversationPresentation {
     private val tools = setOf("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "functionCallOutput", "webSearch", "imageView", "imageGeneration", "collabAgentToolCall", "subAgentActivity", "reasoning", "contextCompaction", "turn/diff/updated")
     /** Kept in the timeline (they drive [liveStatus]) but never drawn as transcript rows on the phone. */
     private val statusOnly = setOf("reasoning", "contextCompaction")
+
+    /** A close event can precede the final item. One bounded read repairs a partial lifecycle. */
+    fun needsCompletionRead(timeline: NativeTimeline, turnId: String): Boolean {
+        if (timeline.turns[turnId]?.status != "completed") return false
+        val values = timeline.items.values.filter { it.turnId == turnId }
+        return values.none { it.complete && (it.type == "plan" || (it.type == "agentMessage" &&
+            it.raw.string("phase") != "commentary" && it.raw.string("channel") != "commentary" && it.raw.array("questions").isEmpty())) }
+    }
 
     enum class LiveStatus { Working, Thinking, Compacting }
 
@@ -58,8 +69,9 @@ object ConversationPresentation {
         return rows.firstOrNull { row -> row.items.any { it.key == nativeKey } }?.key ?: oldKey
     }
 
-    fun rows(timeline: NativeTimeline, blockedTurns: Set<String> = emptySet(), foldTasks: Boolean = true, includeReasoning: Boolean = false): List<TranscriptRow> {
-        if (foldTasks) return taskRows(timeline, blockedTurns)
+    fun rows(timeline: NativeTimeline, blockedTurns: Set<String> = emptySet(), foldTasks: Boolean = true, includeReasoning: Boolean = false,
+        resolvedRequestIds: Set<String> = emptySet(), agentLiveStatuses: Map<String, AgentLiveStatus> = emptyMap()): List<TranscriptRow> {
+        if (foldTasks) return taskRows(timeline, blockedTurns, resolvedRequestIds, agentLiveStatuses)
         val rows = mutableListOf<TranscriptRow>()
         var span = mutableListOf<TimelineItem>()
         var canAppend = false
@@ -94,77 +106,123 @@ object ConversationPresentation {
             canAppend = groupable
         }
         // Copy once per span, rather than repeatedly copying a growing tool group on every delta.
-        return rows.map { it.copy(items = it.items.toList()) }
+        return rows.map { it.copy(items = it.items.toList(), foldReason = TaskFoldReason.Disabled) }
     }
 
-    private fun taskRows(timeline: NativeTimeline, blockedTurns: Set<String>): List<TranscriptRow> {
+    private fun taskRows(timeline: NativeTimeline, blockedTurns: Set<String>, resolvedRequestIds: Set<String>,
+        agentLiveStatuses: Map<String, AgentLiveStatus>): List<TranscriptRow> {
+        val roots = mutableMapOf<String, String>()
+        val invalidLinks = mutableSetOf<String>()
         fun root(turn: String): String {
+            roots[turn]?.let { return it }
             var id = turn
             val seen = mutableSetOf<String>()
-            while (seen.add(id)) { id = timeline.turns[id]?.let { it.rootId ?: it.observedParentId }?.takeIf { it != id } ?: return id }
+            while (seen.add(id)) {
+                val parent = timeline.turns[id]?.let { it.rootId ?: it.observedParentId }?.takeIf { it != id }
+                if (parent == null) { seen.forEach { roots[it] = id }; return id }
+                id = parent
+            }
+            invalidLinks += seen
             return turn
         }
+        val metadata = timeline.turns.values.groupBy { root(it.id) }
         val spans = mutableListOf<MutableList<TimelineItem>>()
         timeline.items.values.forEach { item ->
             if (spans.lastOrNull()?.lastOrNull()?.let { root(it.turnId) == root(item.turnId) } == true) spans.last() += item
             else spans += mutableListOf(item)
         }
         val occurrences = spans.groupingBy { root(it.first().turnId) }.eachCount()
+        val answered = timeline.items.values.filter { it.type == "userMessage" }.flatMap { AsyncQuestions.replies(it.text) }
+            .map { it.string("questionItemId") }.toSet() + resolvedRequestIds
+        val resumedOwners = buildMap<String, String> {
+            timeline.items.values.forEach { item -> agentResumeEvidence(item).keys.forEach { put(it, item.turnId) } }
+        }
         return spans.flatMap { items ->
             val ids = items.map { it.turnId }.distinct()
             val taskRoot = root(items.first().turnId)
             // Itemless ancestors/children can still be failed, stopped or waiting. Pagination must
             // supply the root metadata before a partial child can be treated as a finished task.
-            val meta = timeline.turns.values.filter { root(it.id) == taskRoot }
+            val meta = metadata[taskRoot].orEmpty()
             val visibleItems = items.filter(::visible)
             val finalTurn = ids.last()
             val subset = timeline.copy(items = items.associateTo(linkedMapOf()) { it.key to it })
-            val questionsResolved = AsyncQuestions.pending(subset).isEmpty()
-            fun resolvedAsyncQuestion(item: TimelineItem) = questionsResolved && item.complete && item.type == "agentMessage" &&
-                item.raw.string("delivery") == "async" && item.raw.array("questions").isNotEmpty() &&
-                item.raw.array("questions").all { it.asObject().string("title").isNotBlank() }
-            val attention = setOf(ActivityStatus.Failed, ActivityStatus.Waiting, ActivityStatus.Interrupted, ActivityStatus.Running)
+            // Replies may arrive in a later native turn. Completion/submission alone never answers
+            // an async question, while a completed native request tool is a resolved old guard.
+            fun requestResolved(item: TimelineItem): Boolean {
+                val raw = item.raw
+                val aliases = listOf(item.key, item.itemId, raw.string("requestId"), raw.string("id"),
+                    raw.obj("params").string("requestId"), raw.obj("params").string("id")).filter(String::isNotBlank)
+                if (aliases.any { it in resolvedRequestIds }) return true
+                if (item.type == "agentMessage" && raw.array("questions").isNotEmpty()) {
+                    if (raw.string("delivery") != "async") return false
+                    return raw.array("questions").withIndex().all { (index, question) ->
+                        question.asObject().string("title").isNotBlank() &&
+                            buildJsonArray { add("request_user_input_async"); add(item.itemId); add(index) }.toString() in answered
+                    }
+                }
+                return item.complete && NativeActivityPresentation.state(item) in
+                    setOf(ActivityStatus.Completed, ActivityStatus.Failed, ActivityStatus.Interrupted)
+            }
+            fun requestGuard(item: TimelineItem): Boolean =
+                item.raw.array("questions").isNotEmpty() || item.raw.obj("params").array("questions").isNotEmpty() ||
+                listOf(item.type, item.raw.string("method")).any { it.contains("approval", true) || it.contains("requestUserInput", true) } ||
+                listOf(item.raw.string("tool"), item.raw.string("name")).any {
+                    it.substringAfterLast('.') in setOf("request_user_input", "requestUserInput", "send_user_message")
+                }
             // Only the final linked native turn supplies the task's answer. Older replies stay in
-            // the process; legacy protocols without final markers expose only the last reply.
+            // the process. Legacy protocols did not distinguish commentary from answers: only
+            // their last assistant item is a final result. Explicit final fragments stay intact.
             val replies = visibleItems.filter { it.turnId == finalTurn && it.type == "agentMessage" && it.raw.array("questions").isEmpty() }
             val explicit = replies.filter { it.raw.string("phase") in setOf("final_answer", "final") || it.raw.string("channel") == "final" }
-            val finals = explicit.ifEmpty { listOfNotNull(replies.lastOrNull { it.raw.string("phase") != "commentary" && it.raw.string("channel") != "commentary" }) }
-            val agentAttention = agentRoster(subset).any { agent ->
-                if (agent.status !in attention) false else {
-                    val lastState = items.lastOrNull { item -> NativeActivityPresentation.agents(item).any { it.threadId == agent.threadId && it.nativeStatus.isNotBlank() } }
-                    // A successful native close of a previously completed child is cleanup.
-                    val closedAfterCompletion = agent.nativeStatus == "shutdown" && lastState?.type == "collabAgentToolCall" &&
-                        lastState.raw.string("tool") == "closeAgent" && NativeActivityPresentation.state(lastState) == ActivityStatus.Completed &&
-                        agentRoster(subset.copy(items = items.takeWhile { it.key != lastState.key }.associateTo(linkedMapOf()) { it.key to it }))
-                            .any { it.threadId == agent.threadId && it.status == ActivityStatus.Completed }
-                    !closedAfterCompletion
-                }
+            val answers = explicit.ifEmpty { replies.filter { it.raw.string("phase") != "commentary" && it.raw.string("channel") != "commentary" }.takeLast(1) }
+            val finalKeys = answers.map { it.key }.toSet()
+            val finals = visibleItems.filter { it.key in finalKeys || (it.turnId == finalTurn && it.type == "plan" && it.text.isNotBlank()) }
+            // A parent success closes historical Running/Failed/Interrupted child observations.
+            // Only the latest native waiting state still represents an unresolved decision.
+            // A later task's confirmed native resume does not reopen this historical process.
+            val taskLiveStatuses = agentLiveStatuses.filter { (id, _) -> resumedOwners[id]?.let(::root)?.let { it == taskRoot } != false }
+            val taskAgents = agentRoster(subset, taskLiveStatuses)
+            val agentAttention = taskAgents.any { it.workPhase == AgentWorkPhase.Waiting }
+            val liveAgentRunning = taskAgents.any { it.workPhase == AgentWorkPhase.Running &&
+                taskLiveStatuses[it.threadId]?.status == ActivityStatus.Running }
+            val pendingRequest = blockedTurns.any { root(it) == taskRoot } || agentAttention || items.any {
+                if (requestGuard(it)) !requestResolved(it)
+                else it.type !in setOf("subAgentActivity", "collabAgentToolCall") && NativeActivityPresentation.state(it) == ActivityStatus.Waiting
             }
-            val safe = occurrences[taskRoot] == 1 && timeline.activeTurn?.let(::root) != taskRoot &&
-                blockedTurns.none { root(it) == taskRoot } && taskRoot in timeline.turns && ids.all { it in timeline.turns } &&
-                meta.all { it.status == "completed" } && finals.any { it.turnId == finalTurn } && finals.all { it.complete } &&
-                visibleItems.all { it.type == "subAgentActivity" || it.complete || NativeActivityPresentation.state(it) == ActivityStatus.Completed } &&
-                items.none { (it.type != "subAgentActivity" && (NativeActivityPresentation.state(it) in attention ||
-                    (NativeActivityPresentation.attentionBoundary(it) && !resolvedAsyncQuestion(it)))) ||
-                    it.type in setOf("error", "turn/error", "thread/error", "turn/failed") } &&
-                !agentAttention && questionsResolved
-            if (!safe) rows(subset, foldTasks = false)
+            val reason = when {
+                meta.any { it.status == "failed" } -> TaskFoldReason.Failed
+                meta.any { it.status == "interrupted" } -> TaskFoldReason.Interrupted
+                pendingRequest -> TaskFoldReason.PendingRequest
+                liveAgentRunning -> TaskFoldReason.ActiveAgent
+                timeline.activeTurn?.let(::root) == taskRoot -> TaskFoldReason.Active
+                occurrences[taskRoot] != 1 -> TaskFoldReason.NonContiguous
+                taskRoot !in timeline.turns || ids.any { it !in timeline.turns || it in invalidLinks } -> TaskFoldReason.MissingTurnMetadata
+                meta.any { it.status != "completed" } -> TaskFoldReason.Unfinished
+                visibleItems.none { it.type == "userMessage" && it.turnId == taskRoot } -> TaskFoldReason.MissingInitialUser
+                finals.isEmpty() -> TaskFoldReason.MissingFinal
+                finals.any { !it.complete } -> TaskFoldReason.IncompleteFinal
+                else -> TaskFoldReason.Successful
+            }
+            if (reason != TaskFoldReason.Successful) rows(subset, foldTasks = false).map { it.copy(foldReason = reason) }
             else {
                 val firstUser = visibleItems.firstOrNull { it.type == "userMessage" }
-                val finalKeys = finals.map { it.key }.toSet()
-                val process = visibleItems.filter { it.key != firstUser?.key && it.key !in finalKeys }
+                val keptKeys = finals.map { it.key }.toSet()
+                val process = visibleItems.filter { it.key != firstUser?.key && it.key !in keptKeys }
                 val result = mutableListOf<TranscriptRow>()
-                firstUser?.let { result += TranscriptRow(it.key, TranscriptKind.User, listOf(it), true) }
+                firstUser?.let { result += TranscriptRow(it.key, TranscriptKind.User, listOf(it), true, foldReason = reason) }
                 if (process.isNotEmpty()) {
                     val duration = meta.fold<NativeTurnInfo, Long?>(0L) { total, info ->
                         val elapsed = info.elapsedMs
                         if (total == null || elapsed == null || elapsed > Long.MAX_VALUE - total) null else total + elapsed
                     }
-                    val label = duration?.let { (if (meta.any { it.observed }) "观察用时 " else "用时 ") + processDurationLabel(it) + " · 查看过程" }
-                        ?: "查看过程 · ${process.size} 项"
-                    result += TranscriptRow("process:${root(items.first().turnId)}", TranscriptKind.Process, process, true, label)
+                    val failures = process.count { NativeActivityPresentation.state(it) in setOf(ActivityStatus.Failed, ActivityStatus.Interrupted) || it.type in setOf("error", "turn/error", "thread/error") }
+                    val agentFailures = taskAgents.count { it.workPhase == AgentWorkPhase.Error }
+                    val detail = listOfNotNull(duration?.let { (if (meta.any { it.observed }) "观察用时 " else "用时 ") + processDurationLabel(it) },
+                        "$failures 条失败记录".takeIf { failures > 0 }, "$agentFailures 个子代理失败".takeIf { agentFailures > 0 })
+                        .joinToString(" · ").takeIf(String::isNotBlank)
+                    result += TranscriptRow("process:${root(items.first().turnId)}", TranscriptKind.Process, process, true, "上 ${process.size} 条消息", detail, reason)
                 }
-                finals.forEach { result += TranscriptRow(it.key, TranscriptKind.Answer, listOf(it), true) }
+                finals.forEach { result += TranscriptRow(it.key, if (it.type == "plan") TranscriptKind.Plan else TranscriptKind.Answer, listOf(it), true, foldReason = reason) }
                 result
             }
         }

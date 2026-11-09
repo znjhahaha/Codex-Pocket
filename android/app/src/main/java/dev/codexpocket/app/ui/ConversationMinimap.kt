@@ -1,82 +1,66 @@
 package dev.codexpocket.app.ui
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.snap
-import androidx.compose.animation.core.tween
+import android.os.SystemClock
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.key.type
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.ProgressBarRangeInfo
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.onClick
-import androidx.compose.ui.semantics.progressBarRangeInfo
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.setProgress
-import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.*
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
 import dev.codexpocket.app.data.TranscriptKind
 import dev.codexpocket.app.data.TranscriptRow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.receiveAsFlow
-import kotlin.math.abs
-import kotlin.math.floor
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
 
-private val MinimapWidth = 52.dp
-private val MinimapIdleWidth = 12.dp
 private val MinimapInset = 8.dp
-private val MinimapMinimumThumb = 16.dp
-private const val MinimapIdleMillis = 2_500L
-private const val MinimapTickLimit = 160
+private val MinimapMinimumThumb = 44.dp
+private data class MinimapSeekRequest(val target: MinimapTarget?, val flush: Boolean, val serial: Long, val intent: Long,
+    val commitHidden: Boolean = false)
 
 /**
- * Loaded transcript overview, hosted as a LEFT sibling of LazyColumn in a bounded Box.
+ * Loaded folded overview. Share [state] with the host and reserve [ConversationMinimapState.reservedWidth]
+ * in the transcript's measured constraints (24dp collapsed, 48dp expanded), not in content padding.
+ * [keys] is the complete ordered LazyColumn key snapshot including chrome. Keep this rail below the
+ * header and above the composer/IME. Its width and the host's reservation use the same 240ms motion.
  *
- * [rows] must be the currently displayed/folded rows; [keys] must include ALL LazyColumn
- * keys in their actual order (including history/live/end chrome). Use immutable snapshots.
- * Reserve a small idle gutter; expansion temporarily overlays its adjacent margin without reflow.
- * Constrain [modifier] below the header and above the composer/IME.
- *
- * Pass the transcript-only [backdrop], or provide it via LocalPocketBackdrop. Capture the
- * LazyColumn itself, never this composable or its surrounding Box: the glass must not sample
- * itself. Row bands approximate density; this does not render Markdown or hidden child rows.
- * The thumb uses measured visible row fractions; tap/drag seeks only already loaded keys.
+ * Capture only the transcript LazyColumn into [backdrop]. The rail and its transient press preview
+ * must be siblings outside that capture. Samples include loaded hidden process children; the
+ * overview itself never expands the transcript. [scope] identifies the native conversation and
+ * [navigationEpoch] changes on pagination/reset. [onExpandProcess] must add, never toggle, an owner.
+ * [onSeek] fires before an expansion/scroll and never restores the host's following intent.
+ * [ConversationMinimapState.isInteracting] includes the queued final release, for host end detection.
  */
 @Composable
 internal fun ConversationMinimap(
@@ -86,89 +70,152 @@ internal fun ConversationMinimap(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = LocalPocketBackdrop.current,
     onSeek: () -> Unit = {},
+    state: ConversationMinimapState = rememberConversationMinimapState(listState),
+    scope: String = "",
+    navigationEpoch: Any? = null,
+    onExpandProcess: (String) -> Unit = {},
 ) {
-    val map = remember(rows, keys) { ConversationMinimapMap(rows, keys) }
-    if (map.entries.isEmpty()) return
+    val samples = remember(listState, scope) { MinimapSampleCache() }
+    val map = remember(rows, keys, samples) { ConversationMinimapMap(rows, keys, samples) }
     val latestMap by rememberUpdatedState(map)
+    val latestKeys by rememberUpdatedState(keys)
     val reportSeek by rememberUpdatedState(onSeek)
+    val expandProcess by rememberUpdatedState(onExpandProcess)
     val preferences = rememberPocketGlassPreferences()
-    val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    var expanded by remember(listState) { mutableStateOf(false) }
-    val latestExpanded by rememberUpdatedState(expanded)
-    var held by remember(listState) { mutableStateOf(false) }
-    var interaction by remember(listState) { mutableLongStateOf(0L) }
-    val expansion by animateFloatAsState(
-        if (expanded) 1f else 0f,
-        if (motion) tween(180) else snap(), label = "conversation-minimap-width",
-    )
-    val requests = remember(listState) { Channel<MinimapTarget>(Channel.CONFLATED) }
-    DisposableEffect(requests) { onDispose { requests.close() } }
-    val scrolling by remember(listState) { derivedStateOf { listState.isScrollInProgress } }
-    LaunchedEffect(expanded, held, interaction, scrolling) {
-        if (expanded && !held && !scrolling) {
-            val idleInteraction = interaction
-            delay(MinimapIdleMillis)
-            // A pointer can arrive before recomposition cancels this older idle effect (also
-            // when the test clock advances past its deadline). Check live state after delay;
-            // collapsing a held rail would resize it and synthesize a pointer cancellation.
-            if (!held && !scrolling && interaction == idleInteraction) expanded = false
+    val requests = remember(listState, state, scope, navigationEpoch) { Channel<MinimapSeekRequest>(Channel.CONFLATED) }
+    var requestSerial by remember(requests) { mutableLongStateOf(0L) }
+    var intentSerial by remember(requests) { mutableLongStateOf(0L) }
+    fun request(target: MinimapTarget?, flush: Boolean = false, commitHidden: Boolean = flush) {
+        if (state.navigationToken !== requests) return
+        requestSerial++
+        state.seeking = target != null
+        state.seekKey = target?.key
+        requests.trySend(MinimapSeekRequest(target, flush, requestSerial, intentSerial, commitHidden))
+    }
+    DisposableEffect(requests) {
+        state.navigationToken = requests
+        onDispose {
+            requests.close()
+            if (state.navigationToken === requests) {
+                state.navigationToken = null
+                state.seeking = false; state.seekKey = null; state.held = false; state.previewKey = null; state.focused = false
+            }
+        }
+    }
+    LaunchedEffect(map, state, requests) {
+        if (map.entries.isEmpty()) { request(null); state.collapse() }
+        else {
+            if (state.previewKey != null && map.slot(state.previewKey!!) == null) state.previewKey = null
+            if (state.seekKey != null && map.slot(state.seekKey!!) == null) request(null)
         }
     }
     LaunchedEffect(listState, requests) {
-        requests.receiveAsFlow().collectLatest { target ->
-            // Resolve immediately before each scroll, never retain a numeric list index across
-            // suspension or pagination. A removed/folded target is a no-op, not an index fallback.
-            val index = latestMap.listIndex(target.key) ?: return@collectLatest
-            reportSeek()
-            listState.scrollToItem(index)
-            if (target.withinRow > 0f) {
-                val measured = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == target.key }
-                val offset = measured?.let { (it.size * target.withinRow).toInt().coerceIn(0, (it.size - 1).coerceAtLeast(0)) } ?: 0
-                val resolved = latestMap.listIndex(target.key) ?: return@collectLatest
-                if (offset > 0) listState.scrollToItem(resolved, offset)
+        val coalescer = MinimapSeekCoalescer()
+        var activeIntent = -1L
+        requests.receiveAsFlow().collectLatest { request ->
+            var dispatched: MinimapTarget? = null
+            var finished = false
+            try {
+                if (request.intent != activeIntent) {
+                    coalescer.cancel()
+                    activeIntent = request.intent
+                }
+                val requested = request.target
+                if (requested == null) { coalescer.cancel(); return@collectLatest }
+                // While dragging, a hidden item targets its folded process header.
+                // Release must still commit the expansion even for the same native key.
+                if (request.commitHidden && latestMap.seekPlan(requested, true)?.expandProcessKey != null)
+                    coalescer.abandon(requested)
+                var target = coalescer.offer(requested, SystemClock.uptimeMillis(), request.flush)
+                if (target == null) {
+                    delay(coalescer.waitMillis(SystemClock.uptimeMillis()))
+                    target = coalescer.take(SystemClock.uptimeMillis())
+                }
+                val resolvedTarget = target ?: return@collectLatest
+                dispatched = resolvedTarget
+                // Resolve after the cadence delay and again after measurement. Never retain an
+                // index through pagination/reflow or substitute another row for a folded target.
+                val plan = latestMap.seekPlan(resolvedTarget, request.commitHidden) ?: return@collectLatest
+                reportSeek()
+                if (plan.expandProcessKey != null) {
+                    expandProcess(plan.expandProcessKey)
+                    // Projection is asynchronous. Wait until its exact key snapshot has reached
+                    // LazyColumn measurement before scrolling; never guess an old numeric index.
+                    val ready = withTimeoutOrNull(2_000L) {
+                        snapshotFlow { latestMap.slot(resolvedTarget.key) == null ||
+                            (latestMap.listIndex(resolvedTarget.key) != null &&
+                                listState.layoutInfo.totalItemsCount == latestKeys.size) }.first { it }
+                    }
+                    if (ready != true) return@collectLatest
+                }
+                val index = latestMap.listIndex(plan.scrollKey) ?: return@collectLatest
+                listState.scrollToItem(index)
+                val measured = withTimeoutOrNull(2_000L) {
+                    snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == plan.scrollKey } }.first { it != null }
+                } ?: return@collectLatest
+                if (resolvedTarget.withinRow > 0f && plan.scrollKey == resolvedTarget.key) {
+                    val offset = (measured.size * resolvedTarget.withinRow).toInt()
+                        .coerceIn(0, (measured.size - 1).coerceAtLeast(0))
+                    val currentIndex = latestMap.listIndex(plan.scrollKey) ?: return@collectLatest
+                    if (offset > 0) listState.scrollToItem(currentIndex, offset)
+                }
+                finished = true
+            } finally {
+                // Release can cancel an identical request before its offset is applied.
+                if (!finished) dispatched?.let(coalescer::abandon)
+                if (state.navigationToken === requests && request.serial == requestSerial) { state.seeking = false; state.seekKey = null }
             }
-            // Direct, cancellable seeks avoid an index-based body animation landing on a different
-            // row after insertion. Only the minimap's reveal animates; it has no idle frame loop.
         }
     }
+    if (map.entries.isEmpty()) return
     val viewport by remember(map, listState) {
         derivedStateOf {
             val info = listState.layoutInfo
             map.viewport(info.visibleItemsInfo.map { MinimapVisibleRow(it.key, it.offset, it.size) },
-                maxOf(0, info.viewportStartOffset), info.viewportEndOffset - info.afterContentPadding,
-                info.reverseLayout)
+                maxOf(0, info.viewportStartOffset), info.viewportEndOffset - info.afterContentPadding, info.reverseLayout)
         }
     }
-    val colors = MaterialTheme.colorScheme
+    val latestViewport by rememberUpdatedState(viewport)
     val density = LocalDensity.current
     val insetPx = with(density) { MinimapInset.toPx() }
     val minimumThumbPx = with(density) { MinimapMinimumThumb.toPx() }
+    val colors = MaterialTheme.colorScheme
+    val railBackground = colors.background
+    val inkBackdrop = rememberLayerBackdrop { drawRect(railBackground); drawContent() }
+    var railHeight by remember { mutableIntStateOf(0) }
+    val expandedMarks = remember(map, railHeight, density) {
+        minimapMarks(map, null, with(density) { 48.dp.toPx() }, railHeight.toFloat(), density.density, expanded = true)
+    }
+    val latestExpandedMarks by rememberUpdatedState(expandedMarks)
 
-    BoxWithConstraints(modifier.width(20.dp + (MinimapWidth - 20.dp) * expansion).fillMaxHeight().clipToBounds()
+    BoxWithConstraints(modifier.width(state.reservedWidth).fillMaxHeight().clipToBounds()
+        .onSizeChanged { railHeight = it.height }
         .testTag("conversation-minimap")
         .semantics(mergeDescendants = true) {
             contentDescription = "对话缩略图"
-            stateDescription = if (expanded) "已展开" else "已收起"
+            stateDescription = if (state.expanded) "已展开" else "已收起"
             progressBarRangeInfo = ProgressBarRangeInfo(viewport?.start ?: 0f, 0f..1f)
-            onClick(if (expanded) "收起对话缩略图" else "展开对话缩略图") {
-                expanded = !expanded
-                interaction++
+            onClick(if (state.expanded) "收起对话缩略图" else "展开对话缩略图") {
+                if (state.expanded) state.collapse() else state.expand()
                 true
             }
             setProgress { fraction ->
                 val target = latestMap.targetAt(fraction)
                 if (target == null) false else {
-                    expanded = true
-                    interaction++
-                    requests.trySend(target).isSuccess
+                    intentSerial++
+                    state.expand()
+                    request(target, flush = true)
+                    true
                 }
             }
         }
         .onKeyEvent { event ->
             if (event.type != KeyEventType.KeyDown) false else when (event.key) {
-                Key.Enter, Key.Spacebar -> { expanded = !expanded; interaction++; true }
+                Key.Enter, Key.Spacebar -> { if (state.expanded) state.collapse() else state.expand(); true }
+                Key.Escape -> { state.collapse(); true }
                 Key.DirectionUp, Key.DirectionDown, Key.MoveHome, Key.MoveEnd -> {
-                    val current = viewport?.start ?: 0f
+                    intentSerial++
+                    val current = latestViewport?.start ?: 0f
                     val step = 1f / latestMap.entries.size
                     val fraction = when (event.key) {
                         Key.MoveHome -> 0f
@@ -176,171 +223,210 @@ internal fun ConversationMinimap(
                         Key.DirectionUp -> current - step
                         else -> current + step
                     }
-                    latestMap.targetAt(fraction)?.let { requests.trySend(it) }
-                    expanded = true
-                    interaction++
+                    state.expand()
+                    request(latestMap.targetAt(fraction), flush = true)
                     true
                 }
                 else -> false
             }
-        }.focusable()
-        .pointerInput(listState) {
+        }
+        .onFocusChanged { state.focused = it.hasFocus; state.touch() }
+        .focusable()
+        .pointerInput(listState, state, density, railHeight, scope, navigationEpoch) {
             awaitEachGesture {
                 val down = awaitFirstDown()
-                // Freeze the gesture's row identities, but resolve their indices against latestMap.
                 val gestureMap = latestMap
-                val wasExpanded = latestExpanded
+                val wasExpanded = state.expanded
+                val initialViewport = latestViewport
                 val trackInset = insetPx.coerceAtMost(size.height / 4f)
                 val trackHeight = (size.height - 2f * trackInset).coerceAtLeast(1f)
                 fun fraction(y: Float) = ((y - trackInset) / trackHeight).coerceIn(0f, 1f)
-                val info = listState.layoutInfo
-                val initialViewport = gestureMap.viewport(
-                    info.visibleItemsInfo.map { MinimapVisibleRow(it.key, it.offset, it.size) },
-                    maxOf(0, info.viewportStartOffset), info.viewportEndOffset - info.afterContentPadding, info.reverseLayout)
                 val thumb = minimapThumb(initialViewport, size.height.toFloat(), trackInset, minimumThumbPx)
-                val grabbedThumb = thumb != null && down.position.y >= thumb.top && down.position.y <= thumb.top + thumb.height
-                val origin = if (grabbedThumb) initialViewport!!.start else fraction(down.position.y)
+                val grabbedThumb = wasExpanded && thumb != null && down.position.y in thumb.top..(thumb.top + thumb.height)
+                val grabOffset = if (grabbedThumb) down.position.y - thumb!!.top else 0f
+                val tick = if (wasExpanded) minimapTickAt(latestExpandedMarks, density.density, down.position.y)
+                    ?.let { gestureMap.targetForKey(it.key) } else null
                 var dragged = false
-                held = true
-                expanded = true
-                interaction++
+                var previewShown = false
+                var completed = false
+                var lastTarget: MinimapTarget? = null
+                val pressedAt = SystemClock.uptimeMillis()
+                state.held = true
+                intentSerial++
+                request(null)
+                state.touch()
+                // Touch is the Codex-style inspection gesture. Width only changes after a tap
+                // has completed, never under a held finger or during a collapsed scrub.
+                fun previewAt(y: Float) {
+                    val target = gestureMap.userTargetAt(fraction(y), 10f * density.density / trackHeight)
+                    state.previewKey = target?.key?.takeIf { latestMap.slot(it) != null }
+                    state.previewFraction = fraction(y)
+                }
+                if (!wasExpanded) previewAt(down.position.y)
                 down.consume()
                 try {
                     while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                        if (change == null || change.isConsumed || event.changes.count { it.pressed } > 1) {
-                            break
+                        val elapsed = (SystemClock.uptimeMillis() - pressedAt).coerceAtLeast(0)
+                        val event = if (wasExpanded && tick != null && !dragged && !previewShown) {
+                            withTimeoutOrNull((viewConfiguration.longPressTimeoutMillis - elapsed).coerceAtLeast(1)) { awaitPointerEvent() }
+                        } else awaitPointerEvent()
+                        if (event == null) {
+                            if (latestMap.slot(tick!!.key) != null) {
+                                state.previewKey = tick.key
+                                state.previewFraction = fraction(down.position.y)
+                            }
+                            previewShown = true
+                            continue
                         }
-                        val delta = change.position.y - down.position.y
-                        if (!dragged && abs(delta) > viewConfiguration.touchSlop) dragged = true
-                        if (dragged) {
-                            gestureMap.targetAt(origin + delta / trackHeight)?.let { requests.trySend(it) }
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || change.isConsumed || event.changes.count { it.pressed } > 1) break
+                        val delta = change.position - down.position
+                        if (!dragged && delta.getDistance() > viewConfiguration.touchSlop) {
+                            dragged = true
+                            if (wasExpanded) state.previewKey = null
+                        }
+                        if (!wasExpanded && change.pressed) previewAt(change.position.y)
+                        if (wasExpanded && dragged) {
+                            val targetFraction = if (grabbedThumb) minimapDragFraction(initialViewport!!, thumb!!,
+                                size.height.toFloat(), trackInset, grabOffset, change.position.y) else fraction(change.position.y)
+                            lastTarget = gestureMap.targetAt(targetFraction)
+                            state.previewKey = lastTarget?.key?.takeIf { latestMap.listIndex(it) == null && latestMap.slot(it) != null }
+                            state.previewFraction = targetFraction
+                            request(lastTarget, flush = !change.pressed)
                         }
                         change.consume()
                         if (!change.pressed) {
                             val inside = change.position.x in 0f..size.width.toFloat() && change.position.y in 0f..size.height.toFloat()
-                            if (!dragged && inside && wasExpanded && !grabbedThumb) {
-                                gestureMap.targetAt(fraction(change.position.y))?.let { requests.trySend(it) }
+                            val hiddenTick = tick?.key?.let { gestureMap.listIndex(it) == null } == true
+                            if (wasExpanded && !dragged && inside && (!grabbedThumb || hiddenTick) && (!previewShown || hiddenTick)) {
+                                // A held landmark remains the same native key even if streaming
+                                // changes its rail fraction before release.
+                                request(if (hiddenTick) tick else gestureMap.targetAt(fraction(change.position.y)), flush = true)
                             }
+                            if (!wasExpanded && inside) {
+                                // Event timestamps describe the finger, whereas dispatch time can
+                                // include a slow layout/frame and turn an ordinary tap into a hold.
+                                val longPress = change.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis
+                                if (dragged || longPress) {
+                                    lastTarget = state.previewKey?.let { gestureMap.targetForKey(it) }
+                                    request(lastTarget, flush = true)
+                                } else state.expand()
+                            }
+                            completed = true
                             break
                         }
                     }
                 } finally {
-                    held = false
-                    interaction++
+                    // Busy stays set through a completed drag's queued release flush.
+                    if (!completed && lastTarget != null) request(null)
+                    if (state.navigationToken === requests) {
+                        state.previewKey = null
+                        state.held = false
+                        state.touch()
+                    }
                 }
             }
         }) {
         val heightPx = with(density) { maxHeight.toPx() }
+        val widthPx = with(density) { maxWidth.toPx() }
+        val expansion = state.expansion.value.coerceIn(0f, 1f)
+        val dark = colors.background.luminance() < .3f
+        val accent = if (dark) Color(0xFFD5AF76) else Color(0xFFA57E44)
+        val activeThumb = state.held && state.expanded
         val thumb = minimapThumb(viewport, heightPx, insetPx, minimumThumbPx)
-        val visualWidth = MinimapIdleWidth + (MinimapWidth - MinimapIdleWidth) * expansion
-        Canvas(Modifier.fillMaxSize()) {
-            val inset = insetPx.coerceAtMost(size.height / 4f)
-            val trackHeight = (size.height - inset * 2f).coerceAtLeast(0f)
-            val width = visualWidth.toPx()
-            // At most 160 samples, three tiny strokes each; no transcript text composables/images.
-            val paintLimit = (trackHeight / 4.dp.toPx()).toInt().coerceIn(0, MinimapTickLimit)
-            val samples = minimapSampleIndices(map.ticks.size, paintLimit)
-            val band = trackHeight / samples.size.coerceAtLeast(1)
-            for (sample in samples) {
-                val tick = map.ticks[sample]
-                val tint = when (tick.kind) {
-                    TranscriptKind.User -> colors.primary
-                    TranscriptKind.Error -> colors.error
-                    else -> colors.onSurfaceVariant
-                }.copy(alpha = if (preferences.highContrast) .85f else .48f)
-                val lineGap = minOf(2.dp.toPx(), band / 4f)
-                tick.widths.forEachIndexed { line, length ->
-                    val y = inset + trackHeight * tick.fraction + (line - (tick.widths.size - 1) / 2f) * lineGap
-                    val start = 2.dp.toPx()
-                    val end = start + (width - 4.dp.toPx()).coerceAtLeast(0f) * length
-                    drawLine(tint, Offset(start, y.coerceIn(inset, inset + trackHeight)),
-                        Offset(end, y.coerceIn(inset, inset + trackHeight)), 1.dp.toPx(), StrokeCap.Round)
+        val collapsedWidth = minOf(widthPx, with(density) { 24.dp.toPx() })
+        val collapsedMarks = remember(map, heightPx, collapsedWidth, density) {
+            minimapMarks(map, null, collapsedWidth, heightPx, density.density, expanded = false)
+        }
+        // Cache normalized expanded geometry: the width animation scales it without recreating
+        // every mark on each frame, and scrolling only redraws the current tint/thumb.
+        Canvas(Modifier.fillMaxSize().layerBackdrop(inkBackdrop)) {
+            fun paint(marks: List<MinimapMark>, opacity: Float, expanded: Boolean) {
+                if (opacity <= 0f) return
+                val currentRow = viewport?.let { map.targetAt(it.start)?.key }
+                val currentKey = if (expanded) currentRow else map.currentQuestion(currentRow)
+                val widthScale = if (expanded) size.width / with(density) { 48.dp.toPx() } else 1f
+                for (mark in marks) {
+                    val inspected = mark.key == state.previewKey
+                    val current = mark.key == currentKey
+                    val inWindow = thumb != null && mark.top in thumb.top..(thumb.top + thumb.height)
+                    val alpha = if (preferences.highContrast) {
+                        if (current) 1f else .72f
+                    } else when {
+                        inspected || current -> .90f
+                        !expanded -> if (mark.kind == TranscriptKind.User) .38f else .16f
+                        mark.ink == MinimapInk.Question -> .82f
+                        mark.ink == MinimapInk.Added || mark.ink == MinimapInk.Removed -> .72f
+                        mark.ink == MinimapInk.Strong -> .56f
+                        mark.ink == MinimapInk.Faint -> .24f
+                        else -> .36f
+                    }
+                    val ink = if (!expanded || preferences.highContrast) colors.onSurface else when (mark.ink) {
+                        MinimapInk.Question -> accent
+                        MinimapInk.Added -> if (dark) Color(0xFF75C791) else Color(0xFF34834E)
+                        MinimapInk.Removed -> if (dark) Color(0xFFE58E8E) else Color(0xFFBB5757)
+                        else -> colors.onSurface
+                    }
+                    val emphasis = if (expanded && inWindow && mark.ink != MinimapInk.Question) 1.04f else 1f
+                    val left = mark.left * widthScale
+                    val length = if (!expanded && (current || inspected)) with(density) { 15.dp.toPx() } else mark.width * widthScale * emphasis
+                    // Question marks travel from equal Codex spacing to the length-weighted map;
+                    // replies fade in in place. No parsing/allocation is needed for the transition.
+                    val inset = insetPx.coerceAtMost(size.height / 4f)
+                    val track = size.height - 2f * inset
+                    val questionFraction = map.questionFraction(mark.key, 10f * density.density / track)
+                    val y = if (questionFraction != null) {
+                        val collapsedY = inset + questionFraction * track - mark.height / 2f
+                        val expandedY = if (expanded) mark.top else map.slot(mark.key)?.let { inset + map.tick(it).fraction * track - mark.height / 2f } ?: mark.top
+                        collapsedY + (expandedY - collapsedY) * expansion
+                    } else mark.top
+                    drawRoundRect(ink.copy(alpha = (alpha * opacity).coerceAtMost(1f)), Offset(left, y),
+                        Size(length.coerceAtMost(size.width - left), mark.height), CornerRadius(mark.height / 2f))
                 }
             }
+            paint(collapsedMarks, 1f - expansion, false)
+            paint(expandedMarks, expansion, true)
         }
-        if (thumb != null) {
-            PocketGlassSurface(
-                modifier = Modifier.offset { IntOffset(0, thumb.top.roundToInt()) }
-                    .width(visualWidth).height(with(density) { thumb.height.toDp() })
-                    .testTag("conversation-minimap-thumb"),
-                shape = RoundedCornerShape(5.dp), backdrop = backdrop,
-            ) { }
+        if (thumb != null && expansion > 0f) {
+            val thumbInset = minOf(5.dp, maxWidth / 4)
+            MinimapGlassThumb(inkBackdrop, activeThumb, expansion,
+                Modifier.offset { IntOffset(with(density) { thumbInset.roundToPx() }, thumb.top.roundToInt()) }
+                    .width(minOf(30.dp, (maxWidth - thumbInset * 2).coerceAtLeast(0.dp)))
+                    .height(with(density) { thumb.height.toDp() }).testTag("conversation-minimap-thumb"))
         }
+        val preview = state.previewKey?.let(map::preview)
+        if (preview != null) MinimapPressPreview(preview, state.previewFraction, backdrop)
     }
 }
 
-internal data class MinimapTarget(val key: String, val withinRow: Float)
-internal data class MinimapVisibleRow(val key: Any, val offset: Int, val size: Int)
-internal data class MinimapViewport(val start: Float, val end: Float)
-internal data class MinimapThumb(val top: Float, val height: Float)
-internal data class MinimapEntry(val key: String, val rowIndex: Int, val kind: TranscriptKind)
-internal data class MinimapTick(val fraction: Float, val kind: TranscriptKind, val widths: List<Float>)
-
-/** Pure key/geometry mapping. The only retained rows are the parent's current folded snapshot. */
-internal class ConversationMinimapMap(rows: List<TranscriptRow>, keys: List<String>) {
-    private val indices = buildMap {
-        val duplicate = keys.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
-        keys.forEachIndexed { index, key -> if (key !in duplicate) put(key, index) }
-    }
-    val entries: List<MinimapEntry> = run {
-        val counts = rows.groupingBy { it.key }.eachCount()
-        rows.mapIndexedNotNull { index, row ->
-            if (row.key in indices && counts[row.key] == 1) MinimapEntry(row.key, index, row.kind) else null
+/** The transient preview is outside transcript capture and does not reserve permanent text width. */
+@Composable
+private fun MinimapPressPreview(preview: MinimapPreview, fraction: Float, backdrop: Backdrop?) {
+    val density = LocalDensity.current
+    val gap = with(density) { 8.dp.roundToPx() }
+    val position = remember(fraction, gap) {
+        object : PopupPositionProvider {
+            override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize,
+                layoutDirection: LayoutDirection, popupContentSize: IntSize): IntOffset {
+                val x = if (layoutDirection == LayoutDirection.Ltr) anchorBounds.right + gap else anchorBounds.left - gap - popupContentSize.width
+                val y = anchorBounds.top + (fraction * anchorBounds.height).roundToInt() - popupContentSize.height / 2
+                val lower = maxOf(gap, anchorBounds.top)
+                val upper = minOf(windowSize.height - gap, anchorBounds.bottom) - popupContentSize.height
+                return IntOffset(x.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0)),
+                    y.coerceIn(lower.coerceAtMost(upper.coerceAtLeast(0)), upper.coerceAtLeast(0)))
+            }
         }
     }
-    private val slots = entries.mapIndexed { slot, row -> row.key to slot }.toMap()
-    val ticks: List<MinimapTick> = minimapSampleIndices(entries.size, MinimapTickLimit).map { slot ->
-        val entry = entries[slot]
-        val row = rows[entry.rowIndex]
-        // Inspect at most 192 characters of ONE item per sampled row. Never expand a process,
-        // scan a complete body, render Markdown, or access an attachment/network source.
-        val prefix = (if (row.kind == TranscriptKind.Process) row.processLabel.orEmpty()
-            else row.items.firstOrNull()?.text.orEmpty()).take(192)
-        val widths = prefix.lineSequence().take(3).map { (it.length / 64f).coerceIn(.25f, 1f) }.toList().ifEmpty { listOf(.5f) }
-        MinimapTick((slot + .5f) / entries.size, entry.kind, widths)
-    }
-
-    fun listIndex(key: String): Int? = if (key in slots) indices[key] else null
-
-    fun targetAt(fraction: Float): MinimapTarget? {
-        if (entries.isEmpty() || !fraction.isFinite()) return null
-        val position = fraction.coerceIn(0f, 1f).toDouble() * entries.size
-        val slot = floor(position).toInt().coerceIn(0, entries.lastIndex)
-        return MinimapTarget(entries[slot].key, (position - slot).toFloat().coerceIn(0f, .999999f))
-    }
-
-    fun viewport(visible: List<MinimapVisibleRow>, start: Int, end: Int, reverse: Boolean = false): MinimapViewport? {
-        if (entries.isEmpty() || end <= start) return null
-        var first = Float.POSITIVE_INFINITY
-        var last = Float.NEGATIVE_INFINITY
-        for (item in visible) {
-            val slot = slots[item.key] ?: continue
-            if (item.size <= 0 || item.offset.toLong() + item.size <= start || item.offset >= end) continue
-            val clippedStart = ((start.toDouble() - item.offset) / item.size).toFloat().coerceIn(0f, 1f)
-            val clippedEnd = ((end.toDouble() - item.offset) / item.size).toFloat().coerceIn(0f, 1f)
-            val from = if (reverse) 1f - clippedEnd else clippedStart
-            val to = if (reverse) 1f - clippedStart else clippedEnd
-            first = minOf(first, (slot + from) / entries.size)
-            last = maxOf(last, (slot + to) / entries.size)
+    Popup(popupPositionProvider = position,
+        properties = PopupProperties(focusable = false, dismissOnBackPress = false, dismissOnClickOutside = false)) {
+        PocketGlassSurface(Modifier.width(240.dp).testTag("conversation-minimap-preview"),
+            shape = RoundedCornerShape(12.dp), backdrop = backdrop, dense = true) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Text("提问：${preview.question}", style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("邻近：${preview.neighbor}", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(preview.position, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
-        return if (first.isFinite() && last > first) MinimapViewport(first, last) else null
     }
-}
-
-internal fun minimapThumb(viewport: MinimapViewport?, height: Float, inset: Float, minimum: Float): MinimapThumb? {
-    if (viewport == null || !height.isFinite() || height <= 0f || !viewport.start.isFinite() || !viewport.end.isFinite()) return null
-    val padding = inset.coerceIn(0f, height / 4f)
-    val track = height - padding * 2f
-    val thumbHeight = ((viewport.end - viewport.start).coerceIn(0f, 1f) * track).coerceIn(minimum.coerceIn(0f, track), track)
-    val top = (padding + viewport.start.coerceIn(0f, 1f) * track).coerceIn(padding, height - padding - thumbHeight)
-    return MinimapThumb(top, thumbHeight)
-}
-
-internal fun minimapSampleIndices(count: Int, limit: Int): List<Int> {
-    if (count <= 0 || limit <= 0) return emptyList()
-    val size = minOf(count, limit)
-    if (size == 1) return listOf((count - 1) / 2)
-    return List(size) { (it.toLong() * (count - 1) / (size - 1)).toInt() }
 }
