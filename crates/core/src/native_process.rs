@@ -120,11 +120,13 @@ mod tests {
             created_at: 0
         }
         .terminated());
-        // System is protected; inability to query it must not count as exit.
-        assert!(!NativeProcess {
+        // Ordinary users cannot query System; an elevated runner may be able to.
+        // Use its real identity when available, rather than mistaking our fake
+        // creation time for proof of PID reuse in that environment.
+        let system = NativeProcess::capture(4).unwrap_or(NativeProcess {
             pid: 4,
             created_at: 1
-        }
-        .terminated());
+        });
+        assert!(!system.terminated());
     }
 }
