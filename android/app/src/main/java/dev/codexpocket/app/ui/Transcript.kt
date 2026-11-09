@@ -54,6 +54,8 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                 Icon(PocketIcons.ChevronRight, null, Modifier.padding(start = 5.dp).size(14.dp).graphicsLayer { rotationZ = angle }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             row.processDetail?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            // Completion remains visible when the successful task's other work is folded.
+            if (!expanded) row.items.filter { it.type == "contextCompaction" }.forEach { CompactionStatus(it, timeline) }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
         }
         TranscriptKind.User -> Column(Modifier.fillMaxWidth().padding(start = 48.dp), horizontalAlignment = Alignment.End,
@@ -118,7 +120,24 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             ConversationErrorPresentation.from(item, timeline)
         }, messageScope + item.key)
         TranscriptKind.Plan -> NativeActivityCard(item, messageScope + item.key, expanded, onExpand, { onDetail(item) }, onPlan, onReopenPlan)
-        TranscriptKind.Activity -> NativeActivityTrace(row, messageScope, expanded, onExpand, onDetail, activityExpansions, onActivityExpansion)
+        TranscriptKind.Activity -> if (item.type == "contextCompaction") CompactionStatus(item, timeline)
+            else NativeActivityTrace(row, messageScope, expanded, onExpand, onDetail, activityExpansions, onActivityExpansion)
+    }
+}
+
+@Composable
+private fun CompactionStatus(item: TimelineItem, timeline: NativeTimeline?) {
+    CompactionStatusRow(ConversationPresentation.compactionLabel(item, timeline), Modifier.testTag("compaction-status:${item.key}"))
+}
+
+/** The native compaction milestone uses the same compact row in live and historical views. */
+@Composable
+internal fun CompactionStatusRow(label: String, modifier: Modifier = Modifier) {
+    Row(modifier.padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Icon(PocketIcons.FoldVertical, null, Modifier.size(16.dp).testTag("compaction-status-icon"),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

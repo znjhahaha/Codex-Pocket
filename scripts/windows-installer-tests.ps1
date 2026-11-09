@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
@@ -347,7 +347,7 @@ Write-Output '-----END CERTIFICATE-----'
 $global:LASTEXITCODE = 0
 '@
     $fakeSigner = Join-Path $buildRoot 'apksigner.ps1'
-    Put $fakeSigner ("Write-Output 'Signer #1 certificate SHA-256 digest: " + ('0' * 64) + "'`n" + '$global:LASTEXITCODE = 0')
+    Put $fakeSigner ("Write-Output 'Number of signers: 1'`nWrite-Output 'Signer #1 certificate SHA-256 digest: " + ('0' * 64) + "'`n" + '$global:LASTEXITCODE = 0')
     function script:Get-PocketKeytoolPath { return $script:fakeKeytool }
     function script:cargo { $script:cargoArguments = @($args); $global:LASTEXITCODE = $script:cargoExit }
     Put (Join-Path $buildRoot 'scripts\fetch-cloudflared.ps1') '$global:LASTEXITCODE=0'
@@ -374,7 +374,7 @@ $global:LASTEXITCODE = 0
         # Exercise the successful public pipeline with distinct native output
         # directories and a synthetic signer that matches only this fixture.
         $digest=Get-PocketBytesHash ([Text.Encoding]::UTF8.GetBytes('fixture-public-certificate'))
-        Put $fakeSigner ("Write-Output 'Signer #1 certificate SHA-256 digest: " + $digest + "'`n" + '$global:LASTEXITCODE = 0')
+        Put $fakeSigner ("Write-Output 'Number of signers: 1'`nWrite-Output 'Signer #1 certificate SHA-256 digest: " + $digest + "'`n" + '$global:LASTEXITCODE = 0')
         foreach($file in Get-PocketWindowsFiles) {
             if($file -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$targetFile=Join-Path $buildRoot ('.local\tools\'+$file)}
             elseif($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}

@@ -78,7 +78,7 @@ private fun JsonElement.summaryText(): String? = when (this) {
 private fun JsonObject.nativeSummaryParts(): List<String> = array("summary").mapNotNull { it.summaryText() }
 
 data class TimelineItem(val turnId: String, val itemId: String, val type: String, val text: String = "", val status: String = "", val raw: JsonObject = buildJsonObject {}, val complete: Boolean = false,
-    // Only a live lifecycle event establishes activity; snapshots/cache default to unknown.
+    // Live lifecycle, or a native timed start at the tail of an active snapshot. Cache defaults to unknown.
     val liveStarted: Boolean = false) {
     val summaryParts: List<String> get() = when {
         "summary" in raw -> raw.nativeSummaryParts()
@@ -140,14 +140,23 @@ object NativeReducer {
                 observedParentId = previous?.observedParentId,
                 observedDurationMs = previous?.observedStartNanos?.let { (System.nanoTime() - it).takeIf { nanos -> nanos >= 0 }?.div(1_000_000) }
                     ?: previous?.observedDurationMs?.takeIf { previous.status == native.status })
-            val result = old.copy(activeTurn = if (old.activeTurn == turn) null else old.activeTurn, status = info.status, completedTurns = old.completedTurns + turn, turns = old.turns + (turn to info))
+            val result = old.copy(activeTurn = if (old.activeTurn == turn) null else old.activeTurn, status = info.status, completedTurns = old.completedTurns + turn, turns = old.turns + (turn to info),
+                items = old.items.mapValues { (_, item) ->
+                    if (item.turnId == turn && item.type == "contextCompaction") item.copy(liveStarted = false) else item
+                })
             val message = p.obj("turn").obj("error").string("message")
             if (message.isBlank() && result.status != "failed") return result
             val failure = TimelineItem(turn, "turn-error:$turn", "error", message, "failed",
                 raw = buildJsonObject { put("error", p.obj("turn").obj("error")); put("willRetry", false) }, complete = true)
             return result.copy(items = LinkedHashMap(result.items).apply { put(failure.key, failure) })
         }
-        if (method == "thread/status/changed") return old.copy(status = p.obj("status").string("type"), activeFlags = p.obj("status").nativeActiveFlags())
+        if (method == "thread/status/changed") {
+            val status = p.obj("status").string("type")
+            return old.copy(status = status, activeFlags = p.obj("status").nativeActiveFlags(),
+                items = if (status in setOf("idle", "notLoaded", "systemError")) old.items.mapValues { (_, item) ->
+                    if (item.type == "contextCompaction") item.copy(liveStarted = false) else item
+                } else old.items)
+        }
         // Deprecated but still present in the native schema: ContextCompactedNotification.
         if (method == "thread/compacted") {
             if (turn.isBlank()) return old
@@ -158,6 +167,9 @@ object NativeReducer {
         val next: TimelineItem = when (method) {
             "item/started", "item/completed" -> {
                 val native = TimelineItem.from(turn, p.obj("item"), method == "item/completed").copy(liveStarted = method == "item/started")
+                // Replayed starts must not revive compaction in a terminal native turn.
+                if (method == "item/started" && native.type == "contextCompaction" &&
+                    (turn in old.completedTurns || old.turns[turn]?.status in setOf("completed", "failed", "interrupted"))) return old
                 val existing = old.items[native.key]
                 if (method == "item/completed" || existing == null) native
                 else {
@@ -201,8 +213,13 @@ object NativeReducer {
         return old.copy(items = LinkedHashMap(old.items).apply {
             if (next.type !in setOf("userMessage", "contextCompaction")) entries.forEach { entry ->
                 val item = entry.value
-                if (item.turnId == next.turnId && item.type == "contextCompaction" && item.liveStarted)
-                    entry.setValue(item.copy(liveStarted = false))
+                if (item.turnId == next.turnId && item.type == "contextCompaction" && item.liveStarted) {
+                    // Native retries are still the same operation; a later tool/message is not.
+                    val error = next.type in setOf("error", "turn/error", "thread/error", "turn/failed")
+                    val retry = (p["willRetry"] as? JsonPrimitive)?.booleanOrNull
+                    if (!error || retry != true) entry.setValue(item.copy(liveStarted = false,
+                        status = if (error && retry == false) "failed" else item.status))
+                }
             }
             put(next.key, next)
         })
@@ -221,7 +238,9 @@ object NativeReducer {
             for (item in turn.array("items")) {
                 val nativeItem = item.asObject()
                 val itemCompleted = (nativeItem["completedAtMs"] as? JsonPrimitive)?.longOrNull?.takeIf { it >= 0 } != null
-                val value = TimelineItem.from(turn.string("id"), nativeItem, itemCompleted || turn.string("status") != "inProgress")
+                // Turn completion alone never establishes compaction success, including in history.
+                val complete = itemCompleted || (nativeItem.string("type") != "contextCompaction" && turn.string("status") != "inProgress")
+                val value = TimelineItem.from(turn.string("id"), nativeItem, complete)
                 if (ConversationPresentation.visible(value)) items[value.key] = value
             }
             if (turn.string("status") == "failed" || turn.obj("error").string("message").isNotBlank()) {
@@ -229,6 +248,17 @@ object NativeReducer {
                     raw = buildJsonObject { put("error", turn.obj("error")); put("willRetry", false) }, complete = true)
                 items[failure.key] = failure
             }
+        }
+        // Recover mid-compaction only from a recorded native start on the active turn's tail.
+        // Untimed historical markers, terminal turns, later actions and Room cache are not running evidence.
+        if (thread.obj("status").string("type") in setOf("", "active")) {
+            // Inspect the native tail before display filtering: even an unknown later action invalidates it.
+            val nativeTurn = thread.array("turns").lastOrNull { it.asObject().string("id") == active }?.asObject()
+            val tail = nativeTurn?.array("items")?.lastOrNull { it.asObject().string("type") != "userMessage" }?.asObject()
+            val item = items.values.lastOrNull { it.turnId == active && it.itemId == tail?.string("id") }
+            val startedAt = (tail?.get("startedAtMs") as? JsonPrimitive)?.longOrNull
+            if (tail?.string("type") == "contextCompaction" && item != null && !item.complete && startedAt != null && startedAt >= 0)
+                items[item.key] = item.copy(liveStarted = true)
         }
         return NativeTimeline(items, active, thread.obj("status").string("type"), completed, metadata, thread.obj("status").nativeActiveFlags())
     }

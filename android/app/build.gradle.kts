@@ -33,8 +33,8 @@ android {
         applicationId = "dev.codexpocket.app"
         minSdk = 28
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.6.0"
+        versionCode = 11
+        versionName = "0.6.1"
         buildConfigField("String", "HUAWEI_APP_ID", "\"$huaweiAppId\"")
         manifestPlaceholders["pocketHuaweiAppId"] = huaweiAppId
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

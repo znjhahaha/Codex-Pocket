@@ -1,5 +1,5 @@
 {
-  "name": "codex-pocket-desktop", "version": "0.6.0", "private": true, "type": "module",
+  "name": "codex-pocket-desktop", "version": "0.6.1", "private": true, "type": "module",
   "scripts": {"dev":"vite --host 127.0.0.1", "build":"tsc -b && vite build", "test":"vitest run", "tauri":"tauri", "test:ui":"playwright test"},
   "dependencies": {"@tauri-apps/api":"^2.10.1", "react":"^19.2.0", "react-dom":"^19.2.0", "qrcode.react":"^4.2.0", "lucide-react":"^0.468.0"},
   "devDependencies": {"@tauri-apps/cli":"^2.10.0", "@types/react":"^19.2.0", "@types/react-dom":"^19.2.0", "@vitejs/plugin-react":"^4.7.0", "typescript":"~5.9.3", "vite":"^6.4.1", "vitest":"^3.2.4", "@playwright/test":"^1.56.1"}

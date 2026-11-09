@@ -14,8 +14,8 @@ data class TranscriptAnchor(val key: String?, val offset: Int = 0) {
 /** The same policy is applied to live events, authoritative snapshots and legacy Room rows. */
 object ConversationPresentation {
     private val tools = setOf("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "functionCallOutput", "webSearch", "imageView", "imageGeneration", "collabAgentToolCall", "subAgentActivity", "reasoning", "contextCompaction", "turn/diff/updated")
-    /** Kept in the timeline (they drive [liveStatus]) but never drawn as transcript rows on the phone. */
-    private val statusOnly = setOf("reasoning", "contextCompaction")
+    /** Reasoning prose is displayed by the live summary, or inside expanded history. */
+    private val statusOnly = setOf("reasoning")
 
     /** A close event can precede the final item. One bounded read repairs a partial lifecycle. */
     fun needsCompletionRead(timeline: NativeTimeline, turnId: String): Boolean {
@@ -41,12 +41,31 @@ object ConversationPresentation {
     /** What the running turn is doing now, for the single status line under the transcript. Null when idle. */
     fun liveStatus(timeline: NativeTimeline): LiveStatus? {
         val turn = timeline.activeTurn ?: return null
-        // Snapshot presence and a missing completion are not evidence of current compaction.
-        // Later actions invalidate its liveStarted evidence without inventing a native completion.
-        val last = timeline.items.values.lastOrNull { it.turnId == turn && visible(it) && it.type != "userMessage" &&
-            (it.type != "contextCompaction" || (it.liveStarted && !it.complete)) }
-        if (last?.type == "contextCompaction") return LiveStatus.Compacting
+        if (turn in timeline.completedTurns || timeline.turns[turn]?.status in setOf("completed", "failed", "interrupted")) return null
+        // The reducer retains lifecycle evidence across native retries and invalidates it on later work.
+        if (timeline.items.values.any { it.type == "contextCompaction" && visible(it) && compactionActive(it, timeline) }) return LiveStatus.Compacting
+        val last = timeline.items.values.lastOrNull { it.turnId == turn && visible(it) && it.type !in setOf("userMessage", "contextCompaction") }
         return if (last == null || (last.type == "reasoning" && !last.complete)) LiveStatus.Thinking else LiveStatus.Working
+    }
+
+    private fun compactionActive(item: TimelineItem, timeline: NativeTimeline?) = item.liveStarted && !item.complete &&
+        NativeActivityPresentation.state(item) == ActivityStatus.Running &&
+        timeline?.activeTurn == item.turnId && item.turnId !in timeline.completedTurns &&
+        timeline.turns[item.turnId]?.status !in setOf("completed", "failed", "interrupted")
+
+    /** Completion belongs to the item; a later failed turn must not erase a successful compaction. */
+    fun compactionLabel(item: TimelineItem, timeline: NativeTimeline? = null): String {
+        val state = NativeActivityPresentation.state(item)
+        return when {
+            // complete means the lifecycle ended. Compatible native failure/status fields still win.
+            state == ActivityStatus.Failed -> "上下文压缩失败"
+            state == ActivityStatus.Interrupted -> "上下文压缩已中断"
+            item.complete && state == ActivityStatus.Completed -> "上下文已压缩"
+            timeline?.turns?.get(item.turnId)?.status == "failed" -> "上下文压缩失败"
+            timeline?.turns?.get(item.turnId)?.status == "interrupted" -> "上下文压缩已中断"
+            compactionActive(item, timeline) -> "正在压缩上下文"
+            else -> "上下文压缩状态未知"
+        }
     }
     private val messages = setOf("userMessage", "agentMessage", "plan", "turn/plan/updated", "error", "turn/error", "thread/error", "turn/failed")
     fun hookType(value: String): Boolean {
@@ -83,6 +102,11 @@ object ConversationPresentation {
             }
             // Codex on desktop shows thinking only while it runs; the phone shows it in the live status line instead.
             if (item.type in statusOnly && !includeReasoning) return@forEach
+            // The current compaction is shown once by LiveTurnStatus. Retain its native marker afterward.
+            if (item.type == "contextCompaction" && compactionActive(item, timeline) && !includeReasoning) {
+                canAppend = false
+                return@forEach
+            }
             val kind = when (item.type) {
                 "userMessage" -> TranscriptKind.User
                 "agentMessage" -> if (item.raw.string("phase") == "commentary" || item.raw.string("channel") == "commentary") TranscriptKind.Commentary else TranscriptKind.Answer
@@ -94,7 +118,7 @@ object ConversationPresentation {
             // Completion changes expansion defaults, never message identity or prose order.
             // Each native agent call is a clickable created/sent-count line of its own.
             // Commands and edits on either side still form their own contiguous work groups.
-            val groupable = kind == TranscriptKind.Activity && item.type !in setOf("collabAgentToolCall", "subAgentActivity") &&
+            val groupable = kind == TranscriptKind.Activity && item.type !in setOf("collabAgentToolCall", "subAgentActivity", "contextCompaction") &&
                 !NativeActivityPresentation.attentionBoundary(item)
             val previous = rows.lastOrNull()
             if (groupable && canAppend && previous?.kind == kind && previous.items.first().turnId == item.turnId) {
@@ -233,6 +257,7 @@ object ConversationPresentation {
         if (!visible(item)) return ""
         val raw = item.raw
         return when (item.type) {
+            "contextCompaction" -> compactionLabel(item)
             "reasoning" -> item.summaryParts.filter(String::isNotBlank).joinToString("\n\n")
             "fileChange", "turn/diff/updated" -> item.diff
             "functionCallOutput" -> NativeActivityPresentation.describe(item).output.text

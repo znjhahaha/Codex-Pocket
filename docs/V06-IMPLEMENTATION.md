@@ -14,7 +14,7 @@ plain-language documentation with real screenshots.
 - Unknown mutation results are reconciled, never silently resent.
 - Secrets stay out of Git, diagnostics, screenshots and distributed artifacts.
 - Default is desktop follow; CLI requires an explicit choice. No silent CLI fallback.
-- Release target is 0.6.0 / Android versionCode 10; original Android signing identity.
+- Initial target was 0.6.0 / Android versionCode 10. The compaction repair advances to 0.6.1 / code 11 without moving the existing tag; original Android signing identity.
 - Commit/push/CI are authorized after checks; publication stops at a Release draft.
 
 ## Work packages
@@ -31,3 +31,6 @@ plain-language documentation with real screenshots.
 
 This file is an implementation ledger, not an acceptance claim. Live server setup,
 Windows login, phone hardware and 24-hour stability require separate evidence.
+
+The 0.6.0 release build stopped at signer comparison after compilation. Follow-up
+compaction fixes and signing diagnostics are tracked in [0.6.1 acceptance](V061-ACCEPTANCE.md).

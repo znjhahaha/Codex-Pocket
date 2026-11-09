@@ -57,13 +57,14 @@ internal fun nativeSummaryActive(turnId: String, reasoning: TimelineItem?, timin
 @Composable
 internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifier = Modifier,
     reasoning: TimelineItem? = null, observedAtMillis: Long? = null, timing: NativeTurnInfo? = null) {
-    val parts = reasoning?.summaryParts.orEmpty().filter(String::isNotBlank)
-    if (parts.isEmpty()) {
-        val nativeStatus = liveStatusLabel(status)
-        if (nativeStatus.isNotBlank()) Text(nativeStatus, modifier.testTag("live-turn-status").padding(vertical = 8.dp),
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    // Current native compaction takes precedence over a summary from earlier in the same turn.
+    val nativeStatus = liveStatusLabel(status)
+    if (nativeStatus.isNotBlank()) {
+        CompactionStatusRow(nativeStatus, modifier.testTag("live-turn-status"))
         return
     }
+    val parts = reasoning?.summaryParts.orEmpty().filter(String::isNotBlank)
+    if (parts.isEmpty()) return
     var expanded by rememberSaveable(turnId) { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
     val active = nativeSummaryActive(turnId, reasoning, timing)

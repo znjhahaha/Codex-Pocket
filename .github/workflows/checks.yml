@@ -49,6 +49,7 @@ jobs:
           ./scripts/windows-installer-tests.ps1
           ./scripts/windows-identity-installer-tests.ps1 -AgentPath (Join-Path $PWD 'target/debug/pocket-agent.exe')
           ./scripts/windows-native-path-tests.ps1
+          ./scripts/apk-signer-tests.ps1
       - name: Preserve test reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

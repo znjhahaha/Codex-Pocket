@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-desktop"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-desktop-runtime"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

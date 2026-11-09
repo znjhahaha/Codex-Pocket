@@ -48,9 +48,7 @@ jobs:
             # Only public certificate/algorithm diagnostics; no signing secrets or APK payload.
             $verification | ForEach-Object { Write-Host "$_" }
             if($exit -ne 0){throw 'APK verification failed'}
-            $matches=[regex]::Matches(($verification -join [Environment]::NewLine),'(?m)^Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9]{64})\s*$')
-            Write-Host "Matched signer count: $($matches.Count)"
-            if($matches.Count -ne 1 -or $matches[0].Groups[1].Value -ne $expected){throw 'Signer identity comparison failed'}
+            Assert-PocketApkSignerIdentity -Verification $verification -ExpectedSigner $expected
           } finally {
             if(Test-Path -LiteralPath $env:POCKET_KEYSTORE){Remove-Item -LiteralPath $env:POCKET_KEYSTORE -Force}
             Remove-Item Env:POCKET_STORE_PASSWORD,Env:POCKET_KEY_PASSWORD -ErrorAction SilentlyContinue

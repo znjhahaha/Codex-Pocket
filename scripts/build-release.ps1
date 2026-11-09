@@ -74,6 +74,20 @@ function Find-PocketApkSigner([string]$Root) {
     throw 'apksigner.bat is required; set -ApkSignerPath or the Android SDK path.'
 }
 function Get-PocketKeytoolPath { return (Get-Command keytool.exe -ErrorAction Stop).Source }
+function Assert-PocketApkSignerIdentity([string[]]$Verification,[string]$ExpectedSigner) {
+    $output = $Verification -join "`n"
+    $counts = [regex]::Matches($output,'(?m)^Number of signers: ([0-9]+)\s*$')
+    # Build-tools 37 prints one certificate per verified scheme instead of Signer #1.
+    # Every reported signing certificate must be the approved original identity.
+    $signers = [regex]::Matches($output,'(?m)^(?:Signer #1|V[1-4](?:\.[0-9]+)? Signer:) certificate SHA-256 digest:[ \t]*([a-fA-F0-9]{64})\s*$')
+    $certificateLines = @($Verification | Where-Object { $_ -match 'certificate SHA-256 digest:' -and $_ -notmatch '^Source Stamp Signer ' })
+    $mismatch = @($signers | Where-Object { $_.Groups[1].Value -ne $ExpectedSigner })
+    if ($ExpectedSigner -notmatch '^[a-fA-F0-9]{64}$' -or $counts.Count -ne 1 -or $counts[0].Groups[1].Value -ne '1' -or
+        $signers.Count -eq 0 -or $certificateLines.Count -ne $signers.Count -or $mismatch.Count -gt 0) {
+        $actual = @($signers | ForEach-Object { $_.Groups[1].Value }) -join ','
+        throw "Release APK signer does not match the existing release.jks identity. Expected: $ExpectedSigner; matched: $($signers.Count); actual: $actual"
+    }
+}
 function Invoke-PocketDesktopBuild([string]$Root,[string]$Target) {
     Push-Location (Join-Path $Root 'desktop')
     try {
@@ -139,6 +153,9 @@ function Invoke-PocketReleaseBuild {
         $certificate = [regex]::Match(($certOutput -join [Environment]::NewLine),'(?s)-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----')
         if (-not $certificate.Success) { throw 'Existing signing certificate could not be decoded.' }
         $expectedSigner = Get-PocketBytesHash ([Convert]::FromBase64String(($certificate.Groups[1].Value -replace '\s','')))
+        if ($env:POCKET_EXPECTED_SIGNER -and $expectedSigner -ne $env:POCKET_EXPECTED_SIGNER) {
+            throw "Configured public signing certificate differs from the approved identity: $expectedSigner"
+        }
         & (Join-Path $Root 'android\gradlew.bat') -p (Join-Path $Root 'android') :app:assembleRelease --no-daemon
         if ($LASTEXITCODE -ne 0) { throw 'Android Release build failed; no package published.' }
         $apk = Join-Path $Root 'android\app\build\outputs\apk\release\app-release.apk'
@@ -146,8 +163,8 @@ function Invoke-PocketReleaseBuild {
         if (-not $apkHash) { throw 'Release APK missing after build.' }
         $verification = @(& $ApkSignerPath verify --verbose --print-certs $apk 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'Release APK signature verification failed (output omitted).' }
-        $signers = [regex]::Matches(($verification -join [Environment]::NewLine),'(?m)^Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9]{64})\s*$')
-        if ($signers.Count -ne 1 -or $signers[0].Groups[1].Value -ne $expectedSigner) { throw 'Release APK signer does not match the existing release.jks identity.' }
+        Write-Host "APK verifier: $ApkSignerPath"
+        Assert-PocketApkSignerIdentity -Verification $verification -ExpectedSigner $expectedSigner
         if ((Get-PocketFileHash $apk) -ne $apkHash) { throw 'Release APK changed during signature verification.' }
         $evidence = @{builtThisInvocation=$true;windowsTarget=$target;windowsProfile='release';apkSignatureVerified=$true;apkSha256=$apkHash;apkSignerSha256=$expectedSigner;cargoLockSha256=(Get-PocketFileHash (Join-Path $Root 'Cargo.lock'));nativeLiveAcceptance='separate-parent-validation'}
         $evidence.desktopCargoLockSha256=Get-PocketFileHash (Join-Path $Root 'desktop\Cargo.lock')
