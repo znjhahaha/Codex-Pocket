@@ -186,16 +186,26 @@ pub fn read_physical(path: &Path, limit: u64) -> Result<Vec<u8>> {
 pub(crate) fn verify_physical_file(path: &Path, file: &fs::File) -> Result<()> {
     #[cfg(not(windows))] let _ = (path, file);
     #[cfg(windows)] unsafe {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GetLongPathNameW};
         let mut buffer = vec![0u16; 32768];
         let count = GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), buffer.len() as u32, 0);
         if count == 0 { return Err(std::io::Error::last_os_error().into()); }
         if count as usize >= buffer.len() { bail!("Physical state path exceeds limit"); }
         let actual = String::from_utf16_lossy(&buffer[..count as usize]);
-        let expected = std::path::absolute(path)?.to_string_lossy().replace('/', "\\");
+        // TEMP on Windows CI (and some real installations) uses an 8.3 alias.
+        // Expand names only: canonicalize would follow a redirected/reparse path
+        // and make the security comparison tautological.
+        let absolute = std::path::absolute(path)?;
+        let name: Vec<u16> = absolute.as_os_str().encode_wide().chain(Some(0)).collect();
+        let count = GetLongPathNameW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32);
+        if count == 0 { return Err(std::io::Error::last_os_error().into()); }
+        if count as usize >= buffer.len() { bail!("Physical state path exceeds limit"); }
+        let expected = String::from_utf16_lossy(&buffer[..count as usize]).replace('/', "\\");
         let normalize = |s: &str| s.strip_prefix(r"\\?\").unwrap_or(s).to_lowercase();
-        if normalize(&actual) != normalize(&expected) { bail!("state_path_redirected"); }
+        let actual = normalize(&actual);
+        if (actual.contains("\\packages\\") && actual.contains("\\localcache\\"))
+            || actual != normalize(&expected) { bail!("state_path_redirected"); }
     }
     Ok(())
 }
@@ -216,6 +226,24 @@ pub fn config_store(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn physical_read_accepts_windows_short_names_but_not_a_different_handle() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let directory = tempfile::Builder::new().prefix("pocket physical path fixture ").tempdir().unwrap();
+        let path = directory.path().join("long state name.json");
+        fs::write(&path, b"preserved").unwrap();
+        let input: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut output = vec![0u16; 32768];
+        let count = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32) };
+        assert!(count > 0 && (count as usize) < output.len());
+        let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&output[..count as usize]));
+        assert_eq!(read_physical(&short, 1024).unwrap(), b"preserved");
+        let other = directory.path().join("other.json");
+        fs::write(&other, b"wrong").unwrap();
+        assert!(verify_physical_file(&path, &fs::File::open(other).unwrap()).is_err());
+    }
     #[test]
     fn durable_replace_reopens_complete_state_and_keeps_no_temporary_files() {
         let directory = tempfile::tempdir().unwrap();

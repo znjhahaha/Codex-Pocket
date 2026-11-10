@@ -43,8 +43,13 @@ pub fn unredirected(path:&Path)->Result<()> {
         if count as usize>=buffer.len(){bail!("Physical path exceeds limit")}
         let physical=String::from_utf16_lossy(&buffer[..count as usize]);
         let physical=physical.strip_prefix(r"\\?\").unwrap_or(&physical);
-        let expected=existing.to_string_lossy().replace('/',"\\");
-        if !physical.eq_ignore_ascii_case(&expected){return Err(RedirectedPath.into())}
+        // Expand 8.3 aliases without resolving a junction or MSIX redirection.
+        let count=GetLongPathNameW(name.as_ptr(),buffer.as_mut_ptr(),buffer.len() as u32);
+        if count==0{return Err(std::io::Error::last_os_error().into())}
+        if count as usize>=buffer.len(){bail!("Physical path exceeds limit")}
+        let expected=String::from_utf16_lossy(&buffer[..count as usize]).replace('/',"\\");
+        let lower=physical.to_lowercase();
+        if (lower.contains("\\packages\\")&&lower.contains("\\localcache\\"))||!physical.eq_ignore_ascii_case(&expected){return Err(RedirectedPath.into())}
     }
     Ok(())
 }
@@ -92,6 +97,30 @@ pub fn read<T:serde::de::DeserializeOwned>(path:&Path)->Result<T>{unredirected(p
 pub struct Lock(File);
 impl Lock {pub fn acquire(path:&Path)->Result<Self>{plain(path)?;let f=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;f.try_lock_exclusive().context("Another instance already owns this state or user")?;Ok(Self(f))}}
 impl Drop for Lock {fn drop(&mut self){let _=FileExt::unlock(&self.0);}}
+
+#[cfg(all(test, windows))]
+mod physical_path_tests {
+    use super::*;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[test]
+    fn short_path_alias_keeps_state_readable_and_does_not_allow_localcache() {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let dir=tempfile::Builder::new().prefix("Pocket path fixture ").tempdir().unwrap();
+        let path=dir.path().join("desktop state.json");
+        fs::write(&path,br#"{"enabled":true}"#).unwrap();
+        let input:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut output=vec![0u16;32768];
+        let n=unsafe{GetShortPathNameW(input.as_ptr(),output.as_mut_ptr(),output.len() as u32)};
+        assert!(n>0&&(n as usize)<output.len());
+        let short=PathBuf::from(std::ffi::OsString::from_wide(&output[..n as usize]));
+        let value:serde_json::Value=read(&short).unwrap();
+        assert_eq!(value["enabled"],true);
+        let cache=dir.path().join("Packages/test/LocalCache/state.json");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache,b"{}").unwrap();
+        assert!(unredirected(&cache).is_err());
+    }
+}
 #[derive(Serialize,Deserialize,Clone,Debug,Default)]
 #[serde(rename_all="camelCase")]
 pub struct Desired{pub enabled:bool, pub changed_at:u64}
