@@ -64,6 +64,9 @@ internal class MarkdownRenderCache(context: Context, foreground: Int, keyword: I
         .usePlugin(object : AbstractMarkwonPlugin() {
             override fun configureSpansFactory(builder: io.noties.markwon.MarkwonSpansFactory.Builder) {
                 builder.setFactory(org.commonmark.node.Code::class.java) { configuration, _ -> RoundedCodeSpan(configuration.theme()) }
+                builder.appendFactory(org.commonmark.node.Link::class.java) { _, props ->
+                    MarkdownLinkMetadata(io.noties.markwon.core.CoreProps.LINK_DESTINATION.require(props))
+                }
             }
             override fun configureVisitor(builder: io.noties.markwon.MarkwonVisitor.Builder) {
                 builder.on(org.commonmark.node.Code::class.java) { visitor, node ->
@@ -104,13 +107,13 @@ internal class MarkdownRenderCache(context: Context, foreground: Int, keyword: I
         })
         ensureActive()
         // Markwon advances startNumber while numbering items; restore it so the per-part render below starts at 1 again.
-        val full = SpannedString(withInlineCodeSpacing(markwon.render(document), inlineDensity))
+        val full = SpannedString(withMarkdownDecorations(markwon.render(document), inlineDensity))
         lists.forEach { (list, start) -> list.startNumber = start }
         val parts = mutableListOf<MarkdownPart>()
         val headings = mutableListOf<MarkdownHeading>()
         val usedAnchors = mutableMapOf<String, Int>()
         var prose = Document()
-        fun flush() { if (prose.firstChild != null) { parts += MarkdownPart(spans = SpannedString(withInlineCodeSpacing(markwon.render(prose), inlineDensity))); prose = Document() } }
+        fun flush() { if (prose.firstChild != null) { parts += MarkdownPart(spans = SpannedString(withMarkdownDecorations(markwon.render(prose), inlineDensity))); prose = Document() } }
         var node: Node? = document.firstChild
         while (node != null) {
             val next = node.next
@@ -130,7 +133,7 @@ internal class MarkdownRenderCache(context: Context, foreground: Int, keyword: I
                                 while (cell != null) {
                                     val document = Document()
                                     while (cell.firstChild != null) document.appendChild(cell.firstChild)
-                                    cells += SpannedString(withInlineCodeSpacing(markwon.render(document), inlineDensity))
+                                    cells += SpannedString(withMarkdownDecorations(markwon.render(document), inlineDensity))
                                     cell = cell.next
                                 }
                                 rows += cells

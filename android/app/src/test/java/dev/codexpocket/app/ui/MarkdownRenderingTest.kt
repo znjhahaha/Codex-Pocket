@@ -14,6 +14,27 @@ import org.robolectric.annotation.Config
 class MarkdownRenderingTest {
     private fun renderer() = MarkdownRenderCache(RuntimeEnvironment.getApplication(), Color.BLACK, Color.BLUE, Color.GRAY)
 
+    @Test fun fileAndWebLinksHaveBadgesWithoutChangingCopyTextOrClickSpans() = runBlocking {
+        val rendered = renderer().render("links", "已完成 [升级协调模块](/D:/codex2/upgrade.rs:12) · [官方文档](https://example.invalid) · [标题](#title)")
+        assertEquals("已完成 升级协调模块 · 官方文档 · 标题", rendered.spans.toString())
+        val badges = rendered.spans.getSpans(0, rendered.spans.length, MarkdownLinkBadgeSpan::class.java).sortedBy { rendered.spans.getSpanStart(it) }
+        assertEquals(2, badges.size)
+        assertEquals("RS", badges.first().badge.label); assertTrue(badges.last().badge.web)
+        assertEquals(3, rendered.spans.getSpans(0, rendered.spans.length, android.text.style.ClickableSpan::class.java).size)
+        assertEquals(2, rendered.parts.single().spans!!.getSpans(0, rendered.spans.length, MarkdownLinkBadgeSpan::class.java).size)
+    }
+
+    @Test fun codeLinkBadgeSharesEdgeSpacingAndKeepsGraphemesIntact() = runBlocking {
+        val rendered = renderer().render("code-link", "[`upgrade.rs`](/D:/space%20name/upgrade.rs#L12)")
+        val badge = rendered.spans.getSpans(0, rendered.spans.length, MarkdownLinkBadgeSpan::class.java).single()
+        assertEquals("upgrade.rs", rendered.spans.toString())
+        assertEquals("RS", badge.badge.label)
+        assertEquals(1, rendered.spans.getSpans(0, 1, android.text.style.ReplacementSpan::class.java).size)
+        assertNull(markdownLinkBadge("javascript:alert(1)"))
+        assertNull(markdownLinkBadge("#local"))
+        assertEquals("KT", markdownLinkBadge("C:\\app\\Main.kt:12:3")?.label)
+    }
+
     @Test fun cacheKeepsUnchangedMessagesAndReplacesOnlyChangedRevision() = runBlocking {
         val renderer = renderer()
         val first = renderer.render("chat-a/item", "**one**")

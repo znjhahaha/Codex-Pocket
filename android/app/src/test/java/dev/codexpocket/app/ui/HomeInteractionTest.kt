@@ -34,6 +34,41 @@ class HomeInteractionTest {
         compose.waitForIdle()
     }
 
+    @Test fun cachedHomeRemountDoesNotShowLoadingOrForceRefresh() {
+        val row = chat("cached", "已缓存的会话")
+        var mounted by mutableStateOf(true)
+        var ensures = 0
+        var forced = 0
+        content {
+            if (mounted) ChatsHome(PocketPreviewStates.home.copy(chats = listOf(row),
+                computerId = row.key.computerId, online = true, directoryRefreshing = true, directoryLoading = false),
+                {}, {}, { _, _, _ -> forced++ }, {}, {}, onEnsureDirectory = { _, _ -> ensures++ })
+        }
+        repeat(5) {
+            compose.mainClock.advanceTimeBy(500)
+            compose.onNodeWithTag("home-chat-${row.key.encoded}").assertIsDisplayed()
+            compose.onNodeWithTag("home-sync-state").assertDoesNotExist()
+            compose.runOnIdle { mounted = false }
+            compose.runOnIdle { mounted = true }
+        }
+        compose.mainClock.advanceTimeBy(500)
+        compose.runOnIdle { assertEquals(0, forced); assertTrue(ensures > 0) }
+    }
+
+    @Test fun directoryFailureKeepsCachedRowsAndRetryWhileConnectionStaysOnline() {
+        val row = chat("cached", "已缓存的会话")
+        var retries = 0
+        content {
+            ChatsHome(PocketPreviewStates.home.copy(chats = listOf(row), computerId = row.key.computerId,
+                online = true, directoryError = "会话列表更新超时，已保留缓存，可重试"),
+                {}, {}, { _, _, _ -> retries++ }, {}, {}, onEnsureDirectory = { _, _ -> })
+        }
+        compose.onNodeWithTag("home-chat-${row.key.encoded}").assertIsDisplayed()
+        compose.onNodeWithText("会话列表更新超时，已保留缓存，可重试").assertIsDisplayed()
+        compose.onNodeWithText(compose.activity.getString(dev.codexpocket.app.R.string.v03_home_retry)).performClick()
+        compose.runOnIdle { assertEquals(1, retries) }
+    }
+
     @Test fun runningWinsOverPinAndEachNativeChatOccursOnce() {
         val runningPin = chat("running", "运行置顶", pinned = true)
         val pinned = chat("pin", "普通置顶", pinned = true)

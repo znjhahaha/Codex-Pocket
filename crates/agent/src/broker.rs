@@ -1789,6 +1789,7 @@ impl Broker {
         let s = self.state.lock().await;
         let mut value = self.connection.snapshot();
         value["protocol"] = json!(1);
+        value["helperRuntime"] = crate::installation::current();
         value["updatedAt"] = json!(crate::connection::now());
         value["runtimes"] = json!(
             Self::runtime_values(&s)
@@ -1982,6 +1983,7 @@ impl Broker {
         capabilities.extend(
             [
                 "sync",
+                "transport.chunkedReplies.v1",
                 "approvals/respond",
                 "attachment/upload",
                 "devices/revoke",

@@ -74,6 +74,7 @@ internal val LocalDesktopImages = staticCompositionLocalOf<DesktopImageSource?> 
 /** Parent supplies authenticated, owner-bound endpoint reads. No desktop path is accepted. */
 internal fun interface ToolMediaImageSource { suspend fun read(media: ToolMediaRef, offset: Long, maxBytes: Int): ToolMediaChunk }
 internal val LocalToolMediaImages = staticCompositionLocalOf<ToolMediaImageSource?> { null }
+internal val LocalImageConnection = staticCompositionLocalOf { 0L to false }
 private val LocalGalleryToolRefs = staticCompositionLocalOf<Map<String, ToolMediaRef>> { emptyMap() }
 private val imageDecodeSlots = Semaphore(2)
 
@@ -147,7 +148,8 @@ private fun rememberGalleryBitmap(path: String, maxSide: Int): ImageLoad {
     val identity = "${source?.ownerKey}:${media?.cacheKey ?: path}"
     val key = "$maxSide:$identity"
     val retry = galleryRetries[identity] ?: 0
-    val load by produceState<ImageLoad>(bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading, key, source, toolSource, retry) {
+    val connection = LocalImageConnection.current
+    val load by produceState<ImageLoad>(bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading, key, source, toolSource, retry, connection) {
         value = bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading
         if (value is ImageLoad.Ready) return@produceState
         value = try {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -77,10 +77,8 @@ pub fn private_ip(ip: IpAddr) -> bool {
     }
 }
 pub fn default_lan_bind() -> Option<SocketAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    (private_ip(ip) && !ip.is_loopback()).then(|| SocketAddr::new(ip, 43821))
+    let rows = pocket_network::interfaces().ok()?;
+    pocket_network::preferred(&rows, None).map(|ip| SocketAddr::new(ip.into(), 43821))
 }
 pub fn validate_public_url(value: &str) -> Result<url::Url> {
     let url = url::Url::parse(value)?;
@@ -200,6 +198,19 @@ impl RoutePreferences {
     }
 }
 /// Parent broker uses this for routes/list; reads persisted changes despite stale Broker.config.
+pub fn lan_bindings(prefs:&RoutePreferences)->Vec<(String,LanConfig)> {
+    let mut bindings=Vec::new();
+    if let Some(settings)=&prefs.lan{bindings.push(("lan".into(),settings.clone()));}
+    for route in prefs.advertised_routes(crate::connection::now()).into_iter().filter(|r|r.kind==RouteKind::Lan) {
+        let Some(address)=route.url.trim_end_matches('/').strip_prefix("tls://").and_then(|s|s.parse::<SocketAddr>().ok()) else{continue};
+        if !bindings.iter().any(|(_,s)|s.bind==address) {
+            bindings.push((route.id,LanConfig{bind:address,mdns:prefs.lan.as_ref().is_some_and(|s|s.mdns)}));
+        }
+    }
+    bindings
+}
+
+/// Parent broker uses this for routes/list; reads persisted changes despite stale Broker.config.
 pub fn snapshot(config: &Config, state_dir: &Path) -> Value {
     Config::load(state_dir)
         .unwrap_or_else(|_| config.clone())
@@ -210,6 +221,7 @@ pub struct Controller {
     state: PathBuf,
     config: Mutex<Config>,
     changes: watch::Sender<(Config,u64)>,
+    detected_lan: Mutex<Option<Vec<Ipv4Addr>>>,
     pub health: Arc<Connection>,
 }
 impl Controller {
@@ -220,6 +232,7 @@ impl Controller {
             state,
             config: Mutex::new(config),
             changes,
+            detected_lan: Mutex::new(None),
             health,
         })
     }
@@ -263,23 +276,58 @@ impl Controller {
     /// Network probing supplies only a private address; identity and public routes
     /// come from the current on-disk configuration, never from the probe.
     pub async fn refresh_auto_lan(&self,discovered:Option<SocketAddr>)->Result<bool>{
-        let Some(discovered)=discovered.filter(|a|private_ip(a.ip())&&!a.ip().is_loopback()) else{return Ok(false)};
+        let Some(SocketAddr::V4(discovered))=discovered.filter(|a|private_ip(a.ip())&&!a.ip().is_loopback()) else{return Ok(false)};
+        self.refresh_auto_network(vec![*discovered.ip()]).await
+    }
+    /// Inputs come from the shared physical-adapter inventory, never default-route guessing.
+    /// The saved primary retains the user's port when offline; live health is invalidated.
+    pub async fn refresh_auto_network(&self, discovered: Vec<Ipv4Addr>) -> Result<bool> {
+        let mut seen=BTreeSet::new();
+        let mut discovered:Vec<_>=discovered.into_iter().filter(|ip|ip.is_private()&&seen.insert(*ip)).take(16).collect();
+        let preferred=discovered.first().copied();
+        discovered.sort();
         let mut config=self.config.lock().await;
         let mut next=Config::load(&self.state)?;
         let mut prefs=next.preferences();
         if !prefs.auto_lan{return Ok(false)}
+        let mut previous=self.detected_lan.lock().await;
+        let network_changed=previous.as_ref()!=Some(&discovered);
         let port=prefs.lan.as_ref().map(|c|c.bind.port()).filter(|p|*p>0).unwrap_or(43821);
-        let lan=LanConfig{bind:SocketAddr::new(discovered.ip(),port),mdns:prefs.lan.as_ref().is_none_or(|c|c.mdns)};
-        if prefs.lan.as_ref()==Some(&lan){return Ok(false)}
-        prefs.lan=Some(lan);prefs.validate(&next.room)?;
-        next.route_preferences=Some(prefs);next.save(&self.state)?;
+        let selected=prefs.lan.as_ref().and_then(|c|match c.bind.ip(){IpAddr::V4(ip) if discovered.contains(&ip)=>Some(ip),_=>None}).or(preferred);
+        // This namespace is derived network inventory, not saved public routes.
+        prefs.routes.retain(|r|r.kind!=RouteKind::Lan||!r.id.starts_with("pocket-lan-auto-"));
+        if let Some(ip)=selected {
+            prefs.lan=Some(LanConfig{bind:SocketAddr::new(ip.into(),port),mdns:prefs.lan.as_ref().is_none_or(|c|c.mdns)});
+            for ip in discovered.iter().filter(|ip|Some(**ip)!=selected) {
+                if prefs.routes.len()>=32{break}
+                let endpoint=format!("tls://{}",SocketAddr::new((*ip).into(),port));
+                if !prefs.routes.iter().any(|r|r.kind==RouteKind::Lan&&r.url.trim_end_matches('/')==endpoint) {
+                    prefs.routes.push(Route{id:format!("pocket-lan-auto-{}",ip.to_string().replace('.',"-")),kind:RouteKind::Lan,url:endpoint,priority:1,expires_at:None});
+                }
+            }
+        }
+        prefs.validate(&next.room)?;
+        let preferences_changed=next.preferences()!=prefs;
+        if !network_changed&&!preferences_changed{return Ok(false)}
+        if preferences_changed {next.route_preferences=Some(prefs);next.save(&self.state)?;}
+        *previous=Some(discovered);
         *config=next.clone();
         let generation=self.health.reset_routes(&next.routes());
         self.changes.send_replace((next,generation));
         Ok(true)
     }
+    async fn address_present(&self, address: IpAddr) -> bool {
+        self.detected_lan.lock().await.as_ref().is_none_or(|rows|match address{IpAddr::V4(ip)=>rows.contains(&ip),_=>false})
+    }
     pub fn subscribe(&self) -> watch::Receiver<(Config,u64)> {
         self.changes.subscribe()
+    }
+    /// A paused runtime retires its health generation. Re-enable must acquire
+    /// a fresh generation without changing identity or saved route preferences.
+    pub async fn resume(&self) {
+        let config = self.config.lock().await;
+        let generation = self.health.reset_routes(&config.routes());
+        self.changes.send_replace((config.clone(), generation));
     }
     pub async fn refresh_expired(&self,expected_generation:u64){
         let config=self.config.lock().await;
@@ -313,7 +361,14 @@ impl Runtime {
         let network_task=tokio::spawn(async move {
             let mut interval=tokio::time::interval(Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {interval.tick().await;let _=network.refresh_auto_lan(default_lan_bind()).await;}
+            loop {
+                interval.tick().await;
+                let rows=tokio::task::spawn_blocking(pocket_network::interfaces).await;
+                match rows {
+                    Ok(Ok(rows))=>{let _=network.refresh_auto_network(rows.into_iter().filter(|r|r.automatic).map(|r|r.address).collect()).await;}
+                    _=>network.health.route_failure_at(network.health.generation(),"mdns-inventory",crate::connection::RouteFailure{stage:"network_inventory",code:"network_inventory_failed",os_code:None}),
+                }
+            }
         });
         let task = tokio::spawn(async move {
             let mut changes = controller.subscribe();
@@ -322,15 +377,19 @@ impl Runtime {
                 let prefs = config.preferences();
                 controller.health.set("idle");
                 let mut workers = JoinSet::new();
-                let mut lan = None;
-                if let Some(settings) = &prefs.lan {
-                    match lan::Server::start_at(
+                let mut lan = Vec::new();
+                for (id,settings) in lan_bindings(&prefs) {
+                    if prefs.auto_lan&&!controller.address_present(settings.bind.ip()).await {
+                        controller.health.route_failure_at(generation,&id,crate::connection::RouteFailure{stage:"lan_bind",code:"address_unavailable",os_code:None});continue;
+                    }
+                    match lan::Server::start_named_at(
                         settings.clone(),
                         identity.clone(),
                         sessions.clone(),
                         controller.health.clone(),
                         config.computer_id.clone(),
                         generation,
+                        id.clone(),
                     )
                     .await
                     {
@@ -347,9 +406,10 @@ impl Runtime {
                                     Some(endpoint.clone()),
                                 );
                             }
-                            lan = Some(server);
+                            lan.push(server);
                         }
-                        Err(_) => controller.health.route_phase_at(generation,"lan", "failed", false, None),
+                        Err(e) => controller.health.route_failure_at(generation,&id,crate::connection::RouteFailure {
+                            stage:"lan_bind",code:"listener_bind_failed",os_code:e.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error) }),
                     }
                 }
                 let mut gateway = None;

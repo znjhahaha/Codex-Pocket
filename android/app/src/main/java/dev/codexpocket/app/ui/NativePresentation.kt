@@ -31,11 +31,11 @@ internal fun compactFileName(path: String): String = path.replace('\\', '/').sub
 
 internal data class ConversationReadPresentation(val skeleton: Boolean, val empty: Boolean, val failed: Boolean, val refreshing: Boolean)
 
-internal fun conversationReadPresentation(state: ConversationLoadState, hasRows: Boolean) = ConversationReadPresentation(
-    skeleton = !hasRows && state == ConversationLoadState.Loading,
+internal fun conversationReadPresentation(state: ConversationLoadState, hasRows: Boolean, hasCachedWindow: Boolean = false) = ConversationReadPresentation(
+    skeleton = !hasRows && !hasCachedWindow && state == ConversationLoadState.Loading,
     empty = !hasRows && state in setOf(ConversationLoadState.Idle, ConversationLoadState.Ready),
     failed = state == ConversationLoadState.Failed,
-    refreshing = hasRows && state == ConversationLoadState.Loading,
+    refreshing = (hasRows || hasCachedWindow) && state == ConversationLoadState.Loading,
 )
 
 /** Approvals and native execution are distinct from the phone's pending-command journal. */

@@ -5,6 +5,8 @@ pub mod supervisor;
 pub mod launcher;
 pub mod pairing;
 pub mod connection;
+pub mod installation;
+pub use pocket_network as network;
 
 pub mod connectivity;
 #[cfg(test)]

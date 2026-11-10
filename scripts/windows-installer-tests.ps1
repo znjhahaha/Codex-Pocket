@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
@@ -37,8 +37,27 @@ function Send-PocketEnvironmentChanged { $script:broadcasts++ }
 function Get-PocketDesktopPackage { return $script:fakePackage }
 $script:fakeTask=$null
 $script:taskFailure=$false
-function Get-PocketTaskXml { return $script:fakeTask }
-function Set-PocketTaskXml([AllowNull()]$Xml) { if($script:taskFailure){$script:taskFailure=$false;throw 'injected task registration failure'}; $script:fakeTask=$Xml }
+$script:taskReadFailure=$false
+$script:taskFailureAfterWrite=$false
+$script:taskWrites=0
+$script:shortcutFailure=$false
+$script:shortcutWrites=0
+$script:realShortcutBytes=${function:New-PocketShortcutBytes}
+function Get-PocketTaskXml {
+    if($script:taskReadFailure){Invoke-PocketInstallStep 'startup_read' 'ITaskFolder.GetTask' {throw [Runtime.InteropServices.COMException]::new('fixture-secret-task-read',-2147024891)}}
+    return $script:fakeTask
+}
+function Set-PocketTaskXml([AllowNull()]$Xml) {
+    $script:taskWrites++
+    if($script:taskFailureAfterWrite){$script:taskFailureAfterWrite=$false;$script:fakeTask=$Xml;$script:taskReadFailure=$true;Invoke-PocketInstallStep 'startup_register' 'ITaskFolder.RegisterTask' {throw [Runtime.InteropServices.COMException]::new('fixture-secret-unknown-outcome',-2147467259)}}
+    if($script:taskFailure){$script:taskFailure=$false;Invoke-PocketInstallStep 'startup_register' 'ITaskFolder.RegisterTask' {throw [Runtime.InteropServices.COMException]::new('injected task registration failure',-2147467259)}}
+    $script:fakeTask=$Xml
+}
+function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$Mode,[string]$IconPath) {
+    $script:shortcutWrites++
+    if($script:shortcutFailure){Invoke-PocketInstallStep 'shortcut' 'IPersistFile.Save' {throw [Runtime.InteropServices.COMException]::new('fixture-secret-shortcut',-2147467259)}}
+    & $script:realShortcutBytes @PSBoundParameters
+}
 function Invoke-PocketDesktopBuild([string]$Root,[string]$Target) { $script:desktopBuilt=$true }
 function Assert-PocketWindowsPrerequisites { } # Host runtime availability is not a fixture prerequisite.
 
@@ -71,7 +90,7 @@ $script:fakePackage = [pscustomobject]@{InstallLocation=$native;PackageFamilyNam
 $binarySource = Join-Path $testRoot 'binaries'
 Put (Join-Path $binarySource 'pocket-agent.exe') 'agent fixture; never execute'
 Put (Join-Path $binarySource 'pocket-bridge.exe') 'bridge fixture; never execute'
-foreach($name in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')) { Put (Join-Path $binarySource $name) ($name+' fixture; never execute') }
+foreach($name in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')) { Put (Join-Path $binarySource $name) ($name+' fixture; never execute') }
 Put (Join-Path $binarySource 'private-key.der') 'must never ship'
 $apk = Join-Path $testRoot 'synthetic.apk'
 Put $apk 'unsigned fixture; never install'
@@ -184,6 +203,8 @@ Test 'apply, idempotence, and preserved shortcut backup' {
     Assert ((Get-FileHash -LiteralPath (Join-Path $context.InstallRoot 'desktop-install.json')).Hash -eq $before) 'Idempotent apply rewrote manifest'
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
     Assert ($link.TargetPath -eq $script:installedCliPath -and $link.Arguments -eq '--pocket-ui') 'Stable UI entry point missing'
+    Assert (-not (Test-Path -LiteralPath (Join-Path $context.Programs 'Codex Pocket Desktop.lnk'))) 'A second Pocket entry was created'
+    Assert ($link.IconLocation -like '*codex-pocket.ico*') 'Pocket shortcut must use its stable brand icon'
     Assert (Test-PocketTaskLogon $script:fakeTask) 'Current-user logon task missing'
     Assert (-not (Test-Path -LiteralPath (Join-Path $context.Startup 'Codex Pocket.lnk'))) 'Legacy startup link was not migrated'
     Invoke-PocketWindowsInstall @argsInstall -Uninstall | Out-Null
@@ -199,6 +220,33 @@ Test 'shortcut and environment drift refuse overwrite' {
     Expect-Failure { Invoke-PocketWindowsInstall @argsInstall -Apply } 'changed|drift'
     $script:fakeCliPath = $script:installedCliPath
 }
+Test 'shortcut publication refuses an edit made after its snapshot' {
+    $path=Join-Path $testRoot 'concurrently edited.lnk'
+    Put $path 'owned snapshot'
+    $snapshot=Get-PocketBackup $path
+    Put $path 'new user edit'
+    Expect-Failure { Write-PocketBackup @{path=$path;bytes=$null;hash=$null} -ExpectedHash $snapshot.hash -Compare } 'refusing drift'
+    Assert ([IO.File]::ReadAllText($path) -eq 'new user edit') 'User edit was deleted'
+}
+Test 'matching legacy second entry migrates and rollback restores its exact bytes' {
+    $recordPath=Join-Path $context.InstallRoot 'desktop-install.json'
+    $record=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $record.PSObject.Properties.Remove('singleEntry')
+    $icon=Join-Path $context.InstallRoot ('resources\'+(Get-PocketFileHash (Join-Path $source 'codex-pocket.ico'))+'\codex-pocket.ico')
+    $legacyPath=Join-Path $context.Programs 'Codex Pocket Desktop.lnk'
+    $bytes=New-PocketShortcutBytes (Join-Path $testRoot 'legacy-temp.lnk') $script:installedCliPath '--pocket-desktop' $icon
+    Write-PocketAtomic $legacyPath $bytes
+    $record.shortcuts[1].installed=[Convert]::ToBase64String($bytes)
+    $record.shortcuts[1].installedHash=Get-PocketBytesHash $bytes
+    Write-PocketJson $recordPath $record
+    $legacyRecord=Get-PocketFileHash $recordPath
+    Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
+    Assert (-not (Test-Path -LiteralPath $legacyPath)) 'Verified legacy shortcut remains'
+    Invoke-PocketWindowsInstall -Context $context -Rollback -Apply | Out-Null
+    Assert ((Get-PocketFileHash $recordPath) -eq $legacyRecord) 'Legacy rollback record changed'
+    Assert ((Get-PocketFileHash $legacyPath) -eq (Get-PocketBytesHash $bytes)) 'Legacy link did not restore exactly'
+    Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
+}
 Test 'uninstall restores exact prior shortcut and environment; reapply works' {
     Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply | Out-Null
     Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Prior override lost'
@@ -208,7 +256,7 @@ Test 'uninstall restores exact prior shortcut and environment; reapply works' {
     Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
 }
 Test 'locked shortcut causes reversible partial uninstall and supports retry' {
-    $lockedPath = Join-Path $context.Programs 'Codex Pocket Desktop.lnk'
+    $lockedPath = Join-Path $context.Programs 'Codex Pocket.lnk'
     $lock = [IO.File]::Open($lockedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try { Expect-Failure { Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply } 'denied|another process|being used|access|使用|拒绝' }
     finally { $lock.Dispose() }
@@ -303,16 +351,153 @@ Test 'delivery upgrade and rollback restore integration byte for byte' {
     Assert ((Get-PocketFileHash $shortcut) -eq $linkBefore) 'Rollback shortcut is not exact'
     Assert ($script:fakeTask -eq $taskBefore) 'Rollback task differs'
 }
-Test 'failed scheduled task registration rolls back all global integration' {
+Test 'failed scheduled task registration keeps verified core and retries only startup' {
     Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply | Out-Null
     $cliBefore=$script:fakeCliPath; $shortcutBefore=Get-PocketFileHash $shortcut
     $script:taskFailure=$true
-    Expect-Failure { Invoke-PocketWindowsInstall @argsInstall -Apply } 'injected task'
-    Assert ($script:fakeCliPath -eq $cliBefore) 'Task failure left environment changed'
-    Assert ((Get-PocketFileHash $shortcut) -eq $shortcutBefore) 'Task failure left shortcut changed'
+    $result=Invoke-PocketWindowsInstall @argsInstall -Apply
+    $recordPath=Join-Path $context.InstallRoot 'desktop-install.json'
+    $partial=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert ($result.state -eq 'installed_incomplete' -and $result.coreInstalled) 'Optional task failure lost verified core'
+    Assert ($script:fakeCliPath -ne $cliBefore -and [IO.File]::Exists($script:fakeCliPath)) 'Verified CLI publication was rolled back'
+    Assert ((Get-PocketFileHash $shortcut) -ne $shortcutBefore) 'Successful shortcut was rolled back'
+    Assert ($partial.integration.startup.stage -eq 'startup_register' -and $partial.integration.startup.hresult -eq '0x80004005') 'Task failure attribution missing'
     Assert ($null -eq $script:fakeTask) 'Task failure left a task behind'
+    $shortcutCount=$script:shortcutWrites
+    $result=Invoke-PocketWindowsInstall @argsInstall -Apply
+    Assert ($result.state -eq 'installed') 'Startup retry did not complete'
+    Assert ($script:shortcutWrites -eq $shortcutCount) 'Startup retry regenerated a successful shortcut'
+    $hash=Get-PocketFileHash $recordPath
     Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
+    Assert ((Get-PocketFileHash $recordPath) -eq $hash) 'Completed repeat apply rewrote its record'
     Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply | Out-Null
+}
+Test 'core publication failure still rolls back the previous CLI and record' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'core-publication');Programs=(Join-Path $testRoot 'core-publication-programs');Startup=(Join-Path $testRoot 'core-publication-startup')}
+    $cliBefore=$script:fakeCliPath; $taskBefore=$script:fakeTask
+    $script:realWriteBackup=${function:Write-PocketBackup}
+    $script:failManifest=Join-Path $custom.InstallRoot 'desktop-install.json'
+    function script:Write-PocketBackup($Backup,[AllowNull()]$ExpectedHash,[switch]$Compare) {
+        if($Backup.path -eq $script:failManifest -and $null -ne $Backup.bytes){$script:failManifest=$null;throw 'injected core publication failure'}
+        & $script:realWriteBackup @PSBoundParameters
+    }
+    try {
+        Expect-Failure { Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply } 'injected core publication'
+        Assert ($script:fakeCliPath -eq $cliBefore -and $script:fakeTask -eq $taskBefore) 'Core failure did not restore prior integration'
+        Assert (-not [IO.File]::Exists((Join-Path $custom.InstallRoot 'desktop-install.json'))) 'Failed core publication left a valid install claim'
+        Assert (-not [IO.File]::Exists((Join-Path $custom.InstallRoot 'installation-pending.json'))) 'Recoverable core failure retained a journal'
+    } finally { Set-Item -LiteralPath Function:\Write-PocketBackup -Value $script:realWriteBackup; $script:failManifest=$null }
+}
+Test 'ambiguous task mutation retains its journal and does not replay until recovered' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'ambiguous-task');Programs=(Join-Path $testRoot 'ambiguous-task-programs');Startup=(Join-Path $testRoot 'ambiguous-task-startup')}
+    $script:fakeTask=$null; $script:taskFailureAfterWrite=$true
+    try {
+        $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+        $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+        $journalPath=Join-Path $custom.InstallRoot 'installation-pending.json'
+        Assert ($result.state -eq 'installed_incomplete' -and $result.recoveryPending -and [IO.File]::Exists($journalPath)) 'Ambiguous mutation was replayed or lost its journal'
+        $journal=Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert ($journal.failure.stage -eq 'startup_register' -and $journal.failure.hresult -eq '0x80004005') 'Unknown mutation did not persist the exact failure'
+        $recordHash=Get-PocketFileHash $recordPath; $writes=$script:taskWrites; $shortcuts=$script:shortcutWrites
+        $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+        Assert ($result.recoveryPending -and $script:taskWrites -eq $writes -and $script:shortcutWrites -eq $shortcuts) 'Unknown outcome was automatically replayed'
+        Assert ((Get-PocketFileHash $recordPath) -eq $recordHash) 'Unknown recovery changed committed core'
+    } finally { $script:taskReadFailure=$false; $script:taskFailureAfterWrite=$false }
+    $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+    Assert ($result.state -eq 'installed' -and -not [IO.File]::Exists($journalPath)) 'Authoritative recovery did not finish'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+}
+Test 'shortcut COM failure preserves custom links and retries only that slot' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'shortcut-partial');Programs=(Join-Path $testRoot 'shortcut-partial-programs');Startup=(Join-Path $testRoot 'shortcut-partial-startup')}
+    $customLink=Join-Path $custom.Startup 'Codex Pocket.lnk'
+    Put $customLink 'user custom startup bytes'
+    $primaryLink=Join-Path $custom.Programs 'Codex Pocket.lnk'
+    Put $primaryLink 'user custom primary bytes'
+    $script:shortcutFailure=$true
+    try {
+        $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+        Assert ($result.state -eq 'installed_incomplete') 'Shortcut failure was not partial success'
+        $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+        $record=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert ($record.version -eq 3 -and $record.shortcuts.Count -eq 3) 'Version 3 shortcut ABI changed'
+        Assert ($record.integration.shortcuts[0].stage -eq 'shortcut' -and $record.integration.shortcuts[0].hresult -eq '0x80004005') 'Shortcut COM attribution missing'
+        Assert ([IO.File]::ReadAllText($customLink) -eq 'user custom startup bytes') 'Custom link was deleted'
+        Assert ([IO.File]::ReadAllText($primaryLink) -eq 'user custom primary bytes') 'Failed COM overwrote the primary backup'
+        $taskWrites=$script:taskWrites
+    } finally { $script:shortcutFailure=$false }
+    $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+    Assert ($result.state -eq 'installed' -and $script:taskWrites -eq $taskWrites) 'Shortcut retry replayed startup'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+    Assert ([IO.File]::ReadAllText($customLink) -eq 'user custom startup bytes') 'Uninstall changed custom bytes'
+}
+Test 'unknown task read is pending without mutation and captures its original only on retry' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'task-read-partial');Programs=(Join-Path $testRoot 'task-read-programs');Startup=(Join-Path $testRoot 'task-read-startup')}
+    $launcher=Join-Path $custom.InstallRoot 'pocket-launcher.exe'
+    $originalTask=New-PocketTaskXml $launcher $false
+    $script:fakeTask=$originalTask; $script:taskReadFailure=$true
+    $writes=$script:taskWrites
+    try {
+        $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -UiStartup Enable -Apply
+        Assert ($result.state -eq 'installed_incomplete' -and $script:taskWrites -eq $writes) 'Unknown task was treated as absence'
+        $record=Get-Content -LiteralPath (Join-Path $custom.InstallRoot 'desktop-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert (-not $record.previousTaskKnown -and $record.integration.startup.hresult -eq '0x80070005') 'Unknown snapshot or HRESULT was lost'
+        $shortcuts=$script:shortcutWrites
+    } finally { $script:taskReadFailure=$false }
+    Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+    Assert (Test-PocketTaskLogon $script:fakeTask) 'Retry lost the requested Enable setting'
+    Assert ($script:shortcutWrites -eq $shortcuts) 'Task read retry replayed shortcut COM'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+    Assert ($script:fakeTask -eq $originalTask) 'Retry did not preserve the late known original task'
+    $script:fakeTask=$null
+}
+Test 'foreign task ownership remains pending and is never registered or deleted' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'foreign-task');Programs=(Join-Path $testRoot 'foreign-task-programs');Startup=(Join-Path $testRoot 'foreign-task-startup')}
+    $script:fakeTask='<Task>custom owner</Task>'; $writes=$script:taskWrites
+    $result=Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply
+    Assert ($result.state -eq 'installed_incomplete' -and $script:taskWrites -eq $writes) 'Foreign task ownership was swallowed'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+    Assert ($script:fakeTask -eq '<Task>custom owner</Task>' -and $script:taskWrites -eq $writes) 'Foreign task was changed'
+    $script:fakeTask=$null
+}
+Test 'partial upgrade rollback restores the prior generation and repeated rollback is safe' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'partial-rollback');Programs=(Join-Path $testRoot 'partial-rollback-programs');Startup=(Join-Path $testRoot 'partial-rollback-startup')}
+    Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+    $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+    $prior=Get-PocketFileHash $recordPath
+    $priorLink=Get-PocketFileHash (Join-Path $custom.Programs 'Codex Pocket.lnk')
+    $priorTask=$script:fakeTask
+    $script:taskFailure=$true
+    $result=Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -UiStartup Disable -Apply
+    Assert ($result.state -eq 'installed_incomplete') 'Upgrade task failure discarded core'
+    # Same-generation retry must retain the original rollback archive.
+    $script:taskFailure=$true
+    Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -Apply | Out-Null
+    Invoke-PocketWindowsInstall -Context $custom -Rollback -Apply | Out-Null
+    Assert ((Get-PocketFileHash $recordPath) -eq $prior -and (Get-PocketFileHash (Join-Path $custom.Programs 'Codex Pocket.lnk')) -eq $priorLink) 'Partial rollback was not exact'
+    Assert ($script:fakeTask -eq $priorTask) 'Partial rollback changed the prior task'
+    Expect-Failure { Invoke-PocketWindowsInstall -Context $custom -Rollback -Apply } 'No previous installation'
+    Assert ((Get-PocketFileHash $recordPath) -eq $prior) 'Repeated rollback changed the restored record'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+}
+Test 'unknown upgrade snapshot is captured before retry and rollback restores the prior task' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'unknown-upgrade');Programs=(Join-Path $testRoot 'unknown-upgrade-programs');Startup=(Join-Path $testRoot 'unknown-upgrade-startup')}
+    $script:fakeTask=$null
+    Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+    $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+    $linkPath=Join-Path $custom.Programs 'Codex Pocket.lnk'
+    $prior=Get-PocketFileHash $recordPath; $priorTask=$script:fakeTask; $priorCli=$script:fakeCliPath; $priorLink=Get-PocketFileHash $linkPath
+    $script:taskReadFailure=$true
+    try {
+        Expect-Failure { Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply } 'snapshot is unknown'
+        Assert ($script:fakeCliPath -eq $priorCli -and (Get-PocketFileHash $linkPath) -eq $priorLink) 'Unknown uninstall changed core integration'
+        $result=Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -UiStartup Disable -Apply
+        Assert ($result.state -eq 'installed_incomplete') 'Unknown upgrade snapshot was claimed as complete'
+    } finally { $script:taskReadFailure=$false }
+    Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -Apply | Out-Null
+    Assert (-not (Test-PocketTaskLogon $script:fakeTask)) 'Late snapshot retry did not apply the pending preference'
+    Invoke-PocketWindowsInstall -Context $custom -Rollback -Apply | Out-Null
+    Assert ((Get-PocketFileHash $recordPath) -eq $prior -and $script:fakeTask -eq $priorTask) 'Late snapshot rollback lost the prior task or record'
+    Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
 }
 Test 'unset original environment and missing shortcuts restore to absence' {
     $emptyContext = @{InstallRoot=(Join-Path $testRoot 'empty-install');Programs=(Join-Path $testRoot 'empty-programs');Startup=(Join-Path $testRoot 'empty-startup')}
@@ -321,6 +506,25 @@ Test 'unset original environment and missing shortcuts restore to absence' {
     Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'missing-source') -StateDirectory $state -Context $emptyContext -Uninstall -Apply | Out-Null
     Assert ($null -eq $script:fakeCliPath) 'Unset environment did not restore to absence'
     Assert (-not (Test-Path -LiteralPath (Join-Path $emptyContext.Programs 'Codex Pocket.lnk'))) 'Absent shortcut restored as a file'
+}
+Test 'preserved user Startup link does not replace the previous-generation rollback on repeat install' {
+    $custom=@{InstallRoot=(Join-Path $testRoot 'user-link-install');Programs=(Join-Path $testRoot 'user-link-programs');Startup=(Join-Path $testRoot 'user-link-startup')}
+    $taskOriginal=$script:fakeTask; $cliOriginal=$script:fakeCliPath
+    $script:fakeTask=$null; $script:fakeCliPath=$null
+    $customLink=Join-Path $custom.Startup 'Codex Pocket.lnk'
+    Put $customLink 'user-owned startup entry'
+    try {
+        Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+        $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+        $first=Get-PocketFileHash $recordPath
+        Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -Apply | Out-Null
+        $upgradedRecord=Get-PocketFileHash $recordPath
+        Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -Apply | Out-Null
+        Assert ((Get-PocketFileHash $recordPath) -eq $upgradedRecord) 'Repeated install rewrote the rollback chain'
+        Assert ([IO.File]::ReadAllText($customLink) -eq 'user-owned startup entry') 'User Startup entry changed'
+        Invoke-PocketWindowsInstall -Context $custom -Rollback -Apply | Out-Null
+        Assert ((Get-PocketFileHash $recordPath) -eq $first) 'Rollback no longer points to the previous generation'
+    } finally {$script:fakeTask=$taskOriginal; $script:fakeCliPath=$cliOriginal}
 }
 Test 'ZIP is independently usable with its complete Windows manifest' {
     $extract = Join-Path $testRoot 'extracted zip'
@@ -377,7 +581,7 @@ $global:LASTEXITCODE = 0
         Put $fakeSigner ("Write-Output 'Number of signers: 1'`nWrite-Output 'Signer #1 certificate SHA-256 digest: " + $digest + "'`n" + '$global:LASTEXITCODE = 0')
         foreach($file in Get-PocketWindowsFiles) {
             if($file -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$targetFile=Join-Path $buildRoot ('.local\tools\'+$file)}
-            elseif($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}
+            elseif($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}
             elseif($file -like '*.exe'){$targetFile=Join-Path $buildRoot ('target\x86_64-pc-windows-msvc\release\'+$file)}
             elseif($file -like '*.md'){$targetFile=Join-Path $buildRoot ('docs\'+$file)}
             else{$targetFile=Join-Path $buildRoot ('scripts\'+$file)}

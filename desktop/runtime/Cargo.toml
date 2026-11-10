@@ -16,6 +16,7 @@ url = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 ssh2 = "0.9"
+pocket-network = {path="../../crates/network"}
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
@@ -27,3 +28,7 @@ path = "src/bin/supervisor.rs"
 [[bin]]
 name = "pocket-launcher"
 path = "src/bin/launcher.rs"
+
+[[bin]]
+name = "pocket-upgrade"
+path = "src/bin/upgrade.rs"

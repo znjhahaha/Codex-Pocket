@@ -55,9 +55,9 @@ class ManagementSettingsUiTest {
     private fun panel(state: () -> PocketState, onRuntime: (String) -> Unit = {},
         onToggle: (String, Boolean) -> Unit = { _, _ -> }, onRefresh: () -> Unit = {}) {
         content {
-            SettingsPageLayout(SettingsPage.Extensions) {
-                ExtensionManagementPanel(state(), onRuntime, onToggle, onRefresh)
-            }
+            SettingsPageLayout(SettingsPage.Extensions, extensionContent = { modifier, padding ->
+                ExtensionManagementPanel(state(), onRuntime, onToggle, onRefresh, modifier, padding)
+            }) { }
         }
     }
 
@@ -94,10 +94,10 @@ class ManagementSettingsUiTest {
         compose.onNodeWithTag("extension-toggle:mcp-one").assertIsOn()
         compose.runOnIdle { state = state.copy(extensions = state.extensions.copy(pendingIds = setOf(mcp.id))) }
         compose.onNodeWithTag("extension-toggle:mcp-one").assertIsNotEnabled()
-        compose.onNodeWithTag("extension-refresh").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("extension-refresh").assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(extensions = state.extensions.copy(pendingIds = emptySet(), uncertainIds = setOf(mcp.id))) }
         compose.onNodeWithTag("extension-toggle:mcp-one").assertIsNotEnabled()
-        compose.onNodeWithTag("extension-refresh").performScrollTo().performClick()
+        compose.onNodeWithTag("extension-refresh").performClick()
         compose.runOnIdle { assertEquals(1, refreshes) }
     }
 
@@ -107,14 +107,15 @@ class ManagementSettingsUiTest {
         val loads = mutableListOf<String>()
         panel({ state }, onRuntime = { loads += it })
         compose.onNodeWithText("需要更新电脑桥接").assertExists()
-        compose.onNodeWithTag("extension-runtime:${other.id}").performScrollTo().performClick()
+        compose.onNodeWithTag("extension-runtime-summary").performClick()
+        compose.onNodeWithTag("extension-runtime:${other.id}").performClick()
         compose.onNodeWithText("正在切换运行时").assertExists()
         compose.onNodeWithText("Old runtime error").assertDoesNotExist()
         compose.onNodeWithText("需要更新电脑桥接").assertDoesNotExist()
         compose.onNodeWithTag("extension:${mcp.id}").assertDoesNotExist()
         compose.onNodeWithText("MCP · —").assertExists()
         compose.runOnIdle { assertEquals(listOf(desktop.id, other.id), loads) }
-        compose.onNodeWithTag("extension-refresh").performScrollTo().performClick()
+        compose.onNodeWithTag("extension-refresh").performClick()
         compose.runOnIdle { assertEquals(other.id, loads.last()) }
         compose.runOnIdle { state = state.copy(extensions = ExtensionManagementState("pc", other.id, ExtensionPhase.Ready)) }
         compose.onNodeWithText("尚未配置 MCP").assertExists()
@@ -146,7 +147,7 @@ class ManagementSettingsUiTest {
         var state by mutableStateOf(ready().let { it.copy(extensions = it.extensions.copy(
             appInventoryStatus = "unsupported", entries = emptyList())) })
         panel({ state })
-        compose.onNodeWithTag("extension-category:plugin").performScrollTo().performClick()
+        compose.onNodeWithTag("extension-category:plugin").performClick()
         compose.onNodeWithText("应用 / 插件 · —").assertExists()
         compose.onNodeWithText("当前运行时未提供应用目录").assertExists()
         compose.onNodeWithText("尚未配置应用或插件").assertDoesNotExist()
@@ -157,12 +158,48 @@ class ManagementSettingsUiTest {
 
     @Test fun identicalRuntimeVersionsRemainDistinctAndLargeFontTabsStayUsable() {
         content(1.6f) {
-            SettingsPageLayout(SettingsPage.Extensions) {
-                ExtensionManagementPanel(ready().copy(runtimes = listOf(desktop, other.copy(version = desktop.version))), {}, { _, _ -> }, {})
-            }
+            SettingsPageLayout(SettingsPage.Extensions, extensionContent = { modifier, padding ->
+                ExtensionManagementPanel(ready().copy(runtimes = listOf(desktop, other.copy(version = desktop.version))), {}, { _, _ -> }, {}, modifier, padding)
+            }) { }
         }
-        compose.onNodeWithText("桌面端 · 0.166.0 · 实例 1").assertExists()
-        compose.onNodeWithText("桌面端 · 0.166.0 · 实例 2").assertExists()
+        compose.onNodeWithTag("extension-runtime-summary").performClick()
+        compose.onNodeWithTag("extension-runtime:desktop-a").assertTextContains("桌面端 · 0.166.0 · 实例 1")
+        compose.onNodeWithTag("extension-runtime:desktop-b").assertTextContains("桌面端 · 0.166.0 · 实例 2")
+        compose.onNodeWithTag("extension-runtime:desktop-b").performClick()
         compose.onNodeWithTag("settings-tab:App").assertHeightIsAtLeast(48.dp).performClick().assertIsSelected()
     }
+    @Test fun lazyInventoryKeepsCategorySearchAndScrollAcrossPages() {
+        val many = (0 until 200).map { mcp.copy(id = "mcp-$it", name = "Tool $it") }
+        panel({ ready().let { it.copy(extensions = it.extensions.copy(entries = many + ManagedExtension("skill", "skill", "Writer"))) } })
+        compose.onNodeWithTag("extension:mcp-199").assertDoesNotExist()
+        compose.onNodeWithTag("extension-list").performScrollToNode(hasTestTag("extension:mcp-120"))
+        val before = compose.onNodeWithTag("extension:mcp-120").fetchSemanticsNode().boundsInRoot.top
+        compose.onNodeWithTag("extension-category:skill").performClick()
+        compose.onNodeWithTag("extension-search").performTextInput("Writer")
+        compose.onNodeWithTag("extension-category:mcp").performClick()
+        compose.onNodeWithTag("extension:mcp-120").assertIsDisplayed()
+        assertEquals(before, compose.onNodeWithTag("extension:mcp-120").fetchSemanticsNode().boundsInRoot.top, 1f)
+        compose.onNodeWithTag("settings-tab:App").performClick()
+        compose.onNodeWithTag("settings-tab:Extensions").performClick()
+        compose.onNodeWithTag("extension:mcp-120").assertIsDisplayed()
+        compose.onNodeWithTag("extension-category:skill").performClick()
+        compose.onNodeWithTag("extension-search").assertTextContains("Writer")
+    }
+
+    @Test fun reducedMotionStillAllowsTabsAndDetails() {
+        content {
+            CompositionLocalProvider(LocalPocketGlassPreferences provides PocketGlassPreferences(false, false, false)) {
+                SettingsPageLayout(SettingsPage.Extensions, extensionContent = { modifier, padding ->
+                    ExtensionManagementPanel(ready(), {}, { _, _ -> }, {}, modifier, padding)
+                }) { }
+            }
+        }
+        compose.onNodeWithTag("extension-list").performScrollToNode(hasTestTag("extension:mcp-one"))
+        compose.onNodeWithText("Search tools").performClick()
+        compose.onNodeWithText("Search configured sources").assertIsDisplayed()
+        compose.onNodeWithTag("settings-tab:App").performClick().assertIsSelected()
+        compose.onNodeWithTag("settings-tab:Extensions").performClick().assertIsSelected()
+        compose.onNodeWithText("Search configured sources").assertIsDisplayed()
+    }
+
 }

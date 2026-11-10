@@ -34,6 +34,110 @@ fn fixture() -> (
 }
 
 #[test]
+fn dns_sd_service_contains_only_public_identity_and_explicit_address() {
+    let id=uuid::Uuid::new_v4().to_string();
+    let service=lan::mdns_service(&id,"192.168.2.4:43821".parse().unwrap()).unwrap();
+    assert_eq!(service.get_port(),43821);
+    assert_eq!(service.get_properties().len(),3);
+    assert_eq!(service.get_property_val_str("computerId"),Some(id.as_str()));
+    assert_eq!(service.get_property_val_str("protocol"),Some("1"));
+    assert!(service.get_property_val_str("token").is_none());
+    assert!(lan::mdns_service(&id,"8.8.8.8:43821".parse().unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn multiple_lan_candidates_keep_port_public_routes_and_identity_across_dhcp() {
+    let (d,mut c,_,health)=fixture();
+    let public=routes::Route{id:"saved-public".into(),kind:routes::RouteKind::Relay,
+        url:format!("wss://existing.invalid/v1/tunnel/{}/phone",c.room),priority:30,expires_at:None};
+    c.route_preferences=Some(RoutePreferences{auto_lan:true,routes:vec![public.clone()],lan:Some(LanConfig{bind:"192.168.1.5:47821".parse().unwrap(),mdns:false}),..Default::default()});
+    c.save(d.path()).unwrap();
+    let ctl=routes::Controller::open(d.path().into(),c.clone(),health);
+    let ips=vec!["192.168.1.5".parse().unwrap(),"10.4.3.2".parse().unwrap()];
+    assert!(ctl.refresh_auto_network(ips.clone()).await.unwrap());
+    let prefs=Config::load(d.path()).unwrap().preferences();
+    assert_eq!(routes::lan_bindings(&prefs).len(),2);
+    assert!(routes::lan_bindings(&prefs).iter().all(|(_,s)|s.bind.port()==47821&&!s.mdns));
+    assert!(prefs.routes.contains(&public));
+    assert!(!ctl.refresh_auto_network(ips.into_iter().rev().collect()).await.unwrap());
+    assert!(ctl.refresh_auto_network(vec!["192.168.8.9".parse().unwrap()]).await.unwrap());
+    let loaded=Config::load(d.path()).unwrap();
+    assert_eq!(loaded.preferences().routes,vec![public]);
+    assert_eq!(loaded.preferences().lan.unwrap().bind,"192.168.8.9:47821".parse().unwrap());
+    assert_eq!(loaded.computer_id,c.computer_id);
+    assert_eq!(loaded.phone_token,c.phone_token);
+    assert_eq!(loaded.helper_token,c.helper_token);
+    assert!(ctl.refresh_auto_network(vec![]).await.unwrap());
+    assert_eq!(Config::load(d.path()).unwrap().preferences().lan.unwrap().bind.port(),47821);
+    assert!(ctl.refresh_auto_network(vec!["192.168.8.9".parse().unwrap()]).await.unwrap());
+}
+
+#[tokio::test]
+async fn named_lan_listeners_have_independent_tls_and_health() {
+    let (_d,c,identity,health)=fixture();
+    let (tx,mut rx)=mpsc::channel(8);
+    let generation=health.generation();
+    let mut servers=vec![];
+    for id in ["lan","pocket-lan-auto-fixture"] {
+        servers.push(lan::Server::start_named_at(LanConfig{bind:"127.0.0.1:0".parse().unwrap(),mdns:false},identity.clone(),tx.clone(),health.clone(),c.computer_id.clone(),generation,id.into()).await.unwrap());
+    }
+    for server in &servers {
+        let mut client=phone(server.local_addr(),&identity).await;
+        let mut stream=rx.recv().await.unwrap();
+        pocket_tunnel::write_json(&mut client,&json!({"fixture":"independent-listener"})).await.unwrap();
+        assert_eq!(pocket_tunnel::read_json::<_,Value>(&mut stream).await.unwrap().unwrap()["fixture"],"independent-listener");
+    }
+    assert_eq!(health.route_snapshot().as_array().unwrap().iter().filter(|r|r["listenerReady"]==true&&r["innerHandshake"]==true).count(),2);
+    assert_eq!(health.snapshot()["authenticatedPhone"],false);
+    for server in servers {server.shutdown().await;}
+}
+
+#[tokio::test]
+async fn supervised_pause_closes_tls_but_keeps_control_identity_and_broker_for_resume() {
+    let (d,mut c,identity,_)=fixture();
+    let _lock=pocket_agent::local::try_lock(d.path()).unwrap().unwrap();
+    c.route_preferences=Some(RoutePreferences { lan:Some(LanConfig {bind:"127.0.0.1:0".parse().unwrap(),mdns:false}), ..Default::default() });
+    c.save(d.path()).unwrap();
+    let (broker,_)=pocket_agent::broker::Broker::open(c.clone(),d.path().into()).unwrap();
+    broker.connection.set_remote_enabled(false);
+    let controller=routes::Controller::open(d.path().into(),c.clone(),broker.connection.clone());
+    let _control=pocket_agent::local::Server::start_with_routes(d.path(),broker.clone(),controller.clone()).await.unwrap();
+    let (tx,mut incoming)=mpsc::channel(8);
+    let task=tokio::spawn(pocket_agent::remote::run(d.path().into(),true,controller,identity.clone(),tx,broker.clone()));
+    let snapshot=pocket_agent::local::execute_with_params(d.path(),"routes/read",None,json!({})).await.unwrap();
+    assert_eq!(snapshot["initialized"],true);
+    assert_eq!(broker.connection.snapshot()["remoteEnabled"],false);
+    let desired=d.path().join("desktop/desired.json");
+    for _ in 0..2 {
+        storage::atomic_write(&desired,br#"{"enabled":true}"#).unwrap();
+        let address=tokio::time::timeout(Duration::from_secs(4),async {
+            loop {
+                if let Some(endpoint)=broker.connection.route_snapshot().as_array().and_then(|rows|rows.iter().find(|r|r["id"]=="lan"&&r["listenerReady"]==true)).and_then(|r|r["endpoint"].as_str()).map(str::to_owned) {
+                    break endpoint.trim_start_matches("tls://").parse().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let mut client=phone(address,&identity).await;
+        let mut stream=tokio::time::timeout(Duration::from_secs(3),incoming.recv()).await.unwrap().unwrap();
+        pocket_tunnel::write_json(&mut client,&json!({"id":"fixture","method":"hello","params":{}})).await.unwrap();
+        assert_eq!(pocket_tunnel::read_json::<_,Value>(&mut stream).await.unwrap().unwrap()["id"],"fixture");
+        storage::atomic_write(&desired,br#"{"enabled":false}"#).unwrap();
+        tokio::time::timeout(Duration::from_secs(4),async {
+            while broker.connection.remote_enabled(){tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(3),pocket_tunnel::read_json::<_,Value>(&mut client)).await.unwrap(),Ok(None)|Err(_)));
+        assert!(TcpStream::connect(address).await.is_err());
+        let status=pocket_agent::local::execute(d.path(),"status",None).await.unwrap();
+        assert_eq!(status["remoteEnabled"],false);
+        assert_eq!(status["remoteControlProtocol"],1);
+        assert_eq!(status["authenticatedPhone"],false);
+        assert_eq!(Config::load(d.path()).unwrap().computer_id,c.computer_id);
+    }
+    task.abort();let _=task.await;
+}
+
+#[test]
 fn automatic_lan_advertisement_survives_expired_or_stale_explicit_routes() {
     let mut prefs: RoutePreferences = serde_json::from_value(json!({
         "routes":[{"id":"lan","kind":"lan","url":"tls://192.168.1.2:43821","priority":0,"expiresAt":50}],

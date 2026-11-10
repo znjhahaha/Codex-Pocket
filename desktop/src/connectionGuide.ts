@@ -14,6 +14,37 @@ export function relayBaseUrl(input:string) {
  if(url.protocol!=='wss:'||!url.hostname||url.username||url.password||url.search||url.hash||!['/','/pocket','/pocket/'].includes(url.pathname))throw new Error('invalid_relay_url');
  return url.toString();
 }
+export function savedRelayUrl(snapshot:Snapshot) {
+ for(const route of snapshot.routes?.routePreferences?.routes||[]) {
+  if(route.kind!=='relay')continue;
+  // Pairing endpoints include a room; the editable field only accepts a base URL.
+  const base=route.url.replace(/\/v1\/tunnel\/[A-Za-z0-9_-]+\/phone$/, '');
+  try{return relayBaseUrl(base)}catch{/* Ignore malformed legacy entries. */}
+ }
+ return '';
+}
+// Route endpoints may contain pairing rooms. Only display an allowlisted base.
+export function routeDisplayUrl(route:Pick<Route,'kind'|'url'>) {
+ try {
+  const url=new URL(route.url);
+  if(!['ws:','wss:','tcp:','tls:','http:','https:'].includes(url.protocol)||!url.hostname)return '地址待确认';
+  return `${url.protocol}//${url.host}${route.kind!=='lan'&&(url.pathname==='/pocket'||url.pathname.startsWith('/pocket/'))?'/pocket':''}`;
+ }catch{return '地址待确认'}
+}
+export function routeReadIssue(snapshot:Snapshot) {
+ return snapshot.issues?.find(issue=>issue.stage==='routes_read')
+  ??snapshot.issues?.find(issue=>['helper_control','physical_state_path','physical_supervisor_status','installation'].includes(issue.stage));
+}
+export function requireRoutePreferences(snapshot:Snapshot) {
+ const issue=routeReadIssue(snapshot);
+ if(issue)throw issue;
+ const prefs=snapshot.routes?.routePreferences;
+ if(!prefs||!Array.isArray(prefs.routes))throw Error('route_preferences_unavailable');
+ return prefs;
+}
+export function requiresRouteRead(issue:OperationError) {
+ return issue.code==='route_preferences_unavailable'||['routes_read','helper_control','physical_state_path','physical_supervisor_status','installation'].includes(issue.stage);
+}
 export function validLanBind(bind:string) {
  const match=bind.match(/^(\d+\.\d+\.\d+\.\d+):(\d+)$/);
  if(!match)return false;
@@ -25,21 +56,25 @@ export function lanCandidate(address:string,savedBind?:string) {
  const port=storedPort>0&&storedPort<=65535?storedPort:43821;
  return `${address}:${port}`;
 }
-export interface LanInterface {name:string;address:string}
+export interface LanInterface {name:string;address:string;kind?:'wifi'|'ethernet'|'virtual'|'tunnel'|'unknown';automatic?:boolean}
+export function lanInterfaceLabel(row:LanInterface) {
+ const kind=row.kind?({wifi:'Wi-Fi',ethernet:'以太网',virtual:'虚拟网卡',tunnel:'VPN / 隧道',unknown:'类型待确认'}[row.kind]):'';
+ return `${row.name} · ${row.address}${kind?` · ${kind}`:''}${row.automatic===false?'（仅手动选择）':''}`;
+}
 export function automaticLanBind(savedBind:string|undefined,interfaces:LanInterface[]) {
- if(savedBind&&validLanBind(savedBind)&&interfaces.some(row=>row.address===savedBind.split(':')[0]))return savedBind;
- return interfaces.map(row=>lanCandidate(row.address,savedBind)).find(validLanBind)||'';
+ const eligible=interfaces.filter(row=>row.automatic!==false);
+ if(savedBind&&validLanBind(savedBind)&&eligible.some(row=>row.address===savedBind.split(':')[0]))return savedBind;
+ return eligible.map(row=>lanCandidate(row.address,savedBind)).find(validLanBind)||'';
 }
 export async function prepareAutomaticLan(values:{lanBind?:string;autoLan?:boolean},snapshot:Snapshot,call:GuideInvoke,current:()=>boolean,required=false) {
  if(!current())return;
- const prefs=snapshot.routes?.routePreferences;
- if(!prefs||!Array.isArray(prefs.routes))throw Error('route_preferences_unavailable');
+ const prefs=requireRoutePreferences(snapshot);
  if(required&&!validLanBind(values.lanBind||''))throw Error('auto_lan_unavailable');
  await call('configure_routes',{preferences:{...prefs,policy:'automatic',autoLan:values.autoLan??true,lan:validLanBind(values.lanBind||'')?{bind:values.lanBind,mdns:prefs.lan?.mdns??true}:prefs.lan||null,gateway:prefs.gateway||{bind:'127.0.0.1:17892'}}});
 }
 export async function prepareRoute(method:ConnectionMethod,values:{lanBind?:string;relayUrl?:string;autoLan?:boolean},snapshot:Snapshot,call:GuideInvoke,current:()=>boolean) {
  if(!current())return;
- if(!snapshot.routes?.routePreferences||!Array.isArray(snapshot.routes.routePreferences.routes))throw Error('route_preferences_unavailable');
+ requireRoutePreferences(snapshot);
  const url=method==='relay'?relayBaseUrl(values.relayUrl||''):undefined;
  await prepareAutomaticLan(values,snapshot,call,current,method==='lan');
  if(!current())return;

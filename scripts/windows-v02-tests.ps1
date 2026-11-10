@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param([string]$Only)
 $ErrorActionPreference='Stop'
@@ -79,7 +79,7 @@ $root=Join-Path $testRoot 'package-input'
 Put (Join-Path $testRoot 'native\app\resources\codex.exe') 'never execute'
 foreach($name in Get-PocketWindowsFiles) {
     if($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$path=Join-Path $root ('.local\tools\'+$name)}
-    elseif($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')){$path=Join-Path $root ('desktop\target\release\'+$name)}
+    elseif($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')){$path=Join-Path $root ('desktop\target\release\'+$name)}
     elseif($name -like '*.exe'){$path=Join-Path $root ('target\release\'+$name)}
     elseif($name -like '*.md'){$path=Join-Path $root ('docs\'+$name)}
     else{$path=Join-Path $root ('scripts\'+$name)}
@@ -174,7 +174,7 @@ Test 'v2 migration rolls back exact original record, env and all three links' {
     Write-PocketJson $manifest @{version=2;installRoot=$legacy.InstallRoot;generation=$legacyGeneration;releaseHash=('b'*64);bridge=$bridge;previousCliPath=$null;stateDirectory=$state;shortcuts=$entries}
     $hash=Get-PocketFileHash $manifest; $script:fakeCli=$bridge; $script:fakeKind='ExpandString'; $script:fakeTask=$null
     Invoke-PocketWindowsInstall -Context $legacy -SourceDirectory $source -Apply | Out-Null
-    Assert (-not [IO.File]::Exists($entries[2].path)) 'Old helper startup link not removed'
+    Assert ((Get-PocketFileHash $entries[2].path) -eq $entries[2].installedHash) 'Unverified custom Startup link was changed'
     Invoke-PocketWindowsInstall -Context $legacy -Rollback -Apply | Out-Null
     Assert ((Get-PocketFileHash $manifest) -eq $hash) 'Legacy record changed'
     Assert ($script:fakeCli -eq $bridge -and $script:fakeKind -eq 'ExpandString') 'Legacy CLI not restored exactly'
@@ -291,10 +291,19 @@ Test 'fresh Setup initializes only an absent private state and preserves it on r
     }
     Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize | Out-Null
     Assert ($script:initializations -eq 0) 'Dry-run initialized identity'
-    Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply | Out-Null
+    $shortcutBytesImplementation=${function:New-PocketShortcutBytes}
+    $shortcutBlocked=$true
+    function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$Mode,[string]$IconPath) {
+        if ($shortcutBlocked) { Invoke-PocketInstallStep 'shortcut' 'IPersistFile.Save' {throw [Runtime.InteropServices.COMException]::new('fixture shortcut failure',-2147467259)} }
+        & $shortcutBytesImplementation @PSBoundParameters
+    }
+    $result=Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply
+    Assert ($result.state -eq 'installed_incomplete' -and $result.coreInstalled) 'First Setup shortcut failure rolled back core'
     $identity=Get-PocketFileHash (Join-Path $freshState 'identity/private-key.der')
     Assert ($script:initializations -eq 1) 'Fresh installation did not initialize exactly once'
-    Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply | Out-Null
+    $shortcutBlocked=$false
+    $result=Invoke-PocketWindowsInstall -Context $freshContext -SourceDirectory $source -Initialize -Apply
+    Assert ($result.state -eq 'installed') 'First Setup did not finish the pending shortcut'
     Assert ($script:initializations -eq 1) 'Reapply replaced identity'
     Assert ((Get-PocketFileHash (Join-Path $freshState 'identity/private-key.der')) -eq $identity) 'Pairing identity changed'
     Invoke-PocketWindowsInstall -Context $freshContext -Uninstall -Apply | Out-Null

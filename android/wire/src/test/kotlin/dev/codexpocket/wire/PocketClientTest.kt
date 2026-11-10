@@ -12,6 +12,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PocketClientTest {
+    @Test fun negotiatedReplyChunksReassembleInsidePinnedTlsAndPreserveNotifications() = runBlocking {
+        Relay(replyText = "fixture 测试".repeat(12_000), chunk = 4096, chunkReplies = true).use { relay -> PocketClient(relay).use { client ->
+            client.connect(relay.config)
+            client.request("hello", buildJsonObject { put("protocol", 1); put("deviceId", "fixture"); put("deviceSecret", "fixture-secret") })
+            val event = async(start = CoroutineStart.UNDISPATCHED) { client.notifications.first() }
+            val result = client.request("threads/list", timeoutMillis = 15_000)
+            assertEquals("fixture 测试".repeat(12_000), result.jsonPrimitive.content)
+            assertEquals("fixture/event", withTimeout(5_000) { event.await() }["method"]!!.jsonPrimitive.content)
+            assertEquals(LinkState.ONLINE, client.state.value)
+            assertEquals(1, relay.requests.count { it["method"]?.jsonPrimitive?.content == "threads/list" })
+        } }
+    }
     @Test fun nativeQueueReadDoesNotRequireMutationCommandId() = runBlocking {
         Relay().use { relay -> PocketClient(relay).use { client ->
             client.connect(relay.config)
@@ -51,7 +63,7 @@ class PocketClientTest {
     }
     internal class Relay(val respond: Boolean = true, val disconnect: Boolean = false, val errorCode: String? = null, val replyText: String = "ok",
         val chunk: Int = 23, val pacingMillis: Long = 0,
-        val notificationsBeforeReply: List<JsonObject> = emptyList()) : TransportConnector, AutoCloseable {
+        val notificationsBeforeReply: List<JsonObject> = emptyList(), val chunkReplies: Boolean = false) : TransportConnector, AutoCloseable {
         val cert = certificate()
         val config = ConnectionConfig("wss://relay.example/prefix", "room", "secret", fingerprint(cert))
         val requests = CopyOnWriteArrayList<JsonObject>()
@@ -79,11 +91,21 @@ class PocketClientTest {
                                 put("id", request.getValue("id"))
                                 if (errorCode != null || request["method"]?.jsonPrimitive?.content == "error") put("error", buildJsonObject {
                                     put("code", errorCode ?: "not_found"); put("message", "SECRET_PAYLOAD")
-                                }) else put("result", JsonPrimitive(replyText))
+                                }) else if (chunkReplies && request["method"]?.jsonPrimitive?.content == "hello") put("result", buildJsonObject { put("capabilities", buildJsonArray { add(ReplyChunks.CAPABILITY) }) })
+                                else put("result", JsonPrimitive(replyText))
                             }
                             scope.launch { input.send(byteArrayOf()) } // response is sent below on owner
                             replies.addAll(notificationsBeforeReply)
-                            replies.add(reply)
+                            if (chunkReplies && request["method"]?.jsonPrimitive?.content != "hello") {
+                                val body = reply.toString().toByteArray()
+                                body.asList().chunked(ReplyChunks.BLOCK).forEachIndexed { index, block ->
+                                    replies.add(buildJsonObject { put("method", ReplyChunks.METHOD); put("params", buildJsonObject {
+                                        put("replyId", request.getValue("id")); put("sequence", index); put("totalBytes", body.size)
+                                        put("data", java.util.Base64.getEncoder().encodeToString(block.toByteArray()))
+                                    }) })
+                                    if (index == 0) replies.add(buildJsonObject { put("method", "fixture/event"); put("params", buildJsonObject {}) })
+                                }
+                            } else replies.add(reply)
                         }
                     }
                 }, {}, {})

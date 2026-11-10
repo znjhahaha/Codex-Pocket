@@ -86,6 +86,7 @@ interface PocketDao {
     suspend fun rawChunk(key: ThreadKey, item: String, start: Int, count: Int): String?
     @Upsert suspend fun putItems(items: List<ItemEntity>)
     @Query("DELETE FROM items WHERE chatKey = :key") suspend fun clearItems(key: ThreadKey)
+    @Query("DELETE FROM items WHERE chatKey = :key AND itemKey IN (:items)") suspend fun removeItems(key: ThreadKey, items: List<String>)
     @Query("SELECT * FROM drafts WHERE chatKey = :key") suspend fun draft(key: ThreadKey): DraftEntity?
     @Upsert suspend fun putDraft(draft: DraftEntity)
     @Query("SELECT * FROM cursors WHERE computerId = :computer") suspend fun cursors(computer: String): List<CursorEntity>

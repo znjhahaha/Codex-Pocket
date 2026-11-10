@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,12 +32,17 @@ struct RouteHealth {
     inner_handshake: bool,
     active_sessions: usize,
     last_activity: Option<u64>,
+    failure: Option<RouteFailure>,
 }
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteFailure { pub stage: &'static str, pub code: &'static str, pub os_code: Option<i32> }
 pub struct Connection(
     Mutex<Health>,
     Mutex<BTreeMap<String, RouteHealth>>,
     AtomicUsize,
     AtomicU64,
+    AtomicBool,
 );
 impl Default for Connection {
     fn default() -> Self {
@@ -50,10 +55,13 @@ impl Default for Connection {
             Mutex::new(BTreeMap::new()),
             AtomicUsize::new(0),
             AtomicU64::new(0),
+            AtomicBool::new(true),
         )
     }
 }
 impl Connection {
+    pub fn remote_enabled(&self) -> bool { self.4.load(Ordering::Acquire) }
+    pub fn set_remote_enabled(&self, enabled: bool) { self.4.store(enabled, Ordering::Release); }
     pub fn generation(&self) -> u64 {
         self.3.load(Ordering::Acquire)
     }
@@ -75,14 +83,17 @@ impl Connection {
         let route_connected = routes
             .as_array()
             .is_some_and(|rs| rs.iter().any(|r| r["outerConnected"] == true));
-        let authenticated = self.2.load(Ordering::Acquire) > 0;
+        let authenticated = self.remote_enabled() && self.2.load(Ordering::Acquire) > 0;
+        if !self.remote_enabled() {
+            return json!({"state":"stopped","remoteEnabled":false,"remoteControlProtocol":1,"connected":false,"outerConnected":false,"available":false,"authenticatedPhone":false,"lastActivityAt":h.last_activity,"routeStatus":routes});
+        }
         let available = connected
             || route_connected
             || routes.as_array().is_some_and(|rs| {
                 rs.iter()
-                    .any(|r| r["id"] != "mdns" && r["listenerReady"] == true)
+                    .any(|r| r["kind"] != "discovery" && r["id"] != "mdns" && r["listenerReady"] == true)
             });
-        json!({"state":if route_connected||authenticated||connected {"connected"}else if available {"ready"}else if h.state=="connected" && !connected{"reconnecting"}else{h.state},"connected":connected||route_connected||authenticated,"outerConnected":connected||route_connected,"available":available,"authenticatedPhone":authenticated,"lastActivityAt":h.last_activity,"routeStatus":routes})
+        json!({"state":if route_connected||authenticated||connected {"connected"}else if available {"ready"}else if h.state=="connected" && !connected{"reconnecting"}else{h.state},"remoteEnabled":true,"remoteControlProtocol":1,"connected":connected||route_connected||authenticated,"outerConnected":connected||route_connected,"available":available,"authenticatedPhone":authenticated,"lastActivityAt":h.last_activity,"routeStatus":routes})
     }
     /// Parent session::serve holds this guard only after successful device hello.
     /// TLS success and pairing invitation exchange never increment this count.
@@ -128,16 +139,23 @@ impl Connection {
         }
         let r = map.entry(id.into()).or_insert_with(|| RouteHealth {
             generation: self.3.load(Ordering::Acquire),
-            kind: if id == "lan" { "lan" } else { "cloudflare" }.into(),
+            kind: if id == "mdns" || id.starts_with("mdns-") { "discovery" } else if id == "lan" || id.starts_with("pocket-lan-auto-") { "lan" } else { "cloudflare" }.into(),
             ..Default::default()
         });
         r.phase = phase.into();
         r.listener_ready = ready;
         r.endpoint = endpoint;
+        if ready { r.failure = None; }
         if matches!(phase, "stopped" | "failed" | "reconnecting") {
             r.outer_connected = false;
             r.active_sessions = 0;
         }
+    }
+    pub fn route_failure_at(&self, generation: u64, id: &str, failure: RouteFailure) {
+        self.route_phase_at(generation, id, "failed", false, None);
+        let mut map = self.1.lock().unwrap();
+        if generation != self.generation() { return; }
+        if let Some(route) = map.get_mut(id) { route.failure = Some(failure); }
     }
     pub fn relay_evidence(&self, id: &str, evidence: &Value) {
         self.relay_evidence_at(self.3.load(Ordering::Acquire), id, "", evidence);
@@ -209,7 +227,7 @@ impl Connection {
         }
     }
     pub fn route_snapshot(&self) -> Value {
-        json!(self.1.lock().unwrap().iter().map(|(id,r)|json!({"id":id,"kind":r.kind,"phase":r.phase,"listenerReady":r.listener_ready,"endpoint":r.endpoint,"outerConnected":r.outer_connected,"innerHandshake":r.inner_handshake,"activeSessions":r.active_sessions,"lastActivityAt":r.last_activity})).collect::<Vec<_>>())
+        json!(self.1.lock().unwrap().iter().map(|(id,r)|json!({"id":id,"kind":r.kind,"phase":r.phase,"listenerReady":r.listener_ready,"endpoint":r.endpoint,"outerConnected":r.outer_connected,"innerHandshake":r.inner_handshake,"activeSessions":r.active_sessions,"lastActivityAt":r.last_activity,"failure":r.failure})).collect::<Vec<_>>())
     }
     pub fn gateway_endpoint(&self) -> Option<String> {
         self.1

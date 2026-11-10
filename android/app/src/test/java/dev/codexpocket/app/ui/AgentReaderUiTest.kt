@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -273,6 +274,35 @@ class AgentReaderUiTest {
         compose.onNodeWithContentDescription("收起工具详情").performClick()
         compose.onNodeWithTag("agent-reader-detail:${tool.key}").assertDoesNotExist()
         compose.onAllNodes(hasSetTextAction()).assertCountEquals(0)
+    }
+
+    @Test fun expandedLastToolDoesNotPullReaderBackAfterDragResizeAndAppend() {
+        val tool = TimelineItem("tool", "last", "commandExecution", "echo\n\n" + "Recorded output\n".repeat(30),
+            status = "completed", raw = buildJsonObject { put("command", "echo"); put("aggregatedOutput", "Recorded output\n".repeat(30)) }, complete = true)
+        val items = (0 until 24).map { answer(it, "Recorded answer $it\n".repeat(5)) } + tool
+        var state by mutableStateOf(AgentReaderState(parent, child = child,
+            timeline = NativeTimeline(items.associateBy { it.key }, completedTurns = items.mapTo(hashSetOf()) { it.turnId })))
+        content { AgentReaderPanel(state, listOf(current), emptyMap(), true, {}, {}, {},
+            { state = state.copy(fullScreen = it) }, {}, {}) }
+        val transcript = compose.onNodeWithTag("agent-reader-transcript")
+        compose.waitUntil(5_000) { transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].maxValue() > 20 }
+        transcript.performScrollToNode(hasTestTag("activity-toggle:${tool.key}"))
+        compose.onNodeWithTag("activity-toggle:${tool.key}").performClick()
+        compose.waitForIdle()
+        val before = transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
+        transcript.performTouchInput { down(center); moveBy(Offset(0f, 90f)) }
+        compose.runOnIdle { state = state.copy(fullScreen = true) }
+        transcript.performTouchInput { moveBy(Offset(0f, 160f)); up() }
+        compose.waitForIdle()
+        assertTrue(transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value() < before)
+        transcript.assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "阅读历史"))
+        val appended = answer(100, "Later recorded response\n".repeat(8))
+        compose.runOnIdle { state = state.copy(timeline = state.timeline.copy(items = state.timeline.items + (appended.key to appended))) }
+        compose.waitUntil(5_000) { runCatching {
+            transcript.performScrollToNode(hasTestTag("agent-reader-row:${appended.key}")); true
+        }.getOrDefault(false) }
+        compose.waitForIdle()
+        transcript.assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "阅读历史"))
     }
 
     @Test fun childFileUsesSharedInlineDiffAndCannotReachParentDraftCallback() {

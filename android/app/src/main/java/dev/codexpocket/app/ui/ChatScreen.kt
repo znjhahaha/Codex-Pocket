@@ -37,6 +37,7 @@ import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
@@ -61,7 +62,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         }
         val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns,
             resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses)
-        val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty())
+        val changeCards = rememberTurnChangeCards(s.timeline, rows)
+        val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty(), s.conversationCached)
         val live = s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
         val reasoning = remember(s.timeline) { ConversationPresentation.liveReasoning(s.timeline) }
         val agents = remember(s.timeline, s.agentStatuses, chat.key) { s.currentAgents() }
@@ -79,6 +81,18 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val minimapState = rememberConversationMinimapState(list, chat.key.encoded)
         val minimapShown = rememberConversationMinimapVisibility(chat.key.encoded, rows, list)
         var following by rememberSaveable { mutableStateOf(s.draft?.followEnd ?: true) }
+        var transcriptContact by remember { mutableStateOf(false) }
+        val transcriptGesture = remember(list) { TranscriptGestureState() }
+        var jumpJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        val pauseFollowing = {
+            jumpJob?.cancel()
+            if (following) {
+                following = false
+                // Persist intent immediately, including a drag consumed by a nested tool body.
+                repo.scroll(list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, false,
+                    list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String)
+            }
+        }
         var restoredAnchor by remember { mutableStateOf(false) }
         val reportReading by rememberUpdatedState(onReadingHistory)
         var readingHistory by remember { mutableStateOf(false) }
@@ -140,53 +154,82 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 else if (items > 1 || pixels >= enterDistance) readingHistory = true
             }
         }
-        ObserveTranscriptDrag(list) { following = it }
-        LaunchedEffect(list) {
-            snapshotFlow { list.isScrollInProgress to list.canScrollForward }.distinctUntilChanged().collect { (scrolling, canForward) ->
-                if (!scrolling && !canForward && !minimapState.isInteracting) following = true
+        ObserveTranscriptDrag(list, transcriptGesture) {
+            if (it) { following = true; repo.scroll(list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, true,
+                list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String) }
+            else pauseFollowing()
+        }
+        val anchorReady = restoredAnchor && (following || anchorKey == null || anchorKey in keys)
+        val latestKeys by rememberUpdatedState(keys)
+        LaunchedEffect(list, anchorReady) {
+            if (!anchorReady) return@LaunchedEffect
+            // Layout can publish before the restoration effect cancels this observer.
+            // Check readiness inside the snapshot, before adopting or persisting its first key.
+            snapshotFlow {
+                if (!restoredAnchor || transcriptContact || minimapState.isInteracting ||
+                    list.layoutInfo.totalItemsCount != latestKeys.size ||
+                    list.layoutInfo.visibleItemsInfo.any { it.key !in latestKeys } ||
+                    (!following && anchorKey != null && anchorKey !in latestKeys)) null
+                else Triple(list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == list.firstVisibleItemIndex }?.key as? String,
+                    list.firstVisibleItemScrollOffset, following)
+            }.onEach { position -> position?.let { (key, offset, _) -> if (key != null) { anchorKey = key; anchorOffset = offset } } }
+                .debounce(200).collect { position -> position?.let { (key, offset, follow) ->
+                if (key != null && restoredAnchor && !transcriptContact && !minimapState.isInteracting)
+                    repo.scroll(list.firstVisibleItemIndex, offset, follow, key)
+                }
             }
         }
-        LaunchedEffect(list, restoredAnchor) {
-            if (!restoredAnchor) return@LaunchedEffect
-            snapshotFlow { Triple(list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String, list.firstVisibleItemScrollOffset, following) }
-                .onEach { (key, offset, _) -> if (key != null) { anchorKey = key; anchorOffset = offset } }
-                .debounce(200).collect { (key, offset, follow) ->
-                if (key != null) repo.scroll(list.firstVisibleItemIndex, offset, follow, key)
-            }
-        }
-        LaunchedEffect(keys) {
+        LaunchedEffect(list, keys, following) {
             val resolved = ConversationPresentation.anchorKey(rows, anchorKey)
             // LazyColumn preserves existing keys on prepend/deltas. Restore only on the first
             // nonempty load or when a structural split/merge actually removed our anchor.
             if (rows.isNotEmpty()) {
-                if (!following && !list.isScrollInProgress && (!restoredAnchor || anchorKey !in keys)) {
+                if (!following && (!restoredAnchor || anchorKey !in keys)) {
                     val fallback = if (!restoredAnchor) s.draft?.scrollIndex ?: 0 else list.firstVisibleItemIndex
+                    restoredAnchor = false
                     // A collapsed process header has a different height than its former child.
                     val restoredOffset = if (resolved == anchorKey) anchorOffset else 0
-                    list.scrollToItem(TranscriptAnchor(resolved).resolve(keys, fallback), restoredOffset)
-                    anchorKey = resolved
-                    anchorOffset = restoredOffset
+                    // Keep the saved anchor while contact/minimap/scrolling blocks restoration.
+                    // Projection can precede LazyColumn measurement; do not seek its old indices.
+                    snapshotFlow { !transcriptContact && !minimapState.isInteracting && !list.isScrollInProgress &&
+                        list.layoutInfo.totalItemsCount == keys.size &&
+                        list.layoutInfo.visibleItemsInfo.all { it.key in keys } }.first { it }
+                    val restoredIndex = TranscriptAnchor(resolved).resolve(keys, fallback)
+                    list.scrollToItem(restoredIndex, restoredOffset)
+                    val restoredKey = keys[restoredIndex]
+                    snapshotFlow { list.layoutInfo.visibleItemsInfo.any { it.key == restoredKey } &&
+                        list.layoutInfo.visibleItemsInfo.all { it.key in keys } }.first { it }
+                    anchorKey = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == list.firstVisibleItemIndex }?.key as? String ?: restoredKey
+                    if (anchorKey !in keys) anchorKey = restoredKey
+                    anchorOffset = list.firstVisibleItemScrollOffset
+                    // Commit a structural relocation immediately. It must survive leaving
+                    // the screen before the ordinary scrolling debounce expires.
+                    repo.scroll(list.firstVisibleItemIndex, anchorOffset, false, anchorKey)
+                } else if (!restoredAnchor) {
+                    snapshotFlow { list.layoutInfo.totalItemsCount == keys.size }.first { it }
                 }
                 restoredAnchor = true
             }
         }
-        FollowTranscriptEnd(list, following, minimapState.expanded || minimapState.isInteracting)
+        FollowTranscriptEnd(list, { following }, { transcriptContact || minimapState.expanded || minimapState.isInteracting })
         Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))) {
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                 val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
                 val transcriptInset = maxOf(16.dp, (maxWidth - gutter - 720.dp) / 2)
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
-                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter).testTag("chat-transcript").layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter).testTag("chat-transcript")
+                    .transcriptUserGesture(list, transcriptGesture, pauseFollowing, { transcriptContact = it; if (it) jumpJob?.cancel() })
+                    .layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item(key = "history-control") {
                         ConversationReadStatus(read.copy(failed = false, refreshing = false), null, onRetry = {})
                         if (rows.isNotEmpty() && s.online && s.supports("thread/turns/list") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            PocketTextButton(onClick = { following = false; repo.older() }, enabled = !s.historyLoading) {
+                            PocketTextButton(onClick = { transcriptGesture.cancelResume(); pauseFollowing(); repo.older() }, enabled = !s.historyLoading) {
                                 Text(stringResource(if (s.historyLoading) R.string.delivery_history_loading else R.string.earlier_messages), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                     }
                     items(rows, key = { it.key }, contentType = { it.kind }) { row ->
-                        Box(Modifier.fillMaxWidth().padding(top = when (row.kind) {
+                        Column(Modifier.fillMaxWidth().testTag("transcript-row:${row.key}").padding(top = when (row.kind) {
                             TranscriptKind.User -> 16.dp
                             TranscriptKind.Answer -> 10.dp
                             else -> 2.dp
@@ -199,6 +242,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                                 onReopenPlan = proposedPlan?.takeIf { plan -> row.items.any { it.itemId == plan.itemId && it.turnId == plan.turnId } && PlanPresentation.unavailable(s, plan) == null }
                                     ?.let { plan -> { repo.reopenPlan(plan); following = true } },
                                 onEdit = { repo.beginMessageEdit(it); following = true })
+                            changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary, onDetail) }
                         }
                     }
                     if (live != null) item(key = "live-status", contentType = "live-status") {
@@ -214,7 +258,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 }
                 if (minimapShown) ConversationMinimap(rows, keys, list,
                     Modifier.align(Alignment.CenterStart).width(gutter).padding(top = topInset + 8.dp, bottom = bottomInset + 8.dp),
-                    backdrop = transcriptBackdrop, onSeek = { following = false }, state = minimapState,
+                    backdrop = transcriptBackdrop, onSeek = { transcriptGesture.cancelResume(); pauseFollowing() }, state = minimapState,
                     scope = chat.key.encoded, navigationEpoch = s.historyLoading to s.nextTurns?.toString(), onExpandProcess = repo::expandProcess)
             CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
@@ -240,11 +284,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             // Separate floating layers overlapped each other above the composer.
             Row(Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp).widthIn(max = 720.dp).fillMaxWidth(),
                 verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            androidx.compose.animation.AnimatedVisibility(readingHistory && rows.isNotEmpty(),
+            androidx.compose.animation.AnimatedVisibility(!following && rows.isNotEmpty(),
                 enter = fadeIn(tween(pocketMotionMillis(160))) + scaleIn(tween(pocketMotionMillis(160)), initialScale = .9f),
                 exit = fadeOut(tween(pocketMotionMillis(110))) + scaleOut(tween(pocketMotionMillis(110)), targetScale = .9f)) {
                 val jumpLabel = stringResource(R.string.jump_latest)
-                PocketGlassSurface(onClick = { scope.launch { following = true; if (keys.lastIndex - list.firstVisibleItemIndex > 30 || !android.animation.ValueAnimator.areAnimatorsEnabled()) list.scrollToItem(keys.lastIndex) else list.animateScrollToItem(keys.lastIndex) } },
+                PocketGlassSurface(onClick = { transcriptGesture.cancelResume(); jumpJob?.cancel(); jumpJob = scope.launch { following = true; if (keys.lastIndex - list.firstVisibleItemIndex > 30 || !android.animation.ValueAnimator.areAnimatorsEnabled()) list.scrollToItem(keys.lastIndex) else list.animateScrollToItem(keys.lastIndex) } },
                     modifier = Modifier.padding(bottom = 6.dp).semantics { contentDescription = jumpLabel }, backdrop = transcriptBackdrop, shape = CircleShape, dense = true) {
                     Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
                         Icon(PocketIcons.ArrowDownward, null, Modifier.size(18.dp))
@@ -316,8 +360,13 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
 /** Read status belongs to the selected transcript; cached rows remain mounted throughout retry. */
 @Composable
 internal fun ConversationReadStatus(read: ConversationReadPresentation, error: String?, onRetry: () -> Unit) {
+    var showSkeleton by remember { mutableStateOf(false) }
+    LaunchedEffect(read.skeleton) {
+        showSkeleton = false
+        if (read.skeleton) { kotlinx.coroutines.delay(150); showSkeleton = true }
+    }
     Column(Modifier.fillMaxWidth()) {
-        if (read.skeleton) Column(Modifier.fillMaxWidth().testTag("conversation-skeleton").padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (read.skeleton && showSkeleton) Column(Modifier.fillMaxWidth().testTag("conversation-skeleton").padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             PocketProgressStatus(stringResource(R.string.v04_transcript_loading))
             // Shapes echo a real transcript: a right-aligned request, then prose lines and a work-log line.
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) { SkeletonBar(.46f, 34.dp) }
@@ -326,8 +375,8 @@ internal fun ConversationReadStatus(read: ConversationReadPresentation, error: S
         }
         if (read.refreshing) Text(stringResource(R.string.v04_transcript_refreshing), Modifier.padding(vertical = 8.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         androidx.compose.animation.AnimatedVisibility(read.failed,
-            enter = androidx.compose.animation.fadeIn(tween(pocketMotionMillis(160))) + androidx.compose.animation.slideInVertically(spring(dampingRatio = .82f, stiffness = 520f)) { -it / 3 },
-            exit = androidx.compose.animation.fadeOut(tween(pocketMotionMillis(120)))) {
+            enter = androidx.compose.animation.fadeIn(tween(pocketMotionMillis(180))),
+            exit = androidx.compose.animation.fadeOut(tween(pocketMotionMillis(180)))) {
             ReadFailureCard(error?.takeIf(String::isNotBlank) ?: stringResource(R.string.v04_transcript_failed), onRetry)
         }
     }

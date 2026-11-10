@@ -14,6 +14,7 @@ pub async fn serve<S>(stream: S, broker: Arc<Broker>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if !broker.connection.remote_enabled() { bail!("Remote access paused"); }
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (incoming, mut requests) = mpsc::channel::<Value>(16);
     let reader_task = tokio::spawn(async move {
@@ -33,15 +34,20 @@ where
     let result=async{
   let mut events=broker.subscribe();let (finished,mut replies)=mpsc::channel(32);let permits=Arc::new(Semaphore::new(16));
   let mut device:Option<String>=None;
+  let mut chunking=false;
+  let mut chunks=std::collections::VecDeque::<crate::chunks::ReplyChunks>::new();
+  let mut chunk_bytes=0usize;
   let mut _authenticated_phone=None;
   let deadline=tokio::time::Instant::now()+Duration::from_secs(30);let mut attempts=0;
   let mut tick=tokio::time::interval(Duration::from_secs(1));
   loop{tokio::select!{
    request=requests.recv()=>{
+    if !broker.connection.remote_enabled(){bail!("Remote access paused")}
     let Some(v)=request else{break};let id=v["id"].clone();let method=v["method"].as_str().unwrap_or_default().to_owned();let p=v.get("params").cloned().unwrap_or_else(||json!({}));
     if id.as_str().is_none_or(|s|s.is_empty()||s.len()>128)||!p.is_object(){bail!("Malformed request")}
     if device.is_none(){attempts+=1;if attempts>3{bail!("Authentication retry limit")}
      let result=match method.as_str(){"pair"=>broker.pair(&p).await,"hello"=>match broker.authenticate(&p).await{Ok(d)=>{device=Some(d);_authenticated_phone=Some(broker.connection.authenticated_phone());Ok(broker.hello().await)},Err(e)=>Err(e)},_=>Err(classify(anyhow::anyhow!("Pair or authenticate this device first"),Code::Unauthorized))};
+     if method=="hello"&&result.is_ok(){chunking=p["capabilities"].as_array().is_some_and(|caps|caps.iter().any(|c|c==crate::chunks::CAPABILITY));}
      write_json(&mut writer,&reply(id,result)).await?;continue
     }
     let permit=permits.clone().try_acquire_owned();let Ok(permit)=permit else{write_json(&mut writer,&json!({"id":id,"error":{"code":"busy","message":"Too many pending requests"}})).await?;continue};
@@ -51,7 +57,20 @@ where
    }
    // A history page can be several MB; over a home uplink it legitimately takes longer than
    // 10s. A stalled relay is still detected per chunk by the transport's 5s write timeout.
-   Some(value)=replies.recv()=>{tokio::time::timeout(Duration::from_secs(120),write_reply(&mut writer,&value)).await??;}
+   Some(value)=replies.recv()=>{
+    if chunking {
+     match crate::chunks::ReplyChunks::new(&value) {
+      Ok(item) if item.bytes()<=crate::chunks::CHUNK_BYTES=>{tokio::time::timeout(Duration::from_secs(10),write_reply(&mut writer,&value)).await??;}
+      Ok(item) if chunk_bytes+item.bytes()<=crate::chunks::QUEUE_BYTES=>{chunk_bytes+=item.bytes();chunks.push_back(item);}
+      _=>{tokio::time::timeout(Duration::from_secs(10),write_json(&mut writer,&json!({"id":value["id"],"error":{"code":"payload_too_large","message":"Reply capacity exceeded"}}))).await??;}
+     }
+    }else{tokio::time::timeout(Duration::from_secs(120),write_reply(&mut writer,&value)).await??;}
+   }
+   _=tokio::task::yield_now(),if !chunks.is_empty()=>{
+    let mut item=chunks.pop_front().unwrap();
+    if let Some(frame)=item.next_frame(){tokio::time::timeout(Duration::from_secs(10),write_json(&mut writer,&frame)).await??;}
+    if item.finished(){chunk_bytes-=item.bytes()}else{chunks.push_back(item)}
+   }
    event=events.recv()=>{match event{
     Ok(value)=>{if let Some(d)=&device{if !broker.device_exists(d).await{bail!("Device revoked")};tokio::time::timeout(Duration::from_secs(10),write_json(&mut writer,&value)).await??;}},
     // Busy desktop threads can outrun a phone that is receiving a large reply. Skipped
@@ -60,7 +79,7 @@ where
     Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{if device.is_some(){tokio::time::timeout(Duration::from_secs(10),write_json(&mut writer,&json!({"method":"pocket/resync","params":{"reason":"event_backlog"}}))).await??;}},
     Err(_)=>break,
    }}
-   _=tick.tick()=>{if let Some(d)=&device{if !broker.device_exists(d).await{bail!("Device revoked")}}else if tokio::time::Instant::now()>deadline{bail!("Authentication timed out")}}
+   _=tick.tick()=>{if !broker.connection.remote_enabled(){bail!("Remote access paused")};if let Some(d)=&device{if !broker.device_exists(d).await{bail!("Device revoked")}}else if tokio::time::Instant::now()>deadline{bail!("Authentication timed out")}}
   }}Ok(())
  }.await;
     reader_task.abort();

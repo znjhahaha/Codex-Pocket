@@ -21,6 +21,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -45,12 +47,14 @@ internal fun agentReaderBack(state: AgentReaderState): AgentReaderBack = when {
 private class AgentReaderPageMemory {
     val projection = TranscriptProjectionMemory()
     val list = LazyListState()
+    val gesture = TranscriptGestureState()
     var expansions by mutableStateOf(emptySet<String>())
     var following by mutableStateOf(true)
     var detailKey by mutableStateOf<String?>(null)
     var anchor = TranscriptAnchor(null)
 
     fun toggle(key: String) {
+        gesture.cancelResume()
         anchor = TranscriptAnchor(list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String,
             list.firstVisibleItemScrollOffset)
         following = false
@@ -179,6 +183,8 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
     val child = state.child ?: return
     val scope = "agent-reader:${child.key.encoded}:"
     val rows = rememberTranscriptRows(scope, state.timeline, memory.expansions, retained = memory.projection, agentLiveStatuses = state.liveStatuses)
+    val changeCards = rememberTurnChangeCards(state.timeline, rows)
+    var changeReview by remember(scope) { mutableStateOf<TimelineItem?>(null) }
     val live = ConversationPresentation.liveStatus(state.timeline)
     val turn = state.timeline.activeTurn
     val reasoning = remember(state.timeline) { ConversationPresentation.liveReasoning(state.timeline) }
@@ -196,12 +202,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
     val backdropColor = MaterialTheme.colorScheme.background
     val backdrop = rememberLayerBackdrop { drawRect(backdropColor); drawContent() }
     val latestKeys by rememberUpdatedState(keys)
-    ObserveTranscriptDrag(list) { memory.following = it }
-    LaunchedEffect(memory) {
-        snapshotFlow { list.isScrollInProgress to list.canScrollForward }.distinctUntilChanged().collect { (scrolling, forward) ->
-            if (!scrolling && !forward && !minimapState.isInteracting) memory.following = true
-        }
-    }
+    ObserveTranscriptDrag(list, memory.gesture) { memory.following = it }
     LaunchedEffect(memory) {
         snapshotFlow { list.layoutInfo.visibleItemsInfo.firstOrNull()?.let { TranscriptAnchor(it.key as? String,
             list.firstVisibleItemScrollOffset) } }.distinctUntilChanged().collect { anchor ->
@@ -209,12 +210,12 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
         }
     }
     LaunchedEffect(memory, keys) {
-        if (!list.isScrollInProgress && memory.anchor.key != null && memory.anchor.key !in keys) {
+        if (!memory.gesture.contact && !minimapState.isInteracting && !list.isScrollInProgress && memory.anchor.key != null && memory.anchor.key !in keys) {
             val resolved = ConversationPresentation.anchorKey(rows, memory.anchor.key)
             list.scrollToItem(TranscriptAnchor(resolved).resolve(keys, list.firstVisibleItemIndex), 0)
         }
     }
-    FollowTranscriptEnd(list, memory.following, minimapState.expanded || minimapState.isInteracting)
+    FollowTranscriptEnd(list, { memory.following }, { memory.gesture.contact || minimapState.expanded || minimapState.isInteracting })
     Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).testTag("agent-reader-update"),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -229,12 +230,16 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
         if (state.error != null) AgentReaderNotice(state.error, online, state.loading, onRetry)
         BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
         val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
-        LazyColumn(Modifier.fillMaxSize().padding(start = gutter).testTag("agent-reader-transcript").layerBackdrop(backdrop), state = list,
+        LazyColumn(Modifier.fillMaxSize().padding(start = gutter).testTag("agent-reader-transcript")
+            .semantics { stateDescription = if (memory.following) "自动跟随末尾" else "阅读历史" }
+            .transcriptUserGesture(list, memory.gesture, { memory.following = false }, {})
+            .layerBackdrop(backdrop), state = list,
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item(key = "history-control", contentType = "history") {
                 if (state.nextTurns != null && state.nextTurns != JsonNull) PocketTextButton(
                     enabled = online && !state.loading, modifier = Modifier.testTag("agent-reader-older"), onClick = {
+                        memory.gesture.cancelResume()
                         memory.following = false
                         memory.anchor = TranscriptAnchor(list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String,
                             list.firstVisibleItemScrollOffset)
@@ -246,6 +251,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                     Column(Modifier.fillMaxWidth().testTag("agent-reader-row:${row.key}")) {
                         TranscriptRowView(row, scope, row.kind == TranscriptKind.User || row.key in memory.expansions, { memory.toggle(row.key) },
                             onDetail = { item ->
+                                memory.gesture.cancelResume()
                                 memory.following = false
                                 // Files are already shown by the shared inline diff/reader UI.
                                 // Never append a generic raw file detail in the child transcript.
@@ -257,6 +263,9 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                             }, canFork = false, onPlan = null,
                             activityExpansions = memory.expansions, onActivityExpansion = memory::toggle,
                             timeline = state.timeline)
+                        changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary) {
+                            memory.gesture.cancelResume(); memory.following = false; changeReview = it
+                        } }
                     }
                 }
                 detail?.takeIf { value -> row.kind != TranscriptKind.Process && row.items.any { it.key == value.key } }?.let { value ->
@@ -277,7 +286,12 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
         }
         if (minimapShown) ConversationMinimap(rows, keys, list, Modifier.align(Alignment.CenterStart).width(gutter),
             backdrop = backdrop, state = minimapState, scope = scope, navigationEpoch = state.loading to state.nextTurns?.toString(),
-            onSeek = { memory.following = false }, onExpandProcess = { memory.expansions = memory.expansions + it })
+            onSeek = { memory.gesture.cancelResume(); memory.following = false }, onExpandProcess = { memory.expansions = memory.expansions + it })
+        }
+    }
+    changeReview?.let { item ->
+        PocketModal(title = "本轮文件变更", onDismiss = { changeReview = null }, sheet = false, screen = true) {
+            DetailScreen(item, onBack = { changeReview = null }, canRead = false)
         }
     }
 }

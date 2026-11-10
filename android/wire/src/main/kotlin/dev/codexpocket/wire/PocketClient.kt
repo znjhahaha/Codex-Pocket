@@ -28,11 +28,13 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private var closing = false
     private var socket: BinaryTransport? = null
     private val pending = mutableMapOf<String, Pending>()
+    private val replyChunks = ReplyChunks()
+    private var chunking = false
     private var queuedBytes = 0L
     /** Any relay bytes, including another reply's fragments, prove the tunnel is still moving. */
     @Volatile private var lastInboundNanos = System.nanoTime()
 
-    private class Pending(val id: String, val commandId: String?) {
+    private class Pending(val id: String, val commandId: String?, val hello: Boolean) {
         val result = CompletableDeferred<JsonElement>()
         var sent = false
     }
@@ -114,10 +116,11 @@ class PocketClient internal constructor(private val connector: TransportConnecto
         val nativeMethod = (params["method"] as? JsonPrimitive)?.content
         if (commandId == null && (method in MUTATIONS || (method == "codex/request" && nativeMethod !in NATIVE_READS)))
             throw WireException("invalid_request", "Mutating requests require a command ID")
-        val item = Pending(UUID.randomUUID().toString(), commandId)
+        val item = Pending(UUID.randomUUID().toString(), commandId, method == "hello")
+        val wireParams = if (item.hello) JsonObject(params + ("capabilities" to buildJsonArray { add(ReplyChunks.CAPABILITY) })) else params
         val bytes = FrameCodec.encode(buildJsonObject {
             put("id", item.id); put("method", method)
-            put("params", if (commandId == null) params else JsonObject(params + ("commandId" to JsonPrimitive(commandId))))
+            put("params", if (commandId == null) wireParams else JsonObject(wireParams + ("commandId" to JsonPrimitive(commandId))))
         })
         synchronized(gate) {
             if (terminated || closing || mutableState.value != LinkState.ONLINE) throw WireException("offline", "Tunnel is offline")
@@ -148,7 +151,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
         catch (e: CancellationException) {
             if (synchronized(gate) { item.sent && commandId != null }) throw UnknownOutcomeException(commandId!!)
             throw e
-        } finally { synchronized(gate) { pending.remove(item.id) } }
+        } finally { synchronized(gate) { pending.remove(item.id); replyChunks.discard(item.id) } }
     }
 
     private fun failed(item: Pending, code: String): Exception = synchronized(gate) {
@@ -158,6 +161,15 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     }
 
     private fun receiveMessage(message: JsonObject) {
+        if ((message["method"] as? JsonPrimitive)?.content == ReplyChunks.METHOD) {
+            if (message.containsKey("id")) throw WireException("invalid_reply", "Invalid reply chunk")
+            val reply = synchronized(gate) {
+                if (!chunking) throw WireException("invalid_reply", "Unnegotiated reply chunk")
+                replyChunks.accept(message, pending.keys)
+            }
+            if (reply != null) receiveMessage(reply)
+            return
+        }
         val id = message["id"]
         if (id != null) {
             val primitive = id as? JsonPrimitive
@@ -173,7 +185,12 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                 val failure = if (item.commandId != null && code !in DEFINITE_REJECTIONS)
                     UnknownOutcomeException(item.commandId) else WireException(code, "Remote request failed")
                 item.result.completeExceptionally(failure)
-            } else if (message.containsKey("result")) item.result.complete(message.getValue("result"))
+            } else if (message.containsKey("result")) {
+                if (item.hello) synchronized(gate) {
+                    chunking = ((message["result"] as? JsonObject)?.get("capabilities") as? JsonArray)?.any { (it as? JsonPrimitive)?.content == ReplyChunks.CAPABILITY } == true
+                }
+                item.result.complete(message.getValue("result"))
+            }
             else {
                 item.result.completeExceptionally(failed(item, "invalid_reply"))
                 throw WireException("invalid_reply", "Invalid reply")
@@ -206,6 +223,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             ready.completeExceptionally(WireException(code, "Tunnel unavailable"))
             pending.values.toList().forEach { it.result.completeExceptionally(failed(it, code)) }
             pending.clear()
+            replyChunks.clear(); chunking = false
             events.cancel(); notices.close(if (code == "closed") null else WireException(code, "Tunnel closed"))
             socket.also { socket = null }
         }

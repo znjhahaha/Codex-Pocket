@@ -28,6 +28,8 @@ class V04TranscriptPresentationTest {
             assertEquals(state == ConversationLoadState.Loading, view.refreshing)
         }
         assertTrue(conversationReadPresentation(ConversationLoadState.Loading, false).skeleton)
+        assertFalse(conversationReadPresentation(ConversationLoadState.Loading, false, hasCachedWindow = true).skeleton)
+        assertTrue(conversationReadPresentation(ConversationLoadState.Loading, false, hasCachedWindow = true).refreshing)
         assertFalse(conversationReadPresentation(ConversationLoadState.Failed, false).empty)
         assertTrue(conversationReadPresentation(ConversationLoadState.Ready, false).empty)
         assertTrue(conversationReadPresentation(ConversationLoadState.Idle, false).empty)

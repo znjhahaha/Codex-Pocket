@@ -168,18 +168,22 @@ function Copy-PocketState([string]$Source, [string]$Destination) {
 }
 . (Join-Path $PSScriptRoot 'windows-startup.ps1')
 
-function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$Mode) {
-    $shell = New-Object -ComObject WScript.Shell
-    $link = $null
+function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$Mode,[string]$IconPath) {
+    Invoke-PocketInstallStep 'shortcut' 'Initialize-PocketShellLink' { Initialize-PocketShellLink } | Out-Null
     try {
-        $link=$shell.CreateShortcut($Temporary); $link.TargetPath=$Launcher; $link.Arguments=$Mode
-        $link.WorkingDirectory=[IO.Path]::GetDirectoryName($Launcher); $link.WindowStyle=7; $link.Save()
+        Invoke-PocketInstallStep 'shortcut' 'IShellLinkW/IPersistFile.Save' { [PocketShellLink]::Write($Temporary,$Launcher,$Mode,$IconPath) } | Out-Null
+        $read=Invoke-PocketInstallStep 'shortcut_verify' 'IPersistFile.Load/GetPath/GetArguments/GetIconLocation' { [PocketShellLink]::Read($Temporary) }
+        if ($read[0] -ne $Launcher -or $read[1] -ne $Mode -or $read[2] -ne $IconPath -or $read[3] -ne '0') { throw 'Shortcut verification failed.' }
         return ,([IO.File]::ReadAllBytes($Temporary))
     } finally {
-        if ($link) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link) }
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
         if ([IO.File]::Exists($Temporary)) { [IO.File]::Delete($Temporary) }
     }
+}
+function Test-PocketShortcutTarget([string]$Path,[string]$Launcher,[string]$Mode) {
+    if (-not [IO.File]::Exists($Path)) { return $false }
+    Initialize-PocketShellLink
+    try { $value=[PocketShellLink]::Read($Path); return $value[0] -eq $Launcher -and $value[1] -eq $Mode }
+    catch { return $false } # An unreadable or user-modified link is never deleted as ours.
 }
 function Get-PocketBackup([string]$Path) {
     $hash = Get-PocketFileHash $Path
@@ -189,14 +193,25 @@ function Assert-PocketBackup($Backup) {
     if ($null -eq $Backup.bytes) { if ($null -ne $Backup.hash) { throw 'Invalid backup integrity.' }; return }
     if ((Get-PocketBytesHash ([Convert]::FromBase64String($Backup.bytes))) -ne $Backup.hash) { throw 'Backup integrity check failed.' }
 }
-function Write-PocketBackup($Backup) {
+function Write-PocketBackup($Backup,[AllowNull()]$ExpectedHash,[switch]$Compare) {
     Assert-PocketBackup $Backup
     Assert-PocketPlainPath $Backup.path
-    if ($null -eq $Backup.bytes) { if ([IO.File]::Exists($Backup.path)) { [IO.File]::Delete($Backup.path) } }
+    if ($Compare -and (Get-PocketFileHash $Backup.path) -ne $ExpectedHash) { throw 'Shortcut or integration changed during publication; refusing drift.' }
+    if ($null -eq $Backup.bytes) { if ([IO.File]::Exists($Backup.path)) {
+        if($Compare){Initialize-PocketShellLink;[PocketShellLink]::DeleteIfHash($Backup.path,$ExpectedHash)}else{[IO.File]::Delete($Backup.path)}
+    } }
     else { [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Backup.path)); Write-PocketAtomic $Backup.path ([Convert]::FromBase64String($Backup.bytes)) }
 }
-function Get-PocketIntegrationSnapshot([string]$Manifest,[string[]]$Links) {
-    return @{manifest=(Get-PocketBackup $Manifest);links=@($Links|ForEach-Object{Get-PocketBackup $_});cli=(Get-PocketUserCliPath);cliKind=(Get-PocketUserCliKind);task=(Get-PocketTaskXml)}
+function Get-PocketIntegrationSnapshot([string]$Manifest,[string[]]$Links,[switch]$AllowUnknownTask,[switch]$SkipTask) {
+    $snapshot=@{manifest=(Get-PocketBackup $Manifest);links=@($Links|ForEach-Object{Get-PocketBackup $_});cli=(Get-PocketUserCliPath);cliKind=(Get-PocketUserCliKind);task=$null;taskKnown=$false}
+    if (-not $SkipTask) {
+        try { $snapshot.task=Get-PocketTaskXml; $snapshot.taskKnown=$true }
+        catch {
+            if (-not $AllowUnknownTask) { throw }
+            $snapshot.taskFailure=Get-PocketOptionalFailure $_ 'startup_read' 'startup_snapshot_unknown' 'Get-PocketTaskXml'
+        }
+    }
+    return $snapshot
 }
 function Get-PocketProperty($Value,[string]$Name,$Fallback) {
     if($Value -is [Collections.IDictionary]) { if($Value.Contains($Name)){return $Value[$Name]} }
@@ -217,7 +232,7 @@ function Save-PocketRollbackSnapshot($Snapshot,[string]$InstallRoot) {
     } else { Write-PocketAtomic $path ([Convert]::FromBase64String($Snapshot.manifest.bytes)) }
     # Never embed the preceding installation recursively: the stable bootstrap
     # intentionally bounds its current record to 1 MiB.
-    return @{manifest=@{path=$Snapshot.manifest.path;hash=$hash;bytes=$null;archiveFile=$hash+'.json'};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=$Snapshot.cliKind;task=$Snapshot.task}
+    return @{manifest=@{path=$Snapshot.manifest.path;hash=$hash;bytes=$null;archiveFile=$hash+'.json'};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=$Snapshot.cliKind;task=$Snapshot.task;taskKnown=(Get-PocketProperty $Snapshot 'taskKnown' $true)}
 }
 function Read-PocketRollbackSnapshot($Snapshot,[string]$InstallRoot) {
     $archive=Get-PocketProperty $Snapshot.manifest 'archiveFile' $null
@@ -228,11 +243,13 @@ function Read-PocketRollbackSnapshot($Snapshot,[string]$InstallRoot) {
     if ((Get-Item -LiteralPath $path).Length -gt 64MB) { throw 'Rollback archive exceeds limit.' }
     $backup=Get-PocketBackup $path
     if ($backup.hash -ne $Snapshot.manifest.hash) { throw 'Rollback archive integrity failed.' }
-    return @{manifest=@{path=$Snapshot.manifest.path;hash=$backup.hash;bytes=$backup.bytes};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=(Get-PocketProperty $Snapshot 'cliKind' 'String');task=$Snapshot.task}
+    return @{manifest=@{path=$Snapshot.manifest.path;hash=$backup.hash;bytes=$backup.bytes};links=$Snapshot.links;cli=$Snapshot.cli;cliKind=(Get-PocketProperty $Snapshot 'cliKind' 'String');task=$Snapshot.task;taskKnown=(Get-PocketProperty $Snapshot 'taskKnown' $true)}
 }
 function Assert-PocketSnapshot($Snapshot,[string]$Manifest,[string[]]$Links) {
     if ($Snapshot.manifest.path -ne $Manifest -or $Snapshot.links.Count -ne $Links.Count) { throw 'Invalid recovery record path.' }
     Assert-PocketBackup $Snapshot.manifest
+    if ((Get-PocketProperty $Snapshot 'taskKnown' $true) -isnot [bool]) { throw 'Invalid scheduled task snapshot flag.' }
+    if (-not (Get-PocketProperty $Snapshot 'taskKnown' $true) -and $null -ne $Snapshot.task) { throw 'Unknown scheduled task snapshot cannot contain an authoritative task.' }
     if((Get-PocketProperty $Snapshot 'cliKind' 'String') -notin @('String','ExpandString')) { throw 'Invalid recovery environment kind.' }
     for($i=0;$i -lt $Links.Count;$i++) {
         if ($Snapshot.links[$i].path -ne $Links[$i]) { throw 'Invalid recovery shortcut record path.' }
@@ -242,24 +259,109 @@ function Assert-PocketSnapshot($Snapshot,[string]$Manifest,[string[]]$Links) {
 function Restore-PocketTransaction($Journal,[string]$Manifest,[string[]]$Links,[string]$Launcher) {
     Assert-PocketSnapshot $Journal.before $Manifest $Links
     Assert-PocketSnapshot $Journal.after $Manifest $Links
+    if ((Get-PocketProperty $Journal 'taskManaged' $true) -isnot [bool] -or (Get-PocketProperty $Journal 'optionalIntegration' $false) -isnot [bool]) { throw 'Invalid recovery integration flags.' }
     $cli=Get-PocketUserCliPath
     if ($cli -ne $Journal.before.cli -and $cli -ne $Journal.after.cli) { throw 'Environment drift during recovery.' }
     $kind=Get-PocketUserCliKind
     $beforeKind=Get-PocketProperty $Journal.before 'cliKind' 'String'
     $afterKind=Get-PocketProperty $Journal.after 'cliKind' 'String'
     if ($kind -ne $beforeKind -and $kind -ne $afterKind) { throw 'Environment kind drift during recovery.' }
+    $linkHashes=@()
     foreach($i in 0..($Links.Count-1)) {
         $hash=Get-PocketFileHash $Links[$i]
         if ($hash -ne $Journal.before.links[$i].hash -and $hash -ne $Journal.after.links[$i].hash) { throw 'Shortcut drift during recovery.' }
+        $linkHashes+=,$hash
     }
     $hash=Get-PocketFileHash $Manifest
     if ($hash -ne $Journal.before.manifest.hash -and $hash -ne $Journal.after.manifest.hash) { throw 'Installation record drift during recovery.' }
-    $task=Get-PocketTaskXml
-    if (-not (Test-PocketTaskEquivalent $task $Journal.before.task) -and -not (Test-PocketTaskEquivalent $task $Journal.after.task)) { throw 'Scheduled task drift during recovery.' }
-    if ($task -ne $Journal.before.task) { Set-PocketTaskXml $Journal.before.task }
-    foreach($backup in $Journal.before.links) { Write-PocketBackup $backup }
+    if (Get-PocketProperty $Journal 'taskManaged' $true) {
+        if (-not (Get-PocketProperty $Journal.before 'taskKnown' $true) -or -not (Get-PocketProperty $Journal.after 'taskKnown' $true)) { throw 'Cannot restore an unknown scheduled task snapshot.' }
+        $task=Get-PocketTaskXml
+        if (-not (Test-PocketTaskEquivalent $task $Journal.before.task) -and -not (Test-PocketTaskEquivalent $task $Journal.after.task)) { throw 'Scheduled task drift during recovery.' }
+        if (-not (Test-PocketTaskEquivalent $task $Journal.before.task)) { Set-PocketTaskXml $Journal.before.task }
+    } elseif ($Journal.before.task -cne $Journal.after.task -or (Get-PocketProperty $Journal.before 'taskKnown' $true) -ne (Get-PocketProperty $Journal.after 'taskKnown' $true)) { throw 'Invalid unmanaged task recovery record.' }
+    for($i=0;$i -lt $Journal.before.links.Count;$i++) {
+        $backup=$Journal.before.links[$i]
+        if ($linkHashes[$i] -ne $backup.hash) { Write-PocketBackup $backup -ExpectedHash $linkHashes[$i] -Compare }
+    }
     if ($cli -ne $Journal.before.cli -or $kind -ne $beforeKind) { Set-PocketUserCliPath $Journal.before.cli $beforeKind; Send-PocketEnvironmentChanged }
-    Write-PocketBackup $Journal.before.manifest
+    if ((Get-PocketFileHash $Manifest) -ne $Journal.before.manifest.hash) { Write-PocketBackup $Journal.before.manifest }
+}
+function Set-PocketProperty($Value,[string]$Name,$Content) {
+    if ($Value -is [Collections.IDictionary]) { $Value[$Name]=$Content }
+    else { $Value | Add-Member -NotePropertyName $Name -NotePropertyValue $Content -Force }
+}
+function Get-PocketOptionalFailure($Failure,[string]$Stage,[string]$Code,[string]$Call) {
+    $exception=$Failure.Exception
+    $data=$exception.Data
+    while ($null -ne $exception.InnerException) { $exception=$exception.InnerException }
+    return @{state='pending';stage=$(if($data.Contains('PocketStage')){$data['PocketStage']}else{$Stage});code=$Code;call=$(if($data.Contains('PocketCall')){$data['PocketCall']}else{$Call});hresult=$(if($data.Contains('PocketHResult')){$data['PocketHResult']}else{'0x'+$exception.HResult.ToString('X8')})}
+}
+function New-PocketPendingIntegration([string]$Stage) { return @{state='pending';stage=$Stage;code='integration_pending';call=$null;hresult=$null} }
+function Update-PocketInstallState($Record) {
+    $pending=@($Record.integration.shortcuts | Where-Object {$_.state -ne 'completed'}).Count -gt 0 -or $Record.integration.startup.state -ne 'completed'
+    Set-PocketProperty $Record 'installationState' $(if($pending){'installed_incomplete'}else{'installed'})
+    Set-PocketProperty $Record 'coreInstalled' $true
+    Set-PocketProperty $Record 'runtimeVerification' 'pending'
+}
+function Get-PocketInstallResult($Plan,$Record) {
+    Update-PocketInstallState $Record
+    $Plan.state=$Record.installationState
+    $Plan.coreInstalled=$true
+    $Plan.runtimeVerification='pending'
+    $Plan.exitCode=if($Plan.state -eq 'installed_incomplete'){2}else{0}
+    $Plan.pendingIntegration=@()
+    for($i=0;$i -lt 3;$i++) { if($Record.integration.shortcuts[$i].state -ne 'completed') { $Plan.pendingIntegration+=@{step=('shortcut_'+$i);details=$Record.integration.shortcuts[$i]} } }
+    if ($Record.integration.startup.state -ne 'completed') { $Plan.pendingIntegration+=@{step='startup';details=$Record.integration.startup} }
+    return $Plan
+}
+function Get-PocketRecordBackup($Record,[string]$Path) {
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record | ConvertTo-Json -Depth 30))
+    return @{path=$Path;bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
+}
+function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[string]$Manifest,[string[]]$Links,[string]$Launcher,[switch]$TaskManaged,[switch]$Optional) {
+    $journal=@{before=$Before;after=$After;taskManaged=[bool]$TaskManaged;optionalIntegration=[bool]$Optional}
+    Write-PocketJson $JournalPath $journal
+    try {
+        for($i=0;$i -lt $After.links.Count;$i++) {
+            $backup=$After.links[$i]
+            if ((Get-PocketFileHash $backup.path) -ne $backup.hash) {
+                Invoke-PocketInstallStep 'shortcut_publish' 'Write-PocketBackup' { Write-PocketBackup $backup -ExpectedHash $Before.links[$i].hash -Compare } | Out-Null
+            }
+            if ((Get-PocketFileHash $backup.path) -ne $backup.hash) { throw 'Shortcut publication integrity check failed.' }
+        }
+        if ((Get-PocketUserCliPath) -ne $Before.cli -or (Get-PocketUserCliKind) -ne $Before.cliKind) { throw 'Environment changed during integration.' }
+        $afterKind=Get-PocketProperty $After 'cliKind' 'String'
+        if ($Before.cli -ne $After.cli -or $Before.cliKind -ne $afterKind) { Set-PocketUserCliPath $After.cli $afterKind; Send-PocketEnvironmentChanged }
+        if ($TaskManaged) {
+            if (-not (Get-PocketProperty $Before 'taskKnown' $true) -or -not (Get-PocketProperty $After 'taskKnown' $true)) { throw 'Cannot mutate an unknown scheduled task snapshot.' }
+            if (-not (Test-PocketTaskEquivalent (Get-PocketTaskXml) $Before.task)) { throw 'Scheduled task changed during integration.' }
+            if (-not (Test-PocketTaskEquivalent $Before.task $After.task)) { Set-PocketTaskXml $After.task }
+            if (-not (Test-PocketTaskEquivalent (Get-PocketTaskXml) $After.task)) { throw 'Scheduled task publication verification failed.' }
+        }
+        if ((Get-PocketFileHash $Manifest) -ne $Before.manifest.hash) { throw 'Installation record changed during publication.' }
+        if ($Before.manifest.hash -ne $After.manifest.hash) {
+            Invoke-PocketInstallStep 'installation_publish' 'Write-PocketBackup' { Write-PocketBackup $After.manifest } | Out-Null
+        }
+        if ((Get-PocketFileHash $Manifest) -ne $After.manifest.hash) { throw 'Installation publication integrity check failed.' }
+        [IO.File]::Delete($JournalPath)
+        return @{succeeded=$true;recoveryPending=$false}
+    } catch {
+        $failure=$_; $pending=$false
+        try { Invoke-PocketInstallStep 'rollback' 'Restore-PocketTransaction' { Restore-PocketTransaction $journal $Manifest $Links $Launcher } | Out-Null; [IO.File]::Delete($JournalPath) }
+        catch { $pending=$true; Write-Warning 'Recovery is incomplete. Private journal retained; retry -Apply after resolving the locked or changed integration.' }
+        if (-not $Optional) { throw $failure }
+        $journal.failure=Get-PocketOptionalFailure $failure 'integration' 'integration_apply_failed' 'Invoke-PocketInstallTransaction'
+        if ($failure.Exception.Data['PocketStage'] -eq 'installation_publish') { $failure.Exception.Data['PocketCoreFailure']=$true; throw $failure }
+        if ($pending) { Write-PocketJson $JournalPath $journal }
+        return @{succeeded=$false;failure=$failure;recoveryPending=$pending}
+    }
+}
+function Save-PocketIntegrationRecord($Record,[string]$Manifest,[string[]]$Links,[string]$Launcher,[string]$Journal) {
+    Update-PocketInstallState $Record
+    $before=Get-PocketIntegrationSnapshot $Manifest $Links -SkipTask
+    $after=@{manifest=(Get-PocketRecordBackup $Record $Manifest);links=$before.links;cli=$before.cli;cliKind=$before.cliKind;task=$before.task;taskKnown=$before.taskKnown}
+    Invoke-PocketInstallTransaction $before $after $Journal $Manifest $Links $Launcher | Out-Null
 }
 function Invoke-PocketWindowsInstall {
     [CmdletBinding()]
@@ -288,10 +390,28 @@ function Invoke-PocketWindowsInstall {
         if ([IO.File]::Exists($journalPath)) {
             if (-not $Apply) { throw 'Interrupted installation requires -Apply to recover before a new plan.' }
             $journal=Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            Restore-PocketTransaction $journal $manifestPath $links $launcher
+            try { Restore-PocketTransaction $journal $manifestPath $links $launcher }
+            catch {
+                if (-not (Get-PocketProperty $journal 'optionalIntegration' $false) -or $Uninstall -or $Rollback) { throw }
+                # An optional mutation with an unknown outcome must be recovered
+                # before replay. Keep its journal and the already committed core.
+                $record=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($record.version -ne 3 -or $record.installRoot -ne $installRoot -or $record.bridge -ne $launcher -or $record.generation -notmatch '^[a-f0-9]{64}$' -or $record.releaseHash -ne $record.generation -or (Get-PocketFileHash $launcher) -ne $record.launcherHash) { throw 'Invalid committed core during optional recovery.' }
+                $bin=Join-Path $installRoot ('bin\'+$record.generation)
+                Test-PocketWindowsDirectory $bin | Out-Null
+                if ((Get-PocketFileHash (Join-Path $bin 'windows-manifest.json')) -ne $record.generation) { throw 'Committed generation failed verification.' }
+                $plan=@{action='install';applied=$true;installRoot=$installRoot;stateDirectory=$record.stateDirectory;processesStarted=0;processesStopped=0;shortcuts=$links;scheduledTask=(Get-PocketTaskName);recoveryPending=$true}
+                $result=Get-PocketInstallResult $plan $record
+                $result.state='installed_incomplete';$result.exitCode=2
+                $result.recoveryFailure=Get-PocketOptionalFailure $_ 'rollback' 'integration_recovery_pending' 'Restore-PocketTransaction'
+                $originalFailure=Get-PocketProperty $journal 'failure' $null
+                if ($null -ne $originalFailure) { $result.pendingIntegration+=@{step='recovery';details=$originalFailure} }
+                Write-PocketInstallEvent ($result.recoveryFailure+@{recovery='pending'})
+                return $result
+            }
             [IO.File]::Delete($journalPath)
         }
-        $before=Get-PocketIntegrationSnapshot $manifestPath $links
+        $before=Invoke-PocketInstallStep 'integration_read' 'Get-PocketIntegrationSnapshot' { Get-PocketIntegrationSnapshot $manifestPath $links -AllowUnknownTask }
         $saved=$null
         if ($before.manifest.bytes) {
             $saved=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($before.manifest.bytes)) | ConvertFrom-Json
@@ -307,14 +427,20 @@ function Invoke-PocketWindowsInstall {
             }
             if ($saved.version -eq 3 -and (Get-PocketFileHash $launcher) -ne $saved.launcherHash) { throw 'Stable launcher integrity check failed.' }
             if ((Get-PocketProperty $saved 'previousCliKind' 'String') -notin @('String','ExpandString')) { throw 'Invalid original environment kind.' }
+            if ((Get-PocketProperty $saved 'previousTaskKnown' $true) -isnot [bool]) { throw 'Invalid original task snapshot flag.' }
+            $integration=Get-PocketProperty $saved 'integration' $null
+            if ($null -ne $integration) {
+                if ($integration.shortcuts.Count -ne 3 -or $integration.startup.state -notin @('pending','completed') -or @($integration.shortcuts | Where-Object {$_.state -notin @('pending','completed')}).Count -gt 0) { throw 'Invalid optional integration record.' }
+                if ((Get-PocketProperty $saved 'startupPreference' 'Preserve') -notin @('Preserve','Enable','Disable')) { throw 'Invalid requested startup preference.' }
+            }
         }
-        Assert-PocketTaskOwned $before.task $launcher
         if (($Uninstall -or $Rollback) -and -not $saved) { return @{action='restore';applied=$false;installed=$false} }
         if ($Rollback -and ($saved.version -ne 3 -or -not $saved.rollback)) { throw 'No previous installation available for rollback.' }
+        if (($Uninstall -or $Rollback) -and -not $before.taskKnown -and (Get-PocketProperty $saved 'previousTaskKnown' $true)) { throw 'Scheduled task snapshot is unknown; restoration remains pending without mutation.' }
         if (-not ($Uninstall -or $Rollback)) {
-            Assert-PocketWindowsPrerequisites
+            Invoke-PocketInstallStep 'prerequisites' 'Assert-PocketWindowsPrerequisites' { Assert-PocketWindowsPrerequisites } | Out-Null
             $SourceDirectory=Get-PocketDirectoryPath $SourceDirectory
-            $release=Test-PocketWindowsDirectory $SourceDirectory
+            $release=Invoke-PocketInstallStep 'payload_verify' 'Test-PocketWindowsDirectory' { Test-PocketWindowsDirectory $SourceDirectory }
             $releaseHash=Get-PocketFileHash (Join-Path $SourceDirectory 'windows-manifest.json')
             $generation=$releaseHash
             if (-not $StateDirectory) { $StateDirectory=if($saved){$saved.stateDirectory}else{Join-Path $installRoot 'agent'} }
@@ -344,13 +470,15 @@ function Invoke-PocketWindowsInstall {
         if ($Rollback) {
             $after=Read-PocketRollbackSnapshot $saved.rollback $installRoot
             Assert-PocketSnapshot $after $manifestPath $links
+            # Unknown snapshots never authorize a task mutation on rollback.
+            if (-not (Get-PocketProperty $after 'taskKnown' $true)) { $after.task=$before.task; $after.taskKnown=$before.taskKnown }
         } elseif ($Uninstall) {
-            $after=@{manifest=$before.manifest;cli=$saved.previousCliPath;cliKind=(Get-PocketProperty $saved 'previousCliKind' 'String');task=$(if($saved.version -eq 3){$saved.previousTask}else{$null});links=@()}
+            $after=@{manifest=$before.manifest;cli=$saved.previousCliPath;cliKind=(Get-PocketProperty $saved 'previousCliKind' 'String');task=$(if($saved.version -eq 3 -and (Get-PocketProperty $saved 'previousTaskKnown' $true)){$saved.previousTask}else{$before.task});taskKnown=$before.taskKnown;links=@()}
             foreach($entry in $saved.shortcuts) { $after.links+=@{path=$entry.path;bytes=$entry.original;hash=$entry.originalHash} }
         } else {
             if ($fresh) {
                 $freshStage=$StateDirectory+'.staging-'+[guid]::NewGuid().ToString('N')
-                Initialize-PocketPrivateState (Join-Path $SourceDirectory 'pocket-agent.exe') $freshStage
+                Invoke-PocketInstallStep 'identity_initialize' 'pocket-agent init' { Initialize-PocketPrivateState (Join-Path $SourceDirectory 'pocket-agent.exe') $freshStage } | Out-Null
                 $plan.processesStarted=1
                 Assert-PocketInitializedState $freshStage
                 Move-PocketStagedDirectory $freshStage $StateDirectory
@@ -364,58 +492,166 @@ function Invoke-PocketWindowsInstall {
                 if ((Get-PocketFileHash (Join-Path $stage 'windows-manifest.json')) -ne $releaseHash) { throw 'Staged manifest hash does not match the planned generation.' }
                 Move-PocketStagedDirectory $stage $bin
             }
-            Test-PocketWindowsDirectory $bin | Out-Null
+            Invoke-PocketInstallStep 'staged_verify' 'Test-PocketWindowsDirectory' { Test-PocketWindowsDirectory $bin } | Out-Null
             if ((Get-PocketFileHash (Join-Path $bin 'windows-manifest.json')) -ne $releaseHash) { throw 'Installed manifest hash does not match the planned generation.' }
             # The bootstrap ABI stays stable across deliveries. Never replace an in-use bootstrap.
             if (-not [IO.File]::Exists($launcher)) { Write-PocketAtomic $launcher ([IO.File]::ReadAllBytes((Join-Path $bin 'pocket-launcher.exe'))) }
             elseif (-not $saved -and (Get-PocketFileHash $launcher) -ne (Get-PocketFileHash (Join-Path $bin 'pocket-launcher.exe'))) { throw 'Unmanaged stable launcher exists.' }
-            $savedUi=$saved -and $saved.version -eq 3 -and $null -ne $saved.shortcuts[2].installed
-            $uiEnabled=$false # The scheduled supervisor now also owns background tray startup.
-            $startupUnchanged=$UiStartup -eq 'Preserve' -or ((Test-PocketTaskLogon $before.task) -eq ($UiStartup -eq 'Enable'))
-            $unchanged=$startupUnchanged -and $saved -and $saved.version -eq 3 -and $saved.generation -eq $generation -and $savedUi -eq $uiEnabled -and ([Convert]::FromBase64String($before.manifest.bytes)).Length -lt 1MB
-            if ($unchanged) { $candidate=$saved }
-            else {
+            $icon=Join-Path $installRoot ('resources\'+(Get-PocketFileHash (Join-Path $bin 'codex-pocket.ico'))+'\codex-pocket.ico')
+            Assert-PocketUnredirectedPath $icon
+            if (-not [IO.File]::Exists($icon)) { [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($icon)); Write-PocketAtomic $icon ([IO.File]::ReadAllBytes((Join-Path $bin 'codex-pocket.ico'))) }
+            if ((Get-PocketFileHash $icon) -ne (Get-PocketFileHash (Join-Path $bin 'codex-pocket.ico'))) { throw 'Stable icon integrity check failed.' }
+            $sameGeneration=$saved -and (Get-PocketProperty $saved 'singleEntry' $false) -and $saved.version -eq 3 -and $saved.generation -eq $generation -and ([Convert]::FromBase64String($before.manifest.bytes)).Length -lt 1MB
+            if ($sameGeneration -and (Get-PocketProperty $saved 'integration' $null)) {
+                $candidate=$saved
+                for($i=0;$i -lt 3;$i++) {
+                    if ($before.links[$i].hash -ne $candidate.shortcuts[$i].installedHash) {
+                        $candidate.integration.shortcuts[$i]=New-PocketPendingIntegration 'shortcut'
+                        $candidate.shortcuts[$i].installed=$before.links[$i].bytes
+                        $candidate.shortcuts[$i].installedHash=$before.links[$i].hash
+                    }
+                }
+                if ($before.cli -ne $launcher -or ($before.taskKnown -and $null -eq $before.task)) { $candidate.integration.startup=New-PocketPendingIntegration 'startup_register' }
+                if ($UiStartup -ne 'Preserve' -and ($UiStartup -ne (Get-PocketProperty $candidate 'startupPreference' 'Preserve') -or ($before.taskKnown -and (Test-PocketTaskLogon $before.task) -ne ($UiStartup -eq 'Enable')))) {
+                    if ($candidate.integration.startup.state -eq 'completed') { Set-PocketProperty $candidate 'rollback' (Save-PocketRollbackSnapshot $before $installRoot) }
+                    $candidate.integration.startup=New-PocketPendingIntegration 'startup_register'
+                    Set-PocketProperty $candidate 'startupPreference' $UiStartup
+                }
+            } else {
                 $entries=@()
                 for($i=0;$i -lt 3;$i++) {
                     $original=if($saved){$saved.shortcuts[$i].original}else{$before.links[$i].bytes}
                     $originalHash=if($saved){$saved.shortcuts[$i].originalHash}else{$before.links[$i].hash}
-                    $bytes=if($i -eq 2 -and -not $uiEnabled){$null}else{New-PocketShortcutBytes (Join-Path $installRoot ([guid]::NewGuid().ToString('N')+'.lnk')) $launcher $(if($i -eq 1){'--pocket-desktop'}else{'--pocket-ui'})}
-                    $entries+=@{path=$links[$i];original=$original;originalHash=$originalHash;installed=$(if($null -ne $bytes){[Convert]::ToBase64String($bytes)}else{$null});installedHash=$(if($null -ne $bytes){Get-PocketBytesHash $bytes}else{$null})}
+                    $entries+=@{path=$links[$i];original=$original;originalHash=$originalHash;installed=$before.links[$i].bytes;installedHash=$before.links[$i].hash}
                 }
-                $candidate=[ordered]@{version=3;installRoot=$installRoot;generation=$generation;releaseHash=$releaseHash;bridge=$launcher;launcherHash=(Get-PocketFileHash $launcher);stateDirectory=$StateDirectory;previousCliPath=$(if($saved){$saved.previousCliPath}else{$before.cli});previousCliKind=$(if($saved){Get-PocketProperty $saved 'previousCliKind' 'String'}else{$before.cliKind});previousTask=$(if($saved -and $saved.version -eq 3){$saved.previousTask}else{$before.task});shortcuts=$entries;rollback=$(if($saved){Save-PocketRollbackSnapshot $before $installRoot}else{$null})}
+                $candidate=[ordered]@{version=3;installRoot=$installRoot;generation=$generation;releaseHash=$releaseHash;bridge=$launcher;launcherHash=(Get-PocketFileHash $launcher);stateDirectory=$StateDirectory;previousCliPath=$(if($saved){$saved.previousCliPath}else{$before.cli});previousCliKind=$(if($saved){Get-PocketProperty $saved 'previousCliKind' 'String'}else{$before.cliKind});previousTask=$(if($saved -and $saved.version -eq 3){$saved.previousTask}else{$before.task});previousTaskKnown=$(if($saved){Get-PocketProperty $saved 'previousTaskKnown' $true}else{$before.taskKnown});shortcuts=$entries;rollback=$(if($saved){Save-PocketRollbackSnapshot $before $installRoot}else{$null})}
+                $candidate.singleEntry=$true
+                $candidate.integration=@{shortcuts=@((New-PocketPendingIntegration 'shortcut'),(New-PocketPendingIntegration 'shortcut'),(New-PocketPendingIntegration 'shortcut'));startup=(New-PocketPendingIntegration 'startup_register')}
+                $candidate.startupPreference=$UiStartup
                 if ($saved) {
                     $archive=Join-Path $installRoot ('desktop-install.'+$saved.generation+'.json')
                     if (-not [IO.File]::Exists($archive)) { Write-PocketAtomic $archive ([Convert]::FromBase64String($before.manifest.bytes)) }
                 }
             }
-            $recordBytes=[Text.UTF8Encoding]::new($false).GetBytes(($candidate|ConvertTo-Json -Depth 30))
-            # Preserve the exact record on an idempotent apply.
-            $recordBackup=if($unchanged){$before.manifest}else{@{path=$manifestPath;bytes=[Convert]::ToBase64String($recordBytes);hash=(Get-PocketBytesHash $recordBytes)}}
-            $logon=if($UiStartup -eq 'Enable'){$true}elseif($UiStartup -eq 'Disable'){$false}elseif($null -ne $before.task){Test-PocketTaskLogon $before.task}else{$true}
-            $after=@{manifest=$recordBackup;cli=$launcher;cliKind='String';task=$(if($null -ne $before.task -and (Test-PocketTaskLogon $before.task) -eq $logon){$before.task}else{New-PocketTaskXml $launcher $logon});links=@()}
-            foreach($entry in $candidate.shortcuts) { $after.links+=@{path=$entry.path;bytes=$entry.installed;hash=$entry.installedHash} }
+            Update-PocketInstallState $candidate
+            if (-not $before.taskKnown -and (Get-PocketProperty $before 'taskFailure' $null)) {
+                $candidate.integration.startup=$before.taskFailure
+                Update-PocketInstallState $candidate
+            }
+            $recordBackup=Get-PocketRecordBackup $candidate $manifestPath
+            # A completed repeat apply preserves the exact record bytes, including
+            # any legacy JSON formatting, and never changes its rollback archive.
+            if ($sameGeneration -and $candidate.installationState -eq 'installed' -and $UiStartup -eq 'Preserve') { $recordBackup=$before.manifest }
+            $after=@{manifest=$recordBackup;cli=$launcher;cliKind='String';task=$before.task;taskKnown=$before.taskKnown;links=$before.links}
         }
-        $journal=@{before=$before;after=$after}
-        Write-PocketJson $journalPath $journal
-        try {
-            foreach($backup in $after.links) { if ((Get-PocketFileHash $backup.path) -ne $backup.hash) { Write-PocketBackup $backup } }
-            if ((Get-PocketUserCliPath) -ne $before.cli -or (Get-PocketUserCliKind) -ne $before.cliKind) { throw 'Environment changed during integration.' }
-            $afterKind=Get-PocketProperty $after 'cliKind' 'String'
-            if ($before.cli -ne $after.cli -or $before.cliKind -ne $afterKind) { Set-PocketUserCliPath $after.cli $afterKind; Send-PocketEnvironmentChanged }
-            if ((Get-PocketTaskXml) -ne $before.task) { throw 'Scheduled task changed during integration.' }
-            if ($before.task -ne $after.task) { Set-PocketTaskXml $after.task }
-            Write-PocketBackup $after.manifest
-            [IO.File]::Delete($journalPath)
-        } catch {
-            $failure=$_
-            try { Restore-PocketTransaction $journal $manifestPath $links $launcher; [IO.File]::Delete($journalPath) }
-            catch { Write-Warning 'Recovery is incomplete. Private journal retained; retry -Apply after resolving the locked or changed integration.' }
-            throw $failure
+        $taskManaged=($Uninstall -or $Rollback) -and $before.task -cne $after.task
+        if ($taskManaged) {
+            if (-not $before.taskKnown) { throw 'Scheduled task snapshot is unknown; restore remains pending without mutation.' }
+            Assert-PocketTaskOwned $before.task $launcher
         }
-        return $plan
+        Invoke-PocketInstallTransaction $before $after $journalPath $manifestPath $links $launcher -TaskManaged:$taskManaged | Out-Null
+        if ($Uninstall -or $Rollback) { return $plan }
+        # Optional integrations commit independently after core publication. Their
+        # rollback target is this verified core, never the preceding generation.
+        for($i=0;$i -lt 3;$i++) {
+            if ($candidate.integration.shortcuts[$i].state -eq 'completed') { continue }
+            $snapshot=Get-PocketIntegrationSnapshot $manifestPath $links -SkipTask
+            try {
+                $entry=$candidate.shortcuts[$i]
+                Invoke-PocketInstallStep 'shortcut_publish' 'compare_committed_shortcut_snapshot' {
+                    if ($snapshot.links[$i].hash -ne $entry.installedHash) { throw 'Shortcut changed after core publication; refusing drift.' }
+                } | Out-Null
+                $backup=$snapshot.links[$i]
+                if ($i -eq 0) {
+                    $bytes=New-PocketShortcutBytes (Join-Path $installRoot ([guid]::NewGuid().ToString('N')+'.lnk')) $launcher '--pocket-ui' $icon
+                    $backup=@{path=$links[$i];bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
+                } elseif ($saved -and $snapshot.links[$i].hash -eq $saved.shortcuts[$i].installedHash -and $snapshot.links[$i].hash -ne $saved.shortcuts[$i].originalHash -and
+                    (Test-PocketShortcutTarget $links[$i] $launcher $(if($i -eq 1){'--pocket-desktop'}else{'--pocket-ui'}))) {
+                    $backup=@{path=$links[$i];bytes=$entry.original;hash=$entry.originalHash}
+                }
+                $entry.installed=$backup.bytes; $entry.installedHash=$backup.hash
+                $candidate.integration.shortcuts[$i]=@{state='completed';stage='shortcut';code='integration_completed';call=$null;hresult=$null}
+                Update-PocketInstallState $candidate
+                $targetLinks=@($snapshot.links); $targetLinks[$i]=$backup
+                $target=@{manifest=(Get-PocketRecordBackup $candidate $manifestPath);links=$targetLinks;cli=$snapshot.cli;cliKind=$snapshot.cliKind;task=$snapshot.task;taskKnown=$snapshot.taskKnown}
+                $outcome=Invoke-PocketInstallTransaction $snapshot $target $journalPath $manifestPath $links $launcher -Optional
+                if (-not $outcome.succeeded) { throw $outcome.failure }
+            } catch {
+                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -eq 'installation_publish') { throw }
+                # Reload the committed record; installedHash must describe actual
+                # published bytes, never a failed COM or publication intention.
+                $candidate=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $candidate.integration.shortcuts[$i]=Get-PocketOptionalFailure $_ 'shortcut' 'shortcut_integration_failed' 'New-PocketShortcutBytes'
+                Write-PocketInstallEvent ($candidate.integration.shortcuts[$i]+@{recovery='retry_shortcut';slot=$i})
+                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Get-PocketInstallResult $plan $candidate }
+                Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
+            }
+        }
+        if ($candidate.integration.startup.state -ne 'completed') {
+            try {
+                if (-not $before.taskKnown) {
+                    $failure=Get-PocketProperty $before 'taskFailure' (New-PocketPendingIntegration 'startup_read')
+                    $candidate.integration.startup=$failure
+                    Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
+                    return Get-PocketInstallResult $plan $candidate
+                }
+                Invoke-PocketInstallStep 'startup_ownership' 'Assert-PocketTaskOwned' { Assert-PocketTaskOwned $before.task $launcher } | Out-Null
+                $rollbackSnapshot=Get-PocketProperty $candidate 'rollback' $null
+                if ($null -ne $rollbackSnapshot -and -not (Get-PocketProperty $rollbackSnapshot 'taskKnown' $true)) {
+                    # No task was mutated while its snapshot was unknown. The
+                    # first owned, readable snapshot is retained before retry.
+                    Set-PocketProperty $rollbackSnapshot 'task' $before.task
+                    Set-PocketProperty $rollbackSnapshot 'taskKnown' $true
+                    Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
+                }
+                if (-not (Get-PocketProperty $candidate 'previousTaskKnown' $true)) {
+                    Set-PocketProperty $candidate 'previousTask' $before.task
+                    Set-PocketProperty $candidate 'previousTaskKnown' $true
+                    # Commit the first authoritative original BEFORE any register.
+                    Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
+                }
+                $preference=Get-PocketProperty $candidate 'startupPreference' 'Preserve'
+                $logon=if($preference -eq 'Enable'){$true}elseif($preference -eq 'Disable'){$false}elseif($null -ne $before.task){Test-PocketTaskLogon $before.task}else{$true}
+                $task=if($null -ne $before.task -and (Test-PocketTaskLogon $before.task) -eq $logon){$before.task}else{New-PocketTaskXml $launcher $logon}
+                $snapshot=Get-PocketIntegrationSnapshot $manifestPath $links -SkipTask
+                $snapshot.task=$before.task; $snapshot.taskKnown=$true
+                $candidate.integration.startup=@{state='completed';stage='startup_register';code='integration_completed';call=$null;hresult=$null}
+                Update-PocketInstallState $candidate
+                $target=@{manifest=(Get-PocketRecordBackup $candidate $manifestPath);links=$snapshot.links;cli=$snapshot.cli;cliKind=$snapshot.cliKind;task=$task;taskKnown=$true}
+                $outcome=Invoke-PocketInstallTransaction $snapshot $target $journalPath $manifestPath $links $launcher -TaskManaged -Optional
+                if (-not $outcome.succeeded) { throw $outcome.failure }
+            } catch {
+                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -eq 'installation_publish') { throw }
+                $candidate=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $candidate.integration.startup=Get-PocketOptionalFailure $_ 'startup_register' 'startup_integration_failed' 'Set-PocketTaskXml'
+                Write-PocketInstallEvent ($candidate.integration.startup+@{recovery='retry_startup'})
+                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Get-PocketInstallResult $plan $candidate }
+                Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
+            }
+        }
+        return Get-PocketInstallResult $plan $candidate
     } finally { if($owns){$mutex.ReleaseMutex()}; if($mutex){$mutex.Dispose()} }
 }
 if ($MyInvocation.InvocationName -ne '.') {
     if (-not $SourceDirectory) { $SourceDirectory=if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'windows-manifest.json')){$PSScriptRoot}else{Join-Path $PSScriptRoot '..\dist\windows'} }
-    Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -Initialize:$Initialize -UiStartup $UiStartup
+    $logPath=$null
+    try {
+        if ($Apply) { $logPath=Start-PocketInstallDiagnostics }
+        $result=Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -Initialize:$Initialize -UiStartup $UiStartup
+        $state=Get-PocketProperty $result 'state' $(if($Apply){'completed'}else{'planned'})
+        Write-PocketInstallEvent @{stage='complete';call='install';state=$state;runtimeVerification='pending'}
+        $result
+        if ($state -eq 'installed_incomplete') {
+            Write-Output ('核心文件已安装并验证，可选集成待补全。重新运行本安装包仅重试未完成步骤。后台生效待核验。诊断：'+$logPath)
+            foreach($pending in $result.pendingIntegration) { Write-Output ('待补全：'+$pending.step+'；阶段：'+$pending.details.stage+'；代码：'+$pending.details.code+'；调用：'+$pending.details.call+'；错误：'+$pending.details.hresult) }
+            exit 2
+        }
+        if ($logPath) { Write-Output ('安装操作已完成，后台生效待核验。诊断：'+$logPath) }
+    } catch {
+        $failure=$_; $stage=$_.Exception.Data['PocketStage'];$call=$_.Exception.Data['PocketCall'];$hr=$_.Exception.Data['PocketHResult']
+        if (-not $stage) { $stage='preflight_or_state';$call='Invoke-PocketWindowsInstall';$hr='0x'+$_.Exception.HResult.ToString('X8') }
+        Write-PocketInstallEvent @{stage=$stage;call=$call;state='failed';hresult=$hr;recovery='inspect_journal_then_retry'}
+        Write-Output ('安装未完成。阶段：'+$stage+'；调用：'+$call+'；错误：'+$hr+'；诊断：'+$logPath)
+        exit 1
+    }
 }

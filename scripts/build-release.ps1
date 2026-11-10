@@ -20,7 +20,7 @@ function New-PocketReleasePackage {
     if (-not $DesktopBinaryDirectory) { $DesktopBinaryDirectory=Join-Path $Root 'desktop\target\release' }
     foreach ($name in Get-PocketWindowsFiles) {
         $source = if ($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')) { Join-Path $Root ('.local\tools\' + $name) }
-            elseif ($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe')) { Join-Path $DesktopBinaryDirectory $name }
+            elseif ($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')) { Join-Path $DesktopBinaryDirectory $name }
             elseif ($name -like '*.exe') { Join-Path $BinaryDirectory $name }
             elseif ($name -like '*.md') { Join-Path $Root ('docs\' + $name) }
             else { Join-Path $Root ('scripts\' + $name) }

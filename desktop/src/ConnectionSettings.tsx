@@ -1,23 +1,25 @@
 import {RelaySetup} from './RelaySetup';
+import {RouteEvidence} from './RouteEvidence';
 import {useEffect,useState} from 'react';
 import {invoke} from '@tauri-apps/api/core';
 import type {Snapshot,RoutePreferences} from './domain';
-import {lanCandidate} from './connectionGuide';
+import {lanCandidate,automaticLanBind,lanInterfaceLabel,requireRoutePreferences,routeDisplayUrl,type LanInterface} from './connectionGuide';
 
 export function ConnectionSettings({data,busy,action}:{data:Snapshot;busy:boolean;action:(fn:()=>Promise<void>)=>Promise<void>}) {
  const [lan,setLan]=useState(''),[policy,setPolicy]=useState<RoutePreferences['policy']>('automatic'),[dirty,setDirty]=useState(false),[manualLan,setManualLan]=useState(false);
  const [firewallNotice,setFirewallNotice]=useState('');
- const [interfaces,setInterfaces]=useState<{address:string;name:string}[]>([]);
+ const [interfaces,setInterfaces]=useState<LanInterface[]>([]);
  const [token,setToken]=useState(''),[account,setAccount]=useState(''),[zone,setZone]=useState(''),[hostname,setHostname]=useState('');
  const [accounts,setAccounts]=useState<{id:string;name:string}[]>([]),[zones,setZones]=useState<{id:string;name:string}[]>([]);
  const prefs=data.routes?.routePreferences;
  useEffect(()=>{if(prefs&&!dirty){setLan(prefs.lan?.bind||'');setPolicy(prefs.policy)}},[prefs,dirty]);
- useEffect(()=>{let alive=true;void invoke<{address:string;name:string}[]>('detect_lan').then(rows=>{if(alive)setInterfaces(rows)}).catch(()=>{});return()=>{alive=false}},[]);
- useEffect(()=>{if(!prefs?.lan&&!dirty&&interfaces.length){setLan(lanCandidate(interfaces[0].address,prefs?.lan?.bind));setDirty(true)}},[prefs,interfaces,dirty]);
- const save=()=>void action(async()=>{if(!prefs||!Array.isArray(prefs.routes))throw {code:'route_preferences_unavailable',stage:'routes',message:'线路设置尚未读取，请重新检查。',retryable:true,operationId:''};await invoke('configure_routes',{preferences:{...prefs,routes:prefs.routes,autoLan:manualLan?false:prefs.autoLan,policy,lan:lan?{bind:lan,mdns:prefs?.lan?.mdns??true}:null,gateway:prefs?.gateway||{bind:'127.0.0.1:17892'}}});setDirty(false);setManualLan(false)});
+ useEffect(()=>{let alive=true;void invoke<LanInterface[]>('detect_lan').then(rows=>{if(alive)setInterfaces(rows)}).catch(()=>{});return()=>{alive=false}},[]);
+ useEffect(()=>{const candidate=automaticLanBind(prefs?.lan?.bind,interfaces);if(!prefs?.lan&&!dirty&&candidate){setLan(candidate);setDirty(true)}},[prefs,interfaces,dirty]);
+ const save=()=>void action(async()=>{const current=requireRoutePreferences(data);await invoke('configure_routes',{preferences:{...current,routes:current.routes,autoLan:manualLan?false:current.autoLan,policy,lan:lan?{bind:lan,mdns:current.lan?.mdns??true}:null,gateway:current.gateway||{bind:'127.0.0.1:17892'}}});setDirty(false);setManualLan(false)});
  return <section className="route-panel" aria-label="连接设置"><h2>连接方式</h2><p>同一网络优先使用局域网，离开后自动使用已配置的公网。手动调整网卡并保存后，将固定使用该局域网地址。</p>
-  <ul className="route-list">{data.routes?.routes?.map(r=><li key={r.id}><strong>{r.kind==='lan'?'局域网':r.kind==='cloudflare'?'Cloudflare':'中转'}</strong><code>{r.url}</code></li>)}</ul>
-  {interfaces.length>0&&<p><label>检测到的网络 <select aria-label="检测到的网络" value={lan.split(':')[0]} onChange={e=>{setLan(lanCandidate(e.target.value,prefs?.lan?.bind||lan));setDirty(true);setManualLan(true)}}>{interfaces.map(i=><option key={i.address} value={i.address}>{i.name} · {i.address}</option>)}</select></label> · 选择与手机相同的 Wi-Fi 后保存线路。</p>}
+  <ul className="route-list">{data.routes?.routes?.map(r=><li key={r.id}><strong>{r.kind==='lan'?'局域网':r.kind==='cloudflare'?'Cloudflare':'中转'}</strong><code>{routeDisplayUrl(r)}</code></li>)}</ul>
+  <RouteEvidence data={data}/>
+  {interfaces.length>0&&<p><label>检测到的网络 <select aria-label="检测到的网络" value={lan.split(':')[0]} onChange={e=>{setLan(lanCandidate(e.target.value,prefs?.lan?.bind||lan));setDirty(true);setManualLan(true)}}>{interfaces.map(i=><option key={i.address} value={i.address}>{lanInterfaceLabel(i)}</option>)}</select></label> · 选择与手机相同的 Wi-Fi 后保存线路。</p>}
   <div className="route-form"><label>线路选择<select value={policy} disabled={busy} onChange={e=>{setDirty(true);setPolicy(e.target.value as typeof policy)}}><option value="automatic">自动选择</option><option value="lan">仅局域网</option><option value="public">仅公网</option></select></label><label>电脑局域网地址<input placeholder="192.168.1.10:17891" value={lan} disabled={busy} onChange={e=>{setDirty(true);setManualLan(true);setLan(e.target.value)}}/></label></div>
   <div className="route-actions"><button className="button" disabled={busy||!dirty} onClick={save}>保存线路</button><button className="button" disabled={busy} onClick={()=>void action(async()=>{await invoke('open_codex')})}>打开 Codex 桌面</button></div>
   <div className="route-actions"><button className="button" disabled={busy||dirty||!prefs?.lan?.bind} onClick={()=>void action(async()=>{setFirewallNotice('');const result=await invoke<{configured:boolean;bind:string}>('allow_lan_firewall');if(result.configured)setFirewallNotice(`已允许 ${result.bind} 的专用网络连接，仅限本地子网。`)})}>允许局域网通过防火墙</button></div><p>先保存局域网线路。点击后 Windows 将请求管理员授权（UAC），仅允许此电脑助手的已配置 TCP 端口、专用网络和本地子网；不开放公共网络。</p>{firewallNotice&&<p role="status">{firewallNotice}</p>}

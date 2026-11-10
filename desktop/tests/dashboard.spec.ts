@@ -124,7 +124,7 @@ test('firewall requires an explicit click and does not accept frontend program o
  await expect(button).toBeEnabled();
  expect(await page.evaluate(()=>(window as any).firewallCalls)).toEqual([]);
  await button.click();
- await expect(page.getByRole('status')).toContainText('仅限本地子网');
+ await expect(page.getByRole('status').filter({hasText:'仅限本地子网'})).toBeVisible();
  expect(await page.evaluate(()=>(window as any).firewallCalls)).toEqual([{}]);
 });
 

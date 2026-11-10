@@ -34,6 +34,9 @@ class RoutingPocketConnection internal constructor(
     private var inFlight = 0
     private var closed = false
     private var collectors: Job? = null
+    private var connectingJob: Job? = null
+    private val connecting = mutableSetOf<PocketConnection>()
+    private data class ConnectResult(val route: ConnectionRoute, val client: PocketConnection, val failure: Exception? = null)
 
     override suspend fun connect(config: ConnectionConfig) = switching.withLock {
         synchronized(gate) {
@@ -42,34 +45,119 @@ class RoutingPocketConnection internal constructor(
         }
         manager.configure(config)
         val generation = manager.networkGeneration
-        for (route in manager.candidates()) {
-            val candidate = create(route)
-            try {
-                withTimeout(minOf(attemptTimeoutMillis, if (route.kind == "lan") 7000 else 20000)) { candidate.connect(config) }
-                if (manager.networkGeneration != generation) throw WireException("network_changed", "Network changed")
+        try {
+            val selected = coroutineScope {
+                val raceContext = currentCoroutineContext()
                 synchronized(gate) {
                     if (closed) throw WireException("closed", "Closed")
-                    delegate = candidate; candidateRoute = route; link.value = LinkState.ONLINE
+                    connectingJob = raceContext[Job]
                 }
-                observe(candidate)
-                return@withLock
-            } catch (e: CancellationException) {
-                candidate.close()
-                if (e !is TimeoutCancellationException) {
-                    failureCode = "closed"; link.value = LinkState.OFFLINE
-                    throw e
+                val pending = manager.candidates().toMutableList()
+                // Keep policy/backoff filtering, but give the first eligible LAN a head start.
+                val firstLan = pending.indexOfFirst { it.kind == "lan" }
+                if (firstLan > 0) pending.add(0, pending.removeAt(firstLan))
+                val results = Channel<ConnectResult?>(33) // bounded candidate results plus the stagger signal
+                val attempts = mutableListOf<PocketConnection>()
+                val jobs = mutableListOf<Job>()
+                var winner: PocketConnection? = null
+                var running = 0
+                var parallel = false
+                var preferPublic = pending.firstOrNull()?.kind == "lan"
+                fun checkRace() {
+                    raceContext.ensureActive()
+                    synchronized(gate) { if (closed) throw WireException("closed", "Closed") }
+                    if (manager.networkGeneration != generation) throw WireException("network_changed", "Network changed")
                 }
-                manager.failed(route)
-            } catch (_: Exception) {
-                candidate.close(); manager.failed(route)
+                fun startNext() {
+                    checkRace()
+                    val index = if (attempts.isNotEmpty() && preferPublic) {
+                        preferPublic = false
+                        pending.indexOfFirst { it.kind != "lan" }.coerceAtLeast(0)
+                    } else 0
+                    val route = pending.removeAt(index)
+                    val candidate = create(route)
+                    synchronized(gate) {
+                        if (closed) { candidate.close(); throw WireException("closed", "Closed") }
+                        connecting += candidate
+                    }
+                    attempts += candidate
+                    running++
+                    jobs += launch(start = CoroutineStart.UNDISPATCHED) {
+                        var verified = false
+                        try {
+                            // PocketClient.connect awaits the original pinned TLS handshake.
+                            withTimeout(minOf(attemptTimeoutMillis, if (route.kind == "lan") 7000 else 20000)) {
+                                candidate.connect(config)
+                            }
+                            ensureActive()
+                            verified = true
+                            results.trySend(ConnectResult(route, candidate))
+                        } catch (e: Exception) {
+                            if (e is CancellationException && !isActive) throw e
+                            closeConnecting(candidate)
+                            results.trySend(ConnectResult(route, candidate, e))
+                        } finally { if (!verified) closeConnecting(candidate) }
+                    }
+                }
+                val stagger = launch { delay(250); results.send(null) }
+                // RouteManager has no change flow; bound stale-network attempts to one poll interval.
+                val network = launch {
+                    while (isActive) {
+                        if (manager.networkGeneration != generation) throw WireException("network_changed", "Network changed")
+                        delay(50)
+                    }
+                }
+                try {
+                    if (pending.isNotEmpty()) startNext()
+                    while (running > 0) {
+                        val result = results.receive()
+                        checkRace()
+                        if (result == null) parallel = true
+                        else {
+                            running--
+                            if (result.failure == null) {
+                                winner = result.client
+                                return@coroutineScope result
+                            }
+                            if (result.failure is CancellationException && result.failure !is TimeoutCancellationException) throw result.failure
+                            manager.failed(result.route)
+                        }
+                        while (running < (if (parallel) 2 else 1) && pending.isNotEmpty()) startNext()
+                    }
+                    throw WireException("routes_unavailable", "No configured route is available")
+                } finally {
+                    // Close even already-verified losers before exposing a single request delegate.
+                    attempts.filter { it !== winner }.forEach(::closeConnecting)
+                    jobs.forEach { it.cancel() }
+                    stagger.cancel(); network.cancel(); results.close()
+                }
             }
-            if (manager.networkGeneration != generation) {
-                failureCode = "network_changed"; link.value = LinkState.OFFLINE
-                throw WireException("network_changed", "Network changed")
+            currentCoroutineContext().ensureActive()
+            synchronized(gate) {
+                if (closed) throw WireException("closed", "Closed")
+                if (manager.networkGeneration != generation) throw WireException("network_changed", "Network changed")
+                if (!manager.eligible(selected.route)) throw WireException("routes_unavailable", "Selected route is no longer eligible")
+                delegate = selected.client; candidateRoute = selected.route; link.value = LinkState.ONLINE
+                connecting -= selected.client
+                observe(selected.client)
             }
+        } catch (e: CancellationException) {
+            failureCode = "closed"; link.value = LinkState.OFFLINE
+            throw e
+        } catch (e: Exception) {
+            failureCode = (e as? WireException)?.code ?: "routes_unavailable"; link.value = LinkState.OFFLINE
+            throw e
+        } finally {
+            val abandoned = synchronized(gate) {
+                connectingJob = null
+                connecting.toList().also { connecting.clear() }
+            }
+            abandoned.forEach { it.close() }
         }
-        failureCode = "routes_unavailable"; link.value = LinkState.OFFLINE
-        throw WireException("routes_unavailable", "No configured route is available")
+    }
+
+    private fun closeConnecting(candidate: PocketConnection) {
+        if (synchronized(gate) { connecting.remove(candidate) }) candidate.close()
     }
 
     override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long): JsonElement {
@@ -153,10 +241,15 @@ class RoutingPocketConnection internal constructor(
         }
     }
     override fun close() {
-        synchronized(gate) {
+        val (attempts, job) = synchronized(gate) {
             if (closed) return
-            closed = true; delegate?.close(); delegate = null; hello = null; activeRoute = null; link.value = LinkState.OFFLINE
+            closed = true
+            val attempts = (connecting + listOfNotNull(delegate)).toList()
+            connecting.clear()
+            delegate = null; hello = null; activeRoute = null; link.value = LinkState.OFFLINE
+            attempts to connectingJob
         }
+        attempts.forEach { it.close() }; job?.cancel()
         collectors?.cancel(); notices.close(); scope.cancel()
     }
 }

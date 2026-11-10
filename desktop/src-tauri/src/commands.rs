@@ -45,6 +45,12 @@ fn startup_enabled(c:&Context)->Result<bool,OperationError>{
 fn connectivity_status(c:&Context)->Value {
     pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map(|m|json!(m.status())).unwrap_or(Value::Null)
 }
+fn public_upgrade(value:&Value)->Value {
+    if !value.is_object(){return Value::Null}
+    json!({"schema":value["schema"],"operationId":value["operationId"],
+        "fromGeneration":value["fromGeneration"],"toGeneration":value["toGeneration"],
+        "phase":value["phase"],"updatedAt":value["updatedAt"],"failure":value["failure"]})
+}
 fn snapshot(c:&Context)->Value{
     let mut issues=Vec::<OperationError>::new();
     let consistent=match preflight(c){Ok(())=>true,Err(e)=>{issues.push(e);false}};
@@ -58,7 +64,20 @@ fn snapshot(c:&Context)->Value{
         match devices(c){Ok(v)=>paired=v,Err(e)=>issues.push(fail("devices",e))}
         match startup_enabled(c){Ok(v)=>startup_on=v,Err(e)=>issues.push(e)}
     }
-    let routes=if consistent {process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).unwrap_or(Value::Null)}else{Value::Null};
+    let routes=if consistent {match process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]) {
+        Ok(value)=>value,Err(error)=>{issues.push(fail("routes_read",error));Value::Null}
+    }}else{Value::Null};
+    let installed_generation=pocket_desktop_runtime::installation::generation(&c.bin).unwrap_or_default();
+    let installed_version=storage::read::<Value>(&c.bin.join("windows-manifest.json")).ok().and_then(|v|v["version"].as_str().map(str::to_owned)).unwrap_or_default();
+    let mut installation=pocket_desktop_runtime::installation::report(&installed_generation,&installed_version,
+        &pocket_desktop_runtime::installation::RuntimeStamp::current(),&supervisor["runtime"],&status["helperRuntime"],consistent);
+    if consistent {
+        match supervisor::upgrade::read_status(&c.state) {
+            Ok(value)=>installation["upgrade"]=public_upgrade(&json!(value)),
+            Err(e)=>issues.push(fail("upgrade_read",e)),
+        }
+    }
+    supervisor["upgrade"]=public_upgrade(&supervisor["upgrade"]);
     let connectivity=if consistent {connectivity_status(c)}else{Value::Null};
     // Route catalog and readiness must come from the same response: a network
     // refresh can change a same-ID endpoint between status and routes/read.
@@ -74,7 +93,7 @@ fn snapshot(c:&Context)->Value{
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
     json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
-        "installation":{"consistent":consistent},"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
+        "installation":installation,"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
         "issues":issues,"discoveryErrors":status["discoveryErrors"],"routes":routes,"cloudflareReceipt":if consistent {storage::read::<Value>(&storage::control(&c.state).join("connectivity/fixed-tunnel.json")).unwrap_or(Value::Null)}else{Value::Null},"connectivity":connectivity,"helperVersion":status["helperVersion"],"sessionPreferences":if consistent&&desired.enabled {process::local_control(&c.state,"session/preferences/read",json!({})).unwrap_or(Value::Null)}else{Value::Null}})
 }
 pub fn tray_status(c:&Context)->String{
@@ -85,6 +104,32 @@ pub fn tray_status(c:&Context)->String{
 #[tauri::command]
 pub async fn dashboard(context:State<'_,Context>)->Result<Value,OperationError>{
     let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||snapshot(&c)).await.map_err(join_error)
+}
+#[tauri::command]
+pub async fn request_upgrade(context:State<'_,Context>)->Result<Value,OperationError>{
+    let c=context.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        let _guard=c.operation.try_lock().map_err(|_|OperationError::new("upgrade","operation_busy",true))?;
+        preflight(&c)?;
+        if let Some(existing)=supervisor::upgrade::read_status(&c.state).map_err(|e|fail("upgrade_read",e))? {
+            // Repeated clicks inspect/resume the existing operation instead of replacing it.
+            if !existing.phase.terminal() {
+                return supervisor::upgrade::resume_upgrade(&existing.install_root,&c.state).map(|s|public_upgrade(&json!(s))).map_err(|e|fail("upgrade",e));
+            }
+            if existing.phase==supervisor::upgrade::Phase::WaitingRestart &&
+                pocket_desktop_runtime::installation::generation(&c.bin).ok().as_deref()==Some(&existing.to_generation) {
+                return Ok(public_upgrade(&json!(existing)));
+            }
+        }
+        let report=snapshot(&c);
+        let source=&report["installation"]["supervisor"];
+        if source["runningVerified"]!=true || source["state"]!="restart_required" {
+            return Err(OperationError::new("upgrade","upgrade_unverified",false));
+        }
+        let from=source["generation"].as_str().ok_or_else(||OperationError::new("upgrade","upgrade_unverified",false))?;
+        let root=storage::local_app_data().map_err(|e|fail("installation",e))?.join("CodexPocket");
+        supervisor::upgrade::request_upgrade(&root,&c.state,from).map(|s|public_upgrade(&json!(s))).map_err(|e|fail("upgrade",e))
+    }).await.map_err(join_error)?
 }
 #[tauri::command]
 pub async fn set_remote(context:State<'_,Context>,enabled:bool)->Result<(),OperationError>{
@@ -157,13 +202,18 @@ fn diagnostics(report:&Value,now:u64)->Value {
     // Export readiness, never URLs, device/route IDs, rooms, tokens or SSH data.
     let mut connection=report["connection"].clone();
     if let Some(object)=connection.as_object_mut(){object.remove("readyRouteIds");}
+    let mut supervisor=report["supervisor"].clone();
+    let mut installation=report["installation"].clone();
+    if supervisor.is_object(){supervisor["upgrade"]=public_upgrade(&supervisor["upgrade"]);}
+    if installation.is_object(){installation["upgrade"]=public_upgrade(&installation["upgrade"]);}
     let choices=|value:&Value,allowed:&[&str]|value.as_str().filter(|s|allowed.contains(s)).unwrap_or("unknown").to_owned();
     let routes:Vec<_>=report["routes"]["routeStatus"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().take(34).map(|r|json!({
-        "kind":if r["id"]=="gateway"{"gateway".into()}else if r["id"]=="mdns"{"discovery".into()}else{choices(&r["kind"],&["lan","cloudflare","relay"])},
-        "phase":choices(&r["phase"],&["configured","connecting","connected","reconnecting","ready","listening","failed","stopped"]),
+        "kind":if r["id"]=="gateway"{"gateway".into()}else if r["id"]=="mdns"||r["kind"]=="discovery"||r["id"].as_str().is_some_and(|s|s.starts_with("mdns-")){"discovery".into()}else{choices(&r["kind"],&["lan","cloudflare","relay"])},
+        "phase":choices(&r["phase"],&["configured","connecting","connected","reconnecting","ready","listening","failed","stopped","starting","advertising"]),
         "listenerReady":r["listenerReady"]==true,"outerConnected":r["outerConnected"]==true,"innerHandshake":r["innerHandshake"]==true,
-        "activeSessions":r["activeSessions"].as_u64().unwrap_or(0)})).collect();
-    json!({"schema":3,"version":env!("CARGO_PKG_VERSION"),"exportedAt":now,"remoteEnabled":report["desired"],"supervisor":report["supervisor"],"connection":connection,"installation":report["installation"],"issues":report["issues"],"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"],"routeStatus":routes,
+        "activeSessions":r["activeSessions"].as_u64().unwrap_or(0),
+        "failure":if r["failure"].is_object(){json!({"stage":choices(&r["failure"]["stage"],&["lan_bind","mdns_start","mdns_service","mdns_register","mdns_announce","mdns_monitor","network_inventory"]),"code":choices(&r["failure"]["code"],&["listener_bind_failed","discovery_bind_failed","discovery_multicast_failed","discovery_queue_full","discovery_stopped","discovery_invalid_service","discovery_announcement_unconfirmed","discovery_failed","network_inventory_failed"]),"osCode":r["failure"]["osCode"].as_i64()})}else{Value::Null}})).collect();
+    json!({"schema":3,"version":env!("CARGO_PKG_VERSION"),"exportedAt":now,"remoteEnabled":report["desired"],"supervisor":supervisor,"connection":connection,"installation":installation,"issues":report["issues"],"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"],"routeStatus":routes,
         "routePolicy":choices(&report["routes"]["policy"],&["automatic","lan","public"]),
         "tunnel":{"phase":choices(&report["connectivity"]["phase"],&["starting","stopped","stopping","failed","waiting_network","tunnel_connected"]),"enabled":report["connectivity"]["enabled"]==true,"mode":choices(&report["connectivity"]["mode"],&["off","quick","fixed"]),"hasPublicAddress":report["connectivity"]["publicUrl"].as_str().is_some_and(|s|!s.is_empty()),"updatedAt":report["connectivity"]["updatedAt"].as_u64()}})
 }
@@ -171,6 +221,19 @@ fn diagnostics(report:&Value,now:u64)->Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_omit_private_upgrade_journal_paths(){
+        let upgrade=json!({"operationId":"operation","phase":"waiting_restart","installRoot":"private-root",
+            "stateDirectory":"private-state","checkpoint":{"savedSha256":"private-checkpoint"}});
+        let report=json!({"supervisor":{"upgrade":upgrade},"installation":{"upgrade":upgrade},
+            "routes":{"routeStatus":[{"id":"mdns-private-address","kind":"discovery","phase":"failed"}]}});
+        let safe=diagnostics(&report,100);
+        assert_eq!(safe["supervisor"]["upgrade"]["phase"],"waiting_restart");
+        assert_eq!(safe["installation"]["upgrade"]["operationId"],"operation");
+        assert_eq!(safe["routeStatus"][0]["kind"],"discovery");
+        assert!(!safe.to_string().contains("private-"));
+    }
 
     #[test]
     fn diagnostics_keep_readiness_without_route_secrets_or_addresses(){
@@ -320,12 +383,7 @@ pub async fn setup_fixed(context:State<'_,Context>,request:pocket_desktop_runtim
 #[tauri::command]
 pub async fn detect_lan()->Result<Value,OperationError>{
  tauri::async_runtime::spawn_blocking(move||{
-  let mut command=Command::new(storage::powershell());
-  command.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ConvertTo-Json -Compress -InputObject @(Get-NetIPConfiguration | Where-Object {$_.NetAdapter.Status -eq 'Up'} | Sort-Object @{Expression={if($_.IPv4DefaultGateway){0}else{1}}} | ForEach-Object {$n=$_.InterfaceAlias; $_.IPv4Address | ForEach-Object {@{address=$_.IPAddress;name=$n}}})"#]);
-  let bytes=process::run_bounded(command,12).map_err(|e|fail("network",e))?;
-  let parsed:Value=serde_json::from_slice(&bytes).map_err(|e|fail("network",e.into()))?;
-  let rows=parsed.as_array().cloned().unwrap_or_else(||vec![parsed]);
-  Ok(Value::Array(rows.into_iter().filter(|v|v["address"].as_str().and_then(|s|s.parse::<std::net::Ipv4Addr>().ok()).is_some_and(|ip|ip.is_private())).collect()))
+  pocket_desktop_runtime::network::interfaces().map(|rows|json!(rows)).map_err(|e|fail("network",e.into()))
  }).await.map_err(join_error)?
 }
 

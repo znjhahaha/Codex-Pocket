@@ -62,19 +62,32 @@ fn bounded_process_times_out_without_exposing_stderr() {
     let mut cmd=Command::new(storage::powershell());cmd.args(["-NoProfile","-Command","[Console]::Error.WriteLine('private-secret');exit 5"]);
     let error=process::run_bounded(cmd,5).unwrap_err().to_string();assert!(!error.contains("private-secret"));
 }
+#[cfg(windows)]
+#[test]
+fn failed_helper_preserves_safe_code_and_exit_status_without_raw_output() {
+    let mut cmd=Command::new(storage::powershell());
+    cmd.args(["-NoProfile","-Command",r#"[Console]::WriteLine('{"error":{"code":"rejected","message":"private-secret"}}');exit 5"#]);
+    let err=process::run_bounded(cmd,5).unwrap_err();
+    let public=serde_json::to_value(pocket_desktop_runtime::connection::OperationError::from_error("routes_read",&err)).unwrap();
+    assert_eq!(public["code"],"control_rejected");
+    assert_eq!(public["exitCode"],5);
+    assert!(!public.to_string().contains("private-secret"));
+}
 struct Owned(Child);
 impl Drop for Owned {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
 fn wait_for(mut predicate:impl FnMut()->bool) {let until=Instant::now()+Duration::from_secs(25);while !predicate(){assert!(Instant::now()<until,"fixture did not reach expected state");thread::sleep(Duration::from_millis(100));}}
 #[cfg(windows)]
 #[test]
-fn real_supervisor_backoff_duplicate_lock_and_stop_survive_relaunch() {
+fn real_supervisor_backoff_and_local_control_retry_survive_remote_pause_and_relaunch() {
     let dir=test_support::tempdir();let state=dir.path().join("state");fs::create_dir(&state).unwrap();fs::write(state.join("config.json"),"{}").unwrap();storage::set_desired(&state,true).unwrap();
     // cmd.exe exits on the helper's arguments. Only this fixture's child is supervised.
     let spawn=||{let mut c=Command::new(env!("CARGO_BIN_EXE_pocket-supervisor"));c.arg("--state").arg(&state).arg("--agent").arg(std::env::var("COMSPEC").unwrap()).arg("--owner-directory").arg(dir.path().join("owner")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());process::hidden(&mut c);Owned(c.spawn().unwrap())};
     let mut first=spawn();let heartbeat=storage::control(&state).join("supervisor.json");
     wait_for(||storage::read::<serde_json::Value>(&heartbeat).is_ok_and(|s|s["failures"].as_u64().unwrap_or(0)>=2));
     let mut duplicate=spawn();wait_for(||duplicate.0.try_wait().unwrap().is_some());assert!(!duplicate.0.wait().unwrap().success());
-    storage::set_desired(&state,false).unwrap();wait_for(||storage::read::<serde_json::Value>(&heartbeat).is_ok_and(|s|s["phase"]=="stopped"&&s["childPid"].is_null()));
+    storage::set_desired(&state,false).unwrap();wait_for(||storage::read::<serde_json::Value>(&heartbeat).is_ok_and(|s|s["phase"]=="restarting"&&s["childPid"].is_null()));
     first.0.kill().unwrap();first.0.wait().unwrap();let mut next=spawn();
-    wait_for(||storage::read::<serde_json::Value>(&heartbeat).is_ok_and(|s|s["pid"].as_u64()==Some(next.0.id() as u64)&&s["phase"]=="stopped"));assert!(next.0.try_wait().unwrap().is_none());
+    // The disposable cmd fixture has no remote gate/local control. Never
+    // claim stop confirmation; retry supervised control despite desired=false.
+    wait_for(||storage::read::<serde_json::Value>(&heartbeat).is_ok_and(|s|s["pid"].as_u64()==Some(next.0.id() as u64)&&s["phase"]=="restarting"&&s["failures"].as_u64().unwrap_or(0)>0));assert!(next.0.try_wait().unwrap().is_none());
 }

@@ -12,12 +12,12 @@ pub fn resolve_release(root:&Path)->Result<(PathBuf,PathBuf)>{
     let manifest_path=bin.join("windows-manifest.json");storage::unredirected(&manifest_path)?;
     let manifest=std::fs::read(manifest_path)?;
     let hash=format!("{:x}",Sha256::digest(&manifest));
-    if v["releaseHash"].as_str()!=Some(&hash){bail!("Installed manifest has changed")}
+    if generation!=hash || v["releaseHash"].as_str()!=Some(&hash){bail!("Installed manifest has changed")}
     let state=PathBuf::from(v["stateDirectory"].as_str().context("Missing installed state")?);storage::plain(&state)?;
     Ok((bin,state))
 }
 pub fn verified_exe(bin:&Path,name:&str)->Result<PathBuf>{
-    if !["pocket-desktop.exe","pocket-supervisor.exe","pocket-bridge.exe","pocket-agent.exe","windows-startup.ps1","windows-common.ps1"].contains(&name){bail!("Unsupported executable or script")}
+    if !["pocket-desktop.exe","pocket-supervisor.exe","pocket-bridge.exe","pocket-agent.exe","pocket-upgrade.exe","windows-startup.ps1","windows-common.ps1"].contains(&name){bail!("Unsupported executable or script")}
     let manifest:Value=storage::read(&bin.join("windows-manifest.json"))?;
     let entry=manifest["files"].as_array().context("Missing inventory")?.iter().find(|e|e["path"]==name).context("Executable absent from inventory")?;
     let path=bin.join(name);storage::unredirected(&path)?;
@@ -38,9 +38,9 @@ pub fn launch()->Result<i32>{
         verified_exe(&bin,"pocket-agent.exe")?;
         let mut command=Command::new(verified_exe(&bin,name)?);command.arg("--state").arg(&state);process::hidden(&mut command);
         if mode=="--pocket-ui"{command.spawn()?;return Ok(0)}
-        #[cfg(windows)]let job=process::ChildJob::new()?;
+        // Keep the stable launcher argument/exit ABI. Supervisor lifetime must
+        // not put existing native/CLI/model descendants in a kill-on-close job.
         let mut child=command.spawn()?;
-        #[cfg(windows)]if let Err(e)=job.assign(&child){let _=child.kill();let _=child.wait();return Err(e)}
         return Ok(child.wait()?.code().unwrap_or(1))
     }
     let package=current_package()?;let location=PathBuf::from(package["location"].as_str().context("Missing package location")?);

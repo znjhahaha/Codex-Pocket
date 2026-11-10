@@ -33,3 +33,11 @@ The official MiSans Font Intellectual Property License Agreement is included as 
 Official font archive: https://hyperos.mi.com/font-download/MiSans.zip
 
 Official license: https://hyperos.mi.com/font-download/MiSans字体知识产权许可协议.pdf
+
+## Experimental DataChannel fixture
+
+The source-only prototype in `native/p2p/` pins libdatachannel and libjuice
+(MPL-2.0), usrsctp (BSD-3-Clause), plog (MIT), and Mbed TLS with its framework
+(Apache-2.0). The precise revisions and source digests are recorded in
+`native/p2p/dependencies.lock.json`; license texts are in `native/p2p/licenses/`.
+These native libraries are not integrated into the delivered APK or Windows app.

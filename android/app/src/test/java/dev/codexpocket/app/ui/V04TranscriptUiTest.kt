@@ -127,7 +127,7 @@ class V04TranscriptUiTest {
     @Test fun emptyLoadingShowsSkeletonAndReadFailureOffersRetryWithoutEmptyPrompt() {
         var state by mutableStateOf(ConversationLoadState.Loading)
         content { ConversationReadStatus(conversationReadPresentation(state, false), null) { state = ConversationLoadState.Loading } }
-        compose.onNodeWithTag("conversation-skeleton").assertExists()
+        compose.waitUntil(2_000) { compose.onAllNodesWithTag("conversation-skeleton").fetchSemanticsNodes().isNotEmpty() }
         compose.runOnIdle { state = ConversationLoadState.Failed }
         compose.onNodeWithTag("conversation-skeleton").assertDoesNotExist()
         compose.onNodeWithText(compose.activity.getString(R.string.v04_transcript_retry)).assertExists()

@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -25,131 +26,140 @@ import dev.codexpocket.app.data.*
 
 @Composable
 internal fun ExtensionManagementPanel(s: PocketState, onRuntime: (String) -> Unit,
-    onToggle: (String, Boolean) -> Unit, onRefresh: () -> Unit) {
+    onToggle: (String, Boolean) -> Unit, onRefresh: () -> Unit,
+    modifier: Modifier = Modifier, contentPadding: PaddingValues = PaddingValues(0.dp)) {
     var runtimeChoice by rememberSaveable(s.computerId) { mutableStateOf<String?>(null) }
     val runtime = s.runtimes.firstOrNull { it.id == runtimeChoice } ?: s.activeRuntime ?: s.runtimes.firstOrNull()
-    var kind by rememberSaveable { mutableStateOf("mcp") }
-    var detail by rememberSaveable(s.computerId, runtime?.id) { mutableStateOf<String?>(null) }
-    // Every piece of presentation metadata, including errors, belongs to one computer/runtime.
+    var runtimeMenu by remember { mutableStateOf(false) }
+    var kind by rememberSaveable(s.computerId, runtime?.id) { mutableStateOf("mcp") }
+    val categories = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     val data = s.extensions.takeIf { runtime != null && it.runtimeId == runtime.id && it.computerId == s.computerId }
     val entries = data?.entries.orEmpty()
-    val rows = entries.filter { it.kind == kind || (kind == "plugin" && it.kind == "app") }
     val hasInventory = data?.phase == ExtensionPhase.Ready || entries.isNotEmpty()
-    val canRefresh = s.online && runtime?.online == true && data?.phase != ExtensionPhase.Loading && data?.pendingIds.isNullOrEmpty()
-    LaunchedEffect(s.computerId, runtime?.id, s.online, runtime?.online) {
-        runtime?.id?.let(onRuntime)
+    val canRefresh = s.online && runtime?.online == true && data?.phase != ExtensionPhase.Loading &&
+        data?.refreshing != true && data?.pendingIds.isNullOrEmpty()
+    LaunchedEffect(s.computerId, runtime?.id, s.online, runtime?.online) { runtime?.id?.let(onRuntime) }
+    Column(modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).testTag("extension-management")
+        .padding(start = contentPadding.calculateStartPadding(androidx.compose.ui.unit.LayoutDirection.Ltr),
+            end = contentPadding.calculateEndPadding(androidx.compose.ui.unit.LayoutDirection.Ltr), top = contentPadding.calculateTopPadding()),
+        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("扩展管理", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
+                Text(s.computerName.ifBlank { "当前电脑" }, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            IconButton(onClick = { if (data == null) runtime?.id?.let(onRuntime) else onRefresh() },
+                enabled = canRefresh, modifier = Modifier.testTag("extension-refresh")) {
+                Icon(PocketIcons.Refresh, "刷新扩展", Modifier.size(19.dp))
+            }
+        }
+        Box {
+            Surface(Modifier.fillMaxWidth().testTag("extension-runtime-summary").clickable { runtimeMenu = true },
+                color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(16.dp)) {
+                Row(Modifier.heightIn(min = 48.dp).padding(12.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(runtime?.let { extensionRuntimeLabel(it, s.runtimes) } ?: "尚未发现运行时", Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(if (s.online && runtime?.online == true) "已连接" else "离线", style = MaterialTheme.typography.labelSmall)
+                    Icon(PocketIcons.ExpandMore, "选择运行时", Modifier.size(16.dp))
+                }
+            }
+            DropdownMenu(expanded = runtimeMenu, onDismissRequest = { runtimeMenu = false }) {
+                s.runtimes.forEach { candidate ->
+                    key(candidate.id) {
+                        DropdownMenuItem(text = { Text(extensionRuntimeLabel(candidate, s.runtimes)) },
+                            onClick = { runtimeChoice = candidate.id; runtimeMenu = false },
+                            modifier = Modifier.testTag("extension-runtime:" + candidate.id))
+                    }
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth().selectableGroup().background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(20.dp))
+            .padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf("mcp" to "MCP", "skill" to "Skills", "plugin" to "应用 / 插件").forEach { (id, label) ->
+                val count = if (hasInventory && !(id == "plugin" && data?.appInventoryStatus in setOf("unsupported", "unavailable")))
+                    entries.count { it.kind == id || (id == "plugin" && it.kind == "app") }.toString() else "—"
+                Surface(Modifier.weight(1f).testTag("extension-category:" + id)
+                    .selectable(kind == id, role = Role.Tab, onClick = { kind = id }), shape = RoundedCornerShape(16.dp),
+                    color = if (kind == id) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer) {
+                    Box(Modifier.heightIn(min = 48.dp).padding(horizontal = 6.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+                        Text(label + " · " + count, style = MaterialTheme.typography.labelMedium,
+                            color = if (kind == id) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+        val runtimeKey = runtime?.id.orEmpty()
+        categories.SaveableStateProvider("${s.computerId.length}:${s.computerId}${runtimeKey.length}:$runtimeKey:$kind") {
+            var query by rememberSaveable { mutableStateOf("") }
+            var detail by rememberSaveable { mutableStateOf<String?>(null) }
+            val list = androidx.compose.foundation.lazy.rememberLazyListState()
+            val rows = remember(entries, kind, query) { entries.filter {
+                (it.kind == kind || (kind == "plugin" && it.kind == "app")) &&
+                    (query.isBlank() || it.name.contains(query, true) || it.description.contains(query, true))
+            } }
+            OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().testTag("extension-search"),
+                placeholder = { Text("搜索当前分类") }, singleLine = true)
+            androidx.compose.foundation.lazy.LazyColumn(state = list,
+                modifier = Modifier.weight(1f).fillMaxWidth().testTag("extension-list"),
+                contentPadding = PaddingValues(top = 4.dp, bottom = contentPadding.calculateBottomPadding()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                item(key = "status", contentType = "status") {
+                    ExtensionStatusCard(if (query.isNotBlank() && rows.isEmpty() && hasInventory)
+                        ExtensionNotice("search-empty", "未找到匹配扩展", "试试其他关键词。")
+                    else extensionNotice(s, runtime, data, kind, rows.isEmpty()))
+                }
+                items(rows.size, key = { rows[it].id }, contentType = { "extension" }) { index ->
+                    val entry = rows[index]
+                    ExtensionRow(entry, entry.id == detail, entry.id in data?.pendingIds.orEmpty(), entry.id in data?.uncertainIds.orEmpty(),
+                        s.online && runtime?.online == true && data?.phase == ExtensionPhase.Ready && data.refreshing == false,
+                        { detail = if (detail == entry.id) null else entry.id }, onToggle)
+                }
+                if (data?.reloadPending == true) item(key = "reload", contentType = "status") {
+                    ExtensionStatusCard(ExtensionNotice("reload", "配置已保存，等待重载", "等待正在运行的工具结束，电脑端会重载配置；随后刷新确认。"))
+                }
+            }
+        }
     }
-    Column(Modifier.fillMaxWidth().testTag("extension-management"), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("管理运行时", Modifier.padding(horizontal = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleSmall)
-            ExtensionSurface {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(s.computerName.ifBlank { "当前电脑" }, style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (s.runtimes.isEmpty()) Text("连接电脑后会显示可用运行时。", style = MaterialTheme.typography.bodySmall)
-                    s.runtimes.forEach { candidate ->
-                        key(candidate.id) {
-                            val selected = candidate.id == runtime?.id
-                            val interaction = remember { MutableInteractionSource() }
-                            Surface(Modifier.fillMaxWidth().testTag("extension-runtime:" + candidate.id)
-                                .selectable(selected, role = Role.RadioButton, interactionSource = interaction, indication = null,
-                                    onClick = { runtimeChoice = candidate.id }),
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = .55f) else MaterialTheme.colorScheme.surfaceContainerLow,
-                                border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = .25f)) else null) {
-                                Row(Modifier.heightIn(min = 64.dp).padding(12.dp), verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    SettingsCircleIcon(if (candidate.source == "cli") PocketIcons.Terminal else PocketIcons.Computer)
-                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Text(extensionRuntimeLabel(candidate, s.runtimes), style = MaterialTheme.typography.labelMedium)
-                                        Text(if (candidate.online && s.online) "已连接" else "离线", style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    if (selected) Icon(PocketIcons.Check, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                                }
-                            }
-                        }
+}
+
+@Composable
+private fun ExtensionRow(entry: ManagedExtension, expanded: Boolean, pending: Boolean, uncertain: Boolean,
+    online: Boolean, onExpand: () -> Unit, onToggle: (String, Boolean) -> Unit) {
+    ExtensionSurface(Modifier.testTag("extension:" + entry.id)) {
+        Column(Modifier.padding(12.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.weight(1f).heightIn(min = 48.dp).clickable(role = Role.Button,
+                    onClickLabel = if (expanded) "收起详情" else "展开详情", onClick = onExpand)
+                    .semantics { stateDescription = if (expanded) "详情已展开" else "详情已收起" },
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SettingsCircleIcon(when (entry.kind) { "mcp" -> PocketIcons.Tune; "skill" -> PocketIcons.BookOpen; else -> PocketIcons.Cube })
+                    Column(Modifier.weight(1f)) {
+                        Text(entry.name, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(when { pending -> "正在更新"; uncertain -> "结果待核对，请刷新"; else -> extensionStatusLabel(entry) },
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(data?.scope?.takeIf { it.isNotBlank() } ?: "查看所选运行时的已有配置",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Icon(if (expanded) PocketIcons.ExpandLess else PocketIcons.ExpandMore, null, Modifier.size(16.dp))
+                }
+                if (entry.enabled != null) PocketToggle(entry.enabled, { onToggle(entry.id, it) },
+                    Modifier.testTag("extension-toggle:" + entry.id).semantics { contentDescription = "启用扩展：" + entry.name },
+                    enabled = online && entry.canToggle && !pending && !uncertain)
+            }
+            androidx.compose.animation.AnimatedVisibility(expanded,
+                enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(pocketMotionMillis(180))) +
+                    androidx.compose.animation.expandVertically(androidx.compose.animation.core.tween(pocketMotionMillis(200))),
+                exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(pocketMotionMillis(180))) +
+                    androidx.compose.animation.shrinkVertically(androidx.compose.animation.core.tween(pocketMotionMillis(200)))) {
+                Column(Modifier.padding(4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    HorizontalDivider()
+                    if (entry.description.isNotBlank()) Text(entry.description, style = MaterialTheme.typography.bodySmall)
+                    if (entry.scope.isNotBlank()) Text("配置范围 · " + entry.scope, style = MaterialTheme.typography.bodySmall)
+                    if (entry.reason.isNotBlank()) Text(extensionReasonLabel(entry.reason), style = MaterialTheme.typography.bodySmall)
+                    else if (!entry.canToggle) Text("在电脑端管理此扩展的配置。", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("扩展分类", Modifier.weight(1f).padding(start = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleSmall)
-                IconButton(onClick = {
-                    // Repository refresh follows its current data; an unmatched selection must load by identity.
-                    if (data == null) runtime?.id?.let(onRuntime) else onRefresh()
-                }, enabled = canRefresh, modifier = Modifier.size(48.dp).testTag("extension-refresh")) {
-                    Icon(PocketIcons.Refresh, "刷新扩展", Modifier.size(19.dp))
-                }
-            }
-            FlowRow(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("mcp" to "MCP", "skill" to "Skills", "plugin" to "应用 / 插件").forEach { (id, label) ->
-                    val count = if (hasInventory && !(id == "plugin" && data?.appInventoryStatus in setOf("unsupported", "unavailable")))
-                        entries.count { it.kind == id || (id == "plugin" && it.kind == "app") }.toString() else "—"
-                    val interaction = remember { MutableInteractionSource() }
-                    Surface(Modifier.testTag("extension-category:" + id)
-                        .selectable(kind == id, role = Role.Tab, interactionSource = interaction, indication = null,
-                            onClick = { kind = id; detail = null }),
-                        shape = RoundedCornerShape(50),
-                        color = if (kind == id) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow) {
-                        Box(Modifier.heightIn(min = 48.dp).padding(horizontal = 14.dp, vertical = 10.dp), contentAlignment = Alignment.Center) {
-                            Text(label + " · " + count, style = MaterialTheme.typography.labelMedium,
-                                color = if (kind == id) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-        }
-        ExtensionStatusCard(extensionNotice(s, runtime, data, kind, rows.isEmpty()))
-        rows.forEach { entry ->
-            key(entry.id) {
-                val interaction = remember { MutableInteractionSource() }
-                val pending = entry.id in data?.pendingIds.orEmpty()
-                val uncertain = entry.id in data?.uncertainIds.orEmpty()
-                val writable = s.online && runtime?.online == true && entry.canToggle && !pending && !uncertain && data?.phase == ExtensionPhase.Ready
-                ExtensionSurface(Modifier.testTag("extension:" + entry.id)) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Row(Modifier.weight(1f).heightIn(min = 48.dp)
-                                .clickable(interactionSource = interaction, indication = null, role = Role.Button,
-                                    onClickLabel = if (detail == entry.id) "收起详情" else "展开详情") {
-                                    detail = if (detail == entry.id) null else entry.id
-                                }.semantics { stateDescription = if (detail == entry.id) "详情已展开" else "详情已收起" },
-                                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                SettingsCircleIcon(when (entry.kind) { "mcp" -> PocketIcons.Tune; "skill" -> PocketIcons.BookOpen; else -> PocketIcons.Cube })
-                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    Text(entry.name, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                    Text(when { pending -> "正在更新"; uncertain -> "结果待核对，请刷新"; else -> extensionStatusLabel(entry) },
-                                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                Icon(if (detail == entry.id) PocketIcons.ExpandLess else PocketIcons.ExpandMore, null, Modifier.size(16.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            if (entry.enabled != null) PocketToggle(entry.enabled, { onToggle(entry.id, it) },
-                                Modifier.testTag("extension-toggle:" + entry.id).semantics { contentDescription = "启用扩展：" + entry.name }, enabled = writable)
-                        }
-                        if (detail == entry.id) {
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
-                            Column(Modifier.padding(horizontal = 4.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                if (entry.description.isNotBlank()) Text(entry.description, style = MaterialTheme.typography.bodySmall)
-                                if (entry.scope.isNotBlank()) Text("配置范围 · " + entry.scope, style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                if (entry.reason.isNotBlank()) Text(extensionReasonLabel(entry.reason), style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                else if (!entry.canToggle) Text("在电脑端管理此扩展的配置。", style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (data?.reloadPending == true) ExtensionStatusCard(ExtensionNotice("reload", "配置已保存，等待重载",
-            "等待正在运行的工具结束，电脑端会重载配置；随后刷新确认。"))
     }
 }
 
@@ -172,6 +182,7 @@ private fun extensionNotice(s: PocketState, runtime: RuntimeInfo?, data: Extensi
     !runtime.online || data?.phase == ExtensionPhase.Offline -> ExtensionNotice("runtime-offline", "所选运行时已离线",
         "在电脑上打开此运行时，或选择一个已连接的运行时；连接后刷新。")
     data == null -> ExtensionNotice("switching", "正在切换运行时", "正在读取所选运行时的配置；之前的列表与状态已收起。")
+    data.refreshing && data.entries.isNotEmpty() -> ExtensionNotice("refreshing", "正在后台刷新扩展", "当前列表仍可查看，等待刷新后再修改。")
     data.phase == ExtensionPhase.Loading -> ExtensionNotice("loading", "正在读取扩展", "正在读取所选运行时的配置，请稍候。")
     data.phase == ExtensionPhase.Failed -> ExtensionNotice("failure", "扩展读取失败", "确认电脑端 Codex 正常运行，然后刷新重试。", data.error)
     data.phase == ExtensionPhase.Ready && data.error != null -> ExtensionNotice("update-failure",

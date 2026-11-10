@@ -1,8 +1,18 @@
 import {describe,it,expect} from 'vitest';
-import {prepareRoute,relayBaseUrl,guideError,lanCandidate,automaticLanBind,guideReadiness} from './connectionGuide';
+import {prepareRoute,relayBaseUrl,guideError,lanCandidate,automaticLanBind,guideReadiness,savedRelayUrl,routeDisplayUrl,requireRoutePreferences,requiresRouteRead} from './connectionGuide';
 import type {Snapshot} from './domain';
 
 const snapshot:Snapshot={computerName:'Fixture',desired:false,supervisor:{phase:'stopped',updatedAt:0,failures:0},relay:{state:'stopped',host:''},devices:[],processes:[],version:'fixture',startup:false,routes:{routes:[],routePreferences:{policy:'automatic',lan:{bind:'192.168.1.2:17891',mdns:false},gateway:{bind:'127.0.0.1:17892'},routes:[{id:'existing',kind:'relay',url:'wss://existing.invalid/pocket',priority:30}]}}};
+
+describe('Saved relay field',()=>{
+ it('recovers the base endpoint without exposing the pairing room',()=>{
+  const s={...snapshot,routes:{routes:[],routePreferences:{...snapshot.routes!.routePreferences!,routes:[{id:'legacy',kind:'relay' as const,url:'wss://existing.invalid/pocket/v1/tunnel/private-room/phone',priority:100}]}}};
+  expect(savedRelayUrl(s)).toBe('wss://existing.invalid/pocket');
+ });
+ it('shows existing base URLs',()=>expect(savedRelayUrl(snapshot)).toBe('wss://existing.invalid/pocket'));
+ it('keeps unknown preferences empty instead of guessing',()=>expect(savedRelayUrl({...snapshot,routes:undefined})).toBe(''));
+ it('does not echo an authenticated or malformed URL',()=>expect(savedRelayUrl({...snapshot,routes:{routes:[],routePreferences:{...snapshot.routes!.routePreferences!,routes:[{id:'bad',kind:'relay',url:'wss://user:secret@host/pocket',priority:1}]}}})).toBe(''));
+});
 describe('Guided route activation',()=>{
  it('preserves the configured port when changing network',()=>expect(lanCandidate('10.0.0.2','192.168.1.20:43821')).toBe('10.0.0.2:43821'));
  it('saves LAN preferences before enabling, preserving other routes and mDNS',async()=>{
@@ -75,6 +85,12 @@ describe('Guided route activation',()=>{
   expect(calls).toEqual([]);
  });
  it('reports unread preferences before validating a relay address',async()=>{await expect(prepareRoute('relay',{}, {...snapshot,routes:undefined},async()=>{},()=>true)).rejects.toThrow('route_preferences_unavailable')});
+ it('preserves authoritative routes_read failure without issuing configuration writes',async()=>{
+  const issue={code:'control_rejected',stage:'routes_read',message:'旧后台拒绝读取',retryable:true,operationId:'read-operation',exitCode:5};
+  const calls:string[]=[];
+  await expect(prepareRoute('lan',{lanBind:'192.168.1.20:43821'},{...snapshot,routes:undefined,issues:[issue]},async cmd=>{calls.push(cmd)},()=>true)).rejects.toEqual(issue);
+  expect(calls).toEqual([]);
+ });
  it('enables ongoing LAN detection even when initially offline',async()=>{
   const calls:{cmd:string;args:any}[]=[];
   await prepareRoute('cloudflare',{}, {...snapshot,routes:{routes:[],routePreferences:{...snapshot.routes!.routePreferences!,lan:undefined}}},async(cmd,args)=>{calls.push({cmd,args})},()=>true);
@@ -91,6 +107,8 @@ describe('Guided route activation',()=>{
 describe('Automatic LAN detection',()=>{
  const rows=[{name:'Wi-Fi',address:'192.168.1.20'},{name:'Ethernet',address:'10.0.0.2'}];
  it('keeps a saved active address and port',()=>expect(automaticLanBind('10.0.0.2:43821',rows)).toBe('10.0.0.2:43821'));
+ it('ignores VPN and virtual default routes during automatic selection',()=>expect(automaticLanBind('10.8.0.2:43821',[{name:'VPN',address:'10.8.0.2',automatic:false},...rows])).toBe('192.168.1.20:43821'));
+ it('requires manual choice if only unverified virtual adapters exist',()=>expect(automaticLanBind(undefined,[{name:'Virtual',address:'10.8.0.2',automatic:false}])).toBe(''));
  it('replaces a stale address with a current candidate while retaining its port',()=>expect(automaticLanBind('192.168.0.50:43821',rows)).toBe('192.168.1.20:43821'));
  it('does not trust a stale bind without any current network',()=>expect(automaticLanBind('192.168.0.50:43821',[])).toBe(''));
  it('ignores non-private or malformed detected addresses',()=>expect(automaticLanBind(undefined,[{name:'loopback',address:'127.0.0.1'},{name:'public',address:'203.0.113.1'},...rows])).toBe('192.168.1.20:43821'));
@@ -104,6 +122,20 @@ describe('Automatic route fallback guidance',()=>{
  it('a ready public route stays independently verified when LAN is lost',()=>{expect(guideReadiness({...mixed,connection:{...mixed.connection!,readyRouteIds:['relay']}},now,'relay')).toEqual({selectedReady:true,lanReady:false,canPair:true,lanOnly:false,pairMethod:'relay'})});
 });
 describe('Plain Chinese guidance',()=>{
+ it('keeps a stale snapshot read error authoritative until a successful refresh',()=>{
+  const issue={code:'control_rejected',stage:'routes_read',message:'旧后台拒绝读取',retryable:true,operationId:'fixture',exitCode:5};
+  expect(()=>requireRoutePreferences({...snapshot,issues:[issue]})).toThrow();
+  expect(requiresRouteRead(issue)).toBe(true);
+  expect(requireRoutePreferences({...snapshot,issues:[]})).toEqual(snapshot.routes!.routePreferences);
+ });
+ it.each([
+  ['wss://user:password@relay.invalid/pocket/v1/tunnel/room-secret/phone?token=secret#key','wss://relay.invalid/pocket'],
+  ['wss://relay.invalid/v1/tunnel/room-secret/phone','wss://relay.invalid'],
+  ['wss://relay.invalid/arbitrary-secret','wss://relay.invalid'],
+  ['not-a-url-secret','地址待确认'],
+  ['javascript:secret','地址待确认'],
+ ])('shows only a public route base for %s',(url,display)=>expect(routeDisplayUrl({kind:'relay',url})).toBe(display));
+ it('preserves the LAN host and port only',()=>expect(routeDisplayUrl({kind:'lan',url:'tcp://192.168.1.20:43821/secret'})).toBe('tcp://192.168.1.20:43821'));
  it.each(['ws://host/pocket','wss://user:secret@host/pocket','wss://host/pocket?token=secret','wss://host/room/id','wss://host/pocket#secret'])('rejects unsafe or non-base relay input %s',url=>expect(()=>relayBaseUrl(url)).toThrow());
  it('accepts a base endpoint and trims whitespace',()=>expect(relayBaseUrl(' wss://relay.invalid/pocket ')).toBe('wss://relay.invalid/pocket'));
  it.each(['wss://relay.invalid','wss://relay.invalid/','wss://relay.invalid/pocket/'])('accepts root and pocket base endpoint %s',url=>expect(relayBaseUrl(url)).toMatch(/^wss:\/\/relay.invalid/));

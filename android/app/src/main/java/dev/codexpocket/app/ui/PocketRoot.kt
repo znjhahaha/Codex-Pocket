@@ -48,6 +48,7 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun PocketRoot(s: PocketState, repo: PocketRepository) { CompositionLocalProvider(LocalPocketGlass provides s.glassEffects,
+    LocalImageConnection provides (s.mediaConnectionEpoch to s.online),
     LocalDesktopImages provides remember(repo, s.selected?.key, s.selected?.runtimeId) { s.selected?.let { owner -> object : DesktopImageSource {
         override val ownerKey = "${owner.key.encoded}:${owner.runtimeId}"
         override suspend fun file(path: String) = repo.desktopImage(path, owner)
@@ -161,7 +162,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                         }, label = "home-section") { shownTab ->
                             homeHolder.SaveableStateProvider(shownTab.name) {
                                 when (shownTab) {
-                                    HomeTab.Chats -> ChatsHome(s, { repo.markRead(it); repo.select(it); home = false }, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention })
+                                    HomeTab.Chats -> ChatsHome(s, { repo.markRead(it); repo.select(it); home = false }, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention }, onEnsureDirectory = { q, a -> repo.ensureDirectory(q, a) })
                                     HomeTab.Attention -> AttentionHome(s, repo) { repo.markRead(it); repo.select(it); home = false }
                                     HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true)
                                 }

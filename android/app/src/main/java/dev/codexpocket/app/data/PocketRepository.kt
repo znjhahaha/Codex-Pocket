@@ -26,6 +26,7 @@ data class LocalAttachment(val id: String, val name: String, val mime: String) {
 }
 data class PocketState(
     val initialized: Boolean = false, val paired: Boolean = false, val online: Boolean = false,
+    val mediaConnectionEpoch: Long = 0,
     val connection: String = "Offline", val computerName: String = "", val computerId: String = "",
     val runtimes: List<RuntimeInfo> = emptyList(), val chats: List<ChatEntity> = emptyList(),
     val selected: ChatEntity? = null, val timeline: NativeTimeline = NativeTimeline(),
@@ -43,6 +44,7 @@ data class PocketState(
     val glassEffects: Boolean = true,
     val busy: Boolean = false, val error: String? = null, val notice: String? = null,
     val directoryLoading: Boolean = false, val actionStatus: Map<String, ActionStatus> = emptyMap(),
+    val directoryRefreshing: Boolean = false, val directoryError: String? = null, val directoryUpdatedAt: Long = 0,
     val sessionPreferences: SessionPreferences = SessionPreferences(), val preferencesFresh: Boolean = false,
     val threadAccess: Map<ThreadKey, ThreadAccess> = emptyMap(), val accessFresh: Set<ThreadKey> = emptySet(),
     val nextThreads: JsonElement? = null, val nextTurns: JsonElement? = null,
@@ -50,6 +52,7 @@ data class PocketState(
     val historyExhausted: Boolean = false, val historyLoading: Boolean = false,
     val conversationLoadState: ConversationLoadState = ConversationLoadState.Idle,
     val conversationLoadError: String? = null,
+    val conversationCached: Boolean = false,
     val unknownHistoryInspected: Boolean = false, val stopping: Boolean = false,
     val sendBusy: Boolean = false, val submittingApprovalKeys: Set<String> = emptySet(),
     val nativeQueue: List<JsonObject> = emptyList(), val queueSupported: Boolean? = null,
@@ -102,6 +105,8 @@ class PocketRepository(
     private val pairStore: PairingStorage = PairStore(context),
     private val db: PocketDatabase = PocketDatabase.create(context),
     private val networkAvailable: Flow<Unit> = networkAvailability(context),
+    historyCacheBudget: Long = 32L * 1024 * 1024,
+    private val directoryTimeoutMillis: Long = 15_000,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val dao = db.dao()
@@ -150,11 +155,12 @@ class PocketRepository(
     private val unreadGate = Any()
     private val planResolutionGate = Any()
     private val fastUpdates = ConcurrentHashMap.newKeySet<ThreadKey>()
-    private val verifiedHistoryLinks = ConcurrentHashMap<ThreadKey, Long>()
+    private val verifiedHistoryLinks = BoundedCache<ThreadKey, Long>(24)
     private val historyVerificationEpoch = AtomicLong()
     private val drafts = ConcurrentHashMap<ThreadKey, DraftEntity>()
     private val activeActions = AtomicInteger()
-    private val directoryActions = AtomicInteger()
+    private val directoryGate = Any()
+    private var directoryActions = 0
     private val preferencesGeneration = AtomicLong()
     private val accessGenerations = ConcurrentHashMap<ThreadKey, AtomicLong>()
     private val accessUpdates = ConcurrentHashMap.newKeySet<ThreadKey>()
@@ -174,6 +180,11 @@ class PocketRepository(
     private val contextRevisions = ConcurrentHashMap<ThreadKey, Long>()
     private val permissionUpdates = ConcurrentHashMap.newKeySet<ThreadKey>()
     private val extensionGeneration = AtomicLong()
+    private val extensionGate = Any()
+    private val extensionCache = BoundedCache<ExtensionCacheKey, CachedExtensions>(12)
+    private val extensionFlights = mutableMapOf<ExtensionCacheKey, Pair<Long, Job>>()
+    private val extensionReadTickets = mutableMapOf<ExtensionCacheKey, Long>()
+    private val extensionMutationVersions = BoundedCache<ExtensionCacheKey, Long>(24)
     private val extensionUpdates = ConcurrentHashMap.newKeySet<String>()
     private val messageEditGeneration = AtomicLong()
     private val messageEditGate = Any()
@@ -206,6 +217,10 @@ class PocketRepository(
     private val directoryLock = Mutex()
     private data class DirectoryQuery(val search: String = "", val archived: Boolean = false)
     @Volatile private var directoryQuery = DirectoryQuery()
+    private data class DirectoryRequest(val query: DirectoryQuery, val link: Long, val more: Boolean)
+    private data class DirectoryStamp(val link: Long, val nanos: Long, val next: JsonElement?)
+    private val directoryJobs = mutableMapOf<DirectoryRequest, Job>()
+    private val directoryStamps = mutableMapOf<DirectoryQuery, DirectoryStamp>()
     private val queueRefresh = Channel<Unit>(Channel.CONFLATED)
     private val queueLock = Mutex()
     private val stoppingTurns = ConcurrentHashMap.newKeySet<String>()
@@ -223,7 +238,8 @@ class PocketRepository(
     private var inspectedCommands: Set<String> = emptySet()
     private var inspectedGeneration: Long? = null
     private var inspectedConnectionGeneration: Long? = null
-    private val timelines = ConcurrentHashMap<ThreadKey, NativeTimeline>()
+    private val timelines = TimelineCache(historyCacheBudget)
+    private val conversationWindows = BoundedCache<ThreadKey, ConversationWindow>(24)
     private val cursors = ConcurrentHashMap<String, Cursor>()
     private val snapshotCursors = ConcurrentHashMap<ThreadKey, Cursor>()
     private val files = File(context.filesDir, "attachments").apply { mkdirs() }
@@ -231,13 +247,16 @@ class PocketRepository(
     init {
         scope.launch {
             for (ignored in directoryRefresh) {
-                delay(100)
+                delay(350)
                 while (directoryRefresh.tryReceive().isSuccess) { }
-                if (_state.value.online) runCatching {
-                    refreshRuntimes()
-                    // Refresh both archive states so moves and ownership changes update cached rows.
-                    refreshDirectory()
-                }
+                if (_state.value.online) try {
+                    synchronized(directoryGate) { directoryStamps.clear() }
+                    // Bound a complete pass, including runtime reads and lock contention.
+                    withTimeout(directoryTimeoutMillis) { refreshRuntimes(); refreshDirectory() }
+                } catch (_: TimeoutCancellationException) {
+                    _state.update { it.copy(directoryError = "会话列表更新超时，已保留缓存，可重试") }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { _state.update { it.copy(directoryError = "会话列表暂未更新，已保留缓存，可重试") } }
             }
         }
         scope.launch {
@@ -389,7 +408,7 @@ class PocketRepository(
                         _state.update { it.copy(connectionPhase = "syncing", connectionDetail = "正在恢复对话与待处理事项") }
                         stage = "synchronization"
                         sync()
-                        _state.update { it.copy(online = true, connection = "Connected", connectionPhase = "ready", connectionDetail = "", lastSyncAt = System.currentTimeMillis(), error = null, pairingPhase = if (it.pairingPhase == PairingPhase.Synchronizing) PairingPhase.Paired else it.pairingPhase) }
+                        _state.update { it.copy(online = true, mediaConnectionEpoch = generation, connection = "Connected", connectionPhase = "ready", connectionDetail = "", lastSyncAt = System.currentTimeMillis(), error = null, pairingPhase = if (it.pairingPhase == PairingPhase.Synchronizing) PairingPhase.Paired else it.pairingPhase) }
                         refreshSessionPreferences()
                         refreshThreadAccess()
                         stage = "connected"
@@ -464,7 +483,7 @@ class PocketRepository(
 
     private fun disconnect() { connectionJob?.cancel(); connectionJob = null; client?.close(); client = null; _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) } }
 
-    fun reloadConversation(): Job = _state.value.selected?.let(::select) ?: scope.launch {}
+    fun reloadConversation(): Job = _state.value.selected?.let { select(it, forceRefresh = true) } ?: scope.launch {}
 
     fun preparePairing() { _state.update { it.copy(pairingPhase = PairingPhase.Idle, error = null) } }
 
@@ -486,7 +505,7 @@ class PocketRepository(
             val saved = PairedComputer(config, result.string("deviceId"), result.string("deviceSecret"), result.string("computerId"), result.string("computerName", code.computerName))
             pairStore.save(saved)
             pair = saved
-            cursors.clear(); timelines.clear(); snapshotCursors.clear()
+            cursors.clear(); timelines.clear(); conversationWindows.clear(); snapshotCursors.clear()
             dao.cursors(saved.computerId).forEach { cursors[it.runtimeId] = Cursor(it.epoch, it.sequence) }
             val cachedChats = dao.allChats().filter { it.key.computerId == saved.computerId }
             val cachedCommands = dao.uncertain(saved.computerId)
@@ -502,7 +521,7 @@ class PocketRepository(
 
     fun forget() = action {
         routeDiscovery?.cancel(); routeDiscovery = null; discoveryComputer = null
-        disconnect(); pairStore.forget(); pair = null; cursors.clear(); timelines.clear(); snapshotCursors.clear()
+        disconnect(); pairStore.forget(); pair = null; cursors.clear(); timelines.clear(); conversationWindows.clear(); snapshotCursors.clear()
         _state.update { PocketState(initialized = true, theme = it.theme) }
     }
 
@@ -588,25 +607,61 @@ class PocketRepository(
         val runtimes = request("runtimes/list").asObject().array("data").map { RuntimeInfo.from(it.asObject()) }
         _state.update { it.copy(runtimes = runtimes) }
     }
-    fun refresh(search: String = "", archived: Boolean = false, more: Boolean = false): Job {
+    /** Returning to a cached home is a freshness check, not a forced network reload. */
+    fun ensureDirectory(search: String = "", archived: Boolean = false): Job = refreshDirectoryRequest(search, archived, false, false)
+    fun refresh(search: String = "", archived: Boolean = false, more: Boolean = false): Job = refreshDirectoryRequest(search, archived, more, true)
+    private fun refreshDirectoryRequest(search: String, archived: Boolean, more: Boolean, force: Boolean): Job = synchronized(directoryGate) {
         val query = DirectoryQuery(search, archived)
-        if (directoryQuery != query) { directoryQuery = query; _state.update { it.copy(nextThreads = null) } }
-        return action(lock = null, statusKey = "directory", globalBusy = false) { directoryScope { refreshRuntimes(); refreshChats(search, archived, more) } }
+        val link = connectionGeneration.get()
+        if (directoryQuery != query) {
+            directoryQuery = query
+            val next = directoryStamps[query]?.takeIf { it.link == link }?.next
+            _state.update { it.copy(nextThreads = next) }
+        }
+        val key = DirectoryRequest(query, link, more)
+        directoryJobs[key]?.takeIf { !it.isCompleted }?.let { return@synchronized it }
+        val stamp = directoryStamps[query]
+        if (!_state.value.online || (!force && !more && stamp != null && stamp.link == link && System.nanoTime() - stamp.nanos < 30_000_000_000L)) {
+            return@synchronized Job().apply { complete() }
+        }
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                withTimeout(directoryTimeoutMillis) {
+                    // hello already contains runtime identity. Do not delay cached list reads on unrelated metadata.
+                    if (force || _state.value.runtimes.isEmpty()) refreshRuntimes()
+                    refreshChats(search, archived, more)
+                }
+            } catch (_: TimeoutCancellationException) {
+                if (connectionGeneration.get() == link && directoryQuery == query) _state.update { it.copy(directoryError = "会话列表更新超时，已保留缓存，可重试") }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) {
+                if (connectionGeneration.get() == link && directoryQuery == query) _state.update { it.copy(directoryError = "会话列表暂未更新，已保留缓存，可重试") }
+            }
+        }
+        directoryJobs[key] = job
+        job.invokeOnCompletion { synchronized(directoryGate) { if (directoryJobs[key] === job) directoryJobs.remove(key) } }
+        job.start(); job
     }
     private suspend fun <T> directoryScope(block: suspend () -> T): T {
-        directoryActions.incrementAndGet(); _state.update { it.copy(directoryLoading = true) }
-        try { return block() }
-        finally { directoryActions.decrementAndGet(); _state.update { it.copy(directoryLoading = directoryActions.get() > 0) } }
+        synchronized(directoryGate) {
+            directoryActions++
+            _state.update { it.copy(directoryLoading = it.chats.none { chat -> chat.key.computerId == it.computerId }, directoryRefreshing = true, directoryError = null) }
+        }
+        try { return withTimeout(directoryTimeoutMillis) { block() } }
+        finally { synchronized(directoryGate) {
+            directoryActions--
+            _state.update { it.copy(directoryLoading = directoryActions > 0 && it.chats.none { chat -> chat.key.computerId == it.computerId }, directoryRefreshing = directoryActions > 0) }
+        } }
     }
     private suspend fun refreshChats(search: String = "", archived: Boolean = false, more: Boolean = false) {
-        directoryLock.withLock {
+        directoryScope { directoryLock.withLock {
             val query = DirectoryQuery(search, archived)
             if (query != directoryQuery) return@withLock
             val cursor = _state.value.nextThreads
             if (more && cursor == null) return@withLock
             val response = readChats(query, if (more) cursor else null)
             if (query == directoryQuery) _state.update { it.copy(nextThreads = response["nextCursor"]?.takeUnless { c -> c is JsonNull }) }
-        }
+        } }
     }
     private suspend fun refreshDirectory() = directoryScope { directoryLock.withLock {
         for (archived in listOf(false, true)) {
@@ -621,8 +676,11 @@ class PocketRepository(
         _state.update { it.copy(nextThreads = null) }
     } }
     private suspend fun readChats(query: DirectoryQuery, cursor: JsonElement?): JsonObject {
-        val response = directoryScope { request("threads/list", buildJsonObject { put("limit", 60); put("search", query.search); put("archived", query.archived); cursor?.let { put("cursor", it) } }).asObject() }
-        val p = pair ?: return response
+        val transport = client ?: throw WireException("offline", "Offline")
+        val link = connectionGeneration.get()
+        val p = pair ?: throw WireException("offline", "Offline")
+        val response = withTimeout(directoryTimeoutMillis) { transport.request("threads/list", buildJsonObject { put("limit", 60); put("search", query.search); put("archived", query.archived); cursor?.let { put("cursor", it) } }, timeoutMillis = directoryTimeoutMillis).asObject() }
+        if (client !== transport || connectionGeneration.get() != link || pair?.computerId != p.computerId) throw CancellationException("Directory connection changed")
         val chats = response.array("data").mapNotNull { value ->
             val o = value.asObject()
             val r = _state.value.runtimes.firstOrNull { it.id == o.string("runtimeId") } ?: return@mapNotNull null
@@ -634,11 +692,21 @@ class PocketRepository(
                 relationSource = if (o.flag("isSubagent") || o.string("parentThreadId").isNotBlank()) "native" else old?.relationSource)
         }.distinctBy { it.key }
         dao.putChats(chats)
+        synchronized(directoryGate) {
+            if (cursor == null) {
+                if (directoryStamps.size >= 32) directoryStamps.remove(directoryStamps.keys.first())
+                directoryStamps[query] = DirectoryStamp(link, System.nanoTime(), response["nextCursor"]?.takeUnless { it is JsonNull })
+            }
+        }
+        _state.update { it.copy(directoryLoading = false, directoryUpdatedAt = System.currentTimeMillis(), directoryError = null) }
         return response
     }
 
-    fun select(chat: ChatEntity): Job {
+    fun select(chat: ChatEntity, forceRefresh: Boolean = false): Job {
+        val outgoing = _state.value
+        outgoing.selected?.let { previous -> ConversationWindow.from(outgoing)?.let { conversationWindows[previous.key] = it } }
         val generation = selectionGeneration.incrementAndGet()
+        timelines.select(chat.key)
         closeAgentReader()
         return action(lock = null, statusKey = "conversation:${chat.key.encoded}", globalBusy = false) {
         val savedDraft = drafts[chat.key] ?: dao.draft(chat.key) ?: DraftEntity(chat.key)
@@ -648,7 +716,8 @@ class PocketRepository(
             latest.copy(text = restored.text, references = encodeReferenceSpans(restored.spans)).also { drafts[chat.key] = it }
         }
         if (draft != savedDraft) scope.launch { persistDraft(chat.key) }
-        val timeline = timelines[chat.key] ?: try {
+        val inMemory = timelines[chat.key]
+        val timeline = inMemory ?: try {
             NativeTimeline(items = db.withTransaction { dao.cachedItems(chat.key) }.associateTo(linkedMapOf()) { it.itemKey to it.item() }).withCachedTurns().also { timelines[chat.key] = it }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: Exception) {
@@ -656,9 +725,13 @@ class PocketRepository(
             NativeTimeline() // Native hydration below can repair the view without deleting any draft/cache.
         }
         if (generation != selectionGeneration.get()) return@action
+        val window = conversationWindows[chat.key]?.takeIf { it.runtimeId == chat.runtimeId && it.conflict == chat.conflict }
+        val reusable = !forceRefresh && window?.reusable(chat, _state.value.online,
+            verifiedHistoryLinks[chat.key], connectionGeneration.get(), inMemory != null) == true
         val cachedContext = dao.contextUsage(chat.key)?.let { runCatching { ContextSnapshot.from(pocketJson.parseToJsonElement(it.snapshot).jsonObject).copy(status = "stale") }.getOrNull() } ?: ContextSnapshot()
-        _state.update { it.copy(selected = chat, messageEdit = readMessageEdit(chat), timeline = timeline, draft = draft, attachments = parseAttachments(draft.attachments), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, modes = emptyList(), mode = null, nextTurns = null, historyExhausted = false, historyLoading = chat.key in loadingHistory, unknownHistoryInspected = false, stopping = stopKey(chat.key, timeline.activeTurn) in stoppingTurns, nativeQueue = emptyList(), queueSupported = null, advanced = AdvancedConversationState(asyncQuestions = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)))) }
-        _state.update { it.copy(conversationLoadState = ConversationLoadState.Idle, conversationLoadError = null,
+        _state.update { it.copy(selected = chat, messageEdit = readMessageEdit(chat), timeline = timeline, draft = draft, attachments = parseAttachments(draft.attachments), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, modes = emptyList(), mode = null, nextTurns = window?.nextTurns, historyExhausted = window?.exhausted ?: false, historyLoading = chat.key in loadingHistory, unknownHistoryInspected = false, stopping = stopKey(chat.key, timeline.activeTurn) in stoppingTurns, nativeQueue = emptyList(), queueSupported = null, advanced = AdvancedConversationState(asyncQuestions = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)))) }
+        _state.update { it.copy(conversationLoadState = if (reusable) ConversationLoadState.Ready else if (it.online) ConversationLoadState.Loading else window?.loadState?.takeIf { load -> load == ConversationLoadState.Failed } ?: ConversationLoadState.Idle, conversationLoadError = window?.error,
+            conversationCached = window != null || timeline.items.isNotEmpty(),
             nativeSettings = NativeSettings(), settingsFresh = false, pendingSettings = emptySet(), contextSnapshot = cachedContext,
             permissions = PermissionState(), resolvedPlans = preferences.getStringSet("resolvedPlans:${chat.key.encoded}", emptySet()).orEmpty().toSet(),
             dismissedPlans = preferences.getStringSet("dismissedPlans:${chat.key.encoded}", emptySet()).orEmpty().toSet(),
@@ -677,7 +750,8 @@ class PocketRepository(
             if (!isSelected(chat, generation)) return@action
             refreshContext()
             refreshPermissions()
-            loadConversation(chat)
+            if (!reusable || verifiedHistoryLinks[chat.key] != connectionGeneration.get()) loadConversation(chat)
+            else scope.launch { loadNativeSettings(chat, generation) }
             if (isSelected(chat, generation)) supervisorScope {
                 launch { loadModels(chat.runtimeId) }
                 launch { runCatching { loadQueue(chat, generation) } }
@@ -702,6 +776,7 @@ class PocketRepository(
         fun current() = client === transport && connectionGeneration.get() == linkGeneration &&
             historyVerificationEpoch.get() == verificationEpoch && isSelected(chat, generation)
         if (!current()) return false
+        verifiedHistoryLinks.remove(chat.key)
         restoreSelectedSettings(chat)
         val settingsTicket = synchronized(settingsGate) { settingsEntry(chat).record.revisions }
         // Optional helper cache read never starts/resumes a thread and does not block history.
@@ -737,7 +812,7 @@ class PocketRepository(
                 val cursor = cursors[chat.runtimeId]
                 if (watermark != null && cursor != null && watermark.epoch != cursor.epoch) throw WireException("stale", "History epoch changed")
                 if (watermark == null && capture.events.isNotEmpty()) throw WireException("stale", "History needs a cursor")
-                var timeline = parsed.withObservedTurns(timelines[chat.key] ?: NativeTimeline())
+                var timeline = parsed.withObservedTurns(timelineBase(chat.key))
                 var goal = thread["goal"] as? JsonObject
                 var usage = thread["tokenUsage"] as? JsonObject ?: _state.value.contextSnapshot.usage
                 val metadataCursor = metadata.obj("pocketCursor").let { o -> o.string("epoch").takeIf(String::isNotBlank)?.let { Cursor(it, o.number("sequence")) } }
@@ -764,12 +839,17 @@ class PocketRepository(
                 // Settings events were applied immediately, once, by consumeEventLocked. Replaying
                 // them here would overwrite a phone edit made after that live notification.
                 applySettingsSnapshot(chat, NativeSettings.snapshot(metadata), settingsTicket, linkGeneration)
+                if (!current()) return@withLock
                 verifiedHistoryLinks[chat.key] = linkGeneration
                 _state.update { if (current()) it.copy(timeline = timeline, nextTurns = next, historyExhausted = page != null && next == null,
-                    conversationLoadState = ConversationLoadState.Ready, conversationLoadError = null,
+                    conversationLoadState = ConversationLoadState.Ready, conversationLoadError = null, conversationCached = true,
                     stopping = stopKey(chat.key, timeline.activeTurn) in stoppingTurns,
                     advanced = it.advanced.copy(goal = goal, usage = usage,
                         asyncQuestions = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)))) else it }
+                // The selected state may already belong to another thread after publication.
+                // Bind this window to the identity and pagination result of this read.
+                conversationWindows[chat.key] = ConversationWindow(chat.runtimeId, chat.conflict, next,
+                    page != null && next == null, ConversationLoadState.Ready)
                 updateAsyncState(chat.key, timeline)
                 applied = true
             }
@@ -1145,6 +1225,7 @@ class PocketRepository(
         val draft = DraftEntity(chat.key)
         drafts[chat.key] = draft
         val timeline = NativeReducer.snapshot(response)
+        timelines.select(chat.key)
         timelines[chat.key] = timeline
         _state.update { it.copy(selected = chat, messageEdit = null, timeline = timeline, draft = draft, attachments = emptyList(), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, modes = emptyList(), mode = null, nextTurns = null, historyExhausted = false, historyLoading = false, unknownHistoryInspected = false, stopping = false, nativeQueue = emptyList(), queueSupported = null, resolvedPlans = emptySet(), permissions = PermissionState(), contextSnapshot = ContextSnapshot(), advanced = AdvancedConversationState()) }
         restoreSelectedSettings(chat)
@@ -1207,7 +1288,7 @@ class PocketRepository(
             if (!current()) return@launch
             // Rebinding is committed below only after the current native runtime confirms the ID.
             if (known == null || known.runtimeId == parent.runtimeId) dao.putChat(child)
-            val cached = timelines[key] ?: runCatching { NativeTimeline(items = db.withTransaction { dao.cachedItems(key) }.associateTo(linkedMapOf()) { it.itemKey to it.item() }).withCachedTurns() }.getOrDefault(NativeTimeline())
+            val cached = timelineBase(key)
             _state.update { if (current()) it.copy(agentReader = AgentReaderState(parent.key, child, cached, connection != null,
                 fullScreen = before?.fullScreen == true, updatedAt = before?.takeIf { r -> r.child?.key == key }?.updatedAt ?: 0,
                 nextTurns = before?.takeIf { r -> r.child?.key == key }?.nextTurns)) else it }
@@ -1238,9 +1319,13 @@ class PocketRepository(
                     check(canReadChildFrom(dao.chat(key), parent)) { "Child ownership changed during read" }
                     if (capture.overflow || (watermark == null && capture.events.isNotEmpty())) throw WireException("history_overflow", "Snapshot unavailable")
                     if (watermark != null && cursors[parent.runtimeId]?.epoch?.let { it != watermark.epoch } == true) throw WireException("stale", "Epoch changed")
-                    var result = parsed.withObservedTurns(timelines[key] ?: cached)
-                    if (older) result = result.copy(items = LinkedHashMap(result.items + (timelines[key] ?: cached).items), turns = result.turns + (timelines[key] ?: cached).turns,
-                        activeTurn = (timelines[key] ?: cached).activeTurn)
+                    // Events received during the read may have evicted this unpinned child.
+                    // Resolve its latest base once under the event lock, including reader/Room.
+                    val base = timelineBase(key)
+                    if (!current() || historyCaptures[key] !== capture) return@withLock
+                    var result = parsed.withObservedTurns(base)
+                    if (older) result = result.copy(items = LinkedHashMap(result.items + base.items), turns = result.turns + base.turns,
+                        activeTurn = base.activeTurn, completedTurns = result.completedTurns + base.completedTurns)
                     capture.events.forEach { envelope ->
                         val c = envelope.obj("cursor").let { Cursor(it.string("epoch"), it.number("sequence")) }
                         if (watermark != null && c.epoch == watermark.epoch && c.sequence > watermark.sequence && envelope.obj("event")["id"] == null)
@@ -1332,7 +1417,7 @@ class PocketRepository(
         val source = _state.value.selected ?: return scope.launch {}
         val generation = selectionGeneration.get()
         val connection = client
-        val timeline = timelines[source.key] ?: _state.value.timeline
+        val timeline = cachedTimelineBase(source.key) ?: return scope.launch {}
         val agent = timeline.items.values.asSequence().filter { it.type in setOf("collabAgentToolCall", "subAgentActivity") }
             .flatMap { NativeActivityPresentation.describe(it).agents.asSequence() }.lastOrNull { it.threadId == id }
             ?: return scope.launch {}
@@ -1376,7 +1461,7 @@ class PocketRepository(
         val generation = selectionGeneration.get()
         val connection = client ?: return scope.launch {}
         val known = _state.value.agentChats.filter { it.runtimeId == source.runtimeId && it.title.isNotBlank() && !it.title.startsWith("子代理") }.map { it.key.nativeId }.toSet()
-        val children = agentRoster(timelines[source.key] ?: _state.value.timeline).filter { it.threadId !in known || it.isCurrent }.sortedByDescending { it.isCurrent }.take(16)
+        val children = agentRoster(cachedTimelineBase(source.key) ?: return scope.launch {}).filter { it.threadId !in known || it.isCurrent }.sortedByDescending { it.isCurrent }.take(16)
         return scope.launch {
             for (batch in children.chunked(4)) coroutineScope {
                 batch.map { agent -> async {
@@ -1414,25 +1499,48 @@ class PocketRepository(
             }
         }
     }
-    fun loadExtensions(runtimeId: String): Job {
+    private fun publishExtensions(key: ExtensionCacheKey, value: CachedExtensions) {
+        extensionCache[key] = value
+        _state.update { s -> if (s.computerId == key.computerId && s.extensions.runtimeId == key.runtimeId)
+            s.copy(extensions = if (value.link == connectionGeneration.get() && s.online) value.state
+                else value.state.copy(phase = ExtensionPhase.Offline, refreshing = false)) else s }
+    }
+
+    fun loadExtensions(runtimeId: String, forceRefresh: Boolean = false): Job = synchronized(extensionGate) {
         val snapshot = _state.value
-        val runtime = snapshot.runtimes.firstOrNull { it.id == runtimeId } ?: return scope.launch {}
-        val generation = extensionGeneration.incrementAndGet()
+        val runtime = snapshot.runtimes.firstOrNull { it.id == runtimeId } ?: return@synchronized scope.launch {}
+        val key = ExtensionCacheKey(snapshot.computerId, runtimeId)
         val link = connectionGeneration.get()
         val transport = client
-        val previous = snapshot.extensions.takeIf { it.runtimeId == runtimeId && it.computerId == snapshot.computerId }
+        val cached = extensionCache[key]
+        val previous = cached?.state ?: snapshot.extensions.takeIf { it.runtimeId == runtimeId && it.computerId == snapshot.computerId }
             ?: ExtensionManagementState(snapshot.computerId, runtimeId)
-        _state.update { it.copy(extensions = previous.copy(phase = if (snapshot.online && runtime.online) ExtensionPhase.Loading else ExtensionPhase.Offline, error = null)) }
-        return scope.launch {
-            fun current() = extensionGeneration.get() == generation && connectionGeneration.get() == link &&
-                client === transport && _state.value.computerId == snapshot.computerId && _state.value.extensions.runtimeId == runtimeId
-            if (!snapshot.online || !runtime.online || transport == null) return@launch
-            if (!snapshot.supports("extensions/list", runtime)) {
-                if (current()) _state.update { it.copy(extensions = it.extensions.copy(phase = ExtensionPhase.Unsupported, status = "helper_update_required", error = "此助手尚未提供扩展管理，请更新电脑助手")) }
-                return@launch
+        val online = snapshot.online && runtime.online && transport != null
+        val flight = extensionFlights[key]?.takeIf { it.first == link && it.second.isActive }?.second
+        val fresh = online && flight == null && !forceRefresh && cached?.fresh(link, android.os.SystemClock.elapsedRealtime()) == true
+        _state.update { it.copy(extensions = previous.copy(
+            phase = when { !online -> ExtensionPhase.Offline; fresh -> previous.phase; previous.entries.isNotEmpty() -> previous.phase; else -> ExtensionPhase.Loading },
+            refreshing = online && !fresh, error = if (fresh || !online) previous.error else null)) }
+        if (!online || fresh) return@synchronized scope.launch {}
+        if (flight != null) return@synchronized flight
+        val generation = extensionGeneration.incrementAndGet()
+        val mutationVersion = extensionMutationVersions[key] ?: 0L
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            // The per-runtime flight token allows another runtime to refresh independently.
+            fun valid() = connectionGeneration.get() == link && client === transport && _state.value.computerId == key.computerId &&
+                synchronized(extensionGate) { extensionReadTickets[key] == generation }
+            fun updateData(transform: (ExtensionManagementState) -> ExtensionManagementState) = synchronized(extensionGate) {
+                if (valid()) {
+                    val existing = extensionCache[key] ?: CachedExtensions(previous, link, 0)
+                    publishExtensions(key, existing.copy(state = transform(existing.state)))
+                }
             }
             try {
-                val result = transport.request("extensions/list", buildJsonObject { put("runtimeId", runtimeId) }).asObject()
+                if (!snapshot.supports("extensions/list", runtime)) {
+                    updateData { it.copy(phase = ExtensionPhase.Unsupported, refreshing = false, status = "helper_update_required", error = "此助手尚未提供扩展管理，请更新电脑助手") }
+                    return@launch
+                }
+                val result = transport!!.request("extensions/list", buildJsonObject { put("runtimeId", runtimeId) }).asObject()
                 val ready = result.string("status") == "ready"
                 val phase = if (ready) ExtensionPhase.Ready else if (result.string("status") == "initializing") ExtensionPhase.Idle else ExtensionPhase.Unsupported
                 val reason = if (ready) null else when (result.string("status")) {
@@ -1440,47 +1548,82 @@ class PocketRepository(
                     "bridge_missing", "update_required" -> "运行中的电脑桥接需要更新，完成电脑任务后重新打开 Codex"
                     else -> "当前运行时未提供扩展管理能力"
                 }
-                if (current()) _state.update { state -> state.copy(extensions = ExtensionManagementState(snapshot.computerId, runtimeId,
-                    phase, managedExtensions(result), result.string("version"), System.currentTimeMillis(), error = reason,
-                    pendingIds = state.extensions.pendingIds,
-                    uncertainIds = state.extensions.uncertainIds - if (ready) managedExtensions(result).filter { it.enabled != null }.map { it.id }.toSet() else emptySet(),
-                    scope = result.string("scope"), reloadPending = result.flag("reloadPending"), status = result.string("status"),
-                    appInventoryStatus = result.obj("appInventory").string("status"))) }
+                synchronized(extensionGate) {
+                    if (valid()) {
+                        val state = extensionCache[key]?.state ?: previous
+                        val entries = managedExtensions(result)
+                        val confirmed = if (ready && (extensionMutationVersions[key] ?: 0L) == mutationVersion)
+                            entries.filter { it.enabled != null && it.id !in state.pendingIds }.mapTo(hashSetOf()) { it.id } else emptySet()
+                        val now = System.currentTimeMillis()
+                        publishExtensions(key, CachedExtensions(ExtensionManagementState(snapshot.computerId, runtimeId,
+                            phase, entries, result.string("version"), now, error = reason,
+                            pendingIds = state.pendingIds, uncertainIds = state.uncertainIds - confirmed,
+                            scope = result.string("scope"), reloadPending = result.flag("reloadPending"), status = result.string("status"),
+                            appInventoryStatus = result.obj("appInventory").string("status")), link, android.os.SystemClock.elapsedRealtime()))
+                    }
+                }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
-                if (current()) _state.update { it.copy(extensions = it.extensions.copy(phase = if (it.online) ExtensionPhase.Failed else ExtensionPhase.Offline,
-                    error = "扩展读取失败，可刷新重试")) }
+                updateData { it.copy(phase = if (_state.value.online) ExtensionPhase.Failed else ExtensionPhase.Offline,
+                    refreshing = false, error = "扩展读取失败，可刷新重试") }
+            } finally {
+                synchronized(extensionGate) { if (extensionReadTickets[key] == generation) { extensionFlights.remove(key); extensionReadTickets.remove(key) } }
             }
         }
+        extensionReadTickets[key] = generation
+        extensionFlights[key] = link to job
+        job.start()
+        job
     }
 
-    fun refreshExtensions(): Job = loadExtensions(_state.value.extensions.runtimeId)
+    fun refreshExtensions(): Job = loadExtensions(_state.value.extensions.runtimeId, forceRefresh = true)
 
     fun setExtensionEnabled(id: String, enabled: Boolean): Job {
         val s = _state.value
         val state = s.extensions
         val entry = state.entries.firstOrNull { it.id == id } ?: return scope.launch {}
         val runtime = s.runtimes.firstOrNull { it.id == state.runtimeId } ?: return scope.launch {}
-        if (!s.online || !runtime.online || !entry.canToggle || entry.enabled == enabled || id in state.uncertainIds ||
-            state.computerId != s.computerId || state.phase != ExtensionPhase.Ready || !extensionUpdates.add(id)) return scope.launch {}
+        val key = ExtensionCacheKey(state.computerId, state.runtimeId)
+        val updateKey = "${state.computerId.length}:${state.computerId}${state.runtimeId.length}:${state.runtimeId}$id"
+        if (!s.online || !runtime.online || extensionCache[key]?.link != connectionGeneration.get() || !entry.canToggle || entry.enabled == enabled || id in state.uncertainIds || id in state.pendingIds || state.refreshing ||
+            state.computerId != s.computerId || state.phase != ExtensionPhase.Ready || !extensionUpdates.add(updateKey)) return scope.launch {}
         val link = connectionGeneration.get()
-        _state.update { it.copy(extensions = it.extensions.copy(pendingIds = it.extensions.pendingIds + id, error = null)) }
+        fun updateData(transform: (ExtensionManagementState) -> ExtensionManagementState) = synchronized(extensionGate) {
+            val existing = extensionCache[key] ?: CachedExtensions(state, link, 0)
+            publishExtensions(key, existing.copy(state = transform(existing.state)))
+        }
+        synchronized(extensionGate) { extensionMutationVersions[key] = (extensionMutationVersions[key] ?: 0L) + 1 }
+        updateData { it.copy(pendingIds = it.pendingIds + id, error = null) }
         return scope.launch {
-            fun current() = _state.value.computerId == state.computerId && _state.value.extensions.runtimeId == state.runtimeId && connectionGeneration.get() == link
             try {
-                mutate("extensions/update", buildJsonObject {
+                val result = mutate("extensions/update", buildJsonObject {
                     put("runtimeId", state.runtimeId); put("id", id); put("enabled", enabled); put("expectedVersion", entry.version.ifBlank { state.version })
-                })
-                if (current()) loadExtensions(state.runtimeId).join()
-            } catch (cancelled: CancellationException) { throw cancelled }
+                }).asObject()
+                synchronized(extensionGate) { extensionMutationVersions[key] = (extensionMutationVersions[key] ?: 0L) + 1 }
+                updateData { it.copy(pendingIds = it.pendingIds - id) }
+                if (extensionUpdateUncertain(result.string("status"))) {
+                    updateData { it.copy(uncertainIds = it.uncertainIds + id, error = "更新结果待核对，请刷新；不会自动重试") }
+                } else if (_state.value.computerId == state.computerId && connectionGeneration.get() == link && _state.value.extensions.runtimeId == state.runtimeId) {
+                    // Discard any read that started before the acknowledgement.
+                    synchronized(extensionGate) { extensionFlights.remove(key)?.second?.cancel(); extensionReadTickets.remove(key) }
+                    loadExtensions(state.runtimeId, forceRefresh = true).join()
+                } else {
+                    updateData { it.copy(uncertainIds = it.uncertainIds + id) }
+                }
+            } catch (cancelled: CancellationException) {
+                synchronized(extensionGate) { extensionMutationVersions[key] = (extensionMutationVersions[key] ?: 0L) + 1 }
+                updateData { it.copy(uncertainIds = it.uncertainIds + id) }
+                throw cancelled
+            }
             catch (error: Exception) {
-                val unknown = error !is WireException
-                if (current()) _state.update { it.copy(extensions = it.extensions.copy(
+                synchronized(extensionGate) { extensionMutationVersions[key] = (extensionMutationVersions[key] ?: 0L) + 1 }
+                val unknown = extensionUpdateUncertain((error as? WireException)?.code)
+                updateData { it.copy(
                     error = if (unknown) "更新结果待核对，请刷新；不会自动重试" else "更新未完成，原选择已保留，请刷新后重试",
-                    uncertainIds = if (unknown) it.extensions.uncertainIds + id else it.extensions.uncertainIds)) }
+                    uncertainIds = if (unknown) it.uncertainIds + id else it.uncertainIds) }
             } finally {
-                extensionUpdates.remove(id)
-                if (current()) _state.update { it.copy(extensions = it.extensions.copy(pendingIds = it.extensions.pendingIds - id)) }
+                extensionUpdates.remove(updateKey)
+                updateData { it.copy(pendingIds = it.pendingIds - id) }
             }
         }
     }
@@ -1966,7 +2109,7 @@ class PocketRepository(
                 require(isSelected(chat, selection) && client === link)
                 require(PlanPresentation.unavailable(now.copy(sendBusy = false), plan) == null)
                 if (feedback != null) require(now.planFeedback?.let { it.matches(chat.key, chat.runtimeId, plan) && it.text == feedback } == true)
-                require(PlanPresentation.latest(timelines[chat.key] ?: now.timeline)?.revision == plan.revision)
+                require(PlanPresentation.latest(timelineBase(chat.key))?.revision == plan.revision)
                 val owned = dao.chat(chat.key)
                 require(owned?.runtimeId == chat.runtimeId && !owned.conflict && !owned.isSubagent)
                 val settingsTicket = synchronized(settingsGate) { settingsEntry(chat).record.revisions }
@@ -1984,7 +2127,7 @@ class PocketRepository(
                 if (isSelected(chat, selection)) refreshNativeSettings()
                 val turnId = result.obj("turn").string("id").ifBlank { result.string("turnId") }
                 if (turnId.isNotBlank()) eventLock.withLock {
-                    val old = timelines[chat.key] ?: now.timeline
+                    val old = timelineBase(chat.key)
                     val next = if (turnId in old.completedTurns || old.activeTurn != null) old else old.copy(activeTurn = turnId, status = "inProgress")
                     persistTimeline(chat.key, next, replace = false)
                     _state.update { if (it.selected?.key == chat.key) it.copy(timeline = next) else it }
@@ -2038,7 +2181,7 @@ class PocketRepository(
         }
         val currentChat = dao.chat(chat.key) ?: chat
         require(currentChat.runtimeId == chat.runtimeId && !currentChat.conflict && pair?.computerId == chat.key.computerId) { "Chat ownership changed" }
-        val running = (timelines[chat.key] ?: s.timeline).activeTurn
+        val running = timelineBase(chat.key).activeTurn
         require(!steer || running != null) { "The turn has finished; send a new message instead" }
         val method = when { steer -> "turn/steer"; running != null -> "thread/queue/add"; else -> "turn/start" }
         require(s.supports(method)) { "This runtime does not support this action" }
@@ -2055,7 +2198,7 @@ class PocketRepository(
         if (method == "thread/queue/add") loadQueue(chat, selectionGeneration.get())
         val turnId = result.obj("turn").string("id").ifBlank { result.string("turnId") }.ifBlank { if (steer) running.orEmpty() else "" }
         if (turnId.isNotBlank()) eventLock.withLock {
-            val old = timelines[chat.key] ?: NativeTimeline()
+            val old = timelineBase(chat.key)
             val related = if (steer && running != null) old.withConfirmedSteer(running, turnId) else old
             val next = if (turnId in related.completedTurns || related.activeTurn != null) related else related.copy(activeTurn = turnId, status = "inProgress")
             persistTimeline(chat.key, next, replace = false)
@@ -2141,7 +2284,7 @@ class PocketRepository(
     }
     fun clearCache() = action {
         db.withTransaction { dao.clearHistory(); dao.clearCursors(); dao.clearSnapshots() }
-        eventLock.withLock { timelines.clear(); cursors.clear(); snapshotCursors.clear(); _state.update { it.copy(timeline = NativeTimeline(), notice = context.getString(R.string.cache_cleared)) } }
+        eventLock.withLock { timelines.clear(); timelines.select(_state.value.selected?.key); conversationWindows.clear(); cursors.clear(); snapshotCursors.clear(); invalidateHistoryVerification(); _state.update { it.copy(timeline = NativeTimeline(), conversationCached = false, notice = context.getString(R.string.cache_cleared)) } }
         disconnect(); reconnect()
     }
     fun checkCommands() = action(lock = null) { reconcileCommands() }
@@ -2502,12 +2645,12 @@ class PocketRepository(
             val watermark = key?.let { snapshotCursors[it] ?: dao.snapshot(it)?.let { row -> Cursor(row.epoch, row.sequence).also { c -> snapshotCursors[key] = c } } }
             val owner = key?.let { dao.chat(it) }
             if (key != null && (owner == null || owner.runtimeId == runtime) && threadId.isNotBlank() && requestId == null && watermark?.covers(next) != true && method !in setOf("serverRequest/resolved", "pocket/approvalResolved")) {
-                val old = timelines[key] ?: NativeTimeline(items = db.withTransaction { dao.cachedItems(key) }.associateTo(linkedMapOf()) { it.itemKey to it.item() }).withCachedTurns()
+                val old = timelineBase(key)
                 val updated = NativeReducer.reduce(old, event, "${next.epoch}:${next.sequence}")
                 val changed = updated.items.values.filter { old.items[it.key] !== it || old.turns[it.turnId] != updated.turns[it.turnId] }
                 val order = updated.items.keys.withIndex().associate { it.value to it.index.toLong() }
                 dao.putItems(changed.map { ItemEntity.from(key, it.withTurnCache(updated.turns[it.turnId]), order.getValue(it.key)) })
-                timelines[key] = updated
+                timelines.update(key, updated, changed)
                 if (_state.value.selected?.key == key && _state.value.selected?.runtimeId == runtime) _state.update { it.copy(timeline = updated, stopping = stopKey(key, updated.activeTurn) in stoppingTurns) }
                 _state.update { s -> if (s.agentReader?.child?.key == key && s.agentReader.child.runtimeId == runtime)
                     s.copy(agentReader = s.agentReader.copy(timeline = updated, updatedAt = System.currentTimeMillis())) else s }
@@ -2571,14 +2714,36 @@ class PocketRepository(
         }
     }
 
+    /** A miss is never an empty-history signal, including delayed writes after selection changes. */
+    private fun cachedTimelineBase(key: ThreadKey): NativeTimeline? {
+        timelines[key]?.let { return it }
+        val current = _state.value
+        if (current.selected?.key == key) return current.timeline
+        current.agentReader?.takeIf { it.child?.key == key }?.let { return it.timeline }
+        return null
+    }
+    private suspend fun timelineBase(key: ThreadKey): NativeTimeline {
+        cachedTimelineBase(key)?.let { return it }
+        return NativeTimeline(items = db.withTransaction { dao.cachedItems(key) }
+            .associateTo(linkedMapOf()) { it.itemKey to it.item() }).withCachedTurns()
+    }
+
     private suspend fun persistTimeline(key: ThreadKey, timeline: NativeTimeline, replace: Boolean) {
-        db.withTransaction { if (replace) dao.clearItems(key); dao.putItems(timeline.items.values.mapIndexed { index, i -> ItemEntity.from(key, i.withTurnCache(timeline.turns[i.turnId]), index.toLong()) }) }
+        db.withTransaction {
+            val next = timeline.items.values.mapIndexed { index, i -> ItemEntity.from(key, i.withTurnCache(timeline.turns[i.turnId]), index.toLong()) }
+            val diff = itemPersistenceDiff(dao.cachedItems(key), next, replace)
+            diff.removed.chunked(400).forEach { dao.removeItems(key, it) }
+            if (diff.upserts.isNotEmpty()) dao.putItems(diff.upserts)
+        }
         timelines[key] = timeline
     }
     fun older(): Job {
         val s = _state.value
         val chat = s.selected ?: return scope.launch {}
         val generation = selectionGeneration.get()
+        val link = connectionGeneration.get()
+        val epoch = historyVerificationEpoch.get()
+        if (s.conversationLoadState != ConversationLoadState.Ready || verifiedHistoryLinks[chat.key] != link) return scope.launch {}
         if (s.historyExhausted || !loadingHistory.add(chat.key)) return scope.launch {}
         _state.update { it.copy(historyLoading = true) }
         return action(lock = null) {
@@ -2587,12 +2752,16 @@ class PocketRepository(
         val turns = response.array("data").reversed()
         val old = NativeReducer.snapshot(buildJsonObject { put("turns", JsonArray(turns)) })
         eventLock.withLock {
-            if (!isSelected(chat, generation)) return@withLock
-            val current = timelines[chat.key] ?: NativeTimeline()
+            if (!isSelected(chat, generation) || connectionGeneration.get() != link || historyVerificationEpoch.get() != epoch) return@withLock
+            val current = timelineBase(chat.key)
             val merged = current.copy(items = LinkedHashMap(old.items).apply { putAll(current.items) }, turns = old.turns + current.turns, completedTurns = old.completedTurns + current.completedTurns)
             persistTimeline(chat.key, merged, true)
             val next = response["nextCursor"]?.takeUnless { v -> v is JsonNull }
-            _state.update { it.copy(timeline = merged, nextTurns = next, historyExhausted = next == null || next == s.nextTurns) }
+            val exhausted = next == null || next == s.nextTurns
+            _state.update { if (isSelected(chat, generation) && connectionGeneration.get() == link && historyVerificationEpoch.get() == epoch)
+                it.copy(timeline = merged, nextTurns = next, historyExhausted = exhausted) else it }
+            conversationWindows[chat.key] = ConversationWindow(chat.runtimeId, chat.conflict, next, exhausted,
+                s.conversationLoadState, s.conversationLoadError)
         }
         } finally { loadingHistory.remove(chat.key); _state.update { it.copy(historyLoading = it.selected?.key?.let { key -> key in loadingHistory } == true) } }
         }
@@ -2635,7 +2804,7 @@ class PocketRepository(
         val chat = selected(); val generation = selectionGeneration.get()
         return action(lock = null) {
             val entry = _state.value.nativeQueue.firstOrNull { it.string("id") == id } ?: error("Queued message changed")
-            val running = (timelines[chat.key] ?: _state.value.timeline).activeTurn ?: error("The turn has finished; the queued message will run next")
+            val running = timelineBase(chat.key).activeTurn ?: error("The turn has finished; the queued message will run next")
             val input = entry.array("input")
             require(input.isNotEmpty())
             // Steer first: if deleting fails afterwards the message is duplicated, never lost.
@@ -2661,7 +2830,7 @@ class PocketRepository(
         val turnId = response.obj("turn").string("id").ifBlank { response.string("turnId") }
         if (turnId.isBlank() || turnId == running) return
         eventLock.withLock {
-            val previous = timelines[chat.key] ?: return@withLock
+            val previous = timelineBase(chat.key)
             val updated = previous.withConfirmedSteer(running, turnId)
             persistTimeline(chat.key, updated, replace = false)
             _state.update { if (it.selected?.key == chat.key && it.selected.runtimeId == chat.runtimeId) it.copy(timeline = updated) else it }
@@ -2862,7 +3031,7 @@ class PocketRepository(
     fun answerAsyncBatch(answers: List<Pair<JsonObject, String>>): Job {
         val chat = selected()
         return action {
-            val timeline = timelines[chat.key] ?: error("Conversation is unavailable")
+            val timeline = timelineBase(chat.key)
             val pending = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)).associateBy { it.string("id") }
             require(answers.isNotEmpty() && answers.size <= 32)
             val checked = answers.map { (question, answer) ->
@@ -2893,7 +3062,7 @@ class PocketRepository(
                 if (running != null) recordSteerRelation(chat, running, response)
             } catch (e: WireException) {
                 preferences.edit().putStringSet("questions:${chat.key.encoded}", submitted - ids).commit()
-                updateAsyncState(chat.key, timelines[chat.key] ?: timeline); throw e
+                updateAsyncState(chat.key, timelineBase(chat.key)); throw e
             }
         }
     }
@@ -3073,7 +3242,8 @@ class PocketRepository(
 
     private val imageCache = File(context.cacheDir, "desktop-images").apply { mkdirs() }
     private val imageFetches = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<File?>>()
-    private val imageFailures = ConcurrentHashMap<String, Long>()
+    private data class ImageFailure(val at: Long, val link: Long, val failure: Exception)
+    private val imageFailures = ConcurrentHashMap<String, ImageFailure>()
     private val imageGate = kotlinx.coroutines.sync.Semaphore(2)
     fun canFetchDesktopImages(): Boolean = _state.value.let { it.online && it.selected != null && it.supports("workspace/image") }
 
@@ -3090,27 +3260,31 @@ class PocketRepository(
     suspend fun desktopImage(path: String, owner: ChatEntity? = _state.value.selected): File? {
         val chat = owner ?: return null
         val name = desktopImageCacheKey(path, chat)
-        val transport = client ?: throw WireException("offline", "Offline")
-        val link = connectionGeneration.get()
         if (pair?.computerId != chat.key.computerId) throw PocketOperationException(PocketFailure.MediaOwner)
         val target = File(imageCache, name)
         if (target.isFile && target.length() > 0) return target.also { it.setLastModified(System.currentTimeMillis()) }
+        val transport = client ?: throw WireException("offline", "Offline")
+        val link = connectionGeneration.get()
         if (!_state.value.online) throw WireException("offline", "Offline")
         if (!_state.value.supports("workspace/image", _state.value.runtimes.firstOrNull { it.id == chat.runtimeId }))
             throw PocketOperationException(PocketFailure.MediaUnsupported)
-        imageFailures[name]?.let { if (System.currentTimeMillis() - it < 60_000) throw PocketOperationException(PocketFailure.MediaFailed) }
-        val job = imageFetches.computeIfAbsent(name) { scope.async {
+        imageFailures[name]?.let { if (it.link == link && System.currentTimeMillis() - it.at < 60_000) throw it.failure else imageFailures.remove(name, it) }
+        val fetchKey = "$name:$link"
+        val job = imageFetches.computeIfAbsent(fetchKey) { scope.async(start = CoroutineStart.LAZY) {
+            val partial = File(imageCache, "$name.$link.part")
+            fun current() = client === transport && connectionGeneration.get() == link && pair?.computerId == chat.key.computerId
+            fun requireCurrent() { if (!current()) throw PocketOperationException(PocketFailure.MediaOwner) }
             try {
                 imageGate.withPermit {
-                    val partial = File(imageCache, "$name.part")
+                    requireCurrent()
                     partial.outputStream().use { out ->
                         var offset = 0L
                         while (true) {
-                            if (client !== transport || connectionGeneration.get() != link || pair?.computerId != chat.key.computerId)
-                                throw PocketOperationException(PocketFailure.MediaOwner)
+                            requireCurrent()
                             val chunk = transport.request("workspace/image", buildJsonObject {
                                 put("runtimeId", chat.runtimeId); put("threadId", chat.key.nativeId); put("path", path); put("offset", offset)
                             }).asObject()
+                            requireCurrent()
                             val bytes = android.util.Base64.decode(chunk.string("data"), android.util.Base64.DEFAULT)
                             require(bytes.isNotEmpty() || chunk.flag("eof"))
                             out.write(bytes); offset += bytes.size
@@ -3118,14 +3292,21 @@ class PocketRepository(
                             if (chunk.flag("eof")) break
                         }
                     }
+                    requireCurrent()
                     check(partial.renameTo(target))
                     trimImageCache()
                     target
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: Exception) { imageFailures[name] = System.currentTimeMillis(); File(imageCache, "$name.part").delete(); throw failure }
-            finally { imageFetches.remove(name) }
+            catch (failure: Exception) {
+                if (current()) imageFailures[name] = ImageFailure(System.currentTimeMillis(), link, failure)
+                throw failure
+            } finally { partial.delete() }
         } }
+        // Publish before execution: an immediate failure must not leave a
+        // completed Deferred permanently cached by computeIfAbsent.
+        job.invokeOnCompletion { imageFetches.remove(fetchKey, job) }
+        job.start()
         return job.await()
     }
 

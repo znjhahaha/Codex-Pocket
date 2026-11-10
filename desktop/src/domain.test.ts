@@ -4,6 +4,7 @@ describe('Pairing lifecycle',()=>{
 it('expires and never shows a negative countdown',()=>{expect(remainingSeconds(100,101)).toBe(0);expect(remainingSeconds(100,99.1)).toBe(1)});
 it('requires a new non-revoked device, not an existing device',()=>{const p={payload:'secret',expiresAt:100,baselineIds:['old']};expect(pairingComplete(p,[{id:'old',name:'old'}])).toBe(false);expect(pairingComplete(p,[{id:'new',name:'new',revoked:true}])).toBe(false);expect(pairingComplete(p,[{id:'new',name:'new'}])).toBe(true)});
 it('never promotes stale running status into healthy',()=>{const s={desired:true,supervisor:{updatedAt:10,phase:'running'},relay:{state:'connected'}} as Snapshot;expect(health(s,30)).toBe('unavailable');expect(health({...s,desired:false},30)).toBe('stopped')});
+it('does not claim pause before the helper acknowledges it',()=>{const s={desired:false,supervisor:{updatedAt:100,phase:'running'},relay:{state:'connected'},connection:{phase:'stopping'}} as Snapshot;expect(health(s,100)).toBe('stopping');expect(health({...s,connection:{...s.connection!,phase:'waiting_restart'}},100)).toBe('waiting_restart')});
 });
 
 describe('Guided connection readiness',()=>{

@@ -79,11 +79,13 @@ class V06SessionRepositoryTest {
         server.directory = { entered.complete(Unit); release.await() }
         val refresh = repo.refresh()
         entered.await()
-        assertTrue(repo.state.value.directoryLoading)
+        assertTrue(repo.state.value.directoryRefreshing)
+        assertFalse("Cached rows do not become a blocking initial load", repo.state.value.directoryLoading)
         assertFalse(repo.state.value.busy)
         assertFalse(repo.state.value.sendBusy)
         release.complete(Unit); refresh.join()
         assertFalse(repo.state.value.directoryLoading)
+        assertFalse(repo.state.value.directoryRefreshing)
     }
 
     @Test fun desktopEnsureIsOneCommandAndOnlyInventoryIsPolled() = runBlocking<Unit> {
@@ -129,7 +131,7 @@ class V06SessionRepositoryTest {
         val reads = server.calls.count { it.method == "workspace/image" }
         server.imageFails = false
         try { repo.desktopImage(path, owner); fail("Expected negative cache") }
-        catch (failure: PocketOperationException) { assertEquals(PocketFailure.MediaFailed, failure.failure) }
+        catch (failure: WireException) { assertEquals("media_failed", failure.code) }
         assertEquals(reads, server.calls.count { it.method == "workspace/image" })
         val other = owner.copy(key = owner.key.copy(nativeId = "other"))
         db.dao().putChat(other); repo.select(other).join()
@@ -147,6 +149,45 @@ class V06SessionRepositoryTest {
         assertTrue(update >= 0)
         assertTrue(server.calls.drop(update + 1).any { it.method == "thread/settings/read" })
         assertFalse("Native normalization is authoritative", repo.state.value.advanced.fastMode)
+    }
+
+    @Test fun cachedImageRemainsReadableOfflineWithoutKeepingACompletedFetch() = runBlocking<Unit> {
+        val owner = repo.state.value.selected!!
+        val path = "cached-${java.util.UUID.randomUUID()}.png"
+        val image = repo.desktopImage(path, owner)!!
+        val reads = server.calls.count { it.method == "workspace/image" }
+        val fetches = PocketRepository::class.java.getDeclaredField("imageFetches").apply { isAccessible = true }.get(repo) as Map<*, *>
+        withTimeout(5_000) { while(fetches.isNotEmpty()) delay(10) }
+        repo.setForeground(false)
+        PocketRepository::class.java.getDeclaredField("client").apply { isAccessible = true }.set(repo, null)
+        assertEquals(image, repo.desktopImage(path, owner))
+        assertEquals(reads, server.calls.count { it.method == "workspace/image" })
+    }
+
+    @Test fun reconnectedImageDoesNotJoinOrPublishAnOldConnectionsDownload() = runBlocking<Unit> {
+        val owner = repo.state.value.selected!!
+        val path = "reconnect-inflight-${java.util.UUID.randomUUID()}.png"
+        val entered = CompletableDeferred<Unit>()
+        val releaseOld = CompletableDeferred<Unit>()
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val freshBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 13, 10, 26, 10, 7)
+        server.imageRead = {
+            val bytes = if (calls.incrementAndGet() == 1) {
+                entered.complete(Unit); releaseOld.await(); freshBytes.copyOf().also { it[it.lastIndex] = 3 }
+            } else freshBytes
+            buildJsonObject { put("data", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)); put("eof", true) }
+        }
+        val old = async { runCatching { repo.desktopImage(path, owner) } }
+        entered.await()
+        val generation = PocketRepository::class.java.getDeclaredField("connectionGeneration").apply { isAccessible = true }
+            .get(repo) as java.util.concurrent.atomic.AtomicLong
+        generation.incrementAndGet()
+        val fresh = try { withTimeoutOrNull(1_500) { repo.desktopImage(path, owner) } }
+            finally { releaseOld.complete(Unit) }
+        val stale = old.await()
+        assertNotNull("A new connection must not wait on the previous connection's download", fresh)
+        assertTrue("The late old response must not be published", stale.isFailure)
+        assertArrayEquals(freshBytes, fresh!!.readBytes())
     }
 
     @Test fun unloadedIdleThreadPreparesOnceUsingRecordedDesktopMode() = runBlocking<Unit> {
@@ -175,6 +216,7 @@ class V06SessionRepositoryTest {
         var mode = "desktop"
         var revision = 4
         var imageFails = false
+        var imageRead: suspend () -> JsonElement? = { null }
         var fastSupported = false
         var ownerMissing = false
         var configuredMode: String? = null
@@ -221,6 +263,7 @@ class V06SessionRepositoryTest {
                 "runtime/ensure" -> { check(commandId == params.string("commandId")); ensureRequested = true; buildJsonObject { put("phase", "starting_desktop"); put("runtimeId", JsonNull) } }
                 "thread/media/read" -> buildJsonObject { put("mediaId", params.string("mediaId")); put("status", "ready"); put("mimeType", "image/png"); put("size", 10); put("offset", 0); put("eof", true); put("data", "fixture") }
                 "workspace/image" -> {
+                    imageRead()?.let { return it }
                     if (imageFails) throw WireException("media_failed", "fixture")
                     buildJsonObject { put("data", "iVBORw0KGgo="); put("eof", true) }
                 }

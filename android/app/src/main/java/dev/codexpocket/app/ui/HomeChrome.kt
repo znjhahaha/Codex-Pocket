@@ -94,8 +94,7 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" },
                         Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                    if (s.directoryLoading) PocketActivityIndicator("正在处理")
-                    else Box(Modifier.size(6.dp).background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
+                    Box(Modifier.size(6.dp).testTag("home-connectivity").background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
                     Text(s.computerName.ifBlank { stringResource(R.string.v03_home_computer) }, Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Icon(PocketIcons.ExpandMore, null, Modifier.size(14.dp).graphicsLayer { rotationZ = arrow }, tint = MaterialTheme.colorScheme.onSurfaceVariant)

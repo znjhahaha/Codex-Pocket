@@ -17,7 +17,18 @@ data class ExtensionManagementState(
     val error: String? = null, val pendingIds: Set<String> = emptySet(), val uncertainIds: Set<String> = emptySet(),
     val scope: String = "", val reloadPending: Boolean = false, val status: String = "",
     val appInventoryStatus: String = "",
+    val refreshing: Boolean = false,
 )
+
+internal const val EXTENSION_CACHE_MILLIS = 60_000L
+internal data class ExtensionCacheKey(val computerId: String, val runtimeId: String)
+internal data class CachedExtensions(val state: ExtensionManagementState, val link: Long, val readAt: Long) {
+    fun fresh(link: Long, now: Long): Boolean = this.link == link && now - readAt in 0 until EXTENSION_CACHE_MILLIS &&
+        state.phase == ExtensionPhase.Ready && state.pendingIds.isEmpty() && state.uncertainIds.isEmpty()
+}
+
+internal fun extensionUpdateUncertain(code: String?): Boolean = code == null || code in
+    setOf("unknown", "submitted", "timeout", "disconnected", "offline", "backpressure", "io", "result_unknown")
 
 fun managedExtensions(value: JsonObject): List<ManagedExtension> = value.array("data").mapNotNull { raw ->
     val row = raw.asObject()

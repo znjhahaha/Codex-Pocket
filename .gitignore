@@ -74,6 +74,8 @@
 /design/previews/
 /docs/*
 !/docs/WIRE.md
+!/docs/IMPLEMENTATION-20261109.md
+!/docs/OPTIMIZATION-20261110-ACCEPTANCE.md
 !/docs/STATUS.md
 !/docs/V052-ACCEPTANCE.md
 !/docs/AWS-RELAY-DEPLOYMENT.md

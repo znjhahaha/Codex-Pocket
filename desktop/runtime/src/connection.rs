@@ -7,6 +7,8 @@ static OPERATION:AtomicU64=AtomicU64::new(1);
 #[serde(rename_all="camelCase")]
 pub struct OperationError {
     pub code:String,pub stage:String,pub message:String,pub retryable:bool,pub operation_id:String,
+    #[serde(skip_serializing_if="Option::is_none")]pub exit_code:Option<i32>,
+    pub actions:Vec<String>,
 }
 impl OperationError {
     pub fn new(stage:&str,code:&str,retryable:bool)->Self {
@@ -22,20 +24,34 @@ impl OperationError {
             "start_required"=>"远程连接已暂停，请先启动连接。",
             "invalid_relay_url"=>"请填写 wss:// 开头的中转基础地址，不要包含账号、令牌或配对房间。",
             "route_configuration_failed"=>"线路设置未完成，请检查地址和网络后重试。",
+            "route_read_failed"=>"无法读取运行中助手的线路设置。请检查后台运行代次与控制协议；已有配置未被清空。",
+            "control_protocol_unsupported"=>"运行中的旧助手不支持此操作。请在安装与更新中完成后台交接。",
+            "control_timeout"=>"本机后台控制请求超时。请检查后台运行状态后重试。",
+            "control_rejected"=>"本机助手拒绝了此请求。请查看安装与运行代次及控制协议；配置没有被当作空值覆盖。",
+            "control_failed"=>"本机控制命令失败。请查看本步骤的退出码与安装诊断后重试。",
+            "control_invalid_params"=>"后台拒绝了请求参数。请重新读取设置后重试。",
+            "control_version_conflict"=>"设置已被其他操作更新。请重新读取并核对后再保存。",
+            "control_unauthorized"=>"本机后台授权校验失败。请从当前 Windows 用户的开始菜单重新打开 Pocket。",
             "network_detection_failed"=>"未能检测局域网，请检查电脑网络；仍可继续配置公网连接。",
             "tunnel_failed"=>"Cloudflare 隧道设置未完成，请检查网络和授权后重试。",
             "deployment_failed"=>"服务器部署步骤未完成，请检查 SSH、域名和端口后重试。",
             "pairing_payload_invalid"=>"配对码未能读取或已经过期，请重新生成配对码。",
             "operation_busy"=>"另一项操作正在进行，请稍后重试。",
+            "upgrade_unverified"=>"尚未取得旧后台的完整进程与安装代次证据，无法自动交接。请保留任务，任务完成后重新登录 Windows，再核验版本。",
             _=>"此步骤未完成，请查看连接诊断后重试。",
         };
         Self{code:code.into(),stage:stage.into(),message:message.into(),retryable,
-            operation_id:format!("{}-{}-{}",crate::storage::now(),std::process::id(),OPERATION.fetch_add(1,Ordering::Relaxed))}
+            operation_id:format!("{}-{}-{}",crate::storage::now(),std::process::id(),OPERATION.fetch_add(1,Ordering::Relaxed)),exit_code:None,
+            actions:if retryable {vec!["refresh".into(),"export_diagnostics".into()]}else{vec!["export_diagnostics".into()]}}
     }
     pub fn from_error(stage:&str,error:&anyhow::Error)->Self {
+        if let Some(failure)=error.downcast_ref::<crate::process::CommandFailure>(){
+            let mut result=Self::new(stage,failure.code,!matches!(failure.code,"control_unauthorized"|"control_protocol_unsupported"));
+            result.exit_code=failure.exit_code;return result;
+        }
         let code=if error.downcast_ref::<crate::storage::RedirectedPath>().is_some(){"path_redirected"}
         else if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::PermissionDenied){"permission_denied"}
-        else {match stage {"installation"=>"installation_invalid","startup"=>"startup_failed","pairing_payload"=>"pairing_payload_invalid","network"=>"network_detection_failed","routes"=>"route_configuration_failed","connectivity"|"cloudflare"=>"tunnel_failed","ssh"=>"deployment_failed",_=>"helper_unavailable"}};
+        else {match stage {"installation"=>"installation_invalid","startup"=>"startup_failed","pairing_payload"=>"pairing_payload_invalid","network"=>"network_detection_failed","routes"=>"route_configuration_failed","routes_read"=>"route_read_failed","connectivity"|"cloudflare"=>"tunnel_failed","ssh"=>"deployment_failed",_=>"helper_unavailable"}};
         Self::new(stage,code,!matches!(code,"path_redirected"|"installation_invalid"|"permission_denied"))
     }
 }
@@ -43,7 +59,13 @@ pub fn fresh(timestamp:u64,now:u64)->bool{timestamp>0&&timestamp<=now.saturating
 pub const STARTUP_TIMEOUT_SECONDS:u64=30;
 pub fn phase(desired:&crate::storage::Desired,consistent:bool,supervisor:&Value,helper:&Value,now:u64)->&'static str{
     if !consistent{return "failed"}
-    if !desired.enabled{return "stopped"}
+    if !desired.enabled {
+        if helper["remoteControlProtocol"]==1 && helper["remoteEnabled"]==false && fresh(helper["updatedAt"].as_u64().unwrap_or(0),now) { return "stopped"; }
+        if supervisor["childPid"].as_u64().is_some() && fresh(supervisor["updatedAt"].as_u64().unwrap_or(0),now) {
+            return if supervisor["phase"]=="waiting_restart" {"waiting_restart"} else {"stopping"};
+        }
+        return "stopped";
+    }
     let heartbeat=supervisor["updatedAt"].as_u64().unwrap_or(0);
     if !fresh(heartbeat,now){
         // Once this enable period has seen a supervisor, a lost heartbeat is recovery.

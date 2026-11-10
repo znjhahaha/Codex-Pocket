@@ -32,6 +32,8 @@ toml = "0.8"
 pocket-core = {path="../core"}
 codex-cli-adapter = {path="../cli-adapter"}
 pocket-tunnel = {path="../tunnel"}
+pocket-network = {path="../network"}
+mdns-sd = "=0.21.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

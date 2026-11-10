@@ -51,9 +51,6 @@ import androidx.core.content.ContextCompat
 import dev.codexpocket.app.WatchService
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
-import com.kyant.backdrop.Backdrop
-import com.kyant.backdrop.backdrops.layerBackdrop
-import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 
 @Composable
 internal fun PairScreen(
@@ -73,6 +70,7 @@ internal enum class SettingsPage(val label: String) {
 internal fun SettingsPageLayout(
     initialPage: SettingsPage = SettingsPage.Connection,
     modifier: Modifier = Modifier,
+    extensionContent: (@Composable (Modifier, PaddingValues) -> Unit)? = null,
     content: @Composable ColumnScope.(SettingsPage) -> Unit,
 ) {
     var page by rememberSaveable { mutableStateOf(initialPage) }
@@ -83,56 +81,57 @@ internal fun SettingsPageLayout(
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
     val background = MaterialTheme.colorScheme.background
-    // Capture the page only. Neither the segment glass nor its moving thumb samples itself.
-    val backdrop = rememberLayerBackdrop { drawRect(background); drawContent() }
     val density = LocalDensity.current
     var segmentHeight by remember { mutableIntStateOf(with(density) { 82.dp.roundToPx() }) }
     Box(modifier.fillMaxSize().background(background).testTag("management-settings")) {
         AnimatedContent(
             targetState = page,
-            modifier = Modifier.fillMaxSize().layerBackdrop(backdrop),
+            modifier = Modifier.fillMaxSize(),
             transitionSpec = {
-                if (motion) fadeIn(tween(140)) togetherWith fadeOut(tween(90))
+                if (motion) fadeIn(tween(180)) togetherWith fadeOut(tween(180))
                 else EnterTransition.None togetherWith ExitTransition.None
             },
             label = "settings-page",
         ) { selected ->
             pages.SaveableStateProvider(selected.name) {
-                val scroll = when (selected) {
-                    SettingsPage.Connection -> connectionScroll
-                    SettingsPage.Extensions -> extensionScroll
-                    SettingsPage.App -> appScroll
+                val padding = PaddingValues(start = 16.dp, end = 16.dp,
+                    top = with(density) { segmentHeight.toDp() } + 4.dp, bottom = 24.dp)
+                if (selected == SettingsPage.Extensions && extensionContent != null) {
+                    extensionContent(Modifier.fillMaxSize().testTag("settings-page:" + selected.name), padding)
+                } else {
+                    val scroll = when (selected) {
+                        SettingsPage.Connection -> connectionScroll
+                        SettingsPage.Extensions -> extensionScroll
+                        SettingsPage.App -> appScroll
+                    }
+                    Column(
+                        Modifier.fillMaxSize().testTag("settings-page:" + selected.name).verticalScroll(scroll).padding(padding),
+                        verticalArrangement = Arrangement.spacedBy(20.dp),
+                    ) { content(selected) }
                 }
-                Column(
-                    Modifier.fillMaxSize().testTag("settings-page:" + selected.name).verticalScroll(scroll)
-                        .padding(start = 16.dp, end = 16.dp,
-                            top = with(density) { segmentHeight.toDp() } + 4.dp, bottom = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(20.dp),
-                ) { content(selected) }
             }
         }
-        // Scroll content travels behind this independent glass control, so its refraction
-        // samples real page content rather than an empty strip above the scrolling layer.
-        SettingsPageSegments(page, { page = it }, backdrop, Modifier.align(Alignment.TopCenter)
+        // An opaque backing keeps moving page content out of the segmented control.
+        SettingsPageSegments(page, { page = it }, Modifier.align(Alignment.TopCenter)
             .onSizeChanged { segmentHeight = it.height }
             .padding(horizontal = 16.dp, vertical = 12.dp))
     }
 }
 
 @Composable
-private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) -> Unit, backdrop: Backdrop, modifier: Modifier) {
+private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) -> Unit, modifier: Modifier) {
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    val selection by animateFloatAsState(page.ordinal.toFloat(), if (motion) pocketPressSpring() else snap(), label = "settings-selected-thumb")
+    val selection by animateFloatAsState(page.ordinal.toFloat(), if (motion) tween(200) else snap(), label = "settings-selected-thumb")
     CompositionLocalProvider(LocalPocketClearGlass provides true) {
-        PocketGlassSurface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), backdrop = backdrop) {
+        Surface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
             BoxWithConstraints(Modifier.fillMaxWidth().padding(5.dp)) {
                 val itemWidth = maxWidth / SettingsPage.entries.size
                 Box {
                     Box(Modifier.matchParentSize()) {
-                        PocketGlassSurface(Modifier.offset(x = itemWidth * selection).width(itemWidth).fillMaxHeight()
+                        Surface(Modifier.offset(x = itemWidth * selection).width(itemWidth).fillMaxHeight()
                             .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f), RoundedCornerShape(24.dp))
-                            .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), backdrop = backdrop) { }
+                            .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.primaryContainer) { }
                     }
                     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).selectableGroup()) {
                         SettingsPage.entries.forEach { item ->
@@ -170,7 +169,17 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     fun changeWatch(enabled: Boolean) {
         if (enabled && Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) else watch(enabled)
     }
-    SettingsPageLayout(if (management) SettingsPage.Connection else SettingsPage.App, modifier) { page ->
+    SettingsPageLayout(if (management) SettingsPage.Connection else SettingsPage.App, modifier,
+        extensionContent = { pageModifier, padding ->
+            if (s.paired) ExtensionManagementPanel(s, { repo.loadExtensions(it) },
+                { id, enabled -> repo.setExtensionEnabled(id, enabled) }, { repo.refreshExtensions() }, pageModifier, padding)
+            else Column(pageModifier.padding(padding)) {
+                SettingsSection("连接电脑后管理扩展") {
+                    Text("先在“电脑连接”中配对电脑，再选择要管理的运行时。", Modifier.padding(12.dp))
+                    if (onPair != null) PocketActionRow("扫码配对电脑", PocketIcons.QrCodeScanner, onPair)
+                }
+            }
+        }) { page ->
         when (page) {
             SettingsPage.Connection -> {
                 SettingsPageTitle("电脑连接", "查看连接状态与已配对设备")
@@ -246,14 +255,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                 }
             }
             SettingsPage.Extensions -> {
-                SettingsPageTitle("扩展管理", "选择运行时，查看 MCP、技能与应用")
-                if (s.paired) ExtensionManagementPanel(s, { repo.loadExtensions(it) },
-                    { id, enabled -> repo.setExtensionEnabled(id, enabled) }, { repo.refreshExtensions() })
-                else SettingsSection("连接电脑后管理扩展") {
-                    Text("先在“电脑连接”中配对电脑，再选择要管理的运行时。", Modifier.padding(12.dp),
-                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (onPair != null) PocketActionRow("扫码配对电脑", PocketIcons.QrCodeScanner, onPair)
-                }
+                Unit
             }
             SettingsPage.App -> {
                 SettingsPageTitle("应用设置", "外观、后台通知与本机数据")

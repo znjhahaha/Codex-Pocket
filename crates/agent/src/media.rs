@@ -155,7 +155,10 @@ impl MediaStore {
         let mut block = original.clone();
         block["status"] = json!("recoverable");
         block["message"] = json!("");
-        if let Some(resolved) = resolved {
+        // A transient read error must not make a refreshed native item unreadable.
+        // Keep its proven opaque recovery reference; reads still report the
+        // current error and recheck the original owner before retrying.
+        if let Some(resolved) = resolved.filter(|value| value["status"] != "failed") {
             for key in ["status", "message", "mimeType", "byteLength"] {
                 if let Some(value) = resolved.get(key) {
                     block[key] = value.clone();
@@ -194,7 +197,7 @@ impl MediaStore {
             .resolved
             .lock()
             .map_err(|_| anyhow::anyhow!("Media recovery unavailable"))?;
-        if resolution.is_none() {
+        if resolution.as_ref().is_none_or(|r| r["status"] == "failed") {
             *resolution = Some(match reference.history.recover(owner, reference.slot) {
                 Ok(part) => self.store.project_user_image(owner, reference.slot, &part),
                 Err(_) => {
@@ -282,6 +285,16 @@ mod tests {
             item_id: "user".into(),
         };
         let first_id = content[0]["mediaId"].as_str().unwrap();
+        // A temporary inaccessible/incomplete history must not poison this
+        // opaque reference for the rest of its 24-hour lifetime.
+        fs::rename(&path, &moved).unwrap();
+        assert_eq!(store.read(&owner, first_id, 0, 8).unwrap()["status"], "failed");
+        let refreshed =
+            store.project_with_history(&native, "runtime", "connection", "thread", &proof);
+        let refreshed_image = &refreshed["thread"]["turns"][0]["items"][0]["content"][0];
+        assert_eq!(refreshed_image["status"], "recoverable");
+        assert_eq!(refreshed_image["mediaId"], first_id);
+        fs::rename(&moved, &path).unwrap();
         for field in 0..5 {
             let mut wrong = owner.clone();
             match field {

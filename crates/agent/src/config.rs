@@ -37,8 +37,8 @@ impl Config {
         let route_preferences = if relay_url.is_empty() {
             let mut p = RoutePreferences::default();
             p.auto_lan = true;
-            // UDP connect selects the current interface without sending any packet.
-            // Disconnected/non-private networks keep identity initialization available.
+            // Shared native inventory selects a physical LAN adapter without network traffic.
+            // Disconnected/unknown adapters keep identity initialization available.
             p.lan = routes::default_lan_bind().map(|bind| routes::LanConfig { bind, mdns: true });
             Some(p)
         } else {
@@ -90,7 +90,7 @@ impl Config {
         serde_json::json!({"computerId":self.computer_id,"policy":self.preferences().policy,"routes":self.routes()})
     }
     pub fn load(state: &Path) -> Result<Self> {
-        let mut value: Self = serde_json::from_slice(&std::fs::read(state.join("config.json"))?)?;
+        let mut value: Self = serde_json::from_slice(&storage::read_physical(&state.join("config.json"), 1024 * 1024)?)?;
         if value.protocol != 1 {
             bail!("Unsupported configuration version")
         };

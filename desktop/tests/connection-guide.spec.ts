@@ -7,7 +7,7 @@ async function fixture(page:Page,existing=false,localReady=false,options:Fixture
  await page.addInitScript(({existing,localReady,options})=>{
   const w=window as any;
   w.guideCalls=[];w.guideReady=existing||localReady;w.guidePhase='stopped';w.deferSave=false;w.rejectRoute=false;w.rejectDeploy=false;w.readyIdsOverride=null;w.failNextRead=false;
-  w.lanRows=options.noLan?[]:[{name:'Wi-Fi',address:'192.168.1.20'},{name:'以太网',address:'10.0.0.2'}];w.detectionFailure=options.detectionFailure;w.missingPrefs=options.missingPrefs;
+  w.lanRows=options.noLan?[]:[{name:'Wi-Fi',address:'192.168.1.20'},{name:'以太网',address:'10.0.0.2'}];w.detectionFailure=options.detectionFailure;w.missingPrefs=options.missingPrefs;w.readIssue=null;
   const preferences:any={routes:existing?[{id:'existing',kind:'relay',url:'wss://existing.invalid/pocket',priority:30}]:[],policy:'automatic',gateway:{bind:'127.0.0.1:17892'},...(localReady||options.staleBind?{lan:{bind:options.staleBind?'192.168.0.50:43821':'192.168.1.20:43821',mdns:true}}:{})};
   let desired=existing||localReady,publicMethod='',runtime=existing;
   w.__TAURI_INTERNALS__={invoke:async(cmd:string,args:any)=>{
@@ -17,7 +17,7 @@ async function fixture(page:Page,existing=false,localReady=false,options:Fixture
    if(cmd==='dashboard'){
     if(w.failNextRead){w.failNextRead=false;w.guideReady=false;w.readyIdsOverride=[];}
     const configured=routes(),readyIds=w.readyIdsOverride??(w.guideReady?configured.map((r:any)=>r.id):[]);
-    return {computerName:'Fixture PC',desired,supervisor:{phase:desired?'running':'stopped',updatedAt:Date.now()/1000,failures:0},relay:{state:existing?'connected':'waiting',host:''},devices:existing?[{id:'old',name:'已有手机'}]:[],processes:runtime?[{name:'desktop',state:'在线'}]:[],version:'fixture',startup:false,installation:{consistent:true},issues:[],routes:{routes:configured,...(!w.missingPrefs?{routePreferences:preferences}:{})},connection:{phase:existing?'connected':desired?'connecting':'setup_required',connected:existing&&desired,available:desired&&readyIds.length>0,helperUpdatedAt:desired?Date.now()/1000:0,configuredRoutes:configured.length,usableRoutes:desired?readyIds.length:0,readyRouteIds:desired?readyIds:[]},connectivity:{phase:w.guidePhase,mode:publicMethod==='cloudflare'?'quick':'off',enabled:publicMethod==='cloudflare',...(w.guidePhase==='tunnel_connected'?{publicUrl:'https://fixture.trycloudflare.com'}:{})}};
+    return {computerName:'Fixture PC',desired,supervisor:{phase:desired?'running':'stopped',updatedAt:Date.now()/1000,failures:0},relay:{state:existing?'connected':'waiting',host:''},devices:existing?[{id:'old',name:'已有手机'}]:[],processes:runtime?[{name:'desktop',state:'在线'}]:[],version:'fixture',startup:false,installation:{consistent:true},issues:w.readIssue?[w.readIssue]:[],routes:{routes:configured,...(!w.missingPrefs?{routePreferences:preferences}:{})},connection:{phase:existing?'connected':desired?'connecting':'setup_required',connected:existing&&desired,available:desired&&readyIds.length>0,helperUpdatedAt:desired?Date.now()/1000:0,configuredRoutes:configured.length,usableRoutes:desired?readyIds.length:0,readyRouteIds:desired?readyIds:[]},connectivity:{phase:w.guidePhase,mode:publicMethod==='cloudflare'?'quick':'off',enabled:publicMethod==='cloudflare',...(w.guidePhase==='tunnel_connected'?{publicUrl:'https://fixture.trycloudflare.com'}:{})}};
    }
    if(cmd==='configure_routes'){if(w.deferSave)await new Promise<void>(resolve=>{w.finishSave=resolve});Object.assign(preferences,args.preferences);w.savedPreferences=args.preferences;return {routes:routes(),routePreferences:preferences};}
    if(cmd==='set_remote'){desired=args.enabled;return;}
@@ -37,6 +37,38 @@ async function fixture(page:Page,existing=false,localReady=false,options:Fixture
 }
 async function mutations(page:Page){return page.evaluate(()=>(window as any).guideCalls.filter((c:any)=>!['dashboard','detect_lan'].includes(c.cmd)))}
 async function choose(page:Page,name:string){await page.getByRole('button',{name:'开启连接',exact:true}).first().click();await page.getByRole('button',{name,exact:true}).click()}
+
+test('routes read failure retains its stage and retry never writes settings',async({page})=>{
+ await fixture(page);await choose(page,'暂不配置公网');
+ await page.evaluate(()=>{(window as any).missingPrefs=true;(window as any).readIssue={code:'control_rejected',stage:'routes_read',message:'后台拒绝读取线路，请检查运行代次。',operationId:'read-fixture',exitCode:5,retryable:true};});
+ await page.getByRole('button',{name:'保存并启用自动连接',exact:true}).click();
+ const guide=page.getByRole('region',{name:'连接引导'});
+ await expect(guide.getByRole('alert')).toContainText('routes_read');
+ await expect(guide.getByRole('alert')).toContainText('退出码 5');
+ await expect(guide.getByRole('button',{name:'重试连接',exact:true})).toHaveCount(0);
+ await guide.getByRole('button',{name:'重新检查',exact:true}).click();
+ await expect(guide.getByRole('alert')).toContainText('read-fixture');
+ expect(await mutations(page)).toEqual([]);
+ await page.evaluate(()=>{(window as any).missingPrefs=false;(window as any).readIssue=null;});
+ await guide.getByRole('button',{name:'重新检查',exact:true}).click();
+ await expect(guide.getByRole('alert')).toHaveCount(0);
+ expect(await mutations(page)).toEqual([]);
+});
+
+test('saved relay is shown and polling preserves a user edit',async({page})=>{
+ await fixture(page,true);
+ await page.getByRole('button',{name:'更换连接方式',exact:true}).click();
+ await page.getByRole('button',{name:'自有服务器中转',exact:true}).click();
+ const field=page.getByPlaceholder('wss://relay.example.com');
+ await expect(field).toHaveValue('wss://existing.invalid/pocket');
+ await field.fill('wss://replacement.invalid/pocket');
+ await page.waitForTimeout(5200);
+ await expect(field).toHaveValue('wss://replacement.invalid/pocket');
+ await field.fill('');
+ await page.waitForTimeout(5200);
+ await expect(field).toHaveValue('');
+ expect(await mutations(page)).toEqual([]);
+});
 
 test('first connection and Add device show three choices without starting or pairing',async({page},info)=>{
  await fixture(page);

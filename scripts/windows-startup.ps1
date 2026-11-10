@@ -1,28 +1,40 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param([ValidateSet('Status','Enable','Disable','Start')][string]$Action='Status',[string]$InstallRoot)
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 
 function Get-PocketTaskName { return 'CodexPocket-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+function Test-PocketTaskMissing($Failure) {
+    $exception=$Failure.Exception
+    while ($null -ne $exception.InnerException) { $exception=$exception.InnerException }
+    # Only GetTask's exact Win32 not-found HRESULTs prove absence. A wrapper
+    # exception, access failure or another facility with low word 2/3 does not.
+    return ('0x'+$exception.HResult.ToString('X8')) -in @('0x80070002','0x80070003')
+}
 function Get-PocketTaskXml {
-    $service = New-Object -ComObject Schedule.Service
+    $service = Invoke-PocketInstallStep 'startup_read' 'CoCreateInstance(Schedule.Service)' { New-Object -ComObject Schedule.Service }
+    $folder=$null; $task=$null
     try {
-        $service.Connect()
-        try { return $service.GetFolder('\').GetTask((Get-PocketTaskName)).Xml }
-        catch { if (($_.Exception.HResult -band 65535) -in @(2,3)) { return $null }; throw }
-    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) }
+        Invoke-PocketInstallStep 'startup_read' 'ITaskService.Connect' { $service.Connect() } | Out-Null
+        $folder=Invoke-PocketInstallStep 'startup_read' 'ITaskService.GetFolder' { $service.GetFolder('\') }
+        try { $task=Invoke-PocketInstallStep 'startup_read' 'ITaskFolder.GetTask' { $folder.GetTask((Get-PocketTaskName)) } }
+        catch { if (Test-PocketTaskMissing $_) { return $null }; throw }
+        return Invoke-PocketInstallStep 'startup_read' 'IRegisteredTask.Xml' { $task.Xml }
+    } finally { foreach($value in @($task,$folder,$service)){if($null -ne $value){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)}} }
 }
 function Set-PocketTaskXml([AllowNull()]$Xml) {
-    $service = New-Object -ComObject Schedule.Service
+    $service = Invoke-PocketInstallStep 'startup_register' 'CoCreateInstance(Schedule.Service)' { New-Object -ComObject Schedule.Service }
+    $folder=$null
     try {
-        $service.Connect(); $folder = $service.GetFolder('\')
+        Invoke-PocketInstallStep 'startup_register' 'ITaskService.Connect' { $service.Connect() } | Out-Null
+        $folder = Invoke-PocketInstallStep 'startup_register' 'ITaskService.GetFolder' { $service.GetFolder('\') }
         if ($null -eq $Xml) {
-            if ($null -ne (Get-PocketTaskXml)) { $folder.DeleteTask((Get-PocketTaskName),0) }
+            if ($null -ne (Get-PocketTaskXml)) { Invoke-PocketInstallStep 'startup_register' 'ITaskFolder.DeleteTask' { $folder.DeleteTask((Get-PocketTaskName),0) } | Out-Null }
         } else {
             # TASK_CREATE_OR_UPDATE + TASK_LOGON_INTERACTIVE_TOKEN; never store a password.
-            [void]$folder.RegisterTask((Get-PocketTaskName),$Xml,6,[Security.Principal.WindowsIdentity]::GetCurrent().User.Value,$null,3,$null)
+            Invoke-PocketInstallStep 'startup_register' 'ITaskFolder.RegisterTask' { [void]$folder.RegisterTask((Get-PocketTaskName),$Xml,6,[Security.Principal.WindowsIdentity]::GetCurrent().User.Value,$null,3,$null) } | Out-Null
         }
-    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) }
+    } finally { foreach($value in @($folder,$service)){if($null -ne $value){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)}} }
 }
 function New-PocketTaskXml([string]$Launcher,[bool]$Logon=$true) {
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -85,14 +97,16 @@ function Test-PocketTaskEquivalent([AllowNull()]$Left,[AllowNull()]$Right) {
     if($null -eq $Left -or $null -eq $Right){return $false}
     # In-memory definitions apply Scheduler's default fields/order without
     # registering, running or changing a task. Keep the original XML for restore.
-    $service=New-Object -ComObject Schedule.Service
+    $service=Invoke-PocketInstallStep 'startup_compare' 'CoCreateInstance(Schedule.Service)' { New-Object -ComObject Schedule.Service }
     $first=$null; $second=$null
     try {
-        $service.Connect()
-        $first=$service.NewTask(0); $first.XmlText=[string]$Left
-        $second=$service.NewTask(0); $second.XmlText=[string]$Right
+        Invoke-PocketInstallStep 'startup_compare' 'ITaskService.Connect' { $service.Connect() } | Out-Null
+        $first=Invoke-PocketInstallStep 'startup_compare' 'ITaskService.NewTask' { $service.NewTask(0) }
+        Invoke-PocketInstallStep 'startup_compare' 'ITaskDefinition.XmlText(left)' { $first.XmlText=[string]$Left } | Out-Null
+        $second=Invoke-PocketInstallStep 'startup_compare' 'ITaskService.NewTask' { $service.NewTask(0) }
+        Invoke-PocketInstallStep 'startup_compare' 'ITaskDefinition.XmlText(right)' { $second.XmlText=[string]$Right } | Out-Null
         return $first.XmlText -ceq $second.XmlText
-    } catch { return $false }
+    }
     finally {
         foreach($value in @($first,$second,$service)){if($null -ne $value){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)}}
     }

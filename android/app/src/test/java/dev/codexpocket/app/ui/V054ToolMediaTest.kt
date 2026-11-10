@@ -28,6 +28,20 @@ class V054ToolMediaTest {
         compose.waitForIdle()
     }
     private fun chunk(ref: ToolMediaRef, offset: Long, data: ByteArray, eof: Boolean) = ToolMediaChunk(ref.mediaId, ToolMediaStatus.Ready, ref.mimeType, ref.byteLength, offset, eof, Base64.encodeToString(data, Base64.NO_WRAP))
+    @Test fun reconnectRetriesFailedImageWithoutChangingItsOwnerOrPath() {
+        val file = MentionedFile("reconnect.png", "D:/fixture/reconnect-${java.util.UUID.randomUUID()}.png", true)
+        var connection by mutableStateOf(1L to false)
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val source = DesktopImageSource { calls.incrementAndGet(); throw dev.codexpocket.wire.WireException("offline", "fixture") }
+        content { CompositionLocalProvider(LocalDesktopImages provides source, LocalImageConnection provides connection) {
+            ImageGrid(listOf(file), false)
+        } }
+        compose.waitUntil(5_000) { calls.get() == 1 }
+        compose.onNodeWithText("连接电脑后可读取图片").assertExists()
+        compose.runOnIdle { connection = 2L to true }
+        compose.waitForIdle()
+        compose.waitUntil(5_000) { calls.get() == 2 }
+    }
     @Test fun fixedAllocationChunkReaderChecksProgressIdentityAndMime() = runBlocking {
         val bytes = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 13, 10, 26, 10) + ByteArray(TOOL_IMAGE_CHUNK_BYTES + 7)
         val ref = media(bytes.size)

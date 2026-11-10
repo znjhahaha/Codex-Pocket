@@ -73,6 +73,7 @@ internal fun ChatsHome(
     runtimeFilter: String? = null,
     onScrollState: (Boolean) -> Unit = {},
     onAttention: () -> Unit = {},
+    onEnsureDirectory: (String, Boolean) -> Unit = { search, archived -> onRefresh(search, archived, false) },
 ) {
     val scopes = rememberSaveableStateHolder()
     scopes.SaveableStateProvider(homeScopeKey(s.computerId, runtimeFilter)) {
@@ -86,7 +87,7 @@ internal fun ChatsHome(
             HomeProjectChips(projects, project, selectProject, { showProjects = true })
             projectStates.SaveableStateProvider(project?.id ?: "all-projects") {
                 HomeProjectSessions(s, project, runtimeFilter, onSelect, onNew, onRefresh, onPin, onArchive,
-                    onScrollState, onAttention, onClearProject = { selectProject(null) })
+                    onScrollState, onAttention, onClearProject = { selectProject(null) }, onEnsureDirectory = onEnsureDirectory)
             }
         }
         if (showProjects) HomeProjectsSheet(projects, project, { showProjects = false }) {
@@ -102,6 +103,7 @@ private fun ColumnScope.HomeProjectSessions(
     s: PocketState, project: HomeProject?, runtimeFilter: String?, onSelect: (ChatEntity) -> Unit,
     onNew: () -> Unit, onRefresh: (String, Boolean, Boolean) -> Unit, onPin: (ChatEntity) -> Unit,
     onArchive: (ChatEntity) -> Unit, onScrollState: (Boolean) -> Unit, onAttention: () -> Unit, onClearProject: () -> Unit,
+    onEnsureDirectory: (String, Boolean) -> Unit,
 ) {
     var search by rememberSaveable { mutableStateOf("") }
     var archived by rememberSaveable { mutableStateOf(false) }
@@ -156,8 +158,13 @@ private fun ColumnScope.HomeProjectSessions(
     LaunchedEffect(filterKey) {
         if (previousFilterKey != filterKey) { previousFilterKey = filterKey; listState.scrollToItem(0) }
     }
-    val refresh by rememberUpdatedState(onRefresh)
-    LaunchedEffect(search, archived, s.online) { if (s.online) { delay(350); refresh(search, archived, false) } }
+    val ensureDirectory by rememberUpdatedState(onEnsureDirectory)
+    LaunchedEffect(search, archived, s.online) { if (s.online) { delay(350); ensureDirectory(search, archived) } }
+    var showInitialLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(s.directoryLoading, chats.isEmpty()) {
+        showInitialLoading = false
+        if (s.directoryLoading && chats.isEmpty()) { delay(150); showInitialLoading = true }
+    }
     HomeLibraryHeader(archived, { archived = it }, chats.size,
         searching = searchExpanded, onSearch = toggleSearch.takeIf { searchCoordinator == null })
     androidx.compose.animation.AnimatedVisibility(searchExpanded,
@@ -172,7 +179,7 @@ private fun ColumnScope.HomeProjectSessions(
         Modifier.weight(1f).fillMaxWidth().testTag("chats-home"), state = listState,
         contentPadding = PaddingValues(top = 2.dp, bottom = LocalHomeContentPadding.current.calculateBottomPadding() + 24.dp),
     ) {
-        if (!s.online || s.directoryLoading || s.error != null) item(key = "home-state", contentType = "state") {
+        if (!s.online || showInitialLoading || s.directoryError != null) item(key = "home-state", contentType = "state") {
             HomeSyncState(s, onRetry = { onRefresh(search, archived, false) })
         }
         if (attentionCount > 0 && !archived && search.isBlank()) item(key = "home-attention", contentType = "attention") {
@@ -198,7 +205,7 @@ private fun ColumnScope.HomeProjectSessions(
         }
         if (s.nextThreads != null && s.online) item(key = "home-load-more", contentType = "footer") {
             Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp), contentAlignment = Alignment.Center) {
-                PocketButton(stringResource(R.string.load_more), { onRefresh(search, archived, true) }, secondary = true, enabled = !s.directoryLoading)
+                PocketButton(stringResource(R.string.load_more), { onRefresh(search, archived, true) }, secondary = true, enabled = !s.directoryRefreshing)
             }
         }
     }
@@ -208,12 +215,12 @@ private fun ColumnScope.HomeProjectSessions(
 private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (s.directoryLoading) PocketLoader()
-        else Icon(if (s.error != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
-            tint = if (s.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(when { s.error != null -> stringResource(R.string.v03_home_sync_error); !s.online -> stringResource(R.string.v03_home_cached); else -> stringResource(R.string.v03_home_loading) },
+        if (s.online && s.directoryLoading && s.directoryError == null) PocketLoader()
+        else Icon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
+            tint = if (s.directoryError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(when { s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
             Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (s.online && s.error != null) PocketTextButton(onRetry, enabled = !s.directoryLoading) { Text(stringResource(R.string.v03_home_retry)) }
+        if (s.online && s.directoryError != null) PocketTextButton(onRetry, enabled = !s.directoryRefreshing) { Text(stringResource(R.string.v03_home_retry)) }
     }
 }
 @Composable

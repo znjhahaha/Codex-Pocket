@@ -6,6 +6,7 @@ use serde::{
     de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
@@ -48,7 +49,8 @@ pub struct NativeHistory {
 }
 struct HistoryIndex {
     file: File,
-    snapshot: fs::Metadata,
+    complete_end: u64,
+    prefix_sha256: [u8; 32],
     records: BTreeMap<String, IndexedItem>,
 }
 struct IndexedItem {
@@ -183,8 +185,9 @@ impl NativeHistory {
             .map_err(|_| anyhow::anyhow!("History index unavailable"))?;
         if let Some(index) = shared.as_ref() {
             let current = index.file.metadata()?;
-            if current.len() != index.snapshot.len()
-                || current.modified()? != index.snapshot.modified()?
+            if current.len() < index.complete_end
+                || prefix_digest(&index.file, index.complete_end)? != index.prefix_sha256
+                || (!index.records.contains_key(&target.owner.item_id) && current.len() > index.complete_end)
             {
                 *shared = None;
             }
@@ -193,7 +196,7 @@ impl NativeHistory {
             *shared = Some(self.build_index(&target.owner)?);
         }
         let index = shared.as_mut().unwrap();
-        if index.snapshot.len() > self.scan_bytes {
+        if index.complete_end > self.scan_bytes {
             bail!("History scan byte limit");
         }
         let record = index
@@ -204,7 +207,7 @@ impl NativeHistory {
         let mut reader = BoundedReader {
             inner: BufReader::new(index.file.try_clone()?),
             position: 0,
-            end: index.snapshot.len(),
+            end: index.complete_end,
             budget: budget.clone(),
         };
         if record.images.is_none() {
@@ -247,8 +250,9 @@ impl NativeHistory {
         {
             bail!("History has no embedded image");
         }
-        let after = index.file.metadata()?;
-        if after.len() != index.snapshot.len() || after.modified()? != index.snapshot.modified()? {
+        // Native history is append-only while a turn is running. Verify the exact
+        // indexed prefix, without treating unrelated appended events as corruption.
+        if prefix_digest(&index.file, index.complete_end)? != index.prefix_sha256 {
             *shared = None;
             bail!("History changed during recovery");
         }
@@ -257,10 +261,11 @@ impl NativeHistory {
     fn build_index(&self, owner: &MediaOwner) -> Result<HistoryIndex> {
         let file = open_history(&self.path)?;
         let original = file.metadata()?;
-        let length = original.len();
-        if length == 0 || length > self.scan_bytes {
+        if original.len() == 0 || original.len() > self.scan_bytes {
             bail!("History scan byte limit");
         }
+        let length = complete_prefix_end(&file, original.len())?;
+        let prefix_sha256 = prefix_digest(&file, length)?;
         #[cfg(test)]
         self.scan_builds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -326,16 +331,51 @@ impl NativeHistory {
             }
             records += 1;
         }
-        let after = reader.inner.get_ref().metadata()?;
-        if after.len() != original.len() || after.modified()? != original.modified()? {
+        if prefix_digest(reader.inner.get_ref(), length)? != prefix_sha256 {
             bail!("History changed during recovery");
         }
         Ok(HistoryIndex {
             file: reader.inner.into_inner(),
-            snapshot: original,
+            complete_end: length,
+            prefix_sha256,
             records: found,
         })
     }
+}
+
+// JSONL writers may be between writes when a phone opens an image. Only parse
+// complete records. All selected records still require exact session/turn/item
+// identity; future/incomplete records cannot supply ownership evidence.
+fn complete_prefix_end(file: &File, length: u64) -> Result<u64> {
+    let mut file = file.try_clone()?;
+    let mut end = length;
+    let mut block = [0u8; 8192];
+    while end > 0 {
+        let start = end.saturating_sub(block.len() as u64);
+        let count = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..count])?;
+        if let Some(index) = block[..count].iter().rposition(|b| *b == b'\n') {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    bail!("No complete history record")
+}
+fn prefix_digest(file: &File, length: u64) -> Result<[u8; 32]> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = length;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        digest.update(&buffer[..count]); remaining -= count as u64;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(digest.finalize().into())
 }
 
 fn valid_id(s: &str) -> bool {
@@ -397,6 +437,7 @@ fn open_history(path: &Path) -> Result<File> {
     if !file.metadata()?.is_file() || linked(&file.metadata()?) {
         bail!("Invalid history file");
     }
+    crate::storage::verify_physical_file(path, &file)?;
     Ok(file)
 }
 
@@ -722,6 +763,57 @@ mod tests {
         }
     }
     #[test]
+    fn append_only_active_history_reuses_verified_prefix_despite_incomplete_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        write(&path, &records());
+        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"{\"type\":\"event_msg\",\"payload\":").unwrap();
+        assert_eq!(proof.recover(&owner(), 3).unwrap(), second_image());
+        assert_eq!(proof.scan_builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn first_recovery_uses_only_complete_records_and_detects_prefix_rewrites() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        write(&path, &records());
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":").unwrap();
+        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
+        let mut changed = records(); changed[0]["payload"]["id"] = json!("foreign");
+        write(&path, &changed);
+        assert!(proof.recover(&owner(), 1).is_err());
+    }
+    #[test]
+    fn unavailable_image_can_recover_after_native_writer_commits_its_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let data = records();
+        write(&path, &data[..3]);
+        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        assert!(proof.recover(&owner(), 1).is_err());
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        serde_json::to_writer(&mut writer, &data[3]).unwrap(); writer.write_all(b"\n").unwrap();
+        assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
+    }
+    #[test]
+    #[ignore = "Read-only local metadata probe; explicit fixture path required, no content printed"]
+    fn supplied_native_image_history_probe() {
+        let input = std::env::var("POCKET_MEDIA_PROBE").expect("Explicit probe metadata required");
+        let thread: Value = serde_json::from_slice(&crate::storage::read_physical(Path::new(&input), 1_048_576).unwrap()).unwrap();
+        let proof = NativeHistory::from_native_thread(&thread, "probe", "probe").unwrap();
+        for target in proof.targets.iter() {
+            let now = std::time::Instant::now();
+            match proof.recover_target(target) {
+                Ok(part) => println!("media_probe success=true elapsedMs={} embedded={}", now.elapsed().as_millis(), part["image_url"].as_str().is_some_and(|s|s.starts_with("data:image/"))),
+                Err(e) => { println!("media_probe success=false elapsedMs={} error={e}", now.elapsed().as_millis()); panic!("Image recovery failed") }
+            }
+        }
+    }
+    #[test]
     fn rejects_foreign_session_turn_role_duplicate_item_and_image_count() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("native.jsonl");
@@ -763,7 +855,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap()
-            .write_all(b"{broken")
+            .write_all(b"{broken\n")
             .unwrap();
         assert!(proof.recover(&owner(), 1).is_err());
         assert!(

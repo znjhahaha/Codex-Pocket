@@ -2634,6 +2634,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "fs2",
+ "pocket-network",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -2643,6 +2644,14 @@ dependencies = [
  "tempfile",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pocket-network"
+version = "0.6.3"
+dependencies = [
+ "serde",
  "windows-sys 0.61.2",
 ]
 

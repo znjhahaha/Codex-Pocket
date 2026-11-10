@@ -16,6 +16,7 @@ struct Args {
     command: String,
     options: BTreeMap<String, String>,
     json: bool,
+    supervised: bool,
 }
 impl Args {
     fn parse(args: &[String]) -> Result<Self> {
@@ -55,6 +56,7 @@ impl Args {
         };
         let mut options = BTreeMap::new();
         let mut json = false;
+        let mut supervised = false;
         let mut index = if matches!(original, "routes" | "session") {
             2
         } else {
@@ -62,6 +64,10 @@ impl Args {
         };
         while index < args.len() {
             let key = &args[index];
+            if key == "--supervised" {
+                if command != "run" || supervised { bail!("Invalid supervised flag"); }
+                supervised = true; index += 1; continue;
+            }
             if key == "--json" {
                 if json
                     || !matches!(
@@ -104,6 +110,7 @@ impl Args {
             command: command.into(),
             options,
             json,
+            supervised,
         })
     }
     fn option(&self, key: &str) -> Option<&str> {
@@ -259,6 +266,7 @@ async fn execute(args: Args) -> Result<()> {
             let c = Config::load(&state)?;
             let identity = Arc::new(ServerIdentity::load_or_create(state.join("identity"))?);
             let (broker, events) = Broker::open(c.clone(), state.clone())?;
+            broker.connection.set_remote_enabled(!args.supervised);
             let controller =
                 routes::Controller::open(state.clone(), c.clone(), broker.connection.clone());
             let _control =
@@ -276,10 +284,9 @@ async fn execute(args: Args) -> Result<()> {
                     Some(_)=sessions.join_next(),if !sessions.is_empty()=>{},
                 }}
             });
-            let runtime = routes::Runtime::start(controller, identity, tx);
+            tasks.spawn(pocket_agent::remote::run(state.clone(), args.supervised, controller, identity, tx, broker.clone()));
             println!("Codex Pocket helper running. Provider credentials stay on this computer.");
             tokio::signal::ctrl_c().await?;
-            runtime.shutdown().await;
             tasks.abort_all();
             broker.connection.stop_routes();
         }

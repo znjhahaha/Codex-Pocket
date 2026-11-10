@@ -1,5 +1,20 @@
 use anyhow::{bail,Context,Result};
 use std::{io::Read,process::{Command,Stdio},thread,time::{Duration,Instant}};
+/// A bounded, allowlisted failure. Never carries stderr, provider output or tokens.
+#[derive(Debug)]
+pub struct CommandFailure{pub code:&'static str,pub exit_code:Option<i32>}
+impl std::fmt::Display for CommandFailure{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+    if self.code=="control_timeout"{write!(f,"Local helper timed out")}else{write!(f,"Local helper failed: {} (exit code {:?})",self.code,self.exit_code)}
+}}
+impl std::error::Error for CommandFailure{}
+fn safe_failure(bytes:&[u8],exit_code:Option<i32>)->CommandFailure{
+    let value=serde_json::from_slice::<serde_json::Value>(bytes).unwrap_or_default();
+    let code=match value["error"]["code"].as_str(){
+        Some("invalid_params")=>"control_invalid_params",Some("version_conflict")=>"control_version_conflict",
+        Some("unauthorized")=>"control_unauthorized",Some("unsupported_method"|"unsupported_protocol")=>"control_protocol_unsupported",
+        Some("rejected")=>"control_rejected",_=>"control_failed"};
+    CommandFailure{code,exit_code}
+}
 pub fn hidden(command:&mut Command){#[cfg(windows)]{use std::os::windows::process::CommandExt;command.creation_flags(0x08000000);}}
 pub fn run_bounded(mut command:Command,seconds:u64)->Result<Vec<u8>>{
     // PowerShell 7's inherited PSModulePath can make Windows PowerShell load an
@@ -12,12 +27,12 @@ pub fn run_bounded(mut command:Command,seconds:u64)->Result<Vec<u8>>{
     let deadline=Instant::now()+Duration::from_secs(seconds);
     let status=loop{
         if let Some(s)=child.try_wait()?{break s}
-        if Instant::now()>=deadline{let _=child.kill();let _=child.wait();let _=reader.join();bail!("Local helper timed out")}
+        if Instant::now()>=deadline{let _=child.kill();let _=child.wait();let _=reader.join();return Err(CommandFailure{code:"control_timeout",exit_code:None}.into())}
         thread::sleep(Duration::from_millis(40));
     };
     let bytes=reader.join().map_err(|_|anyhow::anyhow!("Output reader failed"))??;
-    if !status.success(){bail!("Local helper returned an error (sensitive output omitted)")}
     if bytes.len()>1024*1024{bail!("Local helper output exceeds limit")}
+    if !status.success(){return Err(safe_failure(&bytes,status.code()).into())}
     Ok(bytes)
 }
 pub fn agent(binary:&std::path::Path,state:&std::path::Path,verb:&str,extra:&[&str])->Result<serde_json::Value>{
@@ -53,7 +68,7 @@ pub fn local_control(state:&std::path::Path,method:&str,params:serde_json::Value
     if size>1024*1024{bail!("Control response exceeds limit")}
     let mut bytes=vec![0;size];socket.read_exact(&mut bytes)?;
     let reply:serde_json::Value=serde_json::from_slice(&bytes)?;
-    if reply.get("error").is_some(){bail!("Local control rejected operation; refresh state before retrying")}
+    if reply.get("error").is_some(){return Err(safe_failure(&bytes,None).into())}
     reply.get("result").cloned().context("Invalid local control response")
 }
 

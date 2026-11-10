@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "path": "libdatachannel",
+      "url": "https://github.com/paullouisageneau/libdatachannel.git",
+      "tag": "v0.24.6",
+      "commit": "6b1e2e620f1e37f0eafeee702eaea0043cb305fd",
+      "sourceTreeSha256": "d4704b15ba20bc525a56d06002ebc79efe09a0f0167251c1d99bca63c8c01924",
+      "license": "MPL-2.0"
+    },
+    {
+      "path": "mbedtls",
+      "url": "https://github.com/Mbed-TLS/mbedtls.git",
+      "tag": "mbedtls-3.6.7",
+      "commit": "068ff080b369adfac81509f9b57b2afabaf82dc5",
+      "sourceTreeSha256": "27f865307b3afb271d7cfc4d2bb0172928806a884a21438a11ffd710e2c97f62",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "libdatachannel/deps/libjuice",
+      "url": "https://github.com/paullouisageneau/libjuice.git",
+      "tag": null,
+      "commit": "b89c792e3612faf2f12cf35bcc56857313a06be3",
+      "sourceTreeSha256": "0ef2119fed83abc295627768c3b9d1a5bed45f557859b63f3e5eb5b95769be89",
+      "license": "MPL-2.0"
+    },
+    {
+      "path": "libdatachannel/deps/usrsctp",
+      "url": "https://github.com/paullouisageneau/usrsctp.git",
+      "tag": null,
+      "commit": "fec583d54493f879d2ae44a743423bf8a04371ab",
+      "sourceTreeSha256": "1a638c3852790577192203a904aeb7849e6be7e4e4dcc2a73feb475c39cb288c",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "path": "libdatachannel/deps/plog",
+      "url": "https://github.com/SergiusTheBest/plog.git",
+      "tag": null,
+      "commit": "94899e0b926ac1b0f4750bfbd495167b4a6ae9ef",
+      "sourceTreeSha256": "a850ab35396716028f70ced17d620a2988a58169fbae80825ff2a480da24ba57",
+      "license": "MIT"
+    },
+    {
+      "path": "libdatachannel/deps/json",
+      "url": "https://github.com/nlohmann/json.git",
+      "tag": null,
+      "commit": "55f93686c01528224f448c19128836e7df245f72",
+      "sourceTreeSha256": "5d6a515e964425899c83760f8efc451e4415a984777a829a0792dea60f47345e",
+      "license": "MIT"
+    },
+    {
+      "path": "libdatachannel/deps/libsrtp",
+      "url": "https://github.com/cisco/libsrtp.git",
+      "tag": null,
+      "commit": "24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5",
+      "sourceTreeSha256": "b529fa3e7a5866111a6f320aeb00d9d588dab1da39ce2caa5aecf137d428b22b",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "path": "mbedtls/framework",
+      "url": "https://github.com/Mbed-TLS/mbedtls-framework.git",
+      "tag": null,
+      "commit": "dde0c4a0e448a0552f18817dcea633bb851fd288",
+      "sourceTreeSha256": "d96e93062ebdea1bac09fd3175b716c36f072f3935799501db0eb0c3e2b63969",
+      "license": "Apache-2.0"
+    }
+  ]
+}

@@ -170,6 +170,35 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Read from the verified file handle itself. MSIX may redirect a file even
+/// when its containing directory resolves to the expected physical path.
+pub fn read_physical(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > limit { bail!("State file exceeds limit"); }
+    verify_physical_file(path, &file)?;
+    let mut bytes = vec![];
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit { bail!("State file exceeds limit"); }
+    Ok(bytes)
+}
+pub(crate) fn verify_physical_file(path: &Path, file: &fs::File) -> Result<()> {
+    #[cfg(not(windows))] let _ = (path, file);
+    #[cfg(windows)] unsafe {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+        let mut buffer = vec![0u16; 32768];
+        let count = GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), buffer.len() as u32, 0);
+        if count == 0 { return Err(std::io::Error::last_os_error().into()); }
+        if count as usize >= buffer.len() { bail!("Physical state path exceeds limit"); }
+        let actual = String::from_utf16_lossy(&buffer[..count as usize]);
+        let expected = std::path::absolute(path)?.to_string_lossy().replace('/', "\\");
+        let normalize = |s: &str| s.strip_prefix(r"\\?\").unwrap_or(s).to_lowercase();
+        if normalize(&actual) != normalize(&expected) { bail!("state_path_redirected"); }
+    }
+    Ok(())
+}
 pub fn secret() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];

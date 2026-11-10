@@ -1,5 +1,106 @@
 ﻿#requires -Version 5.1
 # Shared file operations. Dot-sourcing this file performs no integration actions.
+function Initialize-PocketShellLink {
+    if ('PocketShellLink' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+public static class PocketShellLink {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+ static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+ [DllImport("kernel32.dll",SetLastError=true)]
+ static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file,int kind,ref int value,uint size);
+ public static void DeleteIfHash(string path,string expected) {
+  // Deny concurrent writers and renames while checking and deleting this exact file.
+  using(var handle=CreateFile(path,0x80010000u,1,IntPtr.Zero,3,0,IntPtr.Zero)) {
+   if(handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   using(var stream=new System.IO.FileStream(handle,System.IO.FileAccess.Read)) {
+    string actual; using(var hash=System.Security.Cryptography.SHA256.Create()) { actual=BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","").ToLowerInvariant(); }
+    if(!String.Equals(actual,expected,StringComparison.Ordinal)) throw new InvalidOperationException("Shortcut changed during publication; refusing drift.");
+    int delete=1;if(!SetFileInformationByHandle(handle,4,ref delete,4)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   }
+  }
+ }
+ [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+ interface ILink {
+  void GetPath([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder path,int count,IntPtr data,uint flags);
+  void GetIDList(out IntPtr value); void SetIDList(IntPtr value);
+  void GetDescription([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder value,int count);
+  void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string value);
+  void GetWorkingDirectory([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder value,int count);
+  void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string value);
+  void GetArguments([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder value,int count);
+  void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string value);
+  void GetHotkey(out short value); void SetHotkey(short value);
+  void GetShowCmd(out int value); void SetShowCmd(int value);
+  void GetIconLocation([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder value,int count,out int index);
+  void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string value,int index);
+  void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string value,uint reserved);
+  void Resolve(IntPtr hwnd,uint flags);
+  void SetPath([MarshalAs(UnmanagedType.LPWStr)] string value);
+ }
+ static object Create() { return Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046"))); }
+ public static void Write(string file,string target,string args,string icon) {
+  object obj=Create(); try { var link=(ILink)obj;
+   link.SetPath(target); link.SetArguments(args); link.SetWorkingDirectory(System.IO.Path.GetDirectoryName(target));
+   link.SetShowCmd(7); link.SetDescription("Codex Pocket"); link.SetIconLocation(icon,0);
+   ((IPersistFile)obj).Save(file,true);
+  } finally { Marshal.FinalReleaseComObject(obj); }
+ }
+ public static string[] Read(string file) {
+  object obj=Create(); try { ((IPersistFile)obj).Load(file,0); var link=(ILink)obj;
+   var target=new StringBuilder(32768);var args=new StringBuilder(32768);var icon=new StringBuilder(32768);int index;
+   link.GetPath(target,target.Capacity,IntPtr.Zero,4);link.GetArguments(args,args.Capacity);link.GetIconLocation(icon,icon.Capacity,out index);
+   return new[]{target.ToString(),args.ToString(),icon.ToString(),index.ToString()};
+  } finally { Marshal.FinalReleaseComObject(obj); }
+ }
+}
+'@
+}
+
+function Invoke-PocketInstallStep([string]$Stage,[string]$Call,[scriptblock]$Action) {
+    $started=[DateTimeOffset]::UtcNow.ToString('o')
+    try {
+        $result=& $Action
+        Write-PocketInstallEvent @{stage=$Stage;call=$Call;startedAt=$started;state='completed'}
+        return $result
+    } catch {
+        $failure=$_; $exception=$_.Exception
+        while ($null -ne $exception.InnerException) { $exception=$exception.InnerException }
+        $hresult='0x'+$exception.HResult.ToString('X8')
+        # Original messages can contain paths, commands and credentials; retain type/code only.
+        Write-PocketInstallEvent @{stage=$Stage;call=$Call;startedAt=$started;state='failed';hresult=$hresult;exceptionType=$exception.GetType().FullName}
+        if (-not $failure.Exception.Data.Contains('PocketStage')) {
+            $failure.Exception.Data['PocketStage']=$Stage
+            $failure.Exception.Data['PocketCall']=$Call
+            $failure.Exception.Data['PocketHResult']=$hresult
+        }
+        throw $failure
+    }
+}
+function Write-PocketInstallEvent([hashtable]$Event) {
+    $journal=Get-Variable -Name PocketInstallDiagnostics -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $journal -or $null -eq $journal.Value) { return }
+    $record=$journal.Value
+    $record.events+=($Event+@{at=[DateTimeOffset]::UtcNow.ToString('o')})
+    Assert-PocketUnredirectedPath $record.path
+    Write-PocketJson $record.path $record
+}
+function Start-PocketInstallDiagnostics([string]$Root) {
+    if (-not $Root) { $Root=Join-Path (Get-PocketLocalAppData) 'CodexPocketDiagnostics\install' }
+    Assert-PocketUnredirectedPath $Root -ProbeWrite
+    [void][IO.Directory]::CreateDirectory($Root)
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl=[Security.AccessControl.DirectorySecurity]::new();$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+    Set-Acl -LiteralPath $Root -AclObject $acl
+    $id=[guid]::NewGuid().ToString('N')
+    $script:PocketInstallDiagnostics=[ordered]@{schema=1;operationId=$id;path=(Join-Path $Root ($id+'.json'));events=@()}
+    Write-PocketInstallEvent @{stage='preflight';call='install';state='started'}
+    return $script:PocketInstallDiagnostics.path
+}
 function Get-PocketBytesHash([byte[]]$Bytes) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
@@ -155,7 +256,7 @@ function ConvertTo-PocketArgument([string]$Value) {
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
 function Get-PocketWindowsFiles {
-    return @('cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
+    return @('codex-pocket.ico','cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
         'windows-launch-desktop.ps1','windows-tray.ps1','windows-verify-release.ps1',
         'cli-install.ps1','cli-wrapper.mjs','windows-user-guide.md','cli-install-implementation.md',
         'resume-windows-report.md','cli-native-probe-result.md','V02-WINDOWS-INSTALL.md')
