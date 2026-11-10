@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "pocket-runtime-host"
+version = "0.6.3"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = ["server"]
+server = ["dep:pocket-agent", "dep:fs2", "dep:subtle"]
+
+[[bin]]
+name = "pocket-runtime-host"
+path = "src/main.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "pocket-host-fixture"
+path = "src/bin/pocket-host-fixture.rs"
+required-features = ["server"]
+
+[[test]]
+name = "lifetime"
+required-features = ["server"]
+
+[[test]]
+name = "foundation"
+required-features = ["server"]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+subtle = { version = "2", optional = true }
+fs2 = { version = "0.4", optional = true }
+pocket-agent = { path = "../agent", optional = true }
+pocket-core = { path = "../core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

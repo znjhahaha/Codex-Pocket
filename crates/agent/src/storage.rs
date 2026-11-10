@@ -124,41 +124,19 @@ pub fn private_directory(path: &Path) -> Result<()> {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("Missing state parent")?;
     fs::create_dir_all(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).context("Create state staging file")?;
+    file.write_all(bytes).context("Write staged state")?;
+    file.as_file().sync_all().context("Flush staged state")?;
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-        let source = file
-            .path()
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let target = path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let moved = unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                target.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if moved == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?
-            .sync_all()?;
+        // Rust 1.93's Windows rename uses FileRenameInfoEx/POSIX semantics when
+        // legacy MoveFileEx rejects an open destination. Existing readers keep
+        // their old complete snapshot while new readers see the new one. Never
+        // delete/truncate the old file, or retry the business operation.
+        fs::rename(file.path(), path).context("Replace state file")?;
+        // Flush the same verified staging handle, now naming the replacement;
+        // reopening by path would introduce another reader/writer race.
+        file.as_file().sync_all().context("Flush replaced state")?;
     }
     #[cfg(not(windows))]
     {
@@ -255,6 +233,19 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn replacement_keeps_an_existing_reader_on_its_original_snapshot() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("observed.json");
+        atomic_write(&path, b"previous").unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+        atomic_write(&path, b"replacement").unwrap();
+        let mut before = Vec::new();
+        reader.read_to_end(&mut before).unwrap();
+        assert_eq!(before, b"previous");
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
     }
     #[cfg(windows)]
     #[test]
