@@ -173,6 +173,8 @@ object ConversationPresentation {
             // Replies may arrive in a later native turn. Completion/submission alone never answers
             // an async question, while a completed native request tool is a resolved old guard.
             fun requestResolved(item: TimelineItem): Boolean {
+                // Folding a closed native tool is presentation only. It never
+                // confirms the phone's answer; the delivery receipt does that.
                 val raw = item.raw
                 val aliases = listOf(item.key, item.itemId, raw.string("requestId"), raw.string("id"),
                     raw.obj("params").string("requestId"), raw.obj("params").string("id")).filter(String::isNotBlank)
@@ -255,6 +257,7 @@ object ConversationPresentation {
     /** Allowlisted human text only. Never serialize protocol objects as fallback UI. */
     fun detail(item: TimelineItem): String {
         if (!visible(item)) return ""
+        NativeQuestionHistory.from(item)?.let { return it.text }
         val raw = item.raw
         return when (item.type) {
             "contextCompaction" -> compactionLabel(item)

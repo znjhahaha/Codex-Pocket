@@ -96,7 +96,7 @@ class V054ToolMediaTest {
         compose.onNodeWithText(compose.activity.getString(R.string.v03_output_unavailable)).assertDoesNotExist()
         compose.onNodeWithTag("activity-toggle:${item.key}").performClick()
         compose.onNodeWithTag("tool-output-blocks").assertExists()
-        compose.waitUntil(10_000) { compose.onAllNodesWithText("图片已过期").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("图片引用已失效，点击重试").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithContentDescription("图片 1").performClick()
         compose.onNodeWithTag("image-viewer").assertExists()
         compose.onNodeWithContentDescription("关闭").performClick()

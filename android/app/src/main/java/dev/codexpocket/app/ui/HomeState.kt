@@ -85,7 +85,7 @@ internal fun homeChatStatus(s: PocketState, chat: ChatEntity): String {
     if (questions.any { !it.flag("submitted") } || s.approvals.any {
             !it.submitted && it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method)
         }) return "pending"
-    if (s.commands.any { it.chatKey == chat.key && CommandPolicy.blocksNewSend(it.status) }) return "unknown"
+    if (s.commands.any { it.chatKey == chat.key && it.method != "approvals/respond" && CommandPolicy.blocksNewSend(it.status) }) return "unknown"
     val online = s.online && s.runtimes.any { it.id == chat.runtimeId && it.online }
     val nativeStatus = if (online && s.selected?.key == chat.key) {
         if (s.timeline.activeTurn != null) "inProgress" else s.timeline.status.ifBlank { chat.status }

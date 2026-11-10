@@ -111,7 +111,7 @@ class MultiRouteTransportTest {
                     }
                 })
             }
-            RoutingPocketConnection(RouteManager(), 150, factory).use { client ->
+            RoutingPocketConnection(RouteManager(), 150, create = factory).use { client ->
                 client.connect(relay.config.copy(routes = routes))
                 assertEquals(listOf("lan", "public"), opened)
                 assertTrue(cancelled.get()); assertNull(client.activeRoute)

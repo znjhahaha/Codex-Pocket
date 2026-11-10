@@ -97,6 +97,33 @@ class V06SessionRepositoryTest {
         assertTrue(server.calls.count { it.method == "runtimes/list" } >= 2)
         assertEquals(listOf("d"), server.calls.filter { it.method == "codex/request" && it.params.string("method") == "thread/start" }.map { it.params.string("runtimeId") })
     }
+    @Test fun newConversationDoesNotInheritPreviousHistoryFailureOrPagination() = runBlocking<Unit> {
+        repo.editDraft("preserve previous conversation")
+        server.historyFails = true
+        repo.reloadConversation().join()
+        assertEquals(ConversationLoadState.Failed, repo.state.value.conversationLoadState)
+        assertNotNull(repo.state.value.conversationLoadError)
+        server.historyFails = false
+        repo.create(SessionMode.Desktop, "").join()
+        assertEquals("new", repo.state.value.selected!!.key.nativeId)
+        assertEquals(ConversationLoadState.Ready, repo.state.value.conversationLoadState)
+        assertNull(repo.state.value.conversationLoadError)
+        assertTrue(repo.state.value.historyExhausted)
+        assertEquals("preserve previous conversation", db.dao().draft(key)!!.text)
+    }
+    @Test fun expiredMediaRenewsThroughSameHistoryOnceAndKeepsNewReference() = runBlocking<Unit> {
+        val old = userMessageMedia(repo.state.value.timeline.items.values.first()).single()
+        server.mediaId = "b".repeat(32)
+        repo.refreshToolMedia(old)
+        val fresh = userMessageMedia(repo.state.value.timeline.items.values.first()).single()
+        assertEquals(server.mediaId, fresh.mediaId)
+        val reads = server.calls.count { it.method == "codex/request" && it.params.string("method") == "thread/read" }
+        repo.refreshToolMedia(old)
+        repo.refreshToolMedia(fresh)
+        assertEquals(reads, server.calls.count { it.method == "codex/request" && it.params.string("method") == "thread/read" })
+        repo.refreshToolMedia(fresh, manual = true)
+        assertEquals(reads + 1, server.calls.count { it.method == "codex/request" && it.params.string("method") == "thread/read" })
+    }
 
     @Test fun explicitHandoffUsesActualOwnerAndKeepsHistoricalSource() = runBlocking<Unit> {
         repo.editDraft("retained")
@@ -216,6 +243,8 @@ class V06SessionRepositoryTest {
         var mode = "desktop"
         var revision = 4
         var imageFails = false
+        var historyFails = false
+        var mediaId = "a".repeat(32)
         var imageRead: suspend () -> JsonElement? = { null }
         var fastSupported = false
         var ownerMissing = false
@@ -269,11 +298,11 @@ class V06SessionRepositoryTest {
                 }
                 "codex/request" -> when (params.string("method")) {
                     "thread/start" -> buildJsonObject { put("thread", buildJsonObject { put("id", "new"); put("turns", buildJsonArray {}) }) }
-                    "thread/read" -> buildJsonObject { put("pocketCursor", buildJsonObject { put("epoch", "fixture"); put("sequence", 0) }); put("thread", buildJsonObject {
+                    "thread/read" -> buildJsonObject { if (historyFails) throw WireException("remote_error", "fixture"); put("pocketCursor", buildJsonObject { put("epoch", "fixture"); put("sequence", 0) }); put("thread", buildJsonObject {
                         put("id", params.obj("params").string("threadId")); put("turns", buildJsonArray { add(buildJsonObject {
                             put("id", "turn"); put("status", "completed"); put("items", buildJsonArray { add(buildJsonObject {
                                 put("id", "user"); put("type", "userMessage"); put("content", buildJsonArray { add(buildJsonObject {
-                                    put("type", "image"); put("mediaId", "a".repeat(32)); put("runtimeId", params.string("runtimeId")); put("connectionId", "c")
+                                    put("type", "image"); put("mediaId", mediaId); put("runtimeId", params.string("runtimeId")); put("connectionId", "c")
                                     put("threadId", params.obj("params").string("threadId")); put("turnId", "turn"); put("itemId", "user"); put("mimeType", "image/png"); put("byteLength", 10); put("status", "ready")
                                 }) })
                             }) })

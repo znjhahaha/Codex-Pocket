@@ -56,6 +56,20 @@ class QuestionCardUiTest {
         assertEquals(listOf("Phone (Recommended)", "Remote", "fixture-secret"), submissions.single().map { it.second })
     }
 
+    @Test fun completedNativeQuestionsRenderHumanAnswersWithoutRawResultOrSecret() {
+        val item = TimelineItem.from("turn", pocketJson.parseToJsonElement("""{
+            "id":"history","type":"dynamicToolCall","tool":"functions.request_user_input","status":"completed","success":true,
+            "arguments":{"questions":[{"id":"public","question":"Which client?"},{"id":"secret","question":"Access code?","isSecret":true}]},
+            "contentItems":[{"type":"inputText","text":"{\"answers\":{\"public\":{\"answers\":[\"Phone\"]},\"secret\":{\"answers\":[\"private-history-fixture\"]}}}"}]
+        }""").jsonObject)
+        content { HistoricalQuestionRow(NativeQuestionHistory.from(item)!!, item.key) }
+        compose.onNodeWithText("Which client?").assertExists()
+        compose.onNodeWithTag("question-history-answer:public").assertTextEquals("回答：Phone")
+        compose.onNodeWithTag("question-history-answer:secret").assertTextEquals("回答：敏感回答已隐藏")
+        compose.onNodeWithText("private-history-fixture", substring = true).assertDoesNotExist()
+        compose.onNodeWithTag("question-submit").assertDoesNotExist()
+    }
+
     @Test fun offlineAndStaleStatesDisableAnswerAndSubmit() {
         val batch = QuestionBatches.blocking("single", Json.parseToJsonElement("""{"questions":[{"id":"q","question":"Choose","options":[{"label":"Yes"}]}]}""").jsonObject)
         val session = QuestionSession(batch)

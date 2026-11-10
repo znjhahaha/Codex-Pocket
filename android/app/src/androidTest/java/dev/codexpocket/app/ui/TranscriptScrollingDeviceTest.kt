@@ -77,7 +77,7 @@ class TranscriptScrollingDeviceTest {
     private var timeline by mutableStateOf(NativeTimeline())
     private var headerHeight by mutableIntStateOf(48)
 
-    private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null) = runBlocking {
+    private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null, online: Boolean = false) = runBlocking {
         withTimeout(5_000) { repo.state.first { it.initialized } }
         val chat = ChatEntity(key, "runtime", "desktop", "Fixture", "", "", 0, "idle", false)
         db.dao().putChat(chat)
@@ -92,7 +92,7 @@ class TranscriptScrollingDeviceTest {
                     LocalPocketGlassPreferences provides PocketGlassPreferences(false, false, false)) {
                     Surface { ProvideMarkdownRendering {
                         val current by repo.state.collectAsState()
-                        ChatScreen(current.copy(timeline = timeline, conversationCached = true), repo, {}, {}, {},
+                        ChatScreen(current.copy(timeline = timeline, conversationCached = true, online = online), repo, {}, {}, {},
                             header = { Spacer(Modifier.height(headerHeight.dp)) })
                     } }
                 }
@@ -157,6 +157,25 @@ class TranscriptScrollingDeviceTest {
         screenshot("cached-home")
     }
 
+    @Test fun nativeQuestionHistoryKeepsQuestionAndConfirmedAnswerVisible() {
+        content()
+        val item=TimelineItem.from("question-turn",buildJsonObject {
+            put("id","question-item");put("type","dynamicToolCall");put("tool","functions.request_user_input");put("status","completed");put("success",true)
+            put("arguments",buildJsonObject {put("questions",buildJsonArray {add(buildJsonObject {
+                put("id","choice");put("header","交付顺序");put("question","先修复问答还是重连？");put("isOther",true);put("isSecret",false)
+            })})})
+            put("contentItems",buildJsonArray {add(buildJsonObject {put("type","text");put("text","""{"answers":{"choice":{"answers":["先修复问答，然后重连"]}}}""")})})
+        })
+        val history=NativeQuestionHistory.from(item)!!
+        compose.activity.runOnUiThread {compose.activity.setContent {
+            PocketTheme("dark") {Surface {Column(Modifier.fillMaxSize().padding(20.dp)) {HistoricalQuestionRow(history,item.key)}}}
+        }}
+        compose.onNodeWithText("先修复问答还是重连？").assertIsDisplayed()
+        compose.onNodeWithText("回答：先修复问答，然后重连").assertIsDisplayed()
+        compose.onNodeWithText("操作未核对").assertDoesNotExist()
+        screenshot("question-history")
+    }
+
     @Test fun turnSummaryAndLanguageBadgesShowActualRecordedChanges() {
         content()
         val edits = TimelineItem("changes", "files", "fileChange", complete = true, status = "completed", raw = buildJsonObject {
@@ -217,6 +236,93 @@ class TranscriptScrollingDeviceTest {
         compose.waitUntil(5_000) { calls.get() >= 3 }
         compose.onNodeWithContentDescription("关闭", useUnmergedTree = true).assertExists()
         screenshot("image-recovered")
+    }
+
+    @Test fun expiredReferenceRefreshesSameImageAndOpensNewReference() {
+        content()
+        val bitmap=android.graphics.Bitmap.createBitmap(64,48,android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.rgb(63,123,188))
+        val bytes=java.io.ByteArrayOutputStream().also {bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)}.toByteArray()
+        bitmap.recycle()
+        val old=ToolMediaRef("c".repeat(32),"renew-runtime","renew-thread","renew-turn","renew-item","",0,
+            ToolMediaStatus.Recoverable,connectionId="renew-link",contentPart=0)
+        val fresh=old.copy(mediaId="d".repeat(32))
+        var reference by mutableStateOf(old)
+        val renewals=java.util.concurrent.atomic.AtomicInteger()
+        val reads=java.util.concurrent.CopyOnWriteArrayList<String>()
+        val source=object:ToolMediaImageSource {
+            override suspend fun read(media:ToolMediaRef,offset:Long,maxBytes:Int):ToolMediaChunk {
+                reads += media.mediaId
+                if(media==old) throw dev.codexpocket.wire.WireException("media_expired","fixture")
+                assertEquals(fresh,media);assertEquals(0L,offset)
+                return ToolMediaChunk(fresh.mediaId,ToolMediaStatus.Ready,"image/png",bytes.size.toLong(),0,true,
+                    android.util.Base64.encodeToString(bytes,android.util.Base64.NO_WRAP))
+            }
+            override suspend fun refresh(media:ToolMediaRef,manual:Boolean) {
+                assertEquals(old,media);assertFalse(manual);renewals.incrementAndGet()
+                withContext(Dispatchers.Main) {reference=fresh}
+            }
+        }
+        compose.activity.runOnUiThread {compose.activity.setContent {
+            PocketTheme("dark") {Surface {CompositionLocalProvider(LocalImageConnection provides (20L to true),LocalToolMediaImages provides source) {
+                Column(Modifier.fillMaxSize().padding(24.dp)) {ToolMediaGrid(listOf(reference))}
+            }}}
+        }}
+        compose.waitUntil(5_000) {fresh.mediaId in reads}
+        compose.waitForIdle()
+        assertEquals(1,renewals.get())
+        compose.onNodeWithText("图片引用已失效，点击重试").assertDoesNotExist()
+        compose.onNodeWithContentDescription("图片 1").performClick()
+        compose.waitUntil(5_000) {reads.count {it==fresh.mediaId}>=2}
+        compose.onNodeWithContentDescription("关闭",useUnmergedTree=true).assertExists()
+        screenshot("image-reference-renewed")
+    }
+
+    @Test fun mainChatThinkingRequiresActiveNativeWorkAndStopsWhenWaiting() {
+        content(online = true)
+        compose.runOnIdle { timeline = NativeTimeline(activeTurn = "accepted-turn", status = "active") }
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
+        compose.onNodeWithText(compose.activity.getString(dev.codexpocket.app.R.string.what_working)).assertDoesNotExist()
+        compose.runOnIdle { timeline = timeline.copy(activeFlags = setOf("waitingOnUserInput")) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.runOnIdle { timeline = timeline.copy(activeFlags = emptySet(), status = "idle") }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+    }
+
+    @Test fun activeAgentsLeadAndFailureRemainsFoldableWithInitialThinkingFeedback() {
+        content()
+        val failed=TimelineItem("fixture-turn","bad-command","commandExecution","fixture\n\nrecorded failure detail",status="failed",complete=true,
+            raw=buildJsonObject {put("command","fixture");put("exitCode",1);put("aggregatedOutput","recorded failure detail")})
+        val completed=failed.copy(itemId="good-command",status="completed",raw=buildJsonObject {put("command","fixture-good");put("exitCode",0)})
+        val row=TranscriptRow("fixture-failed-group",TranscriptKind.Activity,listOf(failed,completed),completedTurn=true)
+        val agents=listOf(AgentRosterEntry("fixture-unknown","旧记录",isCurrent=true),
+            AgentRosterEntry("fixture-closed","已关闭代理",ActivityStatus.Interrupted,"shutdown",isCurrent=true),
+            AgentRosterEntry("fixture-running","运行中的代理",ActivityStatus.Running,"running",isCurrent=true))
+        var others by mutableStateOf(false)
+        compose.activity.runOnUiThread {compose.activity.setContent {
+            PocketTheme("dark") {Surface {Column(Modifier.fillMaxSize().padding(20.dp)) {
+                LiveTurnStatus("fixture-turn",ConversationPresentation.LiveStatus.Thinking)
+                NativeActivityTrace(row,"fixture-failed",false,{},{})
+                AgentRosterList(agents,emptyMap(),true,false,androidx.compose.foundation.lazy.rememberLazyListState(),
+                    others,{others=!others},{},Modifier.weight(1f))
+            }}}
+        }}
+        compose.onNodeWithText("正在思考").assertIsDisplayed()
+        compose.onNodeWithTag("activity-group-toggle:${row.key}").assertExists()
+        compose.onNodeWithTag("activity-toggle:${failed.key}").assertDoesNotExist()
+        compose.onNodeWithTag("agent-roster-open:fixture-running").assertIsDisplayed()
+        compose.onNodeWithTag("agent-roster-open:fixture-unknown").assertDoesNotExist()
+        compose.onNodeWithTag("agent-roster-open:fixture-closed").assertDoesNotExist()
+        screenshot("active-agents-thinking-folded-failure")
+        compose.onNodeWithTag("activity-group-toggle:${row.key}").performClick()
+        compose.onNodeWithText("退出码 1").assertIsDisplayed()
+        compose.onNodeWithTag("activity-toggle:${failed.key}").performClick()
+        compose.onNodeWithText("recorded failure detail").assertIsDisplayed()
+        compose.onNodeWithTag("activity-group-toggle:${row.key}").performClick()
+        compose.onNodeWithText("recorded failure detail").assertDoesNotExist()
+        compose.onNodeWithTag("agent-reader-history-toggle").performClick()
+        compose.onNodeWithTag("agent-roster-open:fixture-unknown").assertExists()
+        compose.onNodeWithTag("agent-roster-open:fixture-closed").assertExists()
     }
 
     @Test fun firstHistoryProjectionWaitsForContactBeforeRestoringAndPersistingAnchor() {

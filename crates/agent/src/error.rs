@@ -16,6 +16,7 @@ pub enum Code {
     VersionConflict,
     OperationInProgress,
     RequestTimeout,
+    NativeHistoryUnavailable,
 }
 impl Code {
     pub fn as_str(self) -> &'static str {
@@ -35,6 +36,7 @@ impl Code {
             Self::VersionConflict => "version_conflict",
             Self::OperationInProgress => "operation_in_progress",
             Self::RequestTimeout => "request_timeout",
+            Self::NativeHistoryUnavailable => "native_history_unavailable",
         }
     }
     pub fn message(self) -> &'static str {
@@ -54,6 +56,7 @@ impl Code {
             Self::VersionConflict => "Settings changed; refresh before trying again",
             Self::OperationInProgress => "A previous operation is still being reconciled",
             Self::RequestTimeout => "The read operation timed out; the connection may still be available",
+            Self::NativeHistoryUnavailable => "The current Codex runtime cannot read this thread history; cached messages and drafts are retained",
         }
     }
 }

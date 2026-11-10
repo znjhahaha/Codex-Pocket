@@ -1,4 +1,7 @@
 //! Authenticated application request routing, native ownership and replay.
+#[cfg(test)]
+#[path = "broker/history_compat_tests.rs"]
+mod history_compat_tests;
 use crate::{
     access,
     attachments::{self, Attachment},
@@ -33,6 +36,28 @@ mod session_access;
 mod management_tests {
     use super::tests::{fixture, loaded, peer};
     use super::*;
+    #[tokio::test]
+    async fn extension_catalog_failure_is_local_and_status_read_is_concurrent() {
+        let (_dir,b)=fixture().await;
+        let mut native=peer(&b,"r","desktop").await;
+        let mut caps=crate::capabilities::Capabilities::default();
+        caps.0.insert("config/read".into(),["includeLayers".into()].into_iter().collect());
+        caps.0.insert("skills/list".into(),Default::default());
+        caps.0.insert("mcpServerStatus/list".into(),Default::default());
+        let task=tokio::spawn({let b=b.clone();async move{b.request("phone","extensions/list",json!({"runtimeId":"r"})).await}});
+        inventory_reply(&mut native,&caps,true,"v1").await;
+        let skills=native.recv().await;
+        assert_eq!(skills["method"],"skills/list");
+        let status=tokio::time::timeout(Duration::from_secs(1),native.recv()).await.expect("MCP status must not wait for a stuck skills read");
+        assert_eq!(status["method"],"mcpServerStatus/list");
+        native.reply(&status,json!({"data":[{"name":"known","startupState":"ready"}]})).await;
+        native.send(json!({"id":skills["id"],"error":{"code":-32000,"message":"private fixture failure"}})).await;
+        let value=task.await.unwrap().unwrap();
+        assert_eq!(value["categories"]["skills"]["status"],"unavailable");
+        assert_eq!(value["categories"]["mcp"]["status"],"ready");
+        assert!(value["data"].as_array().unwrap().iter().any(|row|row["name"]=="known"&&row["status"]=="ready"));
+        assert!(!value.to_string().contains("private fixture failure"));
+    }
     fn history(turns: bool) -> Value {
         json!({"thread":{"id":"t","cwd":"D:/fixture","updatedAt":1,"status":{"type":"idle"},"turns":if turns {json!([{ "id":"u","status":"completed","items":[{"id":"i","type":"userMessage","content":[{"type":"text","text":"original"}]}]}])} else {json!([])}}})
     }
@@ -515,6 +540,7 @@ struct OwnershipClaim {
     native_process: Option<NativeProcess>,
 }
 struct State {
+    questions: crate::questions::Receipts,
     edits: crate::message_edit::Edits,
     extensions: HashMap<String, crate::extensions::Inventory>,
     discovery_errors: BTreeSet<(String, String)>,
@@ -1383,47 +1409,42 @@ impl Broker {
             );
         }
         let read = if caps.supports("config/read", &json!({"includeLayers":true})) {
-            rpc.call("config/read", json!({"includeLayers":true}))
-                .await?
-        } else {
-            json!({})
-        };
-        let skills = if caps.supports("skills/list", &json!({})) {
-            rpc.call("skills/list", json!({})).await?
-        } else {
-            json!({})
-        };
-        let plugins = if caps.supports("plugin/installed", &json!({})) {
-            rpc.call("plugin/installed", json!({})).await?
-        } else if caps.supports("plugin/list", &json!({"forceRefetch":false})) {
-            rpc.call("plugin/list", json!({"forceRefetch":false}))
-                .await?
-        } else {
-            json!({})
-        };
-        // Optional cached app snapshot: never refresh hosted tools or supply an unverified thread.
-        let apps = if caps.supports("app/installed", &json!({"forceRefresh":false})) {
-            match rpc.call("app/installed", json!({"forceRefresh":false})).await {
-                Ok(apps) if apps["apps"].as_array().is_some_and(|rows| rows.iter().all(|app| {
-                    app["id"].as_str().is_some_and(crate::message_edit::valid_id)
-                        && app["enabled"].is_boolean()
-                        && app["callable"].is_boolean()
-                        && (app["runtimeName"].is_null() || app["runtimeName"].is_string())
-                })) => apps,
-                _ => json!({"status":"unavailable","reason":"native_app_inventory_unavailable"}),
+            match tokio::time::timeout(Duration::from_secs(8),rpc.call("config/read",json!({"includeLayers":true}))).await {
+                Ok(Ok(value))=>value,
+                _=>json!({"pocketLoadStatus":"unavailable"}),
             }
         } else {
-            json!({"status":"unsupported","reason":"native_app_inventory_not_supported"})
-        };
-        let status = if caps.supports("mcpServerStatus/list", &json!({})) {
-            rpc.call("mcpServerStatus/list", json!({}))
-                .await
-                .unwrap_or(json!({}))
-        } else {
             json!({})
         };
+        let slots=Arc::new(tokio::sync::Semaphore::new(3));
+        let section=|method: &'static str, params: Value| {
+            let supported=caps.supports(method,&params);let rpc=rpc.clone();let slots=slots.clone();
+            async move {
+                if !supported {return json!({"status":"unsupported"});}
+                let _slot=slots.acquire().await.expect("local semaphore stays open");
+                match tokio::time::timeout(Duration::from_secs(8),rpc.call(method,params)).await {
+                    Ok(Ok(mut value)) if value.is_object()=>{value["pocketLoadStatus"]=json!("ready");value},
+                    _=>json!({"status":"unavailable","pocketLoadStatus":"unavailable"}),
+                }
+            }
+        };
+        let (plugin_method,plugin_params)=if caps.supports("plugin/installed",&json!({})) {
+            ("plugin/installed",json!({}))
+        }else{("plugin/list",json!({"forceRefetch":false}))};
+        let (skills,plugins,mut apps,status)=tokio::join!(
+            section("skills/list",json!({})), section(plugin_method,plugin_params),
+            section("app/installed",json!({"forceRefresh":false})), section("mcpServerStatus/list",json!({}))
+        );
+        if apps["pocketLoadStatus"]=="ready" && !apps["apps"].as_array().is_some_and(|rows|rows.iter().all(|app|
+            app["id"].as_str().is_some_and(crate::message_edit::valid_id)&&app["enabled"].is_boolean()&&app["callable"].is_boolean()
+                &&(app["runtimeName"].is_null()||app["runtimeName"].is_string()))) {
+            apps=json!({"status":"unavailable","pocketLoadStatus":"unavailable"});
+        }
+        let category=|value:&Value|json!({"status":value["pocketLoadStatus"].as_str().or(value["status"].as_str()).unwrap_or("unsupported")});
+        let categories=json!({"mcp":{"status":if read["pocketLoadStatus"]=="unavailable"{"unavailable"}else if caps.supports("config/read",&json!({"includeLayers":true})){"ready"}else{"unsupported"},"runtime":category(&status)},
+            "skills":category(&skills),"plugins":category(&plugins),"apps":category(&apps)});
         self.edit_idle(device, runtime, "", &generation).await?;
-        let inventory = crate::extensions::Inventory::build(
+        let mut inventory = crate::extensions::Inventory::build(
             runtime,
             &generation,
             &read,
@@ -1433,7 +1454,21 @@ impl Broker {
             &status,
             &caps,
         );
-        let result = inventory.response(runtime);
+        // A failed category keeps its last same-generation rows visible, read-only.
+        // Never retain selectors or enabled-state authority after its source failed.
+        if let Some(previous)=self.state.lock().await.extensions.get(runtime).filter(|v|v.generation==generation) {
+            for (category,kind) in [("mcp","mcp"),("skills","skill"),("plugins","plugin"),("apps","app")] {
+                if categories[category]["status"]!="unavailable"{continue;}
+                for row in previous.data.iter().filter(|row|row["kind"]==kind) {
+                    let mut row=row.clone();row["capabilities"]["update"]=json!(false);
+                    row["reason"]=json!("catalog_refresh_failed");row["cached"]=json!(true);
+                    row["version"]=json!(inventory.version);
+                    inventory.data.push(row);
+                }
+            }
+        }
+        let mut result = inventory.response(runtime);
+        result["categories"]=categories;
         self.state
             .lock()
             .await
@@ -1614,6 +1649,14 @@ fn validate_push(method: &str, p: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn question_outcome(phase: crate::questions::Phase) -> Status {
+    match phase {
+        crate::questions::Phase::Confirmed => Status::Accepted { native_result:json!({"status":"accepted","evidence":"native_question_result"}) },
+        crate::questions::Phase::AnsweredElsewhere => Status::Rejected {reason:"Question answered on another client".into()},
+        crate::questions::Phase::Cancelled => Status::Rejected {reason:"Native question cancelled without an answer".into()},
+        _ => Status::Unknown,
+    }
+}
 fn status_value(s: &Status) -> Value {
     match s {
         Status::Submitted => json!({"status":"submitted"}),
@@ -1658,12 +1701,18 @@ impl Broker {
             .unwrap_or(0);
         storage::observe(persisted_now);
         let now = storage::now();
-        let ledger = if let Some(text) = ledger_text {
+        let mut ledger = if let Some(text) = ledger_text {
             CommandLedger::restore_json(&text, identity, policy, 1, now)
         } else {
             CommandLedger::new(identity, policy, 1, now)
         }
         .map_err(|e| anyhow::anyhow!("Invalid command ledger: {e:?}"))?;
+        let questions = crate::questions::Receipts::open(&state_dir)?;
+        for (key, phase) in questions.terminal_receipts() {
+            if matches!(ledger.status(&key),Some(Status::Unknown | Status::Submitted)) {
+                let _ = ledger.finish(&key, question_outcome(phase), now);
+            }
+        }
         storage::atomic_write(
             &state_dir.join("commands.json"),
             ledger.snapshot_json().as_bytes(),
@@ -1731,6 +1780,7 @@ impl Broker {
                 config,
                 state_dir,
                 state: Mutex::new(State {
+                    questions,
                     edits: Default::default(),
                     extensions: Default::default(),
                     discovery_errors: BTreeSet::new(),
@@ -1757,6 +1807,20 @@ impl Broker {
             &self.state_dir.join("commands.json"),
             state.ledger.snapshot_json().as_bytes(),
         )
+    }
+    fn observe_question_results(&self, state: &mut State, runtime: &str, value: &Value) {
+        let Some(store)=state.runtimes.get(runtime).map(|r|r.store.clone()) else {return;};
+        let before=state.questions.clone();
+        let changes=state.questions.observe(&store,value);
+        if changes.is_empty() {return;}
+        if state.questions.save(&self.state_dir).is_err() {state.questions=before;return;}
+        for (key,phase) in changes {
+            if matches!(phase,crate::questions::Phase::Confirmed|crate::questions::Phase::AnsweredElsewhere|crate::questions::Phase::Cancelled) {
+                let _=state.ledger.finish(&key,question_outcome(phase),storage::now());
+            }
+        }
+        // Durable receipts replay terminal evidence on restart if this second save fails.
+        let _=self.save_ledger(state);
     }
     fn save_devices(&self, state: &State) -> Result<()> {
         storage::atomic_write(
@@ -1993,6 +2057,9 @@ impl Broker {
                 "threads/list",
                 "commands/status",
                 "ping",
+                "questions/list",
+                "questions.v2",
+                "commands.delivery.v2",
                 "diagnostics",
                 "workspace/list",
                 "workspace/read",
@@ -2671,6 +2738,7 @@ impl Broker {
                     if let Some(r) = state.runtimes.get(&runtime_id) {
                         value["pocketCursor"] = cursor_value(&r.journal.cursor());
                     }
+                    self.observe_question_results(&mut state,&runtime_id,&value);
                     trim_history_outputs(&mut value);
                     let _ = reply.send(Ok(value));
                 }
@@ -2763,6 +2831,7 @@ impl Broker {
                             });
                         }
                     }
+                    self.observe_question_results(&mut state,&runtime_id,&value);
                     if matches!(
                         method.as_str(),
                         "serverRequest/resolved"
@@ -2815,6 +2884,8 @@ impl Broker {
                                             Status::Unknown,
                                             storage::now(),
                                         );
+                                        state.questions.unresolved(key);
+                                        let _ = state.questions.save(&self.state_dir);
                                         let _ = self.save_ledger(&state);
                                     }
                                 }
@@ -3037,19 +3108,20 @@ impl Broker {
             "devices/list" => {
                 return Ok(self.devices().await);
             }
+            "questions/list" => {
+                if p.as_object().is_none_or(|o|o.keys().any(|k|k!="threadId")) {bail!("Invalid question selector")}
+                return Ok(json!({"data":self.state.lock().await.questions.list(device,p["threadId"].as_str())}));
+            }
             "commands/status" => {
                 let key = CommandKey {
                     caller_id: device.into(),
                     command_id: field(&p, "commandId")?.into(),
                 };
-                return self
-                    .state
-                    .lock()
-                    .await
-                    .ledger
-                    .status(&key)
-                    .map(status_value)
-                    .ok_or_else(|| classify(anyhow::anyhow!("Command not found"), Code::NotFound));
+                let state=self.state.lock().await;
+                let mut value=state.ledger.status(&key).map(status_value)
+                    .ok_or_else(|| classify(anyhow::anyhow!("Command not found"), Code::NotFound))?;
+                if let Some(delivery)=state.questions.status(&key) {value["delivery"]=delivery;}
+                return Ok(value);
             }
             "sync" => return self.sync(&p).await,
             "threads/list" => return self.threads(&p).await,
@@ -3805,6 +3877,9 @@ impl Broker {
                 }
             }
             attachments::translate(&mut params, device, &s.attachments)?;
+            if method == "thread/start" {
+                crate::native_history_compat::prepare_creation(&mut params, &r.capabilities);
+            }
             (r.rpc.clone(), r.connection_id.clone(), resume_probe)
         };
         if let Some(thread) = resume_probe {
@@ -3842,7 +3917,7 @@ impl Broker {
                 Err(e) => bail!("Cannot establish thread ownership: {e:?}"),
             }
         }
-        let settings_observation = {
+        let (settings_observation, history_cursor) = {
             let mut s = self.state.lock().await;
             let r = s
                 .runtimes
@@ -3866,13 +3941,13 @@ impl Broker {
                     ));
                 }
             }
-            r.settings.prepare(method, &params)
+            (r.settings.prepare(method, &params), cursor_value(&r.journal.cursor()))
         };
         if let Some(token) = &prepared_token {
             self.state.lock().await.edits.consume(token);
         }
         let watched_thread=params["threadId"].as_str().map(str::to_owned);
-        let result = rpc.call(method, params).await?;
+        let result = crate::native_history_compat::call(&rpc, method, params, &history_cursor).await?;
         if matches!(method,"thread/read"|"thread/resume"|"thread/turns/list") {
             if let Some(thread)=watched_thread.as_deref() { self.watch_cli(runtime,thread).await; }
         }
@@ -3937,6 +4012,16 @@ impl Broker {
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
+        if matches!(method,"thread/turns/list"|"thread/items/list") {
+            let turns=if method=="thread/items/list" {
+                json!([{"id":p["params"]["turnId"],"items":projected["data"]}])
+            } else {projected["data"].clone()};
+            let evidence=json!({"thread":{"id":p["params"]["threadId"],"turns":turns}});
+            let mut state=self.state.lock().await;
+            if state.runtimes.get(runtime).is_some_and(|r|r.connection_id==connection_id) {
+                self.observe_question_results(&mut state,runtime,&evidence);
+            }
+        }
         if method == "thread/items/list" {
             projected.as_object_mut().unwrap().remove("threadId");
             projected.as_object_mut().unwrap().remove("turnId");
@@ -3955,6 +4040,7 @@ impl Broker {
                 .context("Approval already resolved or stale")?;
             validate_approval(&pending.event, &p["response"])?;
             let native_id = pending.native_id.clone();
+            let event = pending.event.clone();
             let rpc = s
                 .runtimes
                 .get(runtime)
@@ -3962,11 +4048,21 @@ impl Broker {
                 .context("Runtime offline")?
                 .rpc
                 .clone();
+            let store = s.runtimes[runtime].store.clone();
+            if s.questions.unresolved_request(&store,&event) {
+                return Err(classify(anyhow::anyhow!("Question already has a delivery receipt; reconcile its original command"),Code::Unknown));
+            }
+            let before=s.questions.clone();
+            s.questions.reserve(key.clone(),runtime,&store,&event,&p["response"])?;
+            if let Err(error)=s.questions.save(&self.state_dir) {s.questions=before;return Err(error);}
             s.pending.get_mut(id).unwrap().command = Some(key.clone());
             s.pending.get_mut(id).unwrap().response = Some(p["response"].clone());
             (rpc, native_id)
         };
         rpc.respond(native_id, p["response"].clone()).await?;
+        let mut state=self.state.lock().await;
+        state.questions.forwarded(key);
+        state.questions.save(&self.state_dir).map_err(|e|classify(e,Code::Unknown))?;
         Ok(json!({"status":"submitted"}))
     }
     async fn sync(&self, p: &Value) -> Result<Value> {
@@ -4004,7 +4100,10 @@ impl Broker {
             .pending
             .values()
             .filter(|p| p.command.is_none())
-            .map(|p| json!({"runtimeId":p.runtime,"event":p.event}))
+            .map(|p| {
+                let unresolved=s.runtimes.get(&p.runtime).is_some_and(|r|s.questions.unresolved_request(&r.store,&p.event));
+                json!({"runtimeId":p.runtime,"event":p.event,"deliveryPending":unresolved})
+            })
             .collect();
         Ok(
             json!({"events":events,"snapshotRequired":snapshots,"cursors":cursors,"pendingRequests":pending}),
@@ -4133,6 +4232,75 @@ fn validate_approval(event: &Value, response: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn reattached_question_token_cannot_replay_unconfirmed_answer() {
+        let (dir,b)=fixture().await;
+        b.save_devices(&*b.state.lock().await).unwrap();
+        let mut native=peer(&b,"old","cli").await;
+        let mut events=b.subscribe();
+        let question=json!({"id":7,"method":"item/tool/requestUserInput","params":{
+            "threadId":"t","turnId":"u","itemId":"i","questions":[{"id":"q"}]
+        }});
+        native.send(question.clone()).await;events.recv().await.unwrap();
+        let token=b.sync(&json!({})).await.unwrap()["pendingRequests"][0]["event"]["id"].clone();
+        b.request("phone","approvals/respond",json!({"commandId":"original","runtimeId":"old","requestId":token,"response":{"answers":{"q":{"answers":["chosen"]}}}})).await.unwrap();
+        native.recv().await;
+        let (restored,rx)=Broker::open(b.config.clone(),dir.path().into()).unwrap();
+        tokio::spawn(restored.clone().receive_events(rx));
+        let mut reattached=peer(&restored,"new","cli").await;
+        let mut restored_events=restored.subscribe();
+        reattached.send(question).await;restored_events.recv().await.unwrap();
+        let pending=restored.sync(&json!({})).await.unwrap()["pendingRequests"][0].clone();
+        assert_eq!(pending["deliveryPending"],true);
+        assert_ne!(pending["event"]["id"],token);
+        let duplicate=restored.request("phone","approvals/respond",json!({"commandId":"duplicate","runtimeId":"new","requestId":pending["event"]["id"],"response":{"answers":{"q":{"answers":["chosen"]}}}})).await.unwrap_err();
+        assert_eq!(crate::error::code(&duplicate),Code::Unknown);
+        reattached.assert_idle().await;
+    }
+    #[tokio::test]
+    async fn question_receipt_requires_native_answer_and_survives_restart_without_replay() {
+        for (native_answers, expected_status, expected_phase) in [
+            (json!({"q":{"answers":["phone choice"]}}), "accepted", "confirmed"),
+            (json!({"q":{"answers":["desktop choice"]}}), "rejected", "answered_elsewhere"),
+            (json!({}), "rejected", "cancelled"),
+        ] {
+            let (dir, b) = fixture().await;
+            b.save_devices(&*b.state.lock().await).unwrap();
+            let mut native = peer(&b, "a", "desktop").await;
+            let mut events = b.subscribe();
+            native.send(json!({"id":7,"method":"item/tool/requestUserInput","params":{
+                "threadId":"t","turnId":"u","itemId":"i","questions":[{"id":"q","question":"Choose","isSecret":false}]
+            }})).await;
+            events.recv().await.unwrap();
+            let token=b.sync(&json!({})).await.unwrap()["pendingRequests"][0]["event"]["id"].clone();
+            let response=json!({"answers":{"q":{"answers":["phone choice"]}}});
+            let params=json!({"commandId":"answer","runtimeId":"a","requestId":token,"response":response});
+            assert_eq!(b.request("phone","approvals/respond",params.clone()).await.unwrap()["status"],"submitted");
+            assert_eq!(native.recv().await["result"],response);
+            native.send(json!({"method":"serverRequest/resolved","params":{"threadId":"t","requestId":7}})).await;
+            events.recv().await.unwrap();
+            let pending=b.request("phone","commands/status",json!({"commandId":"answer"})).await.unwrap();
+            assert_eq!(pending["status"],"unknown");
+            assert_eq!(pending["delivery"]["phase"],"awaiting_confirmation");
+            native.send(json!({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{
+                "id":"i","type":"dynamicToolCall","tool":"functions.request_user_input","status":"completed","success":true,
+                "contentItems":[{"type":"inputText","text":json!({"answers":native_answers}).to_string()}]
+            }}})).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event=events.recv().await.unwrap();
+                    if event["params"]["event"]["method"]=="item/completed" {break;}
+                }
+            }).await.unwrap();
+            let result=b.request("phone","commands/status",json!({"commandId":"answer"})).await.unwrap();
+            assert_eq!(result["status"],expected_status,"fixture receipt: {result}");
+            assert_eq!(result["delivery"]["phase"],expected_phase);
+            let (restored, _)=Broker::open(b.config.clone(),dir.path().into()).unwrap();
+            assert_eq!(restored.request("phone","commands/status",json!({"commandId":"answer"})).await.unwrap()["status"],expected_status);
+            let _=b.request("phone","approvals/respond",params).await;
+            native.assert_idle().await;
+        }
+    }
     #[tokio::test]
     async fn settings_replacement_rejects_old_response_and_wrong_thread_metadata() {
         let (_dir, b) = fixture().await;

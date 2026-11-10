@@ -41,7 +41,9 @@ object NativeActivityPresentation {
     fun attentionBoundary(item: TimelineItem): Boolean {
         val raw = item.raw
         val interaction = setOf("request_user_input", "requestUserInput", "send_user_message")
-        return state(item) in setOf(ActivityStatus.Failed, ActivityStatus.Waiting, ActivityStatus.Interrupted) ||
+        // A failed command is finished work, not an outstanding user decision.
+        // Its failure/exit code remain in the summary and expanded row.
+        return state(item) in setOf(ActivityStatus.Waiting, ActivityStatus.Interrupted) ||
             raw.array("questions").isNotEmpty() || raw.obj("params").array("questions").isNotEmpty() ||
             listOf(raw.string("tool"), raw.string("name")).any { it.substringAfterLast('.') in interaction } ||
             listOf(item.type, raw.string("method")).any {
@@ -50,7 +52,7 @@ object NativeActivityPresentation {
     }
 
     fun foldedByDefault(row: TranscriptRow): Boolean = row.items.none(::attentionBoundary) &&
-        (row.completedTurn || row.items.all { state(it) == ActivityStatus.Completed || (it.complete && state(it) !in setOf(ActivityStatus.Running, ActivityStatus.Waiting)) })
+        (row.completedTurn || row.items.all { state(it) in setOf(ActivityStatus.Completed, ActivityStatus.Failed) || (it.complete && state(it) !in setOf(ActivityStatus.Running, ActivityStatus.Waiting)) })
 
     fun groupExpanded(row: TranscriptRow, persisted: Boolean, manual: Boolean?, expandedItems: List<String>): Boolean =
         !foldedByDefault(row) || (manual ?: (persisted || row.items.any { it.key in expandedItems }))
@@ -87,6 +89,9 @@ object NativeActivityPresentation {
     }
 
     fun describe(item: TimelineItem, completedTurn: Boolean = false): PresentedActivity {
+        NativeQuestionHistory.from(item)?.let { history ->
+            return PresentedActivity(item.key, ActivityKind.Tool, state(item), "用户问题", output = ActivityOutput(history.text))
+        }
         if (!ConversationPresentation.visible(item)) return PresentedActivity(item.key, ActivityKind.Unknown, ActivityStatus.Unknown)
         val raw = item.raw
         val state = state(item, completedTurn)

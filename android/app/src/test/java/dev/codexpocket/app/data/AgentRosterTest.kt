@@ -64,7 +64,7 @@ class AgentRosterTest {
         assertEquals(first, reopened)
         assertEquals(2, first.size)
         assertFalse(first.first().isCurrent)
-        assertTrue(first.last().isCurrent)
+        assertFalse(first.last().isCurrent)
         assertEquals(ActivityStatus.Completed, first.last().status)
         assertEquals("Historical result", first.first().resultPreview)
     }
@@ -76,6 +76,21 @@ class AgentRosterTest {
         assertEquals(ActivityStatus.Running, child.status)
         val completed = timeline(call).copy(turns = linkedMapOf("old" to NativeTurnInfo("old", status = "completed"), "new" to NativeTurnInfo("new", status = "completed")))
         assertFalse(agentRoster(completed).single().isCurrent)
+    }
+
+    @Test fun latestRunningSnapshotNeedsCurrentNativeExecutionEvidence() {
+        val call = item("old", """{"id":"call","type":"collabAgentToolCall","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"running"}}}""")
+        val history = timeline(call).copy(turns = mapOf("old" to NativeTurnInfo("old", status = "completed")))
+        for (snapshot in listOf(history, timeline(call), history.copy(activeTurn = "old"),
+            timeline(call, active = "old").copy(status = "idle"))) {
+            val roster = agentRoster(snapshot)
+            assertFalse(roster.single().isCurrent)
+            assertEquals(ActivityStatus.Running, roster.single().status)
+            assertTrue(agentRosterSections(roster).current.isEmpty())
+        }
+        val resumed = agentRoster(history, mapOf("child" to AgentLiveStatus("active", cursor = Cursor("epoch", 10))))
+        assertEquals(listOf("child"), agentRosterSections(resumed).current.map { it.threadId })
+        assertTrue(agentRosterSections(agentRoster(history, mapOf("child" to AgentLiveStatus("active")))).current.isEmpty())
     }
 
     @Test fun onlyActualTypedRecordsSupplyChildrenAndAllowlistedProse() {

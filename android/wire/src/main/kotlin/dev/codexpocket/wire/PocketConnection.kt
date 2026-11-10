@@ -10,6 +10,8 @@ interface PocketConnection : AutoCloseable {
     val notifications: Flow<JsonObject>
     /** Fixed local transport failure code, never peer text or payload. */
     val failureCode: String? get() = null
+    /** Only decoded TLS application traffic counts, never relay packets. Monotonic clock. */
+    val lastApplicationActivityMillis: Long get() = 0
     suspend fun connect(config: ConnectionConfig)
     suspend fun request(method: String, params: JsonObject = buildJsonObject {}, commandId: String? = null,
                         timeoutMillis: Long = 30000): JsonElement

@@ -27,14 +27,14 @@ class V051LiveSummaryUiTest {
         compose.waitForIdle()
     }
 
-    @Test fun noSummaryHasNoGenericThoughtFooterOrFooterTimer() {
+    @Test fun activeTurnWithoutFirstContentShowsThinkingButNoInventedTimer() {
         content { Column {
             LiveTurnStatus("a", ConversationPresentation.LiveStatus.Thinking, timing = NativeTurnInfo("a", status = "inProgress", startedAtMs = 1000))
             LiveTurnStatus("b", ConversationPresentation.LiveStatus.Working)
         } }
         compose.onNodeWithTag("live-turn-status").assertDoesNotExist()
         compose.onNodeWithTag("task-elapsed-label").assertDoesNotExist()
-        compose.onNodeWithText("正在思考").assertDoesNotExist()
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
         compose.onNodeWithText("正在处理").assertDoesNotExist()
     }
 
@@ -58,11 +58,39 @@ class V051LiveSummaryUiTest {
         compose.onNodeWithTag("native-summary-paragraph:1", useUnmergedTree = true).assertTextEquals("Second paragraph streams independently.")
     }
 
+    @Test fun thinkingPlaceholderEndsOnDisconnectAndNeverReplacesActualSummary() {
+        var online by mutableStateOf(true)
+        var summary by mutableStateOf<TimelineItem?>(null)
+        content {LiveTurnStatus("t",ConversationPresentation.LiveStatus.Thinking,reasoning=summary,online=online)}
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
+        compose.runOnIdle {online=false}
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.runOnIdle {online=true;summary=TimelineItem("t","r","reasoning","Native summary")}
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.onNodeWithText("Native summary").assertExists()
+    }
+
     @Test fun headerClockUsesTrustworthyDurationAndHasNoTaskPrefixInVisibleText() {
         content { TaskElapsedLabel(NativeTurnInfo("t", status = "completed", startedAtMs = 1000, completedAtMs = 66_000)) }
         compose.onNodeWithTag("task-elapsed-label").assertTextEquals("1:05")
         compose.onNodeWithContentDescription("任务用时 1:05").assertExists()
         compose.onNodeWithText("任务 1:05").assertDoesNotExist()
+    }
+
+    @Test fun terminalOrMismatchedTurnMetadataCannotShowThinking() {
+        content { Column {
+            LiveTurnStatus("t", ConversationPresentation.LiveStatus.Thinking, timing = NativeTurnInfo("t", status = "completed"))
+            LiveTurnStatus("t", ConversationPresentation.LiveStatus.Thinking, timing = NativeTurnInfo("other", status = "inProgress"))
+        } }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+    }
+
+    @Test fun earlierTurnSummaryCannotReplaceCurrentThinking() {
+        val old = TimelineItem("old", "r", "reasoning", "Historical summary")
+        content { LiveTurnStatus("t", ConversationPresentation.LiveStatus.Thinking, reasoning = old,
+            timing = NativeTurnInfo("t", status = "inProgress")) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
+        compose.onNodeWithText("Historical summary").assertDoesNotExist()
     }
 
     @Test fun incompleteOrInvalidTimesNeverInventElapsedAndCompletionStopsClock() {
@@ -73,7 +101,7 @@ class V051LiveSummaryUiTest {
         val stopped = NativeTurnInfo("t", status = "interrupted", observedStartNanos = 1, observedDurationMs = 4000)
         assertEquals(4L, taskElapsedSeconds(stopped, 20_000, 9_000_000_000))
         assertEquals(4L, taskElapsedSeconds(stopped, 90_000, 50_000_000_000))
-        assertEquals("", liveStatusLabel(ConversationPresentation.LiveStatus.Thinking))
+        assertEquals("正在思考", liveStatusLabel(ConversationPresentation.LiveStatus.Thinking))
         assertEquals("", liveStatusLabel(ConversationPresentation.LiveStatus.Working))
     }
 }

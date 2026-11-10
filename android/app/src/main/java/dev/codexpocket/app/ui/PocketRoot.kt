@@ -56,8 +56,11 @@ fun PocketRoot(s: PocketState, repo: PocketRepository) { CompositionLocalProvide
     } } },
     LocalToolMediaImages provides remember(repo, s.selected?.key, s.selected?.runtimeId, s.agentReader?.child) {
         val main = s.selected; val child = s.agentReader?.child
-        ToolMediaImageSource { media, offset, maxBytes -> repo.toolMedia(media, offset, maxBytes,
-            if (child?.key?.nativeId == media.threadId && child.runtimeId == media.runtimeId) child else main) }
+        object : ToolMediaImageSource {
+            override suspend fun read(media: ToolMediaRef, offset: Long, maxBytes: Int) = repo.toolMedia(media, offset, maxBytes,
+                if (child?.key?.nativeId == media.threadId && child.runtimeId == media.runtimeId) child else main)
+            override suspend fun refresh(media: ToolMediaRef, manual: Boolean) { repo.refreshToolMedia(media, manual) }
+        }
     }) { ProvideMarkdownRendering { PocketBackdrop { PocketContent(s, repo) } } } }
 
 @Composable

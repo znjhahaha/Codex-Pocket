@@ -65,7 +65,9 @@ class AgentRosterUiTest {
         val chip = compose.onNodeWithTag("agent-roster-chip")
         chip.assertContentDescriptionEquals("子代理 2 · 1进行中").performClick()
         compose.onNodeWithText("本轮子代理").assertIsDisplayed()
-        compose.onNodeWithText("历史子代理").assertIsDisplayed()
+        compose.onNodeWithText("其他子代理 · 1").assertIsDisplayed()
+        compose.onNodeWithTag("agent-roster-open:${historical.threadId}").assertDoesNotExist()
+        compose.onNodeWithTag("agent-roster-others-toggle").performClick()
         compose.onNodeWithText("Reviewer").assertIsDisplayed()
         compose.onNodeWithText("上次 · 已完成").assertIsDisplayed()
         compose.onNodeWithText("结果 · Two issues fixed").assertIsDisplayed()
@@ -113,7 +115,26 @@ class AgentRosterUiTest {
     @Test fun historicalRunningStateIsNotCountedAsCurrentWork() {
         content { AgentRosterChip(listOf(current.copy(isCurrent = false)), true, false, {}) }
         compose.onNodeWithTag("agent-roster-chip").assertContentDescriptionEquals("子代理 1 · 0进行中").performClick()
-        compose.onNodeWithText("历史子代理").assertIsDisplayed()
+        compose.onNodeWithText("其他子代理 · 1").assertIsDisplayed()
+        compose.onNodeWithTag("agent-roster-others-toggle").performClick()
         compose.onNodeWithText("上次 · 进行中").assertIsDisplayed()
+    }
+
+    @Test fun runningLeadsWaitingWhileClosedUnknownAndOldRunningStartCollapsed() {
+        val waiting = current.copy(threadId = "waiting", status = ActivityStatus.Waiting, nativeStatus = "pending_init")
+        val closed = current.copy(threadId = "closed", status = ActivityStatus.Interrupted, nativeStatus = "shutdown")
+        val unknown = current.copy(threadId = "unknown", status = ActivityStatus.Unknown, nativeStatus = "futureStatus")
+        val old = current.copy(threadId = "old", isCurrent = false)
+        content { AgentRosterChip(listOf(closed, waiting, unknown, old, current), true, false, {}) }
+        compose.onNodeWithTag("agent-roster-chip").assertContentDescriptionEquals("子代理 5 · 1进行中").performClick()
+        val runningBounds = compose.onNodeWithTag("agent-roster-open:${current.threadId}").fetchSemanticsNode().boundsInRoot
+        val waitingBounds = compose.onNodeWithTag("agent-roster-open:waiting").fetchSemanticsNode().boundsInRoot
+        assertTrue(runningBounds.top < waitingBounds.top)
+        listOf("closed", "unknown", "old").forEach { compose.onNodeWithTag("agent-roster-open:$it").assertDoesNotExist() }
+        compose.onNodeWithText("初始化中").assertExists()
+        compose.onNodeWithTag("agent-roster-others-toggle").performClick()
+        compose.onNodeWithText("已关闭").assertExists()
+        compose.onNodeWithText("状态未知").assertExists()
+        compose.onNodeWithText("上次 · 进行中").assertExists()
     }
 }

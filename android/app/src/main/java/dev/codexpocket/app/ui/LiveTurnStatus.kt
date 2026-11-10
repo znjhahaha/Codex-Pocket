@@ -45,29 +45,45 @@ internal fun elapsedLabel(seconds: Long): String {
 
 /** Only an actual native operation may supply a status when there is no summary. */
 internal fun liveStatusLabel(status: LiveStatus): String =
-    if (status == LiveStatus.Compacting) "正在压缩上下文" else ""
+    when(status) { LiveStatus.Compacting -> "正在压缩上下文"; LiveStatus.Thinking -> "正在思考"; LiveStatus.Working -> "" }
 
 /** Missing or mismatched native timing keeps prose readable but supplies no live-motion proof. */
 internal fun nativeSummaryActive(turnId: String, reasoning: TimelineItem?, timing: NativeTurnInfo?): Boolean =
     reasoning?.type == "reasoning" && reasoning.turnId == turnId &&
         timing?.id == turnId && timing.status == "inProgress"
 
+/** The owner supplies an accepted active identity; optional metadata can veto a stale pointer. */
+internal fun nativeThinkingAllowed(turnId: String, timing: NativeTurnInfo?): Boolean =
+    timing == null || (timing.id == turnId && timing.status == "inProgress")
+
+/** Also used for an accepted active child whose new native turn ID has not arrived yet. */
+@Composable
+internal fun NativeThinkingPlaceholder(modifier: Modifier = Modifier) {
+    Text("正在思考", modifier.fillMaxWidth().padding(vertical = 12.dp)
+        .testTag("live-thinking-placeholder").reasoningSweep(true),
+        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
 /** Native summary prose, without a thought badge, activity spinner or a transcript clock. */
 @Suppress("UNUSED_PARAMETER")
 @Composable
 internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifier = Modifier,
-    reasoning: TimelineItem? = null, observedAtMillis: Long? = null, timing: NativeTurnInfo? = null) {
+    reasoning: TimelineItem? = null, observedAtMillis: Long? = null, timing: NativeTurnInfo? = null, online: Boolean = true) {
     // Current native compaction takes precedence over a summary from earlier in the same turn.
     val nativeStatus = liveStatusLabel(status)
-    if (nativeStatus.isNotBlank()) {
+    if (status == LiveStatus.Compacting && online) {
         CompactionStatusRow(nativeStatus, modifier.testTag("live-turn-status"))
         return
     }
-    val parts = reasoning?.summaryParts.orEmpty().filter(String::isNotBlank)
-    if (parts.isEmpty()) return
+    val parts = reasoning?.takeIf { it.type == "reasoning" && it.turnId == turnId }
+        ?.summaryParts.orEmpty().filter(String::isNotBlank)
+    if (parts.isEmpty()) {
+        if (status == LiveStatus.Thinking && online && nativeThinkingAllowed(turnId, timing)) NativeThinkingPlaceholder(modifier)
+        return
+    }
     var expanded by rememberSaveable(turnId) { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
-    val active = nativeSummaryActive(turnId, reasoning, timing)
+    val active = online && nativeSummaryActive(turnId, reasoning, timing)
     Column(modifier.fillMaxWidth().testTag("live-turn-status")) {
         // Tapping replaces the compact prose with its separate paragraphs, in the same location.
         Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-reasoning-toggle")

@@ -49,9 +49,16 @@ class PocketRepositoryTest {
         repo = PocketRepository(app, { server.connection() }, storage, db, network)
         await { it.initialized }
         repo.setForeground(true)
-        await { it.online && it.chats.any { c -> c.key == key } }
+        try { await { it.online && it.chats.any { c -> c.key == key } } }
+        catch (failure: TimeoutCancellationException) {
+            throw AssertionError("Fixture connect timeout: state=${repo.state.value.connectionPhase}, online=${repo.state.value.online}, chats=${repo.state.value.chats.size}, attempts=${server.attempts.get()}, calls=${server.calls.map { it.method }}, diagnostics=${repo.connectionDiagnostics()}", failure)
+        }
         repo.select(repo.state.value.chats.first { it.key == key }).join()
-        await { it.nativeSettings.model.known && it.model == "model" }
+        try { await { it.nativeSettings.model.known && it.model == "model" } }
+        catch (failure: TimeoutCancellationException) {
+            val s=repo.state.value
+            throw AssertionError("Fixture metadata timeout: online=${s.online}, selected=${s.selected?.key}, known=${s.nativeSettings.model.known}, model=${s.model}, load=${s.conversationLoadState}, calls=${server.calls.takeLast(16).map { it.method + ':' + it.nativeMethod }}",failure)
+        }
         assertNull(repo.state.value.error)
     }
 
@@ -80,6 +87,37 @@ class PocketRepositoryTest {
         (field.get(repo) as CoroutineScope).coroutineContext[Job]!!.cancelAndJoin()
         repo = PocketRepository(app, { server.connection() }, storage, db, network, historyCacheBudget)
         await { it.initialized }
+    }
+
+    @Test fun cancelledConnectionFactoryCannotReplaceAnAuthenticatedConnection() = runBlocking<Unit> {
+        val scopeField = PocketRepository::class.java.getDeclaredField("scope").apply { isAccessible = true }
+        (scopeField.get(repo) as CoroutineScope).coroutineContext[Job]!!.cancelAndJoin()
+        server.links.forEach { it.close() }
+        val entered = CompletableDeferred<Unit>()
+        val release = java.util.concurrent.CountDownLatch(1)
+        val created = AtomicInteger()
+        repo = PocketRepository(app, {
+            val link = server.connection()
+            if (created.incrementAndGet() == 1) {
+                entered.complete(Unit)
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            link
+        }, storage, db, network)
+        await { it.initialized }
+        repo.setForeground(true)
+        withTimeout(5_000) { entered.await() }
+        try {
+            repo.reconnect()
+            await { it.online && it.chats.any { chat -> chat.key == key } }
+            val winner = server.links.last()
+            release.countDown()
+            until { server.links.dropLast(1).all { it.closed } }
+            repo.refresh().join()
+            assertTrue("Cancelled startup must not clear the current client", repo.state.value.online)
+            assertEquals(LinkState.ONLINE, winner.state.value)
+            assertNull(repo.state.value.directoryError)
+        } finally { release.countDown() }
     }
 
     private suspend fun childLink() {
@@ -655,6 +693,211 @@ class PocketRepositoryTest {
         server.pending.clear()
         server.emit("serverRequest/resolved", buildJsonObject { put("requestId", "approval-1") })
         await { it.approvals.isEmpty() && it.commands.none { c -> c.id == command.id } }
+    }
+
+    private suspend fun pendingQuestion(secret: Boolean = false): PendingApproval {
+        val event = buildJsonObject {
+            put("id", "question-request"); put("method", "item/tool/requestUserInput")
+            put("params", buildJsonObject {
+                put("threadId", "t"); put("turnId", "question-turn"); put("itemId", "question-item")
+                put("questions", buildJsonArray { add(buildJsonObject {
+                    put("id", "q"); put("question", "Which client?"); put("isSecret", secret)
+                }) })
+            })
+        }
+        server.pending += event; server.emitRaw(event)
+        return await { it.approvals.any { a -> a.requestId == JsonPrimitive("question-request") } }.approvals
+            .first { it.requestId == JsonPrimitive("question-request") }
+    }
+    private fun questionResponse(answer: String) = buildJsonObject { put("answers", buildJsonObject {
+        put("q", buildJsonObject { put("answers", buildJsonArray { add(answer) }) })
+    }) }
+
+    private suspend fun confirmationBeforeSubmissionReply(lateUnknown: Boolean) {
+        val approval = pendingQuestion()
+        val entered = CompletableDeferred<String>(); val release = CompletableDeferred<Unit>()
+        val confirmed = CompletableDeferred<Unit>()
+        fun delivery(id: String) = buildJsonObject {
+            put("commandId", id); put("runtimeId", approval.runtimeId); put("requestId", approval.requestId)
+            put("threadId", approval.threadId); put("turnId", "question-turn"); put("itemId", "question-item")
+            put("phase", if (confirmed.isCompleted) "confirmed" else "forwarded")
+        }
+        server.intercept = { method, params, id -> when (method) {
+            "approvals/respond" -> {
+                entered.complete(id!!); release.await()
+                if (lateUnknown) throw UnknownOutcomeException(id)
+                buildJsonObject { put("status", "submitted") }
+            }
+            "commands/status" -> buildJsonObject {
+                put("status", if (confirmed.isCompleted) "accepted" else "submitted")
+                put("delivery", delivery(params.string("commandId")))
+            }
+            else -> null
+        } }
+        val sending = repo.respond(approval, questionResponse("Phone"))
+        val id = withTimeout(5_000) { entered.await() }
+        try {
+            confirmed.complete(Unit)
+            repo.checkCommands().join()
+            assertEquals(QuestionDeliveryPhase.Confirmed, QuestionAnswerStore(app).command(id)!!.phase)
+            assertTrue(db.dao().uncertain("computer").none { it.id == id })
+            release.complete(Unit); sending.join()
+            assertEquals(QuestionDeliveryPhase.Confirmed, QuestionAnswerStore(app).command(id)!!.phase)
+            assertEquals(QuestionDeliveryPhase.Confirmed, repo.state.value.questionDeliveries.single { it.commandId == id }.phase)
+            repo.checkCommands().join()
+            assertEquals(1, server.calls.count { it.method == "approvals/respond" })
+        } finally { release.complete(Unit); sending.join() }
+    }
+    @Test fun confirmedQuestionSurvivesLateSubmittedReply() = runBlocking<Unit> { confirmationBeforeSubmissionReply(false) }
+    @Test fun confirmedQuestionSurvivesLateUnknownOutcome() = runBlocking<Unit> { confirmationBeforeSubmissionReply(true) }
+
+    private fun currentConnection(): PocketConnection = PocketRepository::class.java.getDeclaredField("client")
+        .apply { isAccessible = true }.get(repo) as PocketConnection
+    @Suppress("UNCHECKED_CAST") private fun currentCursors(): Map<String, Cursor> =
+        (PocketRepository::class.java.getDeclaredField("cursors").apply { isAccessible = true }.get(repo) as Map<String, Cursor>).toMap()
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun syncCandidate(source: PocketConnection, owner: PocketConnection): List<String> = kotlin.coroutines.suspendCoroutine { continuation ->
+        val method = PocketRepository::class.java.getDeclaredMethod("sync", PocketConnection::class.java, PocketConnection::class.java, kotlin.coroutines.Continuation::class.java)
+            .apply { isAccessible = true }
+        try {
+            val result = method.invoke(repo, source, owner, continuation)
+            if (result !== kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) continuation.resumeWith(Result.success(result as List<String>))
+        } catch (failure: java.lang.reflect.InvocationTargetException) {
+            continuation.resumeWith(Result.failure(failure.cause ?: failure))
+        }
+    }
+    @Test fun routePreparationRequiringSnapshotLeavesCursorAndCacheUntouched() = runBlocking<Unit> {
+        val owner = currentConnection(); val before = currentCursors()
+        val cached = db.dao().cachedItems(key)
+        val candidate = object : PocketConnection by owner {
+            override val state = MutableStateFlow(LinkState.ONLINE)
+            override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long) = buildJsonObject {
+                put("events", JsonArray(emptyList())); put("pendingRequests", JsonArray(emptyList()))
+                put("snapshotRequired", buildJsonArray { add(server.owner) })
+                put("cursors", buildJsonObject { put(server.owner, buildJsonObject { put("epoch", "replacement"); put("sequence", 99) }) })
+            }
+        }
+        val failure = runCatching { syncCandidate(candidate, owner) }.exceptionOrNull()
+        assertEquals("snapshot_required", (failure as? WireException)?.code)
+        assertEquals(before, currentCursors())
+        assertEquals(cached, db.dao().cachedItems(key))
+        assertEquals(ConversationLoadState.Idle, repo.state.value.conversationLoadState)
+        assertTrue(repo.state.value.online)
+    }
+    @Test fun offlinePreparationCannotReportSuccessfulSyncOrAdvanceCursor() = runBlocking<Unit> {
+        val owner = currentConnection(); val before = currentCursors()
+        val candidate = object : PocketConnection by owner {
+            override val state = MutableStateFlow(LinkState.ONLINE)
+            override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long): JsonElement {
+                state.value = LinkState.OFFLINE
+                return server.syncSnapshot()
+            }
+        }
+        assertEquals("disconnected", (runCatching { syncCandidate(candidate, owner) }.exceptionOrNull() as? WireException)?.code)
+        assertEquals(before, currentCursors())
+        assertTrue(repo.state.value.online)
+    }
+    @Test fun replayPrefixAndBufferedCandidateSuffixApplyExactlyOnce() = runBlocking<Unit> {
+        server.emit("item/started", buildJsonObject {
+            put("threadId", "t"); put("turnId", "suffix-turn")
+            put("item", buildJsonObject { put("id", "suffix-item"); put("type", "agentMessage"); put("text", "") })
+        })
+        await { it.timeline.items.values.any { item -> item.itemId == "suffix-item" } }
+        val baseline = server.cursor(); val sequence = baseline.number("sequence")
+        fun delta(text: String) = buildJsonObject {
+            put("method", "item/agentMessage/delta"); put("params", buildJsonObject {
+                put("threadId", "t"); put("turnId", "suffix-turn"); put("itemId", "suffix-item"); put("delta", text)
+            })
+        }
+        val owner = currentConnection()
+        val candidate = object : PocketConnection by owner {
+            override val state = MutableStateFlow(LinkState.ONLINE)
+            override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long) = buildJsonObject {
+                put("snapshotRequired", JsonArray(emptyList())); put("pendingRequests", JsonArray(emptyList()))
+                put("events", buildJsonArray { listOf("A", "B").forEachIndexed { index, text -> add(buildJsonObject {
+                    put("runtimeId", server.owner); put("cursor", JsonObject(baseline + ("sequence" to JsonPrimitive(sequence + index + 1))))
+                    put("event", delta(text))
+                }) } })
+                put("cursors", buildJsonObject { put(server.owner, JsonObject(baseline + ("sequence" to JsonPrimitive(sequence + 2)))) })
+            }
+        }
+        assertTrue(syncCandidate(candidate, owner).isEmpty())
+        listOf("A", "B", "C").forEach { server.emitRaw(delta(it)) }
+        await { it.timeline.items.values.single { item -> item.itemId == "suffix-item" }.text == "ABC" }
+        assertEquals("ABC", db.dao().cachedItems(key).single { it.itemId == "suffix-item" }.text)
+    }
+    @Test fun nativeHistoryUnavailableHasSpecificDraftPreservingMessage() {
+        val method = PocketRepository::class.java.getDeclaredMethod("safeError", Exception::class.java).apply { isAccessible = true }
+        assertEquals("当前电脑 Codex 暂不支持此会话的历史读取；缓存与草稿已保留，可在电脑端查看。",
+            method.invoke(repo, WireException("native_history_unavailable", "private diagnostic")))
+    }
+
+    @Test fun genericResolutionCannotAcceptQuestionButMatchingNativeReceiptCan() = runBlocking<Unit> {
+        val approval = pendingQuestion()
+        var phase = "forwarded"
+        fun delivery(id: String) = buildJsonObject {
+            put("commandId", id); put("runtimeId", "runtime"); put("threadId", "t")
+            put("turnId", "question-turn"); put("itemId", "question-item")
+            put("requestId", approval.requestId); put("phase", phase)
+        }
+        server.intercept = { method, params, id -> when (method) {
+            "approvals/respond" -> buildJsonObject { put("status", "accepted"); put("delivery", delivery(id!!)) }
+            "commands/status" -> buildJsonObject { put("status", "accepted"); put("delivery", delivery(params.string("commandId"))) }
+            else -> null
+        } }
+        repo.respond(approval, questionResponse("Phone")).join()
+        val command = db.dao().uncertain("computer").single { it.method == "approvals/respond" }
+        assertEquals(QuestionDeliveryPhase.Forwarded, repo.state.value.questionDeliveries.single().phase)
+        assertFalse(repo.state.value.uncertainSend)
+        server.pending.clear(); server.emit("serverRequest/resolved", buildJsonObject { put("requestId", approval.requestId) })
+        await { it.approvals.isEmpty() }
+        repo.checkCommands().join()
+        assertEquals(command.id, db.dao().uncertain("computer").single().id)
+        phase = "confirmed"
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "question-turn")
+            put("item", buildJsonObject {
+                put("id", "question-item"); put("type", "dynamicToolCall"); put("tool", "request_user_input")
+                put("status", "completed"); put("success", true); put("arguments", approval.params)
+                put("contentItems", buildJsonArray { add(buildJsonObject { put("type", "inputText"); put("text", questionResponse("Phone").toString()) }) })
+            })
+        })
+        await { it.questionDeliveries.any { r -> r.commandId == command.id && r.phase == QuestionDeliveryPhase.Confirmed } }
+        await { it.commands.none { c -> c.id == command.id } }
+        assertEquals(1, server.calls.count { it.method == "approvals/respond" })
+        assertEquals(command.id, server.calls.single { it.method == "approvals/respond" }.commandId)
+    }
+
+    @Test fun unknownQuestionCannotReplayAndPublicAnswerRestoresAfterOfflineRestart() = runBlocking<Unit> {
+        val approval = pendingQuestion()
+        server.intercept = { method, _, id ->
+            if (method == "approvals/respond") { server.statuses[id!!] = "unknown"; throw UnknownOutcomeException(id) }
+            null
+        }
+        repo.respond(approval, questionResponse("Phone retained fixture")).join()
+        assertFalse(repo.state.value.uncertainSend)
+        repo.respond(approval, questionResponse("Changed answer")).join()
+        assertEquals(1, server.calls.count { it.method == "approvals/respond" })
+        val command = db.dao().uncertain("computer").single()
+        val sends = server.calls.count { it.method == "codex/request" && it.params.string("method") == "turn/start" }
+        repo.editDraft("An unrelated fixture message")
+        repo.send().join()
+        assertEquals(sends + 1, server.calls.count { it.method == "codex/request" && it.params.string("method") == "turn/start" })
+        val before = server.calls.count { it.commandId != null }
+        restartOffline()
+        val restored = QuestionAnswerStore(app).command(command.id)!!
+        assertEquals("Phone retained fixture", restored.restorableAnswers(QuestionBatches.blocking(approval.key, approval.params))["q"])
+        assertEquals(before, server.calls.count { it.commandId != null })
+    }
+
+    @Test fun secretQuestionSubmissionPersistsIdentityButNoSecretAnswerOrHash() = runBlocking<Unit> {
+        val approval = pendingQuestion(secret = true)
+        repo.respond(approval, questionResponse("private-answer-fixture")).join()
+        val command = db.dao().uncertain("computer").single()
+        assertEquals(approval.key, command.draftText)
+        val stored = app.getSharedPreferences("question-delivery", Application.MODE_PRIVATE).all.values.joinToString()
+        assertFalse(stored.contains("private-answer-fixture"))
+        assertTrue(QuestionAnswerStore(app).command(command.id)!!.restorableAnswers(QuestionBatches.blocking(approval.key, approval.params)).isEmpty())
     }
 
     @Test fun definiteApprovalFailureRestoresOnlyAuthoritativePendingRequest() = runBlocking<Unit> {
@@ -1883,11 +2126,12 @@ class PocketRepositoryTest {
         suspend fun emit(method: String, params: JsonObject) = emitRaw(buildJsonObject { put("method", method); put("params", params) })
         suspend fun emitRaw(event: JsonObject) = notify("codex/event", buildJsonObject { put("runtimeId", owner); put("cursor", buildJsonObject { put("epoch", epoch); put("sequence", sequence.incrementAndGet()) }); put("event", event) })
         inner class Link : PocketConnection {
+            @Volatile var closed = false
             override val state = MutableStateFlow(LinkState.OFFLINE)
             val notes = Channel<JsonObject>(Channel.UNLIMITED)
             override val notifications = notes.receiveAsFlow()
             override suspend fun connect(config: ConnectionConfig) { attempts.incrementAndGet(); if (failConnections) throw WireException("offline", "Fixture offline"); state.value = LinkState.ONLINE }
-            override fun close() { state.value = LinkState.OFFLINE; notes.close(WireException("disconnected", "Fixture disconnected")) }
+            override fun close() { state.value = LinkState.OFFLINE; notes.close(WireException("disconnected", "Fixture disconnected")); closed = true }
             override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long): JsonElement {
                 calls += Call(method, params, commandId)
                 intercept(method, params, commandId)?.let { return it }

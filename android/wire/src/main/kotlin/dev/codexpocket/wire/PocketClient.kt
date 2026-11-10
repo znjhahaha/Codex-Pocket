@@ -33,6 +33,8 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private var queuedBytes = 0L
     /** Any relay bytes, including another reply's fragments, prove the tunnel is still moving. */
     @Volatile private var lastInboundNanos = System.nanoTime()
+    @Volatile override var lastApplicationActivityMillis: Long = 0
+        private set
 
     private class Pending(val id: String, val commandId: String?, val hello: Boolean) {
         val result = CompletableDeferred<JsonElement>()
@@ -161,6 +163,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     }
 
     private fun receiveMessage(message: JsonObject) {
+        lastApplicationActivityMillis = System.nanoTime() / 1_000_000
         if ((message["method"] as? JsonPrimitive)?.content == ReplyChunks.METHOD) {
             if (message.containsKey("id")) throw WireException("invalid_reply", "Invalid reply chunk")
             val reply = synchronized(gate) {

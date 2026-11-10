@@ -52,7 +52,11 @@ class V053PlanRepositoryTest {
         repo.setForeground(true)
         await { it.online && it.chats.any { c -> c.key == key } }
         repo.select(repo.state.value.chats.first { it.key == key }).join()
-        await { it.nativeSettings.model.known && it.model == "model" }
+        try { await { it.nativeSettings.model.known && it.model == "model" } }
+        catch (failure: TimeoutCancellationException) {
+            val s=repo.state.value
+            throw AssertionError("Fixture metadata timeout: online=${s.online}, selected=${s.selected?.key}, known=${s.nativeSettings.model.known}, model=${s.model}, settingsFresh=${s.settingsFresh}, load=${s.conversationLoadState}, error=${s.error}, calls=${server.calls.takeLast(16).map { it.method + ':' + it.nativeMethod }}",failure)
+        }
         assertNull(repo.state.value.error)
     }
 

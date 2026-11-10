@@ -30,6 +30,17 @@ val AgentRosterEntry.workPhase: AgentWorkPhase get() = when {
 data class AgentWorkSummary(val running: List<AgentRosterEntry>, val starting: List<AgentRosterEntry>,
     val waiting: List<AgentRosterEntry>, val errors: List<AgentRosterEntry>)
 
+data class AgentRosterSections(val current: List<AgentRosterEntry>, val folded: List<AgentRosterEntry>)
+
+/** Explicit live work first. Old running snapshots are still historical evidence. */
+fun agentRosterSections(agents: List<AgentRosterEntry>): AgentRosterSections {
+    val unique=agents.distinctBy {it.threadId}.filter {it.threadId.isNotBlank()}
+    val running=unique.filter {it.isCurrent && it.workPhase==AgentWorkPhase.Running}
+    val waiting=unique.filter {it.isCurrent && it.workPhase in setOf(AgentWorkPhase.Starting,AgentWorkPhase.Waiting)}
+    val visible=(running+waiting).mapTo(hashSetOf()) {it.threadId}
+    return AgentRosterSections(running+waiting,unique.filter {it.threadId !in visible})
+}
+
 /** First native appearance order is shared by labels/avatars; no elapsed-time guesses. */
 fun currentAgentWork(agents: List<AgentRosterEntry>): AgentWorkSummary {
     val current = agents.filter { it.isCurrent }.distinctBy { it.threadId }
@@ -204,9 +215,13 @@ fun Map<String, AgentLiveStatus>.withAgentLiveStatus(threadId: String, next: Age
  * Native task roots and confirmed Steer parents supply grouping, never a child execution state.
  */
 fun agentRoster(timeline: NativeTimeline, liveStatuses: Map<String, AgentLiveStatus> = emptyMap()): List<AgentRosterEntry> {
-    val currentTurn = timeline.activeTurn?.takeIf(String::isNotBlank)
-        ?: timeline.turns.keys.lastOrNull()
-        ?: timeline.items.values.lastOrNull()?.turnId
+    // The latest historical task is a grouping record, never proof of current execution.
+    // A stale active pointer also cannot outrank explicit idle/terminal native metadata.
+    val currentTurn = timeline.activeTurn?.takeIf { turn ->
+        turn.isNotBlank() && turn !in timeline.completedTurns &&
+            !agentStatus(timeline.turns[turn]?.status.orEmpty()).agentTerminal() &&
+            (timeline.status.isBlank() || agentStatus(timeline.status) in setOf(ActivityStatus.Running, ActivityStatus.Waiting))
+    }
     val currentRoot = currentTurn?.let { agentTaskRoot(it, timeline.turns) }
     val roster = linkedMapOf<String, AgentRosterEntry>()
     val currentInteractions = mutableSetOf<String>()

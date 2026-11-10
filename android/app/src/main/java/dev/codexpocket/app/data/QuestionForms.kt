@@ -2,7 +2,9 @@ package dev.codexpocket.app.data
 
 import kotlinx.serialization.json.*
 
-enum class QuestionPhase { Waiting, Submitting, Submitted, Offline, Stale, Unsupported }
+const val MAX_QUESTION_ANSWER_BYTES = 65_536
+
+enum class QuestionPhase { Waiting, Submitting, Submitted, Forwarded, AwaitingConfirmation, Confirmed, AnsweredElsewhere, Cancelled, Offline, Stale, Unsupported }
 
 data class QuestionOption(val value: String, val label: String, val description: String, val recommended: Boolean)
 data class FormQuestion(
@@ -16,7 +18,7 @@ data class FormQuestion(
 ) {
     val valid get() = id.isNotBlank() && prompt.isNotBlank() && options.all { it.value.isNotBlank() } &&
         options.map { it.value }.distinct().size == options.size
-    fun accepts(answer: String?) = !answer.isNullOrBlank() && answer.length <= 64_000 &&
+    fun accepts(answer: String?) = !answer.isNullOrBlank() && answer.toByteArray(Charsets.UTF_8).size <= MAX_QUESTION_ANSWER_BYTES &&
         (allowsOther || options.any { it.value == answer })
     internal fun sameInput(other: FormQuestion) = id == other.id && prompt == other.prompt &&
         options == other.options && allowsOther == other.allowsOther && secret == other.secret
@@ -119,6 +121,8 @@ class QuestionSession(initial: QuestionBatch) {
         batch.privateReplyRequired || availability == QuestionPhase.Unsupported -> QuestionPhase.Unsupported
         !batch.valid -> QuestionPhase.Stale
         availability == QuestionPhase.Offline || availability == QuestionPhase.Stale -> availability
+        availability in setOf(QuestionPhase.Forwarded, QuestionPhase.AwaitingConfirmation, QuestionPhase.Confirmed,
+            QuestionPhase.AnsweredElsewhere, QuestionPhase.Cancelled) -> availability
         availability == QuestionPhase.Submitting || phase == QuestionPhase.Submitting -> QuestionPhase.Submitting
         availability == QuestionPhase.Submitted || phase == QuestionPhase.Submitted -> QuestionPhase.Submitted
         else -> QuestionPhase.Waiting
@@ -126,6 +130,16 @@ class QuestionSession(initial: QuestionBatch) {
     fun answer(id: String): String? = answers[id]?.let { if (it.other) it.text else it.option }
     fun otherText(id: String): String = answers[id]?.text.orEmpty()
     fun otherSelected(id: String): Boolean = answers[id]?.other == true
+
+    /** Restore public submitted answers for display only. This does not acknowledge or dispatch anything. */
+    fun restoreSubmitted(receipt: QuestionReceipt, approval: PendingApproval? = null) {
+        receipt.restorableAnswers(batch, approval).forEach { (id, value) ->
+            if (id !in answers) answers[id] = Answer().apply {
+                if (batch.questions.first { it.id == id }.options.any { it.value == value }) option = value
+                else { other = true; text = value }
+            }
+        }
+    }
 
     fun update(next: QuestionBatch) {
         require(next.id == batch.id)

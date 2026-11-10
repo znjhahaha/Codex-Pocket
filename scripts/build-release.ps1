@@ -156,7 +156,7 @@ function Invoke-PocketReleaseBuild {
         if ($env:POCKET_EXPECTED_SIGNER -and $expectedSigner -ne $env:POCKET_EXPECTED_SIGNER) {
             throw "Configured public signing certificate differs from the approved identity: $expectedSigner"
         }
-        & (Join-Path $Root 'android\gradlew.bat') -p (Join-Path $Root 'android') :app:assembleRelease --no-daemon
+        & (Join-Path $Root 'android\gradlew.bat') -p (Join-Path $Root 'android') :app:assembleRelease '-Pkotlin.compiler.execution.strategy=in-process' --no-daemon
         if ($LASTEXITCODE -ne 0) { throw 'Android Release build failed; no package published.' }
         $apk = Join-Path $Root 'android\app\build\outputs\apk\release\app-release.apk'
         $apkHash = Get-PocketFileHash $apk

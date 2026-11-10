@@ -74,7 +74,10 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             .associate { it.key.nativeId to it.title } }
         // Keep observation time above the lazy item: scrolling the footer away must not reset it.
         val timing = live?.first?.let { s.timeline.turns[it] }
-        val keys = remember(rows, live != null) { listOf("history-control") + rows.map { it.key } + listOfNotNull("live-status".takeIf { live != null }) + listOf("agent-working", "timeline-end") }
+        val nativeLive = s.online && (s.timeline.status.isBlank() || s.timeline.status in setOf("active", "inProgress", "running")) &&
+            s.timeline.activeFlags.none { it in setOf("waitingOnApproval", "waitingOnUserInput") }
+        val showSending = s.sendBusy && s.online && live == null && s.actionStatus["send:${chat.key.encoded}"]?.loading == true
+        val keys = remember(rows, live != null, showSending) { listOf("history-control") + rows.map { it.key } + listOfNotNull("live-status".takeIf { live != null || showSending }) + listOf("agent-working", "timeline-end") }
         var anchorKey by rememberSaveable { mutableStateOf(s.draft?.scrollItemKey) }
         var anchorOffset by rememberSaveable { mutableIntStateOf(s.draft?.scrollOffset ?: 0) }
         val list = rememberLazyListState(TranscriptAnchor(anchorKey).resolve(keys, s.draft?.scrollIndex ?: 0), anchorOffset)
@@ -246,12 +249,15 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                         }
                     }
                     if (live != null) item(key = "live-status", contentType = "live-status") {
-                        LiveTurnStatus(live.first, live.second, reasoning = reasoning, timing = timing)
+                        LiveTurnStatus(live.first, live.second, reasoning = reasoning, timing = timing, online = nativeLive)
+                    } else if (showSending) item(key = "live-status", contentType = "live-status") {
+                        Text("正在发送", Modifier.padding(vertical = 12.dp).testTag("live-sending-placeholder"),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     item(key = "agent-working", contentType = "agent-working") { NativeAgentWorkingStrip(agents, onOpen = { repo.showAgentReader() }) }
                     item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
                 }
-                if (read.empty) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
+                if (read.empty && live == null && !showSending) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
                     Column(Modifier.widthIn(max = 420.dp).padding(30.dp)) {
                         EmptyState(stringResource(R.string.what_working), stringResource(R.string.continue_chat))
                     }
@@ -276,7 +282,6 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 if (!s.online) Notice(stringResource(R.string.offline_history), action = stringResource(R.string.reconnect), onAction = repo::reconnect)
                 if (chat.conflict) Notice(stringResource(R.string.owner_conflict))
-                if (s.uncertainSend) UnknownCommandNotice(s, repo)
                 }
             }
             Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().testTag("chat-bottom-dock").onSizeChanged { composerHeight = it.height }) {
@@ -319,6 +324,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     { repo.submitMessageEdit() }, repo::cancelMessageEdit, { repo.checkMessageEdit() },
                     { repo.prepareMessageEditAgain() }, { repo.stop() },
                     Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+            }
+            if (s.uncertainSend) Row(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 20.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("正在确认上次发送，草稿已保留", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PocketTextButton({ repo.checkCommands() }, enabled = s.online) { Text("查看状态") }
             }
             if (dockPlan == null && s.messageEdit == null) composerState.SaveableStateProvider("normal-composer") { PocketComposer(s.draft?.text.orEmpty(), s.modelSelectionLabel,
                 listOfNotNull(s.effort?.let(context::effortLabel), s.mode?.takeUnless { it == "default" }?.let { context.modeLabel(it, it) }).filter(String::isNotBlank).joinToString(" · "),

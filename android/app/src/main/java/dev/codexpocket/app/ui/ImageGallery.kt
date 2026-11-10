@@ -72,7 +72,10 @@ internal fun interface DesktopImageSource {
 internal val LocalDesktopImages = staticCompositionLocalOf<DesktopImageSource?> { null }
 
 /** Parent supplies authenticated, owner-bound endpoint reads. No desktop path is accepted. */
-internal fun interface ToolMediaImageSource { suspend fun read(media: ToolMediaRef, offset: Long, maxBytes: Int): ToolMediaChunk }
+internal fun interface ToolMediaImageSource {
+    suspend fun read(media: ToolMediaRef, offset: Long, maxBytes: Int): ToolMediaChunk
+    suspend fun refresh(media: ToolMediaRef, manual: Boolean = false) = Unit
+}
 internal val LocalToolMediaImages = staticCompositionLocalOf<ToolMediaImageSource?> { null }
 internal val LocalImageConnection = staticCompositionLocalOf { 0L to false }
 private val LocalGalleryToolRefs = staticCompositionLocalOf<Map<String, ToolMediaRef>> { emptyMap() }
@@ -108,7 +111,7 @@ internal suspend fun readToolImage(media: ToolMediaRef, source: ToolMediaImageSo
 internal fun toolMediaLabel(status: ToolMediaStatus): String = when (status) {
     ToolMediaStatus.Ready, ToolMediaStatus.Recoverable -> "图片"
     ToolMediaStatus.Unsupported -> "暂不支持这张图片"
-    ToolMediaStatus.Expired -> "图片已过期"
+    ToolMediaStatus.Expired -> "图片引用已失效，点击重试"
     ToolMediaStatus.Failed -> "图片读取失败"
     ToolMediaStatus.OwnerChanged -> "图片归属已变化，请重新打开"
     ToolMediaStatus.Offline -> "连接电脑后可读取图片"
@@ -152,6 +155,14 @@ private fun rememberGalleryBitmap(path: String, maxSide: Int): ImageLoad {
     val load by produceState<ImageLoad>(bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading, key, source, toolSource, retry, connection) {
         value = bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading
         if (value is ImageLoad.Ready) return@produceState
+        suspend fun unavailable(status: ToolMediaStatus): ImageLoad {
+            if (status == ToolMediaStatus.Expired && media != null && connection.second) {
+                try { toolSource?.refresh(media) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* Keep local retry state if history itself is unavailable. */ }
+            }
+            return ImageLoad.MediaUnavailable(status)
+        }
         value = try {
             val bitmap = withContext(Dispatchers.IO) { imageDecodeSlots.withPermit {
                 val input = if (media != null) {
@@ -175,9 +186,9 @@ private fun rememberGalleryBitmap(path: String, maxSide: Int): ImageLoad {
             bitmapCache.put(key, bitmap)
             ImageLoad.Ready(bitmap)
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (failure: ToolMediaLoadException) { ImageLoad.MediaUnavailable(failure.status) }
-        catch (failure: PocketOperationException) { ImageLoad.MediaUnavailable(mediaFailureStatus(failure.failure)) }
-        catch (failure: dev.codexpocket.wire.WireException) { ImageLoad.MediaUnavailable(
+        catch (failure: ToolMediaLoadException) { unavailable(failure.status) }
+        catch (failure: PocketOperationException) { unavailable(mediaFailureStatus(failure.failure)) }
+        catch (failure: dev.codexpocket.wire.WireException) { unavailable(
             if (failure.code in setOf("offline", "disconnected")) ToolMediaStatus.Offline else mediaFailureStatus(PocketFailure.fromCode(failure.code))) }
         catch (_: Exception) { ImageLoad.MediaUnavailable(ToolMediaStatus.Failed) }
     }
@@ -194,10 +205,13 @@ private fun mediaFailureStatus(failure: PocketFailure?) = when (failure) {
 @Composable
 private fun GalleryRetry(file: MentionedFile) {
     val source = LocalDesktopImages.current
+    val toolSource = LocalToolMediaImages.current
     val media = LocalGalleryToolRefs.current[file.path]
     val scope = rememberCoroutineScope()
     PocketTextButton({ scope.launch {
-        if (media == null) source?.retry(file.path)
+        try { if (media == null) source?.retry(file.path) else toolSource?.refresh(media, manual = true) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { /* Retry stays attached to this image, without a global error. */ }
         val identity = "${source?.ownerKey}:${media?.cacheKey ?: file.path}"
         if (galleryRetries.size > 512) galleryRetries.clear()
         galleryRetries[identity] = (galleryRetries[identity] ?: 0) + 1

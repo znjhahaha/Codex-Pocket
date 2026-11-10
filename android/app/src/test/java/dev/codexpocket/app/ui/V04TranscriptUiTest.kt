@@ -157,7 +157,7 @@ class V04TranscriptUiTest {
         assertEquals(before, after)
     }
 
-    @Test fun draftItemExpansionSurvivesAFailedToolSplittingItsGroup() {
+    @Test fun draftItemExpansionSurvivesFailedToolWithoutSplittingItsGroup() {
         val first = TimelineItem("t", "first", "commandExecution", liveStarted = true)
         val tool = TimelineItem("t", "second", "commandExecution", "echo\n\nvisible result", raw = buildJsonObject { put("command", "echo") }, liveStarted = true)
         var current by mutableStateOf(tool)

@@ -7,18 +7,20 @@ internal data class QuestionDockEntry(
     val key: String,
     val batch: QuestionBatch? = null,
     val approval: PendingApproval? = null,
+    val receipt: QuestionReceipt? = null,
 ) {
     val asynchronous get() = batch?.asynchronous == true
     val submitted get() = approval?.submitted ?: batch?.questions?.all { it.source.flag("submitted") } ?: false
 }
 
-internal fun questionDockEntries(s: PocketState): List<QuestionDockEntry> {
+internal fun questionDockEntries(s: PocketState, receipts: List<QuestionReceipt> = emptyList()): List<QuestionDockEntry> {
     val chat = s.selected ?: return emptyList()
     val approvals = s.approvals.filter {
         it.runtimeId == chat.runtimeId && it.threadId.isNotBlank() && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method)
     }.map { approval ->
         QuestionDockEntry(approval.key,
-            if (approval.method == "item/tool/requestUserInput") QuestionBatches.blocking(approval.key, approval.params) else null, approval)
+            if (approval.method == "item/tool/requestUserInput") QuestionBatches.blocking(approval.key, approval.params) else null, approval,
+            receipts.filter { it.chat == chat.key && (it.requestKey == approval.key || it.matchesNative(chat.key, approval)) }.maxByOrNull { it.createdAt })
     }
     val pending = s.advanced.asyncQuestions.ifEmpty { s.pendingQuestions[chat.key.encoded].orEmpty() }
     val enriched = pending.map { source ->
@@ -36,16 +38,31 @@ internal fun questionDockEntries(s: PocketState): List<QuestionDockEntry> {
         val batch = if (remaining.isEmpty()) full else full.copy(questions = remaining)
         QuestionDockEntry(batch.id, batch)
     }
-    return approvals + asynchronous
+    val retained = receipts.filter { receipt -> receipt.chat == chat.key && receipt.runtimeId == chat.runtimeId &&
+        !receipt.phase.terminal && approvals.none { it.key == receipt.requestKey } &&
+        s.commands.any { it.id == receipt.commandId && CommandPolicy.blocksNewSend(it.status) } }
+        .map { QuestionDockEntry(it.requestKey, receipt = it) }
+    return approvals + asynchronous + retained
 }
 
 internal fun questionAvailability(s: PocketState, entry: QuestionDockEntry): QuestionPhase {
     if (entry.batch?.privateReplyRequired == true) return QuestionPhase.Unsupported
-    val runtimeId = entry.approval?.runtimeId ?: s.selected?.runtimeId
+    val runtimeId = entry.approval?.runtimeId ?: entry.receipt?.runtimeId ?: s.selected?.runtimeId
     if (!s.online || s.runtimes.none { it.id == runtimeId && it.online }) return QuestionPhase.Offline
+    val guarded = s.commands.any { it.method == "approvals/respond" &&
+        (it.draftText == entry.key || it.id == entry.receipt?.commandId) && CommandPolicy.blocksNewSend(it.status) }
+    if (entry.receipt != null && (entry.receipt.phase.terminal || guarded || entry.submitted)) return when (entry.receipt.phase) {
+        QuestionDeliveryPhase.Dispatching -> QuestionPhase.Submitting
+        QuestionDeliveryPhase.Forwarded -> QuestionPhase.Forwarded
+        QuestionDeliveryPhase.AwaitingConfirmation -> QuestionPhase.AwaitingConfirmation
+        QuestionDeliveryPhase.Confirmed -> QuestionPhase.Confirmed
+        QuestionDeliveryPhase.AnsweredElsewhere -> QuestionPhase.AnsweredElsewhere
+        QuestionDeliveryPhase.Cancelled -> QuestionPhase.Cancelled
+    }
     if (entry.approval != null) {
         if (!s.approvalsFresh || s.approvals.none { it.key == entry.key }) return QuestionPhase.Stale
         if (entry.key in s.submittingApprovalKeys) return QuestionPhase.Submitting
+        if (guarded) return QuestionPhase.AwaitingConfirmation
     } else {
         val method = if (s.timeline.activeTurn == null) "turn/start" else "turn/steer"
         if (s.conversationLoadState != ConversationLoadState.Ready || s.selected?.archived != false ||

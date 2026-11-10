@@ -188,13 +188,23 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
     val live = ConversationPresentation.liveStatus(state.timeline)
     val turn = state.timeline.activeTurn
     val reasoning = remember(state.timeline) { ConversationPresentation.liveReasoning(state.timeline) }
+    val childStatus = state.liveStatuses[child.key.nativeId]
+    val nativeActive = state.timeline.status.isBlank() || state.timeline.status in setOf("active", "inProgress", "running")
+    val liveOnline = online && nativeActive && state.timeline.activeFlags.none { it in setOf("waitingOnApproval", "waitingOnUserInput") } &&
+        (childStatus == null || childStatus.status == ActivityStatus.Running)
+    // A cursor-bearing child observation belongs to this parent/runtime, independently of old rows.
+    val thinkingWithoutTurn = online && live == null && childStatus?.status == ActivityStatus.Running &&
+        (childStatus.cursor != null || childStatus.executionGeneration > 0 || childStatus.resumeKey != null)
+    val showThinking = thinkingWithoutTurn || (live == ConversationPresentation.LiveStatus.Thinking && turn != null &&
+        liveOnline && nativeThinkingAllowed(turn, state.timeline.turns[turn]) && reasoning?.summaryParts.orEmpty().none(String::isNotBlank))
     val detail = state.timeline.items.values.firstOrNull { it.key == memory.detailKey }
-    val keys = remember(rows, live, turn, detail?.key) {
+    val keys = remember(rows, live, turn, detail?.key, thinkingWithoutTurn, showThinking) {
         listOf("history-control") + rows.flatMap { row -> listOf(row.key) +
             listOfNotNull(detail?.takeIf { value -> row.kind != TranscriptKind.Process && row.items.any { it.key == value.key } }
                 ?.let { "detail:${it.key}" }) } +
             listOfNotNull(turn?.takeIf { live != null }?.let { "live:$it" }) +
-            listOfNotNull("empty".takeIf { rows.isEmpty() }) + "timeline-end"
+            listOfNotNull("live-native-child".takeIf { thinkingWithoutTurn }) +
+            listOfNotNull("empty".takeIf { rows.isEmpty() && !showThinking }) + "timeline-end"
     }
     val list = memory.list
     val minimapState = rememberConversationMinimapState(list, scope)
@@ -222,7 +232,8 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             val updated = remember(state.updatedAt) { state.updatedAt.takeIf { it > 0 }?.let {
                 DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(it))
             } }
-            Text(if (!online) "离线 · 缓存内容" else if (state.loading) "正在读取" else if (turn != null) "实时更新" else "原生会话记录",
+            Text(if (!online) "离线 · 缓存内容" else if (state.loading) "正在读取"
+                else if ((live != null && turn != null && liveOnline) || thinkingWithoutTurn) "实时更新" else "原生会话记录",
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (updated != null) Text("更新于 $updated", Modifier.weight(1f),
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -275,9 +286,10 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                 }
             }
             if (live != null && turn != null) item(key = "live:$turn", contentType = "live-status") {
-                LiveTurnStatus(turn, live, reasoning = reasoning, timing = state.timeline.turns[turn])
+                LiveTurnStatus(turn, live, reasoning = reasoning, timing = state.timeline.turns[turn], online = liveOnline)
             }
-            if (rows.isEmpty()) item(key = "empty", contentType = "notice") {
+            if (thinkingWithoutTurn) item(key = "live-native-child", contentType = "live-status") { NativeThinkingPlaceholder() }
+            if (rows.isEmpty() && !showThinking) item(key = "empty", contentType = "notice") {
                 Text(if (state.loading) "正在加载子代理对话…" else if (!online) "此子代理暂无缓存内容" else "此子代理尚无对话内容",
                     Modifier.padding(vertical = 24.dp).testTag("agent-reader-empty"),
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -301,7 +313,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
 private fun AgentReaderToolDetail(item: TimelineItem, onClose: () -> Unit) {
     if (item.type == "fileChange" || item.type == "turn/diff/updated") return
     val value = remember(item) { NativeActivityPresentation.describe(item) }
-    val text = remember(item) { ConversationPresentation.detail(item) }
+    val text = remember(item) { nativeActivityDetailText(item) }
     val shown = remember(text) { text.take(65_536) }
     var wrap by rememberSaveable(item.key) { mutableStateOf(true) }
     ToolResultFrame(if (value.command != null) "Shell · 只读" else "工具详情 · 只读", text, wrap, { wrap = !wrap },

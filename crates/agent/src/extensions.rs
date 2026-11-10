@@ -33,6 +33,7 @@ pub fn known_config(read: &Value) -> Vec<Value> {
 }
 #[derive(Clone)]
 pub struct Inventory {
+    pub generation: String,
     pub version: String,
     pub data: Vec<Value>,
     pub updates: BTreeMap<String, (String, Value)>,
@@ -54,6 +55,7 @@ impl Inventory {
     ) -> Self {
         let version = opaque(&format!("{generation}:{}", json!([read, skills, plugins, apps])));
         let mut this = Self {
+            generation: generation.into(),
             version: version.clone(),
             data: Vec::new(),
             updates: BTreeMap::new(),

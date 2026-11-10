@@ -222,4 +222,27 @@ class NativeActivityUiTest {
         assertEquals("import sys", dev.codexpocket.app.data.NativeActivityPresentation.headline("@'\nimport sys\nprint(1)\n'@ | python -"))
         assertEquals("git status", dev.codexpocket.app.data.NativeActivityPresentation.headline("\n  git status\n"))
     }
+
+    @Test fun failedCommandsStayFoldableAndKeepNativeErrorWithoutOutput() {
+        val failed = item("""{"id":"failed","type":"commandExecution","command":"./check","status":"failed","error":{"message":"Process could not start"}}""", true)
+        val done = item("""{"id":"done","type":"commandExecution","command":"./other","status":"completed","exitCode":0}""", true)
+        val row = TranscriptRow("failed-group", TranscriptKind.Activity, listOf(done, failed), true)
+        content {
+            var expanded by remember { mutableStateOf(false) }
+            NativeActivityTrace(row, "test", expanded, { expanded = !expanded }, {})
+        }
+        compose.onNodeWithTag("activity-toggle:${failed.key}").assertDoesNotExist()
+        compose.onNodeWithTag("activity-group-toggle:${row.key}").performClick()
+        waitText("运行失败")
+        compose.onNodeWithText("Process could not start").assertDoesNotExist()
+        compose.onNodeWithTag("activity-toggle:${failed.key}").performClick()
+        waitText("Process could not start")
+        compose.onNodeWithText("Process could not start").assertExists()
+        compose.onNodeWithTag("activity-toggle:${failed.key}").performClick()
+        compose.onNodeWithText("Process could not start").assertDoesNotExist()
+        compose.onNodeWithTag("activity-group-toggle:${row.key}").performClick()
+        compose.onNodeWithTag("activity-toggle:${failed.key}").assertDoesNotExist()
+        assertTrue(nativeActivityDetailText(failed).contains("Process could not start"))
+        assertTrue(nativeActivityDetailText(failed).contains("./check"))
+    }
 }

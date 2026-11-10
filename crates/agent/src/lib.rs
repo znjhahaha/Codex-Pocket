@@ -17,9 +17,11 @@ pub mod remote;
 pub mod media;
 pub mod message_edit;
 pub mod native;
+mod native_history_compat;
 #[path = "../../bridge/src/permission_policy.rs"]
 pub mod permission_policy;
 pub mod permissions;
+pub mod questions;
 pub mod push;
 pub mod session;
 #[path = "../../bridge/src/settings.rs"]

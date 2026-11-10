@@ -72,6 +72,29 @@ class QuestionDockModelTest {
         assertEquals(QuestionPhase.Submitted, questionAvailability(s.copy(approvals = listOf(entry.approval!!.copy(submitted = true))), entry.copy(approval = entry.approval.copy(submitted = true))))
     }
 
+    @Test fun uncertainReplyBlocksOnlyItsExactRequestAndLeavesOtherRequestsActionable() {
+        val first = approval("a").copy(submitted = true)
+        val second = approval("b")
+        val command = CommandEntity("sent-a", "pc", chat.key, "approvals/respond", "unknown", 1, first.key)
+        val s = state().copy(approvals = listOf(first, second), commands = listOf(command))
+        assertFalse(s.uncertainSend)
+        assertEquals(1, s.unresolvedCommands.size)
+        assertEquals(QuestionPhase.AwaitingConfirmation, questionAvailability(s, questionDockEntries(s)[0]))
+        assertEquals(QuestionPhase.Waiting, questionAvailability(s, questionDockEntries(s)[1]))
+        assertTrue(s.copy(commands = listOf(command.copy(method = "turn/start"))).uncertainSend)
+    }
+
+    @Test fun submittedReceiptSurvivesRequestRemovalButCannotAttachToAnotherRuntimeOrThread() {
+        val a = approval("a").copy(params = JsonObject(approval("a").params +
+            mapOf("turnId" to JsonPrimitive("turn"), "itemId" to JsonPrimitive("item"))))
+        val receipt = QuestionReceipt.capture("command", chat.key, a, buildJsonObject {})
+        val command = CommandEntity("command", "pc", chat.key, "approvals/respond", "unknown", 1, a.key)
+        val s = state().copy(commands = listOf(command))
+        assertEquals(a.key, questionDockEntries(s, listOf(receipt)).single().key)
+        assertTrue(questionDockEntries(s.copy(selected = chat.copy(runtimeId = "other")), listOf(receipt)).isEmpty())
+        assertTrue(questionDockEntries(s.copy(selected = chat.copy(key = chat.key.copy(nativeId = "other"))), listOf(receipt)).isEmpty())
+    }
+
     @Test fun cachedAsyncQuestionsCannotSubmitUntilConversationIsFresh() {
         val s = state().copy(advanced = AdvancedConversationState(asyncQuestions = listOf(question("a", 0))))
         val entry = questionDockEntries(s).single()

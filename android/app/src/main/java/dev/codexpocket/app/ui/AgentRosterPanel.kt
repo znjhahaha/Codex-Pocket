@@ -10,6 +10,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
@@ -25,7 +26,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.ActivityStatus
 import dev.codexpocket.app.data.AgentRosterEntry
+import dev.codexpocket.app.data.AgentWorkPhase
 import dev.codexpocket.app.data.currentAgentWork
+import dev.codexpocket.app.data.agentRosterSections
+import dev.codexpocket.app.data.workPhase
 
 /** Place beneath the conversation title. The panel stays readable while cached/offline/loading. */
 @Composable
@@ -91,6 +95,7 @@ internal fun AgentRosterPanel(
     names: Map<String, String> = emptyMap(),
 ) {
     val c = MaterialTheme.colorScheme
+    var othersExpanded by rememberSaveable { mutableStateOf(false) }
     PocketAnchoredMenu("子代理", onDismiss, anchor, widthDp = 320f, alignStart = true, below = true) {
         Column(Modifier.fillMaxWidth().heightIn(max = 320.dp).verticalScroll(rememberScrollState())
             .padding(horizontal = 6.dp, vertical = 4.dp).testTag("agent-roster-panel"),
@@ -102,12 +107,20 @@ internal fun AgentRosterPanel(
             }
             Text(notice, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
-            val current = agents.filter { it.isCurrent }
-            val historical = agents.filterNot { it.isCurrent }
+            val sections = remember(agents) { agentRosterSections(agents) }
+            val current = sections.current
+            val historical = sections.folded
             if (current.isNotEmpty()) AgentRosterGroup("本轮子代理", current, names, online && !loading, onOpen)
             if (historical.isNotEmpty()) {
                 if (current.isNotEmpty()) HorizontalDivider(color = c.outlineVariant.copy(alpha = .5f))
-                AgentRosterGroup("历史子代理", historical, names, online && !loading, onOpen)
+                PocketTextButton({ othersExpanded = !othersExpanded }, modifier = Modifier.testTag("agent-roster-others-toggle")
+                    .semantics { stateDescription = if(othersExpanded) "已展开" else "已折叠" }) {
+                    Text("其他子代理 · ${historical.size}")
+                    Icon(if(othersExpanded) PocketIcons.ExpandLess else PocketIcons.ExpandMore,null,Modifier.size(16.dp))
+                }
+                if(othersExpanded) historical.forEach { agent -> key(agent.threadId) {
+                    AgentRosterItem(agent,names,online && !loading,onOpen)
+                }}
             }
         }
     }
@@ -128,8 +141,9 @@ internal fun AgentRosterList(
 ) {
     val c = MaterialTheme.colorScheme
     val unique = remember(agents) { agents.distinctBy { it.threadId }.filter { it.threadId.isNotBlank() } }
-    val current = remember(unique) { unique.filter { it.isCurrent } }
-    val historical = remember(unique) { unique.filterNot { it.isCurrent } }
+    val sections = remember(unique) { agentRosterSections(unique) }
+    val current = sections.current
+    val historical = sections.folded
     LazyColumn(modifier.testTag("agent-reader-roster"), state = list,
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -146,12 +160,12 @@ internal fun AgentRosterList(
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp))
         }
         if (current.isEmpty()) item(key = "roster-current-empty", contentType = "notice") {
-            Text(if (loading && unique.isEmpty()) "正在读取子代理" else "本轮没有子代理记录",
+            Text(if (loading && unique.isEmpty()) "正在读取子代理" else "暂无进行中的子代理",
                 style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 10.dp))
         }
         items(current, key = { "child:${it.threadId}" }, contentType = { "child" }) { agent ->
-            AgentRosterItem(agent, names, enabled = true, onOpen)
+            AgentRosterItem(agent, names, enabled = true, onOpen, animate = online && !loading)
         }
         if (historical.isNotEmpty()) {
             item(key = "roster-history", contentType = "section") {
@@ -161,14 +175,14 @@ internal fun AgentRosterList(
                     .semantics { stateDescription = if (historyExpanded) "已展开" else "已折叠" }
                     .clickable(role = Role.Button, onClick = onHistoryExpanded)
                     .padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("历史子代理 · ${historical.size}", Modifier.weight(1f),
+                    Text("其他子代理 · ${historical.size}", Modifier.weight(1f),
                         style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
                     Icon(PocketIcons.ExpandMore, null, Modifier.size(16.dp).graphicsLayer { rotationZ = angle },
                         tint = c.onSurfaceVariant)
                 }
             }
             if (historyExpanded) items(historical, key = { "child:${it.threadId}" }, contentType = { "child" }) { agent ->
-                AgentRosterItem(agent, names, enabled = true, onOpen)
+                AgentRosterItem(agent, names, enabled = true, onOpen, animate = false)
             }
         }
     }
@@ -189,13 +203,13 @@ private fun AgentRosterGroup(
 }
 
 @Composable
-private fun AgentRosterItem(agent: AgentRosterEntry, names: Map<String, String>, enabled: Boolean, onOpen: (String) -> Unit) {
+private fun AgentRosterItem(agent: AgentRosterEntry, names: Map<String, String>, enabled: Boolean, onOpen: (String) -> Unit, animate: Boolean = enabled) {
         val c = MaterialTheme.colorScheme
         val name = names[agent.threadId]?.trim().orEmpty().ifBlank { agent.name }.ifBlank { "子代理 ${agent.threadId.take(8)}" }
         val state = agentRosterStatusLabel(agent)
         val color = when (agent.status) {
             ActivityStatus.Failed -> c.error
-            ActivityStatus.Running -> c.primary
+            ActivityStatus.Running -> if (agent.isCurrent) c.primary else c.onSurfaceVariant
             else -> c.onSurfaceVariant
         }
         Column(Modifier.fillMaxWidth().heightIn(min = 48.dp)
@@ -203,7 +217,8 @@ private fun AgentRosterItem(agent: AgentRosterEntry, names: Map<String, String>,
             .semantics { contentDescription = "$name · $state · 查看子会话" }
             .clickable(enabled = enabled, role = Role.Button) { onOpen(agent.threadId) }
             .padding(horizontal = 6.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(name, style = MaterialTheme.typography.labelLarge, color = c.onSurface,
+            Text(name, Modifier.reasoningSweep(animate && agent.isCurrent && agent.status == ActivityStatus.Running),
+                style = MaterialTheme.typography.labelLarge, color = c.onSurface,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(state, style = MaterialTheme.typography.labelSmall, color = color)
             val preview = agent.resultPreview.ifBlank { agent.taskPreview }
@@ -223,12 +238,12 @@ internal fun agentRosterStatusLabel(agent: AgentRosterEntry): String {
     val state = when (agent.nativeStatus) {
         "notFound" -> "未找到"
         "shutdown" -> "已关闭"
-        "pendingInit" -> "初始化中"
+        "pendingInit", "pending_init" -> "初始化中"
         else -> when (agent.status) {
             ActivityStatus.Running -> "进行中"
             ActivityStatus.Completed -> "已完成"
             ActivityStatus.Failed -> "失败"
-            ActivityStatus.Waiting -> "等待中"
+            ActivityStatus.Waiting -> if (agent.workPhase == AgentWorkPhase.Starting) "初始化中" else "等待中"
             ActivityStatus.Interrupted -> "已中断"
             ActivityStatus.Unknown -> "状态未知"
         }

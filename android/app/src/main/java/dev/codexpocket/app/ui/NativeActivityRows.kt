@@ -61,6 +61,13 @@ import kotlinx.coroutines.withContext
 
 private const val VISIBLE_FILES = 6
 
+/** Command launch failures may have no output; keep their native message in copied/full details. */
+internal fun nativeActivityDetailText(item: TimelineItem): String {
+    val text = ConversationPresentation.detail(item)
+    val error = if (item.type == "commandExecution") item.raw.obj("error").agentString("message") else ""
+    return if (error.isBlank() || error in text) text else listOf(text, error).filter(String::isNotBlank).joinToString("\n\n")
+}
+
 @Composable
 internal fun NativeActivityTrace(row: TranscriptRow, scope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit,
     expansionKeys: Set<String>? = null, onExpansionKey: ((String) -> Unit)? = null) {
@@ -208,6 +215,11 @@ internal fun pocketDiffColors(): Pair<Color, Color> = if (MaterialTheme.colorSch
 
 @Composable
 private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Boolean, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit) {
+    val questionHistory = remember(item.raw, item.type) { NativeQuestionHistory.from(item) }
+    if (questionHistory != null) {
+        HistoricalQuestionRow(questionHistory, item.key)
+        return
+    }
     // A superseded revision cannot publish its result; diff/result parsing stays off the UI thread.
     val descriptor by produceState<PresentedActivity?>(null, item, completedTurn) {
         value = withContext(Dispatchers.Default) { NativeActivityPresentation.describe(item, completedTurn) }
@@ -531,10 +543,11 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
         val showCommand = command != null && shownCommand.isNotBlank()
         val hasBlocks = value.outputBlocks.isNotEmpty()
         val hasOutput = value.output.text.isNotBlank() && !hasBlocks
-        if (showCommand || (command?.cwd?.isNotBlank() == true) || hasOutput || hasBlocks) {
+        val commandError = if (command != null) item.raw.obj("error").agentString("message") else ""
+        if (showCommand || (command?.cwd?.isNotBlank() == true) || hasOutput || hasBlocks || commandError.isNotBlank()) {
             var wrap by androidx.compose.runtime.saveable.rememberSaveable(scope, item.key) { mutableStateOf(true) }
             ToolResultFrame(if (command != null) "Shell" else value.title.ifBlank { "工具输出" },
-                ConversationPresentation.detail(item), wrap, { wrap = !wrap }) {
+                nativeActivityDetailText(item), wrap, { wrap = !wrap }) {
                     if (showCommand) SelectionContainer {
                         Text(buildAnnotatedString {
                             withStyle(SpanStyle(color = c.onSurfaceVariant)) { append("$ ") }
@@ -548,6 +561,9 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
                         val result = listOfNotNull(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) },
                             command.durationMs?.let { NativeActivityPresentation.duration(it) }).joinToString(" · ")
                         if (result.isNotBlank()) Text(result, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    }
+                    if (commandError.isNotBlank()) SelectionContainer {
+                        Text(commandError, style = MaterialTheme.typography.bodySmall, color = c.error)
                     }
                     if (value.command == null && value.subtitle.isNotBlank() && value.kind != ActivityKind.Web) Text(value.subtitle,
                         style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)

@@ -39,7 +39,7 @@ impl std::error::Error for RpcFailure {}
 pub type Reply = oneshot::Sender<std::result::Result<Value, RpcFailure>>;
 enum Outgoing {
     Request { value: Value, reply: Reply },
-    Response(Value),
+    Response { value: Value, flushed: oneshot::Sender<std::result::Result<(),RpcFailure>> },
 }
 #[derive(Clone)]
 pub struct Rpc {
@@ -142,10 +142,13 @@ impl Rpc {
             .map_err(|_| RpcFailure::Disconnected)?
     }
     pub async fn respond(&self, id: Value, response: Value) -> std::result::Result<(), RpcFailure> {
+        let (flushed, receiver)=oneshot::channel();
         self.tx
-            .send(Outgoing::Response(json!({"id":id,"result":response})))
+            .send(Outgoing::Response{value:json!({"id":id,"result":response}),flushed})
             .await
-            .map_err(|_| RpcFailure::Disconnected)
+            .map_err(|_| RpcFailure::Disconnected)?;
+        tokio::time::timeout(Duration::from_secs(10),receiver).await
+            .map_err(|_|RpcFailure::Timeout)?.map_err(|_|RpcFailure::Disconnected)?
     }
 }
 fn spawn(
@@ -168,7 +171,7 @@ fn spawn(
              },
              output=rx.recv()=>match output{
               Some(Outgoing::Request{value,reply})=>{if pending.len()>=128{let _=reply.send(Err(RpcFailure::Native(json!({"message":"Too many pending native requests"}))));continue}let id=value["id"].as_str().unwrap().to_owned();let snapshot=value["method"]=="thread/read"||value["method"]=="thread/turns/list";let approvals=value["method"]=="pocket/approvals/list";pending.insert(id,(reply,tokio::time::Instant::now(),snapshot,approvals));if connection.write(&value).await.is_err(){break}},
-              Some(Outgoing::Response(value))=>if connection.write(&value).await.is_err(){break},
+              Some(Outgoing::Response{value,flushed})=>{let result=connection.write(&value).await.map_err(|_|RpcFailure::Disconnected);let failed=result.is_err();let _=flushed.send(result);if failed{break}},
               None=>break,
              },
              _=sweep.tick()=>{pending.retain(|_,(reply,at,_,_)|!reply.is_closed()&&at.elapsed()<Duration::from_secs(100));},

@@ -53,7 +53,7 @@ class QuestionFormsTest {
         session.editOther("secret", "ready")
         session.move(1)
         assertNull(session.beginSubmission(QuestionPhase.Waiting))
-        session.editOther("client", "x".repeat(64_001))
+        session.editOther("client", "x".repeat(MAX_QUESTION_ANSWER_BYTES + 1))
         assertNull(session.beginSubmission(QuestionPhase.Waiting))
         session.selectOption("client", "Desktop")
         assertNull(session.beginSubmission(QuestionPhase.Stale))

@@ -42,10 +42,12 @@ data class ItemEntity(val chatKey: ThreadKey, val itemKey: String, val turnId: S
     }
     companion object {
         fun from(chat: ThreadKey, i: TimelineItem, order: Long): ItemEntity {
+            val safe = NativeQuestionHistory.cacheSafe(i)
             // Local cache proof only: no Room column/migration, and item() strips it from the native payload.
             val cached = if (i.type == "contextCompaction") JsonObject(i.raw +
                 (COMPACTION_COMPLETION_CACHE_KEY to JsonPrimitive(COMPACTION_COMPLETION_CACHE_VERSION))) else i.raw
-            return ItemEntity(chat, i.key, i.turnId, i.itemId, i.type, i.text, i.status, cached, i.complete, order)
+            return ItemEntity(chat, i.key, i.turnId, i.itemId, i.type, safe.text, i.status,
+                if (safe !== i) safe.raw else cached, i.complete, order)
         }
     }
 }

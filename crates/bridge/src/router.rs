@@ -458,7 +458,7 @@ impl Router {
                     self.completed.push_back(Completed {
                         native_id: key,
                         desktop_id: p.desktop_id.clone(),
-                        desktop_notified: p.shareable && client != Client::Desktop,
+                        desktop_notified: false,
                         remote_id: p.remote_id.clone(),
                         thread: p.thread.clone(),
                         winner: if p.shareable && matches!(client, Client::Remote(_)) {
@@ -482,9 +482,9 @@ impl Router {
                         {
                             routes.push(Route::Client(client.clone(),json!({"method":"pocket/approvalSubmitted","params":{"requestId":p.remote_id,"threadId":p.thread,"winner":"thisConnection","response":response}})));
                         }
-                        if client != Client::Desktop {
-                            routes.push(Route::Client(Client::Desktop,json!({"method":"serverRequest/resolved","params":{"requestId":p.desktop_id,"threadId":p.thread}})));
-                        }
+                        // Only native resolution may close the desktop prompt.
+                        // Arbitration has already fenced duplicate answers, but
+                        // inventing this notification made the UI lose the answer.
                         routes.push(Route::Broadcast(json!({"method":"pocket/approvalResolved","params":{"requestId":p.remote_id,"threadId":p.thread}})));
                     }
                     return routes;

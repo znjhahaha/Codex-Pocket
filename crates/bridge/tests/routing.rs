@@ -279,6 +279,21 @@ fn user_input_requires_answer_arrays_for_original_questions() {
 }
 
 #[test]
+fn phone_answer_does_not_fabricate_desktop_resolution_before_native_finishes() {
+    let mut router = Router::default();
+    let issued = router.from_runtime(json!({"id":"input-1","method":"item/tool/requestUserInput",
+        "params":{"threadId":"thread","turnId":"turn","itemId":"question-item","questions":[{"id":"q1"}]}}));
+    let answer = json!({"answers":{"q1":{"answers":["chosen"]}}});
+    let submitted = router.from_client(phone(), json!({"id":remote_id(&issued),"result":answer}));
+    assert!(sent(&submitted));
+    assert!(!submitted.iter().any(|r| matches!(r,Route::Client(Client::Desktop,v) if v["method"]=="serverRequest/resolved")),
+        "A mobile write is not native resolution and must not erase the desktop's answer presentation");
+    let resolved = router.from_runtime(json!({"method":"serverRequest/resolved","params":{"requestId":"input-1","threadId":"thread"}}));
+    assert!(resolved.iter().any(|r| matches!(r,Route::Client(Client::Desktop,v) if v["params"]["requestId"]==desktop_id(&issued))));
+    assert!(!sent(&router.from_client(Client::Desktop,json!({"id":desktop_id(&issued),"result":answer}))));
+}
+
+#[test]
 fn native_resolution_uses_desktop_alias_and_invalidates_both_clients() {
     let mut r = Router::default();
     let issued = r.from_runtime(request());

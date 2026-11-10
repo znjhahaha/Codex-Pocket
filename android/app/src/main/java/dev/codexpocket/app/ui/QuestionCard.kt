@@ -15,6 +15,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -39,19 +40,26 @@ internal fun QuestionDock(
     modifier: Modifier = Modifier,
 ) {
     val memory = remember(s.computerId) { QuestionDockMemory() }
+    val context = LocalContext.current
+    val answerStore = remember(context) { QuestionAnswerStore(context) }
     DisposableEffect(memory) { onDispose { memory.clear() } }
     var selectedKey by remember(memory) { mutableStateOf<String?>(null) }
     var collapsed by remember(memory) { mutableStateOf(false) }
-    val entries = questionDockEntries(s)
+    val receipts = (answerStore.all().associateBy { it.commandId } + s.questionDeliveries.associateBy { it.commandId })
+        .values.filter { it.chat.computerId == s.computerId }
+    val entries = questionDockEntries(s, receipts)
     val scope = s.selected?.key?.encoded.orEmpty()
     memory.reconcile(scope, entries, s.online && s.approvalsFresh && s.conversationLoadState == ConversationLoadState.Ready)
     // Synchronize every batch even while collapsed or while a different batch is selected.
     entries.forEach { entry -> entry.batch?.let { batch ->
         val session = memory.session(batch)
+        entry.receipt?.let { session.restoreSubmitted(it, entry.approval) }
         val submitting = if (entry.approval != null) entry.key in s.submittingApprovalKeys
             else session.phase == QuestionPhase.Submitting && (s.sendBusy || s.busy)
         val availability = questionAvailability(s, entry)
-        session.observe(entry.submitted, submitting, pendingConfirmed = availability == QuestionPhase.Waiting)
+        session.observe(entry.submitted || availability in setOf(QuestionPhase.Forwarded, QuestionPhase.AwaitingConfirmation,
+            QuestionPhase.Confirmed, QuestionPhase.AnsweredElsewhere, QuestionPhase.Cancelled), submitting,
+            pendingConfirmed = availability == QuestionPhase.Waiting)
     } }
     if (entries.isEmpty()) return
     val index = entries.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 } ?: 0
@@ -86,6 +94,9 @@ internal fun QuestionDock(
                         QuestionBatches.blockingResponse(entry.batch, answers)?.let { onRespond(approval, it) }
                     } ?: QuestionBatches.asyncAnswers(entry.batch, answers)?.let(onAsyncAnswers)
                 }, enabled = !s.busy && !s.sendBusy, revealState = memory.reveal(entry.batch))
+            } else if (entry.receipt != null && entry.approval == null) {
+                QuestionStatus(phase)
+                Text("回答已保留 · 核对状态不会再次发送", style = MaterialTheme.typography.bodySmall)
             } else {
                 // Command/file approval decisions keep their own native allow/decline/cancel interface.
                 Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
@@ -131,7 +142,7 @@ internal fun QuestionCard(
                     val scroll = key(batch.id, question.id) { rememberScrollState() }
                     Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(question.prompt, style = MaterialTheme.typography.bodyLarge)
-                        if (phase != QuestionPhase.Submitted && phase != QuestionPhase.Unsupported) {
+                        if (phase == QuestionPhase.Waiting || phase == QuestionPhase.Offline || phase == QuestionPhase.Stale || phase == QuestionPhase.Submitting) {
                             question.options.forEachIndexed { index, option ->
                                 QuestionOptionRow(option.label, option.description, option.recommended,
                                     selected = !session.otherSelected(question.id) && session.answer(question.id) == option.value,
@@ -155,6 +166,13 @@ internal fun QuestionCard(
                                     if (question.secret) Text("敏感回答仅在当前界面内存中保留", style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
+                            }
+                        }
+                        if (!interactive && phase != QuestionPhase.Unsupported) {
+                            if (question.secret) Text("敏感回答不会保存", style = MaterialTheme.typography.bodySmall)
+                            else session.answer(question.id)?.let { answer ->
+                                Text("提交的回答：$answer", Modifier.testTag("question-submitted-answer:${question.id}"),
+                                    style = MaterialTheme.typography.bodyMedium)
                             }
                         }
                     }
@@ -203,6 +221,11 @@ internal fun QuestionStatus(phase: QuestionPhase, enabled: Boolean = true) {
         QuestionPhase.Waiting -> if (enabled) "等待回答 · 完成后提交全部答案" else "等待当前操作完成"
         QuestionPhase.Submitting -> "正在提交 · 等待电脑确认"
         QuestionPhase.Submitted -> "已提交 · 等待问题处理完成"
+        QuestionPhase.Forwarded -> "已转交电脑 · 等待原生答案确认"
+        QuestionPhase.AwaitingConfirmation -> "等待原生答案确认 · 回答已保留"
+        QuestionPhase.Confirmed -> "原生已确认答案"
+        QuestionPhase.AnsweredElsewhere -> "已在其他端回答"
+        QuestionPhase.Cancelled -> "问题已取消"
         QuestionPhase.Offline -> "离线 · 重新连接后提交"
         QuestionPhase.Stale -> "待重新同步 · 确认问题仍有效后提交"
         QuestionPhase.Unsupported -> "此问题包含敏感字段，当前异步协议会保存为聊天消息，请在电脑端处理"

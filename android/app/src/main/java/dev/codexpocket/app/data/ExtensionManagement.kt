@@ -17,6 +17,7 @@ data class ExtensionManagementState(
     val error: String? = null, val pendingIds: Set<String> = emptySet(), val uncertainIds: Set<String> = emptySet(),
     val scope: String = "", val reloadPending: Boolean = false, val status: String = "",
     val appInventoryStatus: String = "",
+    val categoryStatuses: Map<String, String> = emptyMap(),
     val refreshing: Boolean = false,
 )
 

@@ -199,6 +199,8 @@ private fun extensionNotice(s: PocketState, runtime: RuntimeInfo?, data: Extensi
         "在电脑端管理扩展，或选择另一个支持扩展管理的运行时。", data.error)
     data.error != null -> ExtensionNotice("failure", "扩展读取失败", "确认电脑端 Codex 正常运行，然后刷新重试。", data.error)
     data.phase == ExtensionPhase.Idle -> ExtensionNotice("idle", "尚未读取扩展", "点击分类右侧的刷新按钮，读取此运行时的已有配置。")
+    data.categoryStatuses[when(kind){"skill"->"skills";"plugin"->"plugins";else->"mcp"}] == "unavailable" ->
+        ExtensionNotice("category-failed", "当前分类暂未更新", "已有条目保持可见。点击刷新重试，其他分类仍可使用。")
     kind == "plugin" && data.appInventoryStatus == "unsupported" -> ExtensionNotice("apps-unsupported", "当前运行时未提供应用目录",
         "已取得的插件仍可查看；应用请在电脑端管理。这不代表没有安装应用。")
     kind == "plugin" && data.appInventoryStatus == "unavailable" -> ExtensionNotice("apps-unavailable", "应用目录暂未读到",
@@ -212,6 +214,14 @@ private fun extensionNotice(s: PocketState, runtime: RuntimeInfo?, data: Extensi
 
 @Composable
 private fun ExtensionStatusCard(notice: ExtensionNotice) {
+    if (notice.key in setOf("ready", "refreshing", "updating")) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).testTag("extension-status:" + notice.key),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (notice.key != "ready") Icon(PocketIcons.LoaderCircle, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(notice.title, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
     ExtensionSurface(Modifier.testTag("extension-status:" + notice.key)) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             SettingsCircleIcon(when (notice.key) {

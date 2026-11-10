@@ -5,6 +5,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class V04TranscriptPresentationTest {
+    @Test fun failedCommandKeepsContiguousWorkFoldableAndPreservesFailure() {
+        val first=TimelineItem("t","first","commandExecution",status="completed")
+        val failed=first.copy(itemId="failed",status="failed",text="recorded error")
+        val last=first.copy(itemId="last")
+        val row=ConversationPresentation.rows(NativeTimeline(listOf(first,failed,last).associateBy {it.key}),foldTasks=false).single()
+        assertEquals(listOf(first.key,failed.key,last.key),row.items.map {it.key})
+        assertTrue(NativeActivityPresentation.foldedByDefault(row))
+        assertFalse(NativeActivityPresentation.groupExpanded(row,true,false,listOf(failed.key)))
+        assertEquals(1,NativeActivityPresentation.summary(row.items).failed)
+        assertEquals(ActivityStatus.Failed,NativeActivityPresentation.state(failed))
+        assertFalse(NativeActivityPresentation.foldedByDefault(row.copy(items=listOf(failed.copy(status="waitingOnApproval")))))
+    }
     @Test fun completionFoldsByDefaultButNeverOverridesAnExplicitExpansion() {
         val item = TimelineItem("t", "cmd", "commandExecution", liveStarted = true)
         val live = TranscriptRow("activity:${item.key}", TranscriptKind.Activity, listOf(item))

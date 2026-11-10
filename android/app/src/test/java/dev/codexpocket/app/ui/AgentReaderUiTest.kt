@@ -224,6 +224,37 @@ class AgentReaderUiTest {
         compose.onNodeWithContentDescription("旁支讨论").assertDoesNotExist()
     }
 
+    @Test fun acceptedNativeTurnThinksBeforeContentAndStopsOnDisconnectOrIdle() {
+        val started = NativeReducer.reduce(NativeTimeline(), buildJsonObject {
+            put("method", "turn/started")
+            put("params", buildJsonObject { put("turn", buildJsonObject { put("id", "native-turn") }) })
+        })
+        var state by mutableStateOf(AgentReaderState(parent, child = child, timeline = started))
+        var online by mutableStateOf(true)
+        content { AgentReaderPanel(state, listOf(current), emptyMap(), online, {}, {}, {}, {}, {}, {}) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
+        compose.onNodeWithTag("agent-reader-empty").assertDoesNotExist()
+        compose.runOnIdle { online = false }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.runOnIdle { online = true; state = state.copy(timeline = started.copy(status = "idle")) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.onNodeWithText("实时更新").assertDoesNotExist()
+    }
+
+    @Test fun acceptedChildActiveStatusThinksBeforeTurnIdentityButUnversionedDoesNot() {
+        var state by mutableStateOf(AgentReaderState(parent, child = child))
+        content { AgentReaderPanel(state, listOf(current), emptyMap(), true, {}, {}, {}, {}, {}, {}) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.runOnIdle { state = state.withLiveStatus(child.key.nativeId, AgentLiveStatus("active")) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+        compose.runOnIdle { state = state.withLiveStatus(child.key.nativeId, AgentLiveStatus("active", cursor = Cursor("epoch", 10))) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
+        compose.onNodeWithTag("agent-reader-empty").assertDoesNotExist()
+        compose.runOnIdle { state = state.withLiveStatus(child.key.nativeId, AgentLiveStatus("active", cursor = Cursor("epoch", 11),
+            activeFlags = setOf("waitingOnUserInput"))) }
+        compose.onNodeWithTag("live-thinking-placeholder").assertDoesNotExist()
+    }
+
     @Test fun completedTaskExpandsInPlaceAndRetainsChoiceWhenResized() {
         val question = TimelineItem("done", "user", "userMessage", "Original task", complete = true)
         val commentary = TimelineItem("done", "comment", "agentMessage", "Intermediate explanation",

@@ -60,7 +60,7 @@ class ResumedInteractionTest {
         compose.runOnIdle { summary = null }
         compose.onNodeWithTag("live-reasoning-toggle").assertDoesNotExist()
         compose.onNodeWithTag("live-turn-status").assertDoesNotExist()
-        compose.onNodeWithText("正在思考").assertDoesNotExist()
+        compose.onNodeWithTag("live-thinking-placeholder").assertTextEquals("正在思考")
     }
 
     @Test fun agentDetailsOfferOnlyDirectoryVerifiedChildAndKeepActualIdentity() {

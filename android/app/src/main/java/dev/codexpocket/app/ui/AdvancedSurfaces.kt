@@ -41,7 +41,7 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
     val results = s.chats.filter { it.key.encoded in s.unreadKeys || it.status == "failed" }
     val insets = LocalHomeContentPadding.current
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = insets.calculateTopPadding() + 20.dp, bottom = insets.calculateBottomPadding() + 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (approvals.isEmpty() && questions.isEmpty() && s.advanced.asyncQuestions.isEmpty() && s.commands.isEmpty() && results.isEmpty()) item {
+        if (approvals.isEmpty() && questions.isEmpty() && s.advanced.asyncQuestions.isEmpty() && results.isEmpty()) item {
             EmptyState(stringResource(R.string.v02_all_clear), stringResource(R.string.v02_all_clear_detail))
         }
         items(approvals, key = { it.key }, contentType = { "approval" }) { approval ->
@@ -72,7 +72,6 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
                 trailing = { Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
             )
         }
-        if (s.commands.isNotEmpty()) item { UnknownCommandNotice(s, repo) }
     }
 }
 

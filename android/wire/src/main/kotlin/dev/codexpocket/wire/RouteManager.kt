@@ -13,6 +13,7 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     private data class Failure(val count: Int, val until: Long)
     private val failures = mutableMapOf<String, Failure>()
     private var sticky: ConnectionRoute? = null
+    private var recent: ConnectionRoute? = null
     private var stickyUntil = 0L
 
     val networkGeneration: Long @Synchronized get() = generation
@@ -23,7 +24,7 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     @Synchronized internal fun configure(value: ConnectionConfig) {
         if (config == value) return
         if (config?.let { it.certificateSha256 != value.certificateSha256 || it.room != value.room || it.computerId != value.computerId } == true) {
-            discovered = emptyList(); failures.clear(); sticky = null
+            discovered = emptyList(); failures.clear(); sticky = null; recent = null
         }
         config = value; configured = value.routes.toList(); selectedPolicy = value.policy; identity = value.computerId
     }
@@ -64,6 +65,15 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
                 { if (it.kind == "lan") 0 else 1 }, { it.priority }, { it.id }))
     }
 
+    /** Reconnection has one owner (the repository). A previous route cooldown
+     * must not add a second delay after its bounded retry wait or manual wakeup. */
+    @Synchronized internal fun connectionCandidates(): List<ConnectionRoute> =
+        directory().filter(::eligible).sortedWith(compareBy<ConnectionRoute>(
+            { if (recent?.let { previous -> key(previous) == key(it) } == true) 0 else 1 },
+            { if (it.kind == "lan") 0 else 1 }, { it.priority }, { it.id }))
+
+    @Synchronized internal fun hasRecentRoute(): Boolean = recent?.let(::eligible) == true
+
     @Synchronized internal fun eligible(route: ConnectionRoute): Boolean =
         (route.expiresAt == null || route.expiresAt > nowSeconds()) &&
             (selectedPolicy != ConnectionPolicy.LAN_ONLY || route.kind == "lan") &&
@@ -79,7 +89,7 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     @Synchronized internal fun authenticated(route: ConnectionRoute, computerId: String) {
         require(computerId.isNotBlank() && computerId.length <= 256) { "Invalid computer identity" }
         if (identity != null && identity != computerId) throw WireException("identity_mismatch", "Computer identity differs")
-        identity = computerId; failures.remove(key(route)); sticky = route; stickyUntil = nowMillis() + 30_000
+        identity = computerId; failures.remove(key(route)); sticky = route; recent = route; stickyUntil = nowMillis() + 30_000
     }
 
     @Synchronized internal fun checkIdentity(computerId: String) {

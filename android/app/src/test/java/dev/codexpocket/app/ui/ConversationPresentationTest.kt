@@ -135,11 +135,10 @@ class ConversationPresentationTest {
         assertEquals(question.key, rows[1].key)
     }
 
-    @Test fun toolsNeverGroupAcrossFailedWaitingQuestionOrApprovalItems() {
+    @Test fun toolsNeverGroupAcrossWaitingQuestionOrApprovalItems() {
         val before = TimelineItem("t", "before", "commandExecution", complete = true)
         val after = before.copy(itemId = "after")
         listOf(
-            before.copy(itemId = "boundary", status = "failed"),
             before.copy(itemId = "boundary", status = "waitingOnApproval"),
             before.copy(itemId = "boundary", raw = raw("""{"questions":[{"question":"Choose"}]}""")),
             before.copy(itemId = "boundary", raw = raw("""{"method":"item/commandExecution/requestApproval"}""")),
