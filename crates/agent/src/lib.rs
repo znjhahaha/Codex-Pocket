@@ -27,6 +27,7 @@ pub mod session;
 #[path = "../../bridge/src/settings.rs"]
 pub mod settings;
 pub mod storage;
+pub mod startup_diagnostics;
 pub mod transport;
 pub mod workspace;
 

@@ -1,12 +1,16 @@
 use crate::{storage::{self,Lock},process,policy};
 #[path = "upgrade.rs"]
 pub mod upgrade;
+#[path = "maintenance.rs"]
+pub mod maintenance;
+#[path = "startup_failure.rs"]
+pub mod startup_failure;
 use anyhow::{Context,Result};
 use serde::{Serialize,Deserialize};
 use std::{path::{Path,PathBuf},process::{Command,Child,Stdio},time::{Instant,Duration},thread};
 #[derive(Serialize,Deserialize,Clone,Debug,Default)]
 #[serde(rename_all="camelCase")]
-pub struct Status{pub phase:String,pub pid:u32,pub child_pid:Option<u32>,pub updated_at:u64,pub failures:u32,pub last_exit:Option<i32>,#[serde(default)]pub runtime:crate::installation::RuntimeStamp,#[serde(default)]pub upgrade:Option<upgrade::UpgradeStatus>,#[serde(default)]pub upgrade_error:Option<upgrade::Failure>}
+pub struct Status{pub phase:String,pub pid:u32,pub child_pid:Option<u32>,pub updated_at:u64,pub failures:u32,pub last_exit:Option<i32>,#[serde(default)]pub runtime:crate::installation::RuntimeStamp,#[serde(default)]pub upgrade:Option<upgrade::UpgradeStatus>,#[serde(default)]pub upgrade_error:Option<upgrade::Failure>,#[serde(default)]pub maintenance:Option<maintenance::Journal>,#[serde(default)]pub maintenance_error:Option<maintenance::Failure>,#[serde(default)]pub startup_failure:Option<startup_failure::StartupFailure>}
 /// Desired is phone ingress only; stopped may intentionally retain childPid.
 /// Only a fresh, authenticated helper response can confirm the remote gate.
 pub fn remote_phase(enabled:bool,helper:Option<&serde_json::Value>,pid:u32,now:u64)->&'static str {
@@ -72,22 +76,35 @@ pub fn run(state:&Path,agent:&Path,owner_directory:Option<PathBuf>)->Result<()> 
     let mut connectivity=crate::connectivity::ConnectivityManager::new(storage::control(state).join("connectivity"),agent.parent().context("Missing tools directory")?.to_owned())?;
     let mut published:Option<String>=None;
     let mut route_retry=Instant::now();
+    let mut maintenance=maintenance::Gate::default();
+    let mut startup_attempt:Option<startup_failure::Attempt>=None;
+    let agent_generation=agent.parent().and_then(|p|crate::installation::generation(p).ok());
     loop{
         let enabled=storage::desired(state);
+        if let Some(failure)=startup_attempt.as_ref().and_then(|a|a.read(state)){status.startup_failure=Some(failure);}
         if let Some(c)=child.as_mut(){
             if let Some(exit)=c.try_wait()?{status.last_exit=exit.code();child=None;if started.elapsed()>Duration::from_secs(60){status.failures=0};retry=Instant::now()+Duration::from_secs(policy::restart_delay(status.failures));status.failures=status.failures.saturating_add(1);status.phase="restarting".into();}
         }
+        // Maintenance owns only the respawn gate. Retain the live Child and both
+        // supervisor locks: no current agent protocol proves a safe handoff exit.
+        maintenance.poll(state,status.runtime.generation.as_deref(),child.as_ref().map(Child::id));
         // Keep local control and broker alive even with phone ingress disabled.
-        if child.is_none()&&Instant::now()>=retry{
+        if maintenance.respawn_ready(child.is_some(),Instant::now()>=retry){
             let mut c=agent_command(agent,state)?;
-            match c.spawn(){Ok(owned)=>{
+            let operation_id=uuid::Uuid::new_v4().to_string();
+            c.env("POCKET_AGENT_STARTUP_OPERATION_ID",&operation_id).stderr(Stdio::piped());
+            match c.spawn(){Ok(mut owned)=>{
+                startup_attempt=Some(startup_failure::Attempt::new(operation_id,owned.id(),agent_generation.clone(),owned.stderr.take()));
                 started=Instant::now();child=Some(owned);status.phase=if enabled{"starting"}else{"stopping"}.into();
             },Err(_)=>{retry=Instant::now()+Duration::from_secs(policy::restart_delay(status.failures));status.failures=status.failures.saturating_add(1);status.phase="restarting".into();}}
         }
         if let Some(c)=child.as_ref(){
             let helper=helper_status(state).ok();
             status.phase=remote_phase(enabled,helper.as_ref(),c.id(),storage::now()).into();
+            if matches!(status.phase.as_str(),"running"|"stopped"){status.startup_failure=None;}
         }
+        if maintenance.blocks_respawn()&&child.is_none(){status.phase="maintenance".into();}
+        status.maintenance=maintenance.journal.clone();status.maintenance_error=maintenance.error;
         // Corrupt upgrade diagnostics must not drop supervisor ownership while
         // a live agent/native task remains. Surface the failure in the heartbeat.
         match upgrade::read_status(state) {
@@ -96,6 +113,9 @@ pub fn run(state:&Path,agent:&Path,owner_directory:Option<PathBuf>)->Result<()> 
         }
         status.child_pid=child.as_ref().map(Child::id);status.updated_at=storage::now();
         storage::atomic(&control.join("supervisor.json"),&status)?;
+        // Do not republish routes or reconcile/spawn connectivity helpers while
+        // the coordinator owns maintenance or ownership evidence is uncertain.
+        if !maintenance.blocks_respawn(){
         if !enabled {
             let mut request:crate::connectivity::ConnectivityRequest=storage::read(&control.join("connectivity/desired.json")).unwrap_or_default();
             if request.enabled {request.enabled=false;let _=connectivity.configure(request);}
@@ -109,6 +129,7 @@ pub fn run(state:&Path,agent:&Path,owner_directory:Option<PathBuf>)->Result<()> 
                 if publish_tunnel_route(state,agent,endpoint.as_deref()).is_ok(){published=Some(signature);}
             }
             route_retry=Instant::now()+Duration::from_secs(5);
+        }
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -142,6 +163,12 @@ fn updated_tunnel_preferences(mut prefs:serde_json::Value,base:Option<&str>,room
 }
 #[cfg(test)]mod tests{
  use super::*;use serde_json::json;
+ #[test]fn legacy_supervisor_status_has_no_maintenance_claim(){
+  let status:Status=serde_json::from_value(json!({"phase":"running","pid":1,"childPid":2,"updatedAt":100,"failures":0,"lastExit":null})).unwrap();
+  assert!(status.maintenance.is_none());assert!(status.maintenance_error.is_none());
+  let heartbeat=serde_json::to_value(Status{maintenance_error:Some(maintenance::Failure::IdentityUnavailable),..status}).unwrap();
+  assert_eq!(heartbeat["maintenanceError"],"identity_unavailable");assert_eq!(heartbeat["childPid"],2);
+ }
  #[test]fn remote_gate_confirms_pause_without_terminating_agent(){
   let helper=json!({"helperRuntime":{"pid":42},"updatedAt":100,"remoteControlProtocol":1,"remoteEnabled":false});
   assert_eq!(remote_phase(false,Some(&helper),42,100),"stopped");

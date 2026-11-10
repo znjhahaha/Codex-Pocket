@@ -7,6 +7,7 @@ use pocket_agent::{
         routes::{self, GatewayConfig, LanConfig, RoutePolicy, RoutePreferences},
     },
     local, session, storage,
+    startup_diagnostics::{self, Attempt, Phase},
 };
 use pocket_tunnel::ServerIdentity;
 use serde_json::{Value, json};
@@ -148,7 +149,12 @@ async fn main() -> std::process::ExitCode {
     match execute(args).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            if structured {
+            if let Some(failure) = e.downcast_ref::<startup_diagnostics::Failure>() {
+                // Exactly one allowlisted record, including when state cannot be written.
+                if let Ok(record) = failure.0.json() {
+                    eprintln!("{record}");
+                }
+            } else if structured {
                 if let Some(code) = pocket_agent::error::classification(&e) {
                     println!("{}", local::failure(code.as_str(), code.message()));
                 } else {
@@ -262,16 +268,25 @@ async fn execute(args: Args) -> Result<()> {
             println!("{value}");
         }
         "run" => {
-            let _lock = local::try_lock(&state)?.context("Helper already running")?;
-            let c = Config::load(&state)?;
-            let identity = Arc::new(ServerIdentity::load_or_create(state.join("identity"))?);
-            let (broker, events) = Broker::open(c.clone(), state.clone())?;
+            let mut startup = Attempt::current();
+            startup.prepare_state(&state)?;
+            let _lock = startup.lock_agent()?;
+            let c = startup.step(Phase::Config, Config::load(&state))?;
+            let identity = Arc::new(startup.step(
+                Phase::Identity,
+                startup_diagnostics::load_existing_identity(&state),
+            )?);
+            let (broker, events) =
+                startup.step(Phase::Broker, Broker::open(c.clone(), state.clone()))?;
             broker.connection.set_remote_enabled(!args.supervised);
             let controller =
                 routes::Controller::open(state.clone(), c.clone(), broker.connection.clone());
-            let _control =
-                local::Server::start_with_routes(&state, broker.clone(), controller.clone())
-                    .await?;
+            let _control = startup.step(
+                Phase::ControlBind,
+                local::Server::start_with_routes(&state, broker.clone(), controller.clone()).await,
+            )?;
+            let _ = startup.clear_own();
+            drop(startup);
             let mut tasks = tokio::task::JoinSet::new();
             tasks.spawn(broker.clone().discover());
             tasks.spawn(broker.clone().receive_events(events));

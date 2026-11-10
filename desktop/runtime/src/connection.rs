@@ -8,7 +8,29 @@ static OPERATION:AtomicU64=AtomicU64::new(1);
 pub struct OperationError {
     pub code:String,pub stage:String,pub message:String,pub retryable:bool,pub operation_id:String,
     #[serde(skip_serializing_if="Option::is_none")]pub exit_code:Option<i32>,
+    #[serde(skip_serializing_if="Option::is_none")]pub os_code:Option<i32>,
     pub actions:Vec<String>,
+}
+
+#[cfg(test)]
+mod route_failure_tests {
+    use super::*;
+    #[test]
+    fn route_lock_contention_is_actionable_and_keeps_os_code_without_private_text() {
+        let error=anyhow::Error::from(fs2::lock_contended_error()).context("PRIVATE path token");
+        let failure=OperationError::from_error("route_lock",&error);
+        assert_eq!(failure.code,"route_operation_busy");
+        let json=serde_json::to_value(&failure).unwrap();
+        assert_eq!(json["osCode"].as_i64(),fs2::lock_contended_error().raw_os_error().map(i64::from));
+        assert!(!json.to_string().contains("PRIVATE"));
+    }
+    #[test]
+    fn write_and_spawn_failures_do_not_blame_network() {
+        let error=anyhow::anyhow!("PRIVATE low-level error");
+        assert_eq!(OperationError::from_error("route_request_write",&error).code,"route_request_write_failed");
+        let missing=anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(OperationError::from_error("route_apply",&missing).code,"helper_start_failed");
+    }
 }
 impl OperationError {
     pub fn new(stage:&str,code:&str,retryable:bool)->Self {
@@ -23,7 +45,14 @@ impl OperationError {
             "route_not_ready"=>"连接线路还未就绪，请按引导检查网络，再重新检查。",
             "start_required"=>"远程连接已暂停，请先启动连接。",
             "invalid_relay_url"=>"请填写 wss:// 开头的中转基础地址，不要包含账号、令牌或配对房间。",
-            "route_configuration_failed"=>"线路设置未完成，请检查地址和网络后重试。",
+            "route_configuration_failed"=>"线路配置步骤未完成，原因尚未分类。请导出诊断并提供此操作编号。",
+            "route_operation_busy"=>"另一项线路更新正在进行。请稍后重试；当前请求尚未交给助手。",
+            "route_prepare_failed"=>"无法准备本机线路配置目录。请查看本步骤的系统错误码与当前用户权限。",
+            "route_lock_failed"=>"无法取得本机线路配置锁。请查看系统错误码和安装诊断。",
+            "route_request_write_failed"=>"无法写入本机线路配置请求。请检查磁盘空间、文件占用和当前用户权限。",
+            "route_apply_failed"=>"线路配置请求执行失败。请提供操作编号和诊断，确认电脑助手的实际运行状态。",
+            "helper_start_failed"=>"无法启动已安装的电脑助手命令。请检查安装文件是否完整或被安全软件隔离。",
+            "control_invalid_response"=>"电脑助手返回的配置响应无法解析。请导出诊断并核对助手运行代次。",
             "route_read_failed"=>"无法读取运行中助手的线路设置。请检查后台运行代次与控制协议；已有配置未被清空。",
             "control_protocol_unsupported"=>"运行中的旧助手不支持此操作。请在安装与更新中完成后台交接。",
             "control_timeout"=>"本机后台控制请求超时。请检查后台运行状态后重试。",
@@ -41,7 +70,7 @@ impl OperationError {
             _=>"此步骤未完成，请查看连接诊断后重试。",
         };
         Self{code:code.into(),stage:stage.into(),message:message.into(),retryable,
-            operation_id:format!("{}-{}-{}",crate::storage::now(),std::process::id(),OPERATION.fetch_add(1,Ordering::Relaxed)),exit_code:None,
+            operation_id:format!("{}-{}-{}",crate::storage::now(),std::process::id(),OPERATION.fetch_add(1,Ordering::Relaxed)),exit_code:None,os_code:None,
             actions:if retryable {vec!["refresh".into(),"export_diagnostics".into()]}else{vec!["export_diagnostics".into()]}}
     }
     pub fn from_error(stage:&str,error:&anyhow::Error)->Self {
@@ -49,10 +78,15 @@ impl OperationError {
             let mut result=Self::new(stage,failure.code,!matches!(failure.code,"control_unauthorized"|"control_protocol_unsupported"));
             result.exit_code=failure.exit_code;return result;
         }
+        let io=error.downcast_ref::<std::io::Error>();
         let code=if error.downcast_ref::<crate::storage::RedirectedPath>().is_some(){"path_redirected"}
+        else if stage=="route_lock"&&io.is_some_and(|e|e.kind()==std::io::ErrorKind::WouldBlock||e.raw_os_error().is_some()&&e.raw_os_error()==fs2::lock_contended_error().raw_os_error()){ "route_operation_busy" }
         else if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::PermissionDenied){"permission_denied"}
-        else {match stage {"installation"=>"installation_invalid","startup"=>"startup_failed","pairing_payload"=>"pairing_payload_invalid","network"=>"network_detection_failed","routes"=>"route_configuration_failed","routes_read"=>"route_read_failed","connectivity"|"cloudflare"=>"tunnel_failed","ssh"=>"deployment_failed",_=>"helper_unavailable"}};
-        Self::new(stage,code,!matches!(code,"path_redirected"|"installation_invalid"|"permission_denied"))
+        else if stage=="route_apply"&&io.is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound){"helper_start_failed"}
+        else if stage=="route_apply"&&error.downcast_ref::<serde_json::Error>().is_some(){"control_invalid_response"}
+        else {match stage {"installation"=>"installation_invalid","startup"=>"startup_failed","pairing_payload"=>"pairing_payload_invalid","network"=>"network_detection_failed","routes"=>"route_configuration_failed","routes_read"=>"route_read_failed","route_prepare"=>"route_prepare_failed","route_lock"=>"route_lock_failed","route_request_write"=>"route_request_write_failed","route_apply"=>"route_apply_failed","connectivity"|"cloudflare"=>"tunnel_failed","ssh"=>"deployment_failed",_=>"helper_unavailable"}};
+        let mut result=Self::new(stage,code,!matches!(code,"path_redirected"|"installation_invalid"|"permission_denied"));
+        result.os_code=io.and_then(|e|e.raw_os_error());result
     }
 }
 pub fn fresh(timestamp:u64,now:u64)->bool{timestamp>0&&timestamp<=now.saturating_add(2)&&now.saturating_sub(timestamp)<=10}

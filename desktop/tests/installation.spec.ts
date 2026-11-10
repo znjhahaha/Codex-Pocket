@@ -20,7 +20,7 @@ test('same-version different-generation stays pending and control failure keeps 
  await expect(panel.getByText('当前安装已生效',{exact:true})).toHaveCount(1);
  await expect(panel.getByText('等待重启生效',{exact:true})).toHaveCount(1);
  await expect(panel.getByText('尚未核验',{exact:true})).toHaveCount(1);
- await expect(page.getByText('routes_read · control_rejected · 退出码 5')).toBeVisible();
+ await expect(page.getByRole('alert').getByText('routes_read · control_rejected · 退出码 5 · 操作 fixture-operation',{exact:true})).toBeVisible();
  await page.getByRole('button',{name:'重新核验',exact:true}).click();
  await expect(panel.getByText('等待重启生效',{exact:true})).toBeVisible();
 });

@@ -1,12 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod commands;
+mod installed_integrations;
+mod operation_failures;
 #[cfg(test)]
 #[path = "../../runtime/test_support/mod.rs"]
 mod test_support;
 mod deployment;
 mod firewall;
 use tauri::{Manager,Emitter,menu::{Menu,MenuItem},tray::{TrayIconBuilder,TrayIconEvent,MouseButton}};
-fn show(app:&tauri::AppHandle){if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();let _=w.set_focus();}}
+fn show(app:&tauri::AppHandle){
+    if let Some(context)=app.try_state::<commands::Context>(){
+        let context=context.inner().clone();
+        // Manifest/executable verification and spawning must not block window input.
+        tauri::async_runtime::spawn_blocking(move||commands::manual_open(&context));
+    }
+    if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();let _=w.set_focus();}
+}
 fn main(){
     tauri::Builder::default()
       .plugin(tauri_plugin_single_instance::init(|app,args,_|{if !args.iter().any(|a|a=="--background"){show(app)}}))
@@ -38,6 +47,6 @@ fn main(){
         if !args.iter().any(|a|a=="--background"){show(app.handle());}Ok(())
       })
       .on_window_event(|window,event|if let tauri::WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide();})
-      .invoke_handler(tauri::generate_handler![commands::dashboard,commands::request_upgrade,firewall::allow_lan_firewall,commands::set_remote,commands::pair_device,commands::revoke_device,commands::set_startup,commands::export_diagnostics,commands::configure_routes,commands::configure_relay,commands::detect_lan,commands::session_preferences_update,commands::open_codex,commands::configure_connectivity,commands::cloudflare_accounts,commands::cloudflare_zones,commands::setup_fixed,deployment::activate_relay,deployment::inspect_ssh,deployment::preflight_ssh,deployment::deploy_relay,deployment::rollback_relay,deployment::export_relay,deployment::rollback_cloudflare])
+      .invoke_handler(tauri::generate_handler![commands::dashboard,installed_integrations::repair_installed_integration,commands::request_upgrade,firewall::allow_lan_firewall,commands::set_remote,commands::pair_device,commands::revoke_device,commands::set_startup,commands::export_diagnostics,commands::configure_routes,commands::configure_relay,commands::detect_lan,commands::session_preferences_update,commands::open_codex,commands::configure_connectivity,commands::cloudflare_accounts,commands::cloudflare_zones,commands::setup_fixed,deployment::activate_relay,deployment::inspect_ssh,deployment::preflight_ssh,deployment::deploy_relay,deployment::rollback_relay,deployment::export_relay,deployment::rollback_cloudflare])
       .run(tauri::generate_context!()).expect("Could not start Codex Pocket");
 }

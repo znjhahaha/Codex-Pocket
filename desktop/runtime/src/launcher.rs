@@ -24,6 +24,78 @@ pub fn verified_exe(bin:&Path,name:&str)->Result<PathBuf>{
     let bytes=std::fs::read(&path)?;
     if entry["sha256"]!=format!("{:x}",Sha256::digest(&bytes))||entry["bytes"].as_u64()!=Some(bytes.len() as u64){bail!("Installed executable failed integrity check")};Ok(path)
 }
+/// Start local control independently of optional Windows logon registration.
+/// This acknowledges process creation only; the authenticated heartbeat and
+/// installation report remain the authority for readiness and running generation.
+pub fn start_supervisor(bin:&Path,state:&Path)->Result<()> {
+    let mut command=supervisor_command(bin,state)?;
+    command.spawn().context("Could not start Pocket supervisor")?;
+    Ok(())
+}
+fn supervisor_command(bin:&Path,state:&Path)->Result<Command> {
+    storage::unredirected(state)?;
+    // A launch must never initialize missing state or replace an existing identity.
+    let config:Value=storage::read(&state.join("config.json"))?;
+    if !config.is_object(){bail!("Invalid Pocket configuration")}
+    verified_exe(bin,"pocket-agent.exe")?;
+    let mut command=Command::new(verified_exe(bin,"pocket-supervisor.exe")?);
+    command.arg("--state").arg(state);
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    process::hidden(&mut command);
+    // The supervisor's user and state locks reject duplicate launches. Do not
+    // attach it or its native descendants to a kill-on-close job.
+    Ok(command)
+}
+
+#[cfg(test)]
+mod local_start_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    fn fixture()->(tempfile::TempDir,PathBuf,PathBuf) {
+        let root=crate::test_support::tempdir();
+        let bin=root.path().join("installed");let state=root.path().join("中文 state");
+        fs::create_dir(&bin).unwrap();fs::create_dir(&state).unwrap();
+        let mut files=Vec::new();
+        for name in ["pocket-supervisor.exe","pocket-agent.exe"] {
+            let bytes=format!("fixture {name}").into_bytes();
+            files.push(json!({"path":name,"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}));
+            fs::write(bin.join(name),bytes).unwrap();
+        }
+        storage::atomic(&bin.join("windows-manifest.json"),&json!({"files":files})).unwrap();
+        storage::atomic(&state.join("config.json"),&json!({"fixture":true})).unwrap();
+        (root,bin,state)
+    }
+    #[test]
+    fn manual_control_start_does_not_require_or_change_logon_task_or_remote_preference() {
+        let (_root,bin,state)=fixture();
+        let config=fs::read(state.join("config.json")).unwrap();
+        // Fresh installation: no desktop state, scheduled-task receipt or desired flag.
+        let command=supervisor_command(&bin,&state).unwrap();
+        assert_eq!(command.get_program(),bin.join("pocket-supervisor.exe"));
+        assert_eq!(command.get_args().collect::<Vec<_>>(),vec![std::ffi::OsStr::new("--state"),state.as_os_str()]);
+        assert!(!state.join("desktop").exists());
+        storage::set_desired(&state,false).unwrap();
+        let desired=fs::read(state.join("desktop/desired.json")).unwrap();
+        for _ in 0..2 {supervisor_command(&bin,&state).unwrap();}
+        assert_eq!(fs::read(state.join("desktop/desired.json")).unwrap(),desired);
+        assert_eq!(fs::read(state.join("config.json")).unwrap(),config);
+    }
+    #[test]
+    fn local_start_refuses_missing_state_and_tampered_components() {
+        let (_root,bin,state)=fixture();
+        fs::remove_file(state.join("config.json")).unwrap();
+        assert!(supervisor_command(&bin,&state).is_err());
+        assert!(!state.join("config.json").exists());
+        storage::atomic(&state.join("config.json"),&json!({"fixture":true})).unwrap();
+        for name in ["pocket-agent.exe","pocket-supervisor.exe"] {
+            let path=bin.join(name);let original=fs::read(&path).unwrap();
+            fs::write(&path,b"changed").unwrap();
+            assert!(supervisor_command(&bin,&state).is_err());
+            fs::write(path,original).unwrap();
+        }
+    }
+}
 pub fn current_package()->Result<Value>{
     let mut cmd=Command::new(storage::powershell());
     cmd.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop';$p=Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1;if(!$p){throw 'Codex not installed'};@{location=$p.InstallLocation;family=$p.PackageFamilyName}|ConvertTo-Json -Compress"#]);

@@ -1,0 +1,8 @@
+.optional-integrations{margin:20px 0;padding-top:20px;border-top:1px solid var(--line)}
+.optional-integrations>p{margin:9px 0;font-size:13px;overflow-wrap:anywhere}
+.optional-integration{align-items:flex-start;flex-wrap:wrap;gap:12px}
+.optional-integration>div{flex:1;min-width:180px;overflow-wrap:anywhere}
+.optional-integration details{margin-top:6px;font-size:12px}
+.optional-integration summary{cursor:pointer;color:var(--muted)}
+.optional-integration details small{display:block;margin-top:6px}
+.optional-integrations button:disabled{opacity:.5;cursor:not-allowed}

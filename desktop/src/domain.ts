@@ -1,11 +1,22 @@
 export type Theme = 'system'|'light'|'dark';
 export interface Device {id:string;name:string;createdAt?:number;lastSeenAt?:number;revoked?:boolean}
 export interface ProcessInfo {name:string;pid?:number;state:string;version?:string;bridgeVersion?:string;helperVersion?:string;bridgeUpdatePending?:boolean}
-export interface OperationError {code:string;stage:string;message:string;retryable:boolean;operationId:string;exitCode?:number;actions?:string[]}
+export interface OperationError {code:string;stage:string;message:string;retryable:boolean;operationId:string;exitCode?:number;osCode?:number;actions?:string[]}
+export interface OperationFailure {code:string;stage:string;operationId:string;exitCode?:number|null;osCode?:number|null;recordedAt:number}
+export interface StartupFailure {schema:number;operationId:string;pid:number;runtimeGeneration?:string|null;time:number;phase:string;code:string;osCode?:number|null}
+export function diagnosticRuntimeStatus(s:Snapshot,kind:'supervisor'|'helper',now:number) {
+ if(s.issues?.some(e=>e.stage===(kind==='supervisor'?'supervisor_read':'helper_control')))return {label:'状态读取失败',good:false};
+ const evidence=s.installation?.[kind];
+ const updated=kind==='supervisor'?s.supervisor.updatedAt:s.connection?.helperUpdatedAt||0;
+ return evidence?.runningVerified&&freshHeartbeat(updated,now)?{label:'运行中',good:true}:{label:'尚未取得状态',good:false};
+}
+export function operationDetails(e:{code:string;stage:string;operationId:string;exitCode?:number|null;osCode?:number|null}) {
+ return `${e.stage} · ${e.code}${typeof e.osCode==='number'?` · OS ${e.osCode}`:''}${typeof e.exitCode==='number'?` · 退出码 ${e.exitCode}`:''} · 操作 ${e.operationId}`;
+}
 export interface InstalledComponent {version?:string;generation?:string;pid?:number;controlProtocol?:number;runningVerified?:boolean;state:'current'|'restart_required'|'unverified'}
 export interface UpgradeStatus {operationId:string;phase:string;failure?:string;updatedAt:number;fromGeneration?:string;toGeneration?:string}
-export interface InstallationStatus {consistent:boolean;installedVersion?:string;installedGeneration?:string;ui?:InstalledComponent;supervisor?:InstalledComponent;helper?:InstalledComponent;restartRequired?:boolean;upgrade?:UpgradeStatus}
-export interface Snapshot {computerName:string; desired:boolean;supervisor:{phase:string;pid?:number;childPid?:number;updatedAt:number;failures:number};relay:{state:string;host:string};devices:Device[];processes:ProcessInfo[];version:string;error?:string;startup:boolean;routes?:RouteReport;cloudflareReceipt?:{phase:string;operationId:string;hostname?:string;tunnelId?:string;lastError?:string};connectivity?:ConnectivityStatus;sessionPreferences?:{defaultMode:string;revision:number};helperVersion?:string;connection?:{phase:string;helperUpdatedAt:number;connected:boolean;available?:boolean;authenticatedPhone?:boolean;configuredRoutes?:number|null;usableRoutes?:number;readyRouteIds?:string[];lastSuccessAt?:number|null;desiredChangedAt?:number};installation?:InstallationStatus;issues?:OperationError[]}
+export interface InstallationStatus {consistent:boolean;installedVersion?:string;installedGeneration?:string;ui?:InstalledComponent;supervisor?:InstalledComponent;helper?:InstalledComponent;restartRequired?:boolean;upgrade?:UpgradeStatus;optionalIntegrations?:import('./installedRepair').OptionalIntegrations}
+export interface Snapshot {computerName:string; desired:boolean;supervisor:{phase:string;pid?:number;childPid?:number;updatedAt:number;failures:number;startupFailure?:StartupFailure|null};relay:{state:string;host:string};devices:Device[];processes:ProcessInfo[];version:string;error?:string;startup:boolean;startupStatus?:"pending"|"known"|"unknown";routes?:RouteReport;cloudflareReceipt?:{phase:string;operationId:string;hostname?:string;tunnelId?:string;lastError?:string};connectivity?:ConnectivityStatus;sessionPreferences?:{defaultMode:string;revision:number};helperVersion?:string;connection?:{phase:string;helperUpdatedAt:number;connected:boolean;available?:boolean;authenticatedPhone?:boolean;configuredRoutes?:number|null;usableRoutes?:number;readyRouteIds?:string[];lastSuccessAt?:number|null;desiredChangedAt?:number};installation?:InstallationStatus;issues?:OperationError[];operationFailures?:OperationFailure[]}
 export interface Pairing {payload:string;expiresAt:number;baselineIds:string[]}
 export const remainingSeconds=(expires:number,now:number)=> Math.max(0, Math.ceil(expires-now));
 export function pairingComplete(pair:Pairing, devices:Device[]) {return devices.some(d=>!d.revoked&&!pair.baselineIds.includes(d.id));}

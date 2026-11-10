@@ -10,11 +10,15 @@ param(
     [switch]$Uninstall,
     [switch]$Rollback,
     [switch]$Initialize,
-    [ValidateSet('Preserve','Enable','Disable')][string]$UiStartup='Preserve'
+    [ValidateSet('Preserve','Enable','Disable')][string]$UiStartup='Preserve',
+    [string]$RepairStep,
+    [string]$OperationId,
+    [string]$ExpectedGeneration,
+    [switch]$CheckRepair
 )
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 # Read-only Setup probe, before identity creation or OS integration.
-if ($CheckWebViewOnly) { if (Test-PocketWebView2) { exit 0 }; exit 42 }
+if ($CheckWebViewOnly -and -not ($PSBoundParameters.ContainsKey('RepairStep') -or $PSBoundParameters.ContainsKey('OperationId') -or $PSBoundParameters.ContainsKey('ExpectedGeneration') -or $PSBoundParameters.ContainsKey('CheckRepair'))) { if (Test-PocketWebView2) { exit 0 }; exit 42 }
 
 function Get-PocketIdentityAcl([string]$Path,[bool]$IsDirectory) {
     Assert-PocketPlainPath $Path
@@ -257,6 +261,8 @@ function Assert-PocketSnapshot($Snapshot,[string]$Manifest,[string[]]$Links) {
     }
 }
 function Restore-PocketTransaction($Journal,[string]$Manifest,[string[]]$Links,[string]$Launcher) {
+    $repair=Get-PocketProperty $Journal 'repair' $null
+    if ($null -ne $repair) { Assert-PocketRepairScope $Journal $Manifest $Links $Launcher $repair.step $repair.operationId $repair.expectedGeneration }
     Assert-PocketSnapshot $Journal.before $Manifest $Links
     Assert-PocketSnapshot $Journal.after $Manifest $Links
     if ((Get-PocketProperty $Journal 'taskManaged' $true) -isnot [bool] -or (Get-PocketProperty $Journal 'optionalIntegration' $false) -isnot [bool]) { throw 'Invalid recovery integration flags.' }
@@ -286,6 +292,7 @@ function Restore-PocketTransaction($Journal,[string]$Manifest,[string[]]$Links,[
     }
     if ($cli -ne $Journal.before.cli -or $kind -ne $beforeKind) { Set-PocketUserCliPath $Journal.before.cli $beforeKind; Send-PocketEnvironmentChanged }
     if ((Get-PocketFileHash $Manifest) -ne $Journal.before.manifest.hash) { Write-PocketBackup $Journal.before.manifest }
+    if($null -ne $repair){Sync-PocketRepairFile $Manifest}
 }
 function Set-PocketProperty($Value,[string]$Name,$Content) {
     if ($Value -is [Collections.IDictionary]) { $Value[$Name]=$Content }
@@ -319,12 +326,24 @@ function Get-PocketRecordBackup($Record,[string]$Path) {
     $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record | ConvertTo-Json -Depth 30))
     return @{path=$Path;bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
 }
-function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[string]$Manifest,[string[]]$Links,[string]$Launcher,[switch]$TaskManaged,[switch]$Optional) {
+function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[string]$Manifest,[string[]]$Links,[string]$Launcher,[switch]$TaskManaged,[switch]$Optional,
+    [string]$RepairStep,[string]$OperationId,[string]$ExpectedGeneration) {
     $journal=@{before=$Before;after=$After;taskManaged=[bool]$TaskManaged;optionalIntegration=[bool]$Optional}
-    Write-PocketJson $JournalPath $journal
+    if ($RepairStep) {
+        $journal.repair=@{step=$RepairStep;operationId=$OperationId;expectedGeneration=$ExpectedGeneration}
+        Assert-PocketRepairScope $journal $Manifest $Links $Launcher $RepairStep $OperationId $ExpectedGeneration
+        for($i=0;$i -lt $Links.Count;$i++){
+            if((Get-PocketFileHash $Links[$i]) -cne $Before.links[$i].hash){throw 'Integration changed before scoped publication.'}
+        }
+    }
+    if($RepairStep){Write-PocketRepairDurableJson $JournalPath $journal}else{Write-PocketJson $JournalPath $journal}
     try {
         for($i=0;$i -lt $After.links.Count;$i++) {
             $backup=$After.links[$i]
+            if($RepairStep -and $RepairStep -cne ('shortcut_'+$i)){
+                if((Get-PocketFileHash $backup.path) -cne $backup.hash){throw 'Unselected shortcut changed during scoped publication.'}
+                continue
+            }
             if ((Get-PocketFileHash $backup.path) -ne $backup.hash) {
                 Invoke-PocketInstallStep 'shortcut_publish' 'Write-PocketBackup' { Write-PocketBackup $backup -ExpectedHash $Before.links[$i].hash -Compare } | Out-Null
             }
@@ -344,6 +363,7 @@ function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[st
             Invoke-PocketInstallStep 'installation_publish' 'Write-PocketBackup' { Write-PocketBackup $After.manifest } | Out-Null
         }
         if ((Get-PocketFileHash $Manifest) -ne $After.manifest.hash) { throw 'Installation publication integrity check failed.' }
+        if($RepairStep){Sync-PocketRepairFile $Manifest}
         [IO.File]::Delete($JournalPath)
         return @{succeeded=$true;recoveryPending=$false}
     } catch {
@@ -353,8 +373,315 @@ function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[st
         if (-not $Optional) { throw $failure }
         $journal.failure=Get-PocketOptionalFailure $failure 'integration' 'integration_apply_failed' 'Invoke-PocketInstallTransaction'
         if ($failure.Exception.Data['PocketStage'] -eq 'installation_publish') { $failure.Exception.Data['PocketCoreFailure']=$true; throw $failure }
-        if ($pending) { Write-PocketJson $JournalPath $journal }
+        if ($pending) { if($RepairStep){Write-PocketRepairDurableJson $JournalPath $journal}else{Write-PocketJson $JournalPath $journal} }
         return @{succeeded=$false;failure=$failure;recoveryPending=$pending}
+    }
+}
+function Test-PocketRepairValueEqual($Left,$Right) {
+    if ($null -eq $Left -or $null -eq $Right) { return $null -eq $Left -and $null -eq $Right }
+    # Provider-returned strings may have a PSObject wrapper and satisfy
+    # "-is [pscustomobject]". Compare scalar values before JSON object shapes.
+    if($Left -is [string] -or $Left -is [ValueType]){
+        return $Left.GetType() -eq $Right.GetType() -and $Left -ceq $Right
+    }
+    if ($Left -is [Collections.IDictionary] -or $Left -is [pscustomobject]) {
+        if ($Right -isnot [Collections.IDictionary] -and $Right -isnot [pscustomobject]) { return $false }
+        $names=@(if($Left -is [Collections.IDictionary]){$Left.Keys}else{$Left.PSObject.Properties.Name})
+        $other=@(if($Right -is [Collections.IDictionary]){$Right.Keys}else{$Right.PSObject.Properties.Name})
+        if (($names|Sort-Object|ConvertTo-Json -Compress) -cne ($other|Sort-Object|ConvertTo-Json -Compress)) { return $false }
+        foreach($name in $names) { if (-not (Test-PocketRepairValueEqual (Get-PocketProperty $Left $name $null) (Get-PocketProperty $Right $name $null))) { return $false } }
+        return $true
+    }
+    if ($Left -is [array]) {
+        if ($Right -isnot [array] -or $Left.Count -ne $Right.Count) { return $false }
+        for($i=0;$i -lt $Left.Count;$i++){if(-not (Test-PocketRepairValueEqual $Left[$i] $Right[$i])){return $false}}
+        return $true
+    }
+    return $Left -ceq $Right
+}
+function Read-PocketRepairJson([string]$Path,[long]$Limit=1MB) {
+    Assert-PocketUnredirectedPath $Path
+    $file=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        if($file.Length -gt $Limit){throw 'Bounded repair record exceeds limit.'}
+        $reader=[IO.StreamReader]::new($file,[Text.Encoding]::UTF8,$true)
+        try { return $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    } finally { $file.Dispose() }
+}
+function Sync-PocketRepairFile([string]$Path) {
+    Assert-PocketUnredirectedPath $Path
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
+    try{$stream.Flush($true)}finally{$stream.Dispose()}
+}
+function Write-PocketRepairDurableJson([string]$Path,$Value) {
+    Write-PocketJson $Path $Value
+    Sync-PocketRepairFile $Path
+}
+function Assert-PocketRepairScope($Journal,[string]$Manifest,[string[]]$Links,[string]$Launcher,[string]$Step,[string]$Id,[string]$Generation) {
+    if ($Step -cnotin @('shortcut_0','shortcut_1','shortcut_2','startup') -or $Generation -cnotmatch '^[a-f0-9]{64}$' -or
+        $Id -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$' -or
+        (Get-PocketProperty $Journal 'optionalIntegration' $false) -ne $true -or
+        (Get-PocketProperty $Journal 'taskManaged' $false) -ne ($Step -eq 'startup')) { throw 'Repair journal is outside selected scope.' }
+    $binding=Get-PocketProperty $Journal 'repair' $null
+    if($null -ne $binding -and ($binding.step -cne $Step -or $binding.operationId -cne $Id -or $binding.expectedGeneration -cne $Generation)){throw 'Repair journal binding mismatch.'}
+    Assert-PocketSnapshot $Journal.before $Manifest $Links
+    Assert-PocketSnapshot $Journal.after $Manifest $Links
+    foreach($snapshot in @($Journal.before,$Journal.after)){
+        if($null -eq $snapshot.manifest.bytes -or ([Convert]::FromBase64String($snapshot.manifest.bytes)).Length -gt 1MB){throw 'Repair record exceeds the stable launcher limit.'}
+    }
+    if($Journal.before.cli -cne $Journal.after.cli -or $Journal.before.cliKind -cne $Journal.after.cliKind -or $Journal.before.cli -cne $Launcher -or $Journal.before.cliKind -cne 'String'){throw 'Repair cannot change CLI environment.'}
+    for($i=0;$i -lt 3;$i++){
+        if($Step -cne ('shortcut_'+$i) -and -not (Test-PocketRepairValueEqual $Journal.before.links[$i] $Journal.after.links[$i])){throw 'Repair journal contains another shortcut mutation.'}
+    }
+    if($Step -ne 'startup' -and (-not (Test-PocketRepairValueEqual $Journal.before.task $Journal.after.task) -or $Journal.before.taskKnown -ne $Journal.after.taskKnown)){throw 'Repair journal contains a task mutation.'}
+    $before=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Journal.before.manifest.bytes))|ConvertFrom-Json
+    $after=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Journal.after.manifest.bytes))|ConvertFrom-Json
+    foreach($record in @($before,$after)){
+        if($record.version -ne 3 -or $record.generation -cne $Generation -or $record.releaseHash -cne $Generation -or
+            $record.bridge -cne $Launcher -or $record.installRoot -cne [IO.Path]::GetDirectoryName($Manifest) -or $record.coreInstalled -ne $true -or
+            $record.shortcuts.Count -ne 3 -or $record.integration.shortcuts.Count -ne 3){throw 'Repair journal has an invalid committed core.'}
+    }
+    # Derive the only permitted after-record from the before-record. No generic
+    # restoration is authorized until every other field and integration is equal.
+    if($Step -eq 'startup'){
+        $before.integration.startup=$after.integration.startup
+        if(-not $before.previousTaskKnown){
+            if(-not $after.previousTaskKnown -or $after.previousTask -cne $Journal.before.task){throw 'Invalid original task capture.'}
+            $before.previousTask=$after.previousTask;$before.previousTaskKnown=$true
+        }
+        if($null -ne $before.rollback -and -not (Get-PocketProperty $before.rollback 'taskKnown' $true)){
+            if(-not $after.rollback.taskKnown -or $after.rollback.task -cne $Journal.before.task){throw 'Invalid rollback task capture.'}
+            Set-PocketProperty $before.rollback 'task' $after.rollback.task;Set-PocketProperty $before.rollback 'taskKnown' $true
+        }
+        if(-not $Journal.before.taskKnown -or -not $Journal.after.taskKnown){throw 'Repair cannot restore unknown task state.'}
+        Assert-PocketTaskOwned $Journal.before.task $Launcher
+        Assert-PocketTaskOwned $Journal.after.task $Launcher
+    }else{
+        $slot=[int]$Step.Substring(9)
+        $before.integration.shortcuts[$slot]=$after.integration.shortcuts[$slot]
+        $before.shortcuts[$slot].installed=$after.shortcuts[$slot].installed
+        $before.shortcuts[$slot].installedHash=$after.shortcuts[$slot].installedHash
+        if($after.shortcuts[$slot].installedHash -cne $Journal.after.links[$slot].hash -or $after.shortcuts[$slot].installed -cne $Journal.after.links[$slot].bytes){throw 'Invalid selected shortcut publication.'}
+    }
+    Update-PocketInstallState $before
+    if(-not (Test-PocketRepairValueEqual $before $after)){throw 'Repair journal changes unrelated installation metadata.'}
+}
+function New-PocketRepairResult([string]$Id,[string]$Step,[string]$Generation,[string]$State,[string]$Code,[string]$Stage='repair_preflight',[string]$Call='Invoke-PocketIntegrationRepair',$HResult=$null,[string]$Recovery='clear',[bool]$Core=$false) {
+    return [ordered]@{schemaVersion=1;action='repair_integration';operationId=$Id;step=$Step;expectedGeneration=$Generation;state=$State;code=$Code;stage=$Stage;call=$Call;hresult=$HResult;recoveryState=$Recovery;retryable=($State -in @('busy','recovery-needed','unknown'));coreInstalled=$Core;runtimeVerification='pending';processesStarted=0;processesStopped=0;exitCode=$(switch($State){'completed'{0}'recovery-needed'{2}'unknown'{3}'busy'{4}default{1}})}
+}
+function ConvertTo-PocketPublicRepairResult($Result) {
+    # Never return a caller-controlled record or exception object verbatim.
+    $id=Get-PocketProperty $Result 'operationId' ''
+    if($id -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'){$id=''}
+    $step=Get-PocketProperty $Result 'step' '';if($step -notin @('shortcut_0','shortcut_1','shortcut_2','startup')){$step=''}
+    $generation=Get-PocketProperty $Result 'expectedGeneration' '';if($generation -cnotmatch '^[a-f0-9]{64}$'){$generation=''}
+    $state=Get-PocketProperty $Result 'state' 'unknown';if($state -notin @('completed','failed','recovery-needed','unknown','busy')){$state='unknown'}
+    $code=Get-PocketProperty $Result 'code' 'operation_unknown'
+    if($code -notin @('integration_completed','integration_already_completed','invalid_params','generation_changed','installation_unverified','path_unverified','integration_drift','operation_conflict','operation_busy','operation_unknown','integration_repair_failed','integration_recovery_needed','operation_record_failed')){$code='operation_unknown'}
+    $stage=Get-PocketProperty $Result 'stage' 'repair_preflight'
+    if($stage -notin @('repair_preflight','repair_paths','repair_verify','repair_lock','repair_operation','repair_recovery','integration_read','shortcut','shortcut_verify','shortcut_publish','startup_read','startup_ownership','startup_register','startup_compare','installation_publish','rollback')){$stage='repair_preflight'}
+    $call=Get-PocketProperty $Result 'call' 'Invoke-PocketIntegrationRepair'
+    if($call -notin @('Invoke-PocketIntegrationRepair','Assert-PocketUnredirectedPath','Assert-PocketRepairInstalled','Mutex.WaitOne','Read-PocketRepairJson','Write-PocketJson','Restore-PocketTransaction','Invoke-PocketInstallTransaction','Get-PocketIntegrationSnapshot','New-PocketShortcutBytes','Initialize-PocketShellLink','IShellLinkW/IPersistFile.Save','IPersistFile.Save','IPersistFile.Load/GetPath/GetArguments/GetIconLocation','Write-PocketBackup','Assert-PocketTaskOwned','Get-PocketTaskXml','Set-PocketTaskXml','CoCreateInstance(Schedule.Service)','ITaskService.Connect','ITaskService.GetFolder','ITaskFolder.GetTask','IRegisteredTask.Xml','ITaskFolder.RegisterTask','ITaskFolder.DeleteTask','ITaskService.NewTask','ITaskDefinition.XmlText(left)','ITaskDefinition.XmlText(right)')){$call='Invoke-PocketIntegrationRepair'}
+    $hr=Get-PocketProperty $Result 'hresult' $null;if($hr -cnotmatch '^0x[0-9A-F]{8}$'){$hr=$null}
+    $recovery=Get-PocketProperty $Result 'recoveryState' 'unknown';if($recovery -notin @('clear','pending','unknown')){$recovery='unknown'}
+    return New-PocketRepairResult $id $step $generation $state $code $stage $call $hr $recovery ((Get-PocketProperty $Result 'coreInstalled' $false) -eq $true)
+}
+function Assert-PocketRepairInstalled($Record,$Context,[string]$Generation,[Collections.Generic.List[IDisposable]]$Handles) {
+    $root=$Context.InstallRoot;$launcher=Join-Path $root 'pocket-launcher.exe'
+    if($Record.version -ne 3 -or $Record.singleEntry -ne $true -or $Record.coreInstalled -ne $true -or
+        $Record.installRoot -cne $root -or $Record.bridge -cne $launcher -or $Record.releaseHash -cne $Record.generation -or
+        $Record.generation -cnotmatch '^[a-f0-9]{64}$' -or $Record.launcherHash -cnotmatch '^[a-f0-9]{64}$' -or
+        $Record.shortcuts.Count -ne 3 -or $Record.integration.shortcuts.Count -ne 3 -or
+        $Record.integration.startup.state -notin @('pending','completed') -or
+        @($Record.integration.shortcuts|Where-Object{$_.state -notin @('pending','completed')}).Count -gt 0 -or
+        $Record.startupPreference -notin @('Preserve','Enable','Disable') -or $Record.previousTaskKnown -isnot [bool]){throw 'Invalid installed repair record.'}
+    if($Record.generation -cne $Generation){throw 'Requested generation changed.'}
+    $bin=Join-Path $root ('bin\'+$Generation)
+    $payload=Read-PocketRepairJson (Join-Path $bin 'windows-manifest.json')
+    # Inventory names are closed before opening any record-supplied file path.
+    Test-PocketInventory $bin $payload (Get-PocketWindowsFiles) 'windows-manifest.json' | Out-Null
+    foreach($path in @($launcher,(Join-Path $bin 'windows-manifest.json'))+@((Get-PocketWindowsFiles)|ForEach-Object{Join-Path $bin $_})){
+        Assert-PocketUnredirectedPath $path
+        $Handles.Add([IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read))
+    }
+    Test-PocketWindowsDirectory $bin | Out-Null
+    if((Get-PocketFileHash (Join-Path $bin 'windows-manifest.json')) -cne $Generation -or (Get-PocketFileHash $launcher) -cne $Record.launcherHash){throw 'Current core hash verification failed.'}
+    $state=Get-PocketDirectoryPath $Record.stateDirectory
+    if($state -cne $Record.stateDirectory -or ($state+'\').StartsWith((Join-Path $root 'bin')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Invalid installed state path.'}
+    Assert-PocketUnredirectedPath $state
+    Assert-PocketInitializedState $state
+    if((Get-PocketUserCliPath) -cne $launcher -or (Get-PocketUserCliKind) -cne 'String'){throw 'Current CLI environment is not the committed launcher.'}
+    $links=@((Join-Path $Context.Programs 'Codex Pocket.lnk'),(Join-Path $Context.Programs 'Codex Pocket Desktop.lnk'),(Join-Path $Context.Startup 'Codex Pocket.lnk'))
+    for($i=0;$i -lt 3;$i++){
+        if($Record.shortcuts[$i].path -cne $links[$i]){throw 'Invalid fixed shortcut path.'}
+        foreach($kind in @('original','installed')){Assert-PocketBackup @{bytes=$Record.shortcuts[$i].$kind;hash=$Record.shortcuts[$i].($kind+'Hash')}}
+    }
+    $check=$Record|ConvertTo-Json -Depth 30|ConvertFrom-Json;Update-PocketInstallState $check
+    if($Record.installationState -cne $check.installationState -or $Record.runtimeVerification -cne 'pending'){throw 'Invalid installed integration state.'}
+    $icon=Join-Path $root ('resources\'+(Get-PocketFileHash (Join-Path $bin 'codex-pocket.ico'))+'\codex-pocket.ico')
+    Assert-PocketUnredirectedPath $icon
+    $Handles.Add([IO.File]::Open($icon,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read))
+    if((Get-PocketFileHash $icon) -cne (Get-PocketFileHash (Join-Path $bin 'codex-pocket.ico'))){throw 'Existing stable icon failed verification.'}
+    return @{Bin=$bin;Launcher=$launcher;Links=$links;Icon=$icon}
+}
+function Invoke-PocketIntegrationRepair {
+    [CmdletBinding()]
+    param([string]$RepairStep,[string]$OperationId,[string]$ExpectedGeneration,[switch]$CheckRepair,[hashtable]$Context)
+    $ErrorActionPreference='Stop'
+    $operation=$null;$operationPath=$null;$owns=$false;$mutex=$null;$core=$false;$code='path_unverified';$stage='repair_paths';$call='Assert-PocketUnredirectedPath'
+    $handles=[Collections.Generic.List[IDisposable]]::new()
+    if($RepairStep -cnotin @('shortcut_0','shortcut_1','shortcut_2','startup') -or
+        $OperationId -notmatch '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$' -or
+        $ExpectedGeneration -cnotmatch '^[a-f0-9]{64}$'){
+        return ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'invalid_params')
+    }
+    $OperationId=$OperationId.ToLowerInvariant()
+    $fixture=$null -ne $Context
+    $journalPath=$null
+    try {
+        if(-not $Context){$Context=@{InstallRoot=(Join-Path (Get-PocketLocalAppData) 'CodexPocket');Programs=[Environment]::GetFolderPath('Programs');Startup=[Environment]::GetFolderPath('Startup')}}
+        foreach($name in @('InstallRoot','Programs','Startup')){
+            $path=Get-PocketDirectoryPath $Context[$name];if($path -cne $Context[$name]){throw 'Repair requires canonical fixed paths.'}
+            Assert-PocketUnredirectedPath $path
+        }
+        $root=$Context.InstallRoot;$manifest=Join-Path $root 'desktop-install.json';$journalPath=Join-Path $root 'installation-pending.json'
+        $operationDirectory=Join-Path $root 'integration-repair-operations';$operationPath=Join-Path $operationDirectory ($OperationId+'.json')
+        foreach($path in @($manifest,$journalPath,$operationPath)){Assert-PocketUnredirectedPath $path}
+        $stage='repair_lock';$call='Mutex.WaitOne';$code='operation_busy'
+        $mutex=[Threading.Mutex]::new($false,('Local\CodexPocketInstall_'+(Get-PocketBytesHash ([Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())))))
+        try{$owns=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$owns=$true}
+        if(-not $owns){return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'busy' 'operation_busy' $stage $call}
+        $stage='repair_verify';$call='Assert-PocketRepairInstalled';$code='installation_unverified'
+        $record=Read-PocketRepairJson $manifest
+        if($record.generation -cne $ExpectedGeneration){return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'generation_changed' $stage $call}
+        $installed=Assert-PocketRepairInstalled $record $Context $ExpectedGeneration $handles;$core=$true
+        if(-not $fixture -and (Get-PocketDirectoryPath $PSScriptRoot) -cne $installed.Bin){throw 'Repair must execute the current installed script.'}
+        $launcher=$installed.Launcher;$links=$installed.Links
+        $stage='repair_operation';$call='Read-PocketRepairJson';$code='operation_record_failed'
+        if([IO.File]::Exists($operationPath)){
+            $operation=Read-PocketRepairJson $operationPath
+            if($operation.schemaVersion -ne 1 -or $operation.operationId -cne $OperationId -or $operation.step -cne $RepairStep -or $operation.expectedGeneration -cne $ExpectedGeneration){
+                $operation=$null;return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'operation_conflict' $stage $call $null 'clear' $core
+            }
+            if($operation.phase -notin @('running','prepared','terminal')){throw 'Invalid operation phase.'}
+            if($operation.beforeHash -cnotmatch '^[a-f0-9]{64}$' -or ($operation.phase -eq 'prepared' -and $operation.afterHash -cnotmatch '^[a-f0-9]{64}$')){throw 'Invalid operation integrity binding.'}
+            if($operation.phase -eq 'terminal' -and ($operation.result.operationId -cne $OperationId -or $operation.result.step -cne $RepairStep -or $operation.result.expectedGeneration -cne $ExpectedGeneration)){throw 'Invalid terminal result binding.'}
+        }
+        if($CheckRepair -and $null -eq $operation){
+            if([IO.File]::Exists($journalPath)){return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'recovery-needed' 'integration_recovery_needed' 'repair_recovery' 'Read-PocketRepairJson' $null 'pending' $core}
+            return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'unknown' 'operation_unknown' 'repair_operation' 'Read-PocketRepairJson' $null 'clear' $core
+        }
+        $stage='repair_recovery';$call='Restore-PocketTransaction';$code='integration_recovery_needed'
+        if([IO.File]::Exists($journalPath)){
+            try{
+                if($null -ne $operation -and $operation.phase -eq 'terminal'){throw 'Terminal operation cannot authorize a new rollback.'}
+                $journal=Read-PocketRepairJson $journalPath 8MB
+                Assert-PocketRepairScope $journal $manifest $links $launcher $RepairStep $OperationId $ExpectedGeneration
+                if($null -eq $operation){
+                    # A safely targeted legacy journal is still a mutation. Bind
+                    # it durably before rollback and finish this ID as rolled back.
+                    Assert-PocketUnredirectedPath $operationDirectory -ProbeWrite
+                    [void][IO.Directory]::CreateDirectory($operationDirectory)
+                    $operation=@{schemaVersion=1;operationId=$OperationId;step=$RepairStep;expectedGeneration=$ExpectedGeneration;phase='prepared';beforeHash=$journal.before.manifest.hash;afterHash=$journal.after.manifest.hash;result=$null}
+                    Write-PocketRepairDurableJson $operationPath $operation
+                    Set-PocketProperty $journal 'repair' @{step=$RepairStep;operationId=$OperationId;expectedGeneration=$ExpectedGeneration}
+                    Write-PocketRepairDurableJson $journalPath $journal
+                }
+                # Prove all actual files are still one of the journal endpoints
+                # before allowing the existing rollback to touch anything.
+                Restore-PocketTransaction $journal $manifest $links $launcher | Out-Null
+                [IO.File]::Delete($journalPath)
+            }catch{
+                $failure=Get-PocketOptionalFailure $_ $stage $code $call
+                return ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'recovery-needed' $code $failure.stage $failure.call $failure.hresult 'pending' $core)
+            }
+            if($null -ne $operation -and $operation.phase -ne 'terminal'){
+                $original=Get-PocketProperty $journal 'failure' $null
+                $result=ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'integration_repair_failed' (Get-PocketProperty $original 'stage' 'rollback') (Get-PocketProperty $original 'call' 'Restore-PocketTransaction') (Get-PocketProperty $original 'hresult' $null) 'clear' $core)
+                $operation.phase='terminal';$operation.result=$result;Write-PocketRepairDurableJson $operationPath $operation
+                return $result
+            }
+            $record=Read-PocketRepairJson $manifest
+        }
+        if($null -ne $operation){
+            if($operation.phase -eq 'terminal'){return ConvertTo-PocketPublicRepairResult $operation.result}
+            $hash=Get-PocketFileHash $manifest
+            if($operation.phase -eq 'prepared' -and $hash -ceq $operation.afterHash){
+                $result=New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'completed' 'integration_completed' 'repair_operation' 'Read-PocketRepairJson' $null 'clear' $core
+            }elseif($hash -ceq $operation.beforeHash){
+                $result=New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'integration_repair_failed' 'repair_operation' 'Read-PocketRepairJson' $null 'clear' $core
+            }else{return New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'recovery-needed' 'integration_recovery_needed' 'repair_operation' 'Read-PocketRepairJson' $null 'unknown' $core}
+            $operation.phase='terminal';Set-PocketProperty $operation 'result' $result;Write-PocketRepairDurableJson $operationPath $operation;return $result
+        }
+        $stage='repair_paths';$call='Assert-PocketUnredirectedPath';$code='path_unverified'
+        Assert-PocketUnredirectedPath $root -ProbeWrite
+        Assert-PocketUnredirectedPath $operationDirectory -ProbeWrite
+        if($RepairStep -ne 'startup'){Assert-PocketUnredirectedPath $links[[int]$RepairStep.Substring(9)] -ProbeWrite}
+        [void][IO.Directory]::CreateDirectory($operationDirectory)
+        $stage='repair_operation';$call='Write-PocketJson';$code='operation_record_failed'
+        $operation=@{schemaVersion=1;operationId=$OperationId;step=$RepairStep;expectedGeneration=$ExpectedGeneration;phase='running';beforeHash=(Get-PocketFileHash $manifest);afterHash=$null;result=$null}
+        Write-PocketRepairDurableJson $operationPath $operation
+        $stage='integration_read';$call='Get-PocketIntegrationSnapshot';$code='integration_drift'
+        $snapshot=Get-PocketIntegrationSnapshot $manifest $links -SkipTask
+        if($snapshot.manifest.hash -cne $operation.beforeHash){throw 'Installation changed after admission.'}
+        for($i=0;$i -lt 3;$i++){if($snapshot.links[$i].hash -cne $record.shortcuts[$i].installedHash){throw 'Integration changed outside this installer.'}}
+        $candidate=$record|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $targetLinks=@($snapshot.links);$task=$null;$managed=$RepairStep -eq 'startup'
+        $status=if($managed){$record.integration.startup}else{$record.integration.shortcuts[[int]$RepairStep.Substring(9)]}
+        if($status.state -eq 'completed'){
+            $result=New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'completed' 'integration_already_completed' 'repair_operation' 'Read-PocketRepairJson' $null 'clear' $core
+        }else{
+            if($managed){
+                $stage='startup_read';$call='Get-PocketTaskXml';$code='integration_repair_failed';$task=Get-PocketTaskXml
+                Invoke-PocketInstallStep 'startup_ownership' 'Assert-PocketTaskOwned' {Assert-PocketTaskOwned $task $launcher}|Out-Null
+                $snapshot.task=$task;$snapshot.taskKnown=$true
+                if(-not $candidate.previousTaskKnown){$candidate.previousTask=$task;$candidate.previousTaskKnown=$true}
+                if($null -ne $candidate.rollback -and -not (Get-PocketProperty $candidate.rollback 'taskKnown' $true)){Set-PocketProperty $candidate.rollback 'task' $task;Set-PocketProperty $candidate.rollback 'taskKnown' $true}
+                $logon=if($candidate.startupPreference -eq 'Enable'){$true}elseif($candidate.startupPreference -eq 'Disable'){$false}elseif($null -ne $task){Test-PocketTaskLogon $task}else{$true}
+                $task=if($null -ne $task -and (Test-PocketTaskLogon $task) -eq $logon){$task}else{New-PocketTaskXml $launcher $logon}
+                $candidate.integration.startup=@{state='completed';stage='startup_register';code='integration_completed';call=$null;hresult=$null}
+            }else{
+                $slot=[int]$RepairStep.Substring(9);$entry=$candidate.shortcuts[$slot];$backup=$snapshot.links[$slot]
+                $stage='shortcut';$call='New-PocketShortcutBytes';$code='integration_repair_failed'
+                if($slot -eq 0){
+                    $temporary=Join-Path $root ($OperationId+'.lnk');Assert-PocketUnredirectedPath $temporary
+                    if(Test-Path -LiteralPath $temporary){throw 'Repair temporary shortcut is already present.'}
+                    $bytes=New-PocketShortcutBytes $temporary $launcher '--pocket-ui' $installed.Icon
+                    $backup=@{path=$links[$slot];bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
+                }elseif($backup.hash -cne $entry.originalHash -and (Test-PocketShortcutTarget $links[$slot] $launcher $(if($slot -eq 1){'--pocket-desktop'}else{'--pocket-ui'}))){
+                    $backup=@{path=$links[$slot];bytes=$entry.original;hash=$entry.originalHash}
+                }
+                $entry.installed=$backup.bytes;$entry.installedHash=$backup.hash;$targetLinks[$slot]=$backup
+                $candidate.integration.shortcuts[$slot]=@{state='completed';stage='shortcut';code='integration_completed';call=$null;hresult=$null}
+            }
+            Update-PocketInstallState $candidate
+            $target=@{manifest=(Get-PocketRecordBackup $candidate $manifest);links=$targetLinks;cli=$snapshot.cli;cliKind=$snapshot.cliKind;task=$task;taskKnown=$snapshot.taskKnown}
+            $operation.phase='prepared';$operation.afterHash=$target.manifest.hash;Write-PocketRepairDurableJson $operationPath $operation
+            $stage='installation_publish';$call='Invoke-PocketInstallTransaction'
+            $outcome=Invoke-PocketInstallTransaction $snapshot $target $journalPath $manifest $links $launcher -TaskManaged:$managed -Optional -RepairStep $RepairStep -OperationId $OperationId -ExpectedGeneration $ExpectedGeneration 3>$null
+            if(-not $outcome.succeeded){throw $outcome.failure}
+            $result=New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'completed' 'integration_completed' $stage $call $null 'clear' $core
+        }
+        $stage='repair_operation';$call='Write-PocketJson';$code='operation_record_failed'
+        $operation.phase='terminal';$operation.result=$result;Write-PocketRepairDurableJson $operationPath $operation
+        return $result
+    }catch{
+        $failure=Get-PocketOptionalFailure $_ $stage $code $call
+        $pending=$null -ne $journalPath -and [IO.File]::Exists($journalPath)
+        if($code -eq 'operation_record_failed' -and $call -eq 'Write-PocketJson'){
+            return ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'recovery-needed' 'operation_record_failed' 'repair_operation' 'Write-PocketJson' $failure.hresult $(if($pending){'pending'}else{'unknown'}) $core)
+        }
+        $result=ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration $(if($pending){'recovery-needed'}else{'failed'}) $(if($pending){'integration_recovery_needed'}else{$code}) $failure.stage $failure.call $failure.hresult $(if($pending){'pending'}else{'clear'}) $core)
+        if($null -ne $operation -and $operation.phase -ne 'terminal' -and -not $pending){
+            try{$operation.phase='terminal';$operation.result=$result;Write-PocketRepairDurableJson $operationPath $operation}catch{
+                $saveFailure=Get-PocketOptionalFailure $_ 'repair_operation' 'operation_record_failed' 'Write-PocketJson'
+                return ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'recovery-needed' 'operation_record_failed' $saveFailure.stage $saveFailure.call $saveFailure.hresult 'unknown' $core)
+            }
+        }
+        return $result
+    }finally{
+        foreach($handle in $handles){$handle.Dispose()}
+        if($owns){$mutex.ReleaseMutex()};if($null -ne $mutex){$mutex.Dispose()}
     }
 }
 function Save-PocketIntegrationRecord($Record,[string]$Manifest,[string[]]$Links,[string]$Launcher,[string]$Journal) {
@@ -633,6 +960,14 @@ function Invoke-PocketWindowsInstall {
     } finally { if($owns){$mutex.ReleaseMutex()}; if($mutex){$mutex.Dispose()} }
 }
 if ($MyInvocation.InvocationName -ne '.') {
+    if($PSBoundParameters.ContainsKey('RepairStep') -or $PSBoundParameters.ContainsKey('OperationId') -or $PSBoundParameters.ContainsKey('ExpectedGeneration') -or $PSBoundParameters.ContainsKey('CheckRepair')){
+        $allowed=@('RepairStep','OperationId','ExpectedGeneration','CheckRepair')
+        if(@($PSBoundParameters.Keys|Where-Object{$_ -notin $allowed}).Count -gt 0){
+            $result=ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'invalid_params')
+        }else{$result=Invoke-PocketIntegrationRepair -RepairStep $RepairStep -OperationId $OperationId -ExpectedGeneration $ExpectedGeneration -CheckRepair:$CheckRepair}
+        ConvertTo-PocketPublicRepairResult $result | ConvertTo-Json -Depth 10 -Compress
+        exit $result.exitCode
+    }
     if (-not $SourceDirectory) { $SourceDirectory=if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'windows-manifest.json')){$PSScriptRoot}else{Join-Path $PSScriptRoot '..\dist\windows'} }
     $logPath=$null
     try {
