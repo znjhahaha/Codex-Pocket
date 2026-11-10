@@ -1,5 +1,5 @@
-use pocket_runtime_host::client::{Discovery, HostClient, load_descriptor};
-use pocket_runtime_host::{Descriptor, HostConfig, read_frame, write_frame};
+use pocket_runtime_host::HostConfig;
+use pocket_runtime_ipc::{Descriptor, Discovery, HostClient, load_descriptor, read_frame, write_frame};
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
 use tokio::{io::BufReader, net::TcpStream};

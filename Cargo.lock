@@ -1194,6 +1194,7 @@ dependencies = [
  "png",
  "pocket-core",
  "pocket-network",
+ "pocket-runtime-ipc",
  "pocket-tunnel",
  "qrcode",
  "rand 0.9.5",
@@ -1268,6 +1269,19 @@ dependencies = [
  "tokio-util",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "pocket-runtime-ipc"
+version = "0.6.3"
+dependencies = [
+ "anyhow",
+ "pocket-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -22,8 +22,20 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Rust toolchain
         run: rustup toolchain install 1.93.1 --profile minimal
+      - name: Build isolated Runtime Host fixtures
+        run: |
+          cargo +1.93.1 fetch --locked --manifest-path crates/runtime-host/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.1 fetch --locked --manifest-path crates/runtime-ipc/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.1 build --locked --manifest-path crates/runtime-host/Cargo.toml --all-features --bins --target-dir crates/runtime-host/target
       - name: Native tests
         run: cargo +1.93.1 test --locked --workspace --no-fail-fast
+      - name: Runtime Host and IPC fixtures
+        run: |
+          cargo +1.93.1 test --locked --manifest-path crates/runtime-host/Cargo.toml --all-features --target-dir crates/runtime-host/target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.1 test --locked --manifest-path crates/runtime-ipc/Cargo.toml
       - name: Desktop runtime tests
         run: cargo +1.93.1 test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop-runtime
       - name: Frontend dependencies
@@ -41,6 +53,8 @@ jobs:
           npx playwright install chromium
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run test:ui
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx playwright test --config src/installRepair.playwright.config.mjs
       - name: Desktop native command tests
         run: cargo +1.93.1 test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop
       - name: Windows installer fixtures

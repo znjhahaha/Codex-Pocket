@@ -1,6 +1,6 @@
 # Pocket Runtime Host（未接通产品的独立宿主基础）
 
-此 crate 是独立可执行程序和可信本机 client 的基础，目前没有接入 Pocket broker 发现、助理调度、Android 产品流程或 Windows 安装清单。测试通过只证明下面的宿主协议和恢复规则，不能视为助理成品或真实原生会话验收。
+此 crate 是独立可执行程序的基础，并保留可信本机 client 的兼容重导出；client、协议与描述符校验已提取到完全不依赖 agent 的 `pocket-runtime-ipc`。目前没有接入 Pocket broker 发现、助理调度、Android 产品流程或 Windows 安装清单。测试通过只证明下面的宿主协议和恢复规则，不能视为助理成品或真实原生会话验收。
 
 宿主持有 `codex app-server --listen stdio://`，通过现有 `CODEX_HOME` 使用原生配置。broker TCP 连接关闭不会结束子进程；明确空闲退出才关闭 stdin。宿主退出后不保证原生任务继续。单实例锁及描述符中的原生 PID/创建时间负责拒绝重复启动：连接失败本身不是进程退出证据，旧原生身份没有被证实终止时，不能启动第二个原生进程。发现 API 只读取、核验及连接，不启动进程。
 
@@ -46,9 +46,11 @@
 
 ## 依赖边界
 
-当前 `client` / `protocol` 可以用 `default-features = false` 编译，代码不调用 agent；默认 `server` feature 仍通过可选 `pocket-agent` 依赖使用现有 storage 工具。主 Cargo 未纳入此独立 workspace，agent 目前也没有依赖此 crate。
+`client` / `protocol` 现在仅重导出 `pocket-runtime-ipc` 的相同类型与函数，保留原有公开路径。IPC 包没有 `pocket-agent` / `pocket-runtime-host` 的普通、可选、开发或平台依赖，也没有 server feature；进程身份类型仍来自 `pocket-core`。默认 `server` feature 继续通过可选 `pocket-agent` 使用现有 storage 工具。
 
-后续把 `agent -> runtime-host client` 接线时，**不能仅凭 `default-features = false` 就宣称依赖环已经消失**：宿主包仍声明可选 `runtime-host -> agent`，默认 server 构建及 workspace 的 feature 合并可能形成环。产品接线前应把 client / protocol 拆为完全不依赖 agent 的独立包，或先迁移 server 的 storage 依赖，使宿主不再依赖 agent，再验证所有组合的包图。本轮只说明边界，未修改 agent、主 Cargo 或安装脚本。
+后续 agent / NativeConnection **直接依赖 `pocket-runtime-ipc`**。不要让 agent 依赖 host 包，即使关闭 host 默认 feature；host 的可选 server-to-agent 包边仍存在。根 Cargo、agent 与安装脚本留给后续集成，两个 scoped 包当前各有独立 `[workspace]`；纳入根 workspace 时应一并调整声明和锁文件策略。具体消费者 API、信任边界和接线顺序见 [Runtime IPC README](../runtime-ipc/README.md)。
+
+`tests/package_graph.rs` 用 Cargo metadata 校验所有 feature 下的已解析图和包含可选/开发/平台依赖的声明路径图：IPC 可达的本地包只有 IPC 与 core；host 默认 server 确实包含 agent，IPC 分支仍不包含 agent 或 host。此包图证据不能代替尚未实施的根 workspace 与产品接线验收。
 
 ## 构建和确定性测试
 
@@ -56,6 +58,8 @@
 cargo build --offline --manifest-path crates/runtime-host/Cargo.toml --target-dir target --bin pocket-runtime-host
 cargo test --offline --manifest-path crates/runtime-host/Cargo.toml --target-dir target
 cargo check --offline --manifest-path crates/runtime-host/Cargo.toml --target-dir target --no-default-features --lib
+cargo test --offline --manifest-path crates/runtime-ipc/Cargo.toml --target-dir crates/runtime-ipc/target
+cargo test --offline --manifest-path crates/runtime-host/Cargo.toml --target-dir crates/runtime-host/target --no-default-features --test ipc_compat --test package_graph -- --nocapture
 ```
 
 运行参数为：
@@ -66,8 +70,8 @@ pocket-runtime-host --state <private-host-dir> --descriptor <private-registry-fi
 
 `pocket-host-fixture` 仅为测试子进程，不纳入安装交付。测试只启动自己的假 app-server / 宿主，不调用真实模型，不控制用户已有进程。
 
-单测检查：正文/摘要不落盘、schema 1 最小化迁移、schema 2 字段白名单、损坏快照不重置、未知预留不驱逐、回放缺口、显式 MSIX LocalCache 拒绝，以及描述符错误/Debug 不泄露 token。
+host 单测检查：正文/摘要不落盘、schema 1 最小化迁移、schema 2 字段白名单、损坏快照不重置、未知预留不驱逐及回放缺口。描述符 MSIX LocalCache 与错误/Debug 脱敏单测随代码迁入 IPC；新增 IPC 测试覆盖帧边界、超限/残帧/非对象拒绝、操作 ID 范围、配置与字段校验、缺失发现及 PID 创建身份。兼容测试验证旧/新类型相同及帧函数互通；foundation 用新 IPC 导入，lifetime 保留旧路径。
 
 `tests/foundation.rs` 和 `tests/lifetime.rs` 检查：连接断开后相同原生身份、错误 token / 代次 / 身份 / 配置拒绝、重复 command / answer 不重跑、取消请求保留 unknown、运行时拒绝退出、空闲退出、原生退出后恢复不重发。隐私端到端用假进程故意回显 secret 答案和私密结果/错误，验证它们只在内存回放中出现；重启后 completed 结果正文不可用、旧问题不可回答，假进程的 writes / answers 均保持 0。另有实际宿主可执行程序的启动失败 stderr 检查。
 
-尚未完成：产品发现及调度接线、依赖图拆分、安装交付、真实原生协议/会话恢复验收、宿主硬崩溃与系统重启验收、Windows 用户隔离的端到端攻击测试，以及本 crate 之外的日志/历史隐私审计。当前没有自动消除 `reconciliationRequired` 的业务接口，需上层核对策略。
+尚未完成：根 workspace 与 agent / NativeConnection 接线、产品发现及调度、安装交付、真实原生协议/会话恢复验收、宿主硬崩溃与系统重启验收、Windows 用户隔离的端到端攻击测试，以及本 crate 之外的日志/历史隐私审计。当前没有逐项修改恢复记录或消除 `reconciliationRequired` 的业务接口：现有持久证据不足以证明旧未知操作的实际原生结果，不能接收调用方任意“clear unknown”。后续原生核对产品路径须将可信证据绑定原始代次和逐项身份，继续遵守不重放 dispatch 的规则。

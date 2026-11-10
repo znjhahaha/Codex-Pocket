@@ -30,6 +30,7 @@ rquickjs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 pocket-core = {path="../core"}
+pocket-runtime-ipc = {path="../runtime-ipc"}
 codex-cli-adapter = {path="../cli-adapter"}
 pocket-tunnel = {path="../tunnel"}
 pocket-network = {path="../network"}

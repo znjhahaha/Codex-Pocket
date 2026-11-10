@@ -40,9 +40,7 @@ subtle = { version = "2", optional = true }
 fs2 = { version = "0.4", optional = true }
 pocket-agent = { path = "../agent", optional = true }
 pocket-core = { path = "../core" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+pocket-runtime-ipc = { path = "../runtime-ipc" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,5 @@
-//! Private Runtime Host IPC. Brokers depend on this crate with default features disabled.
+//! Private Runtime Host server and compatibility reexports.
+//! Brokers should depend directly on the agent-independent `pocket-runtime-ipc`.
 pub mod client;
 pub mod protocol;
 pub use protocol::{Descriptor, read_frame, write_frame};

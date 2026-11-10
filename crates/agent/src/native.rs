@@ -20,6 +20,9 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+#[path = "native_host.rs"]
+pub mod host;
+
 #[derive(Debug, Clone)]
 pub enum RpcFailure {
     Native(Value),
@@ -44,6 +47,10 @@ enum Outgoing {
 #[derive(Clone)]
 pub struct Rpc {
     tx: mpsc::Sender<Outgoing>,
+    response_tx: Option<mpsc::Sender<Outgoing>>,
+    host_stop: Option<tokio::sync::watch::Sender<bool>>,
+    host_event_start: Option<Arc<tokio::sync::Notify>>,
+    host_cursor: Option<(String, Arc<std::sync::atomic::AtomicU64>)>,
     online: Arc<AtomicBool>,
     capability_failed: bool,
 }
@@ -72,6 +79,7 @@ pub enum NativeEvent {
     },
 }
 pub struct Connected {
+    pub role: NativeRole,
     pub bridge_version: Option<String>,
     pub capabilities: crate::capabilities::Capabilities,
     pub rpc: Rpc,
@@ -81,6 +89,19 @@ pub struct Connected {
     pub config_home: PathBuf,
     pub source: String,
     pub version: String,
+}
+
+/// Native discovery source stays compatible; the owning runtime role is explicit.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum NativeRole {
+    Desktop,
+    CliDaemon,
+    ManagedHost {
+        generation: String,
+        #[serde(rename = "reconciliationRequired")]
+        reconciliation_required: bool,
+    },
 }
 
 enum Connection {
@@ -130,8 +151,20 @@ impl Rpc {
         method: &str,
         params: Value,
     ) -> std::result::Result<Value, RpcFailure> {
+        self.call_with_id(json!(uuid::Uuid::new_v4().to_string()), method, params).await
+    }
+    /// Dispatch with the caller's durable operation ID. Never replace it after an unknown outcome.
+    pub async fn call_with_id(
+        &self,
+        id: Value,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, RpcFailure> {
+        if pocket_runtime_ipc::support::key(&id).is_none() {
+            return Err(RpcFailure::Native(json!({"message":"Invalid operation ID"})));
+        }
         let (tx, rx) = oneshot::channel();
-        let value = json!({"id":uuid::Uuid::new_v4().to_string(),"method":method,"params":params});
+        let value = json!({"id":id,"method":method,"params":params});
         self.tx
             .send(Outgoing::Request { value, reply: tx })
             .await
@@ -143,12 +176,26 @@ impl Rpc {
     }
     pub async fn respond(&self, id: Value, response: Value) -> std::result::Result<(), RpcFailure> {
         let (flushed, receiver)=oneshot::channel();
-        self.tx
+        self.response_tx.as_ref().unwrap_or(&self.tx)
             .send(Outgoing::Response{value:json!({"id":id,"result":response}),flushed})
             .await
             .map_err(|_| RpcFailure::Disconnected)?;
         tokio::time::timeout(Duration::from_secs(10),receiver).await
             .map_err(|_|RpcFailure::Timeout)?.map_err(|_|RpcFailure::Disconnected)?
+    }
+
+    /// The broker calls this after storing Connected, so replay cannot race registration.
+    pub fn activate_events(&self) {
+        if let Some(start) = &self.host_event_start { start.notify_one(); }
+    }
+    /// Detach IPC only. This does not stop the host or its native process.
+    pub fn detach_managed_host(&self) {
+        if let Some(stop) = &self.host_stop { stop.send_replace(true); }
+    }
+    pub fn managed_host_cursor(&self) -> Option<host::Cursor> {
+        self.host_cursor.as_ref().map(|(generation, sequence)| host::Cursor {
+            generation: generation.clone(), after: sequence.load(Ordering::Acquire),
+        })
     }
 }
 fn spawn(
@@ -166,11 +213,11 @@ fn spawn(
         loop {
             tokio::select! {
              event=connection.read()=>match event{
-              Ok(Some(v))=>{if v.get("method").is_some(){if events.send(NativeEvent::Message{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v}).await.is_err(){break}}else if let Some(id)=v["id"].as_str()&& let Some((reply,_,snapshot,approvals))=pending.remove(id){if (snapshot||approvals)&&v.get("error").is_none(){let event=if approvals{NativeEvent::PendingSnapshot{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v["result"].clone(),reply}}else{NativeEvent::Snapshot{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v["result"].clone(),reply}};if events.send(event).await.is_err(){break}}else{let _=reply.send(if let Some(e)=v.get("error"){Err(RpcFailure::Native(e.clone()))}else{Ok(v["result"].clone())});}}},
+              Ok(Some(v))=>{if v.get("method").is_some(){if events.send(NativeEvent::Message{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v}).await.is_err(){break}}else if let Some(id)=pocket_runtime_ipc::support::key(&v["id"])&& let Some((reply,_,snapshot,approvals))=pending.remove(&id){if (snapshot||approvals)&&v.get("error").is_none(){let event=if approvals{NativeEvent::PendingSnapshot{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v["result"].clone(),reply}}else{NativeEvent::Snapshot{runtime_id:runtime_id.clone(),connection_id:connection_id.clone(),value:v["result"].clone(),reply}};if events.send(event).await.is_err(){break}}else{let _=reply.send(if let Some(e)=v.get("error"){Err(RpcFailure::Native(e.clone()))}else{Ok(v["result"].clone())});}}},
               _=>break,
              },
              output=rx.recv()=>match output{
-              Some(Outgoing::Request{value,reply})=>{if pending.len()>=128{let _=reply.send(Err(RpcFailure::Native(json!({"message":"Too many pending native requests"}))));continue}let id=value["id"].as_str().unwrap().to_owned();let snapshot=value["method"]=="thread/read"||value["method"]=="thread/turns/list";let approvals=value["method"]=="pocket/approvals/list";pending.insert(id,(reply,tokio::time::Instant::now(),snapshot,approvals));if connection.write(&value).await.is_err(){break}},
+              Some(Outgoing::Request{value,reply})=>{let id=pocket_runtime_ipc::support::key(&value["id"]).unwrap();if pending.len()>=128||pending.contains_key(&id){let _=reply.send(Err(RpcFailure::Native(json!({"message":"Native operation already pending or capacity exceeded"}))));continue}let snapshot=value["method"]=="thread/read"||value["method"]=="thread/turns/list";let approvals=value["method"]=="pocket/approvals/list";pending.insert(id,(reply,tokio::time::Instant::now(),snapshot,approvals));if connection.write(&value).await.is_err(){break}},
               Some(Outgoing::Response{value,flushed})=>{let result=connection.write(&value).await.map_err(|_|RpcFailure::Disconnected);let failed=result.is_err();let _=flushed.send(result);if failed{break}},
               None=>break,
              },
@@ -190,6 +237,10 @@ fn spawn(
     });
     Rpc {
         tx,
+        response_tx: None,
+        host_stop: None,
+        host_event_start: None,
+        host_cursor: None,
         online,
         capability_failed: false,
     }
@@ -246,6 +297,7 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         .unwrap_or("unknown")
         .to_owned();
     Ok(Connected {
+        role: NativeRole::Desktop,
         bridge_version: status["bridgeVersion"].as_str().map(str::to_owned),
         capabilities,
         rpc,
@@ -315,6 +367,7 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
     );
     rpc.capability_failed = capability_failed;
     Ok(Connected {
+        role: NativeRole::CliDaemon,
         bridge_version: None,
         capabilities,
         rpc,
@@ -396,6 +449,7 @@ pub(crate) mod test_peer {
         let (read, write) = server.into_split();
         (
             Connected {
+                role: if source == "desktop" { NativeRole::Desktop } else { NativeRole::CliDaemon },
                 bridge_version: Some(env!("CARGO_PKG_VERSION").into()),
                 capabilities: crate::capabilities::Capabilities::from_schema(
                     &serde_json::from_str(include_str!(
@@ -447,6 +501,21 @@ pub(crate) mod test_peer {
             // Model an old task's queued completion after its online flag clears.
             self.online.store(false, Ordering::Release);
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_numeric_operation_id_is_preserved_and_pending_duplicate_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let (connected, mut peer) = connect("stable-rpc", "cli", dir.path(), events).await;
+        let rpc = connected.rpc.clone();
+        let first = tokio::spawn(async move { rpc.call_with_id(json!(17), "fixture/count", json!({})).await });
+        let request = peer.recv().await;
+        assert_eq!(request["id"], 17);
+        assert!(matches!(connected.rpc.call_with_id(json!(17), "fixture/count", json!({})).await, Err(RpcFailure::Native(_))));
+        peer.assert_idle().await;
+        peer.reply(&request, json!({"count":1})).await;
+        assert_eq!(first.await.unwrap().unwrap(), json!({"count":1}));
     }
 
     #[cfg(windows)]
