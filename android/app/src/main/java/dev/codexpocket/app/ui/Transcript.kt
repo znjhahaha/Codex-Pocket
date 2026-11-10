@@ -40,7 +40,7 @@ import kotlinx.coroutines.delay
 @Composable
 internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit, onSideChat: (TimelineItem) -> Unit = {}, canFork: Boolean = false, onPlan: ((Boolean) -> Unit)? = null,
     activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null, onReopenPlan: (() -> Unit)? = null,
-    onEdit: ((TimelineItem) -> Unit)? = null) {
+    onEdit: ((TimelineItem) -> Unit)? = null, online: Boolean = false) {
     val item = row.items.first()
     val clipboard = LocalClipboardManager.current
     when (row.kind) {
@@ -119,7 +119,8 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
         TranscriptKind.Error -> ConversationErrorRow(remember(item, timeline?.activeTurn, timeline?.completedTurns, timeline?.items) {
             ConversationErrorPresentation.from(item, timeline)
         }, messageScope + item.key)
-        TranscriptKind.Plan -> NativeActivityCard(item, messageScope + item.key, expanded, onExpand, { onDetail(item) }, onPlan, onReopenPlan)
+        TranscriptKind.Plan -> NativeActivityCard(item, messageScope + item.key, expanded, onExpand, { onDetail(item) }, onPlan, onReopenPlan,
+            writingPlan = PlanPresentation.isWriting(item, timeline, online))
         TranscriptKind.Activity -> if (item.type == "contextCompaction") CompactionStatus(item, timeline)
             else NativeActivityTrace(row, messageScope, expanded, onExpand, onDetail, activityExpansions, onActivityExpansion)
     }

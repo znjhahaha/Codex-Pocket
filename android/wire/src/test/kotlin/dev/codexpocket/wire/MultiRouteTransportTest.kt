@@ -26,7 +26,7 @@ class MultiRouteTransportTest {
                     val connection = listener.accept().also { socket = it }
                     val input = connection.getInputStream(); val output = connection.getOutputStream()
                     val frames = FrameCodec(); val replies = ArrayDeque<JsonObject>()
-                    val tls = TlsPump(serverEngine(cert), { output.write(it); output.flush() }, { bytes ->
+                    val tls = TlsPump(serverEngine(cert), { output.write(it); output.flush(); TransportSendResult.ACCEPTED }, { bytes ->
                         frames.feed(bytes).forEach { request ->
                             requests += request
                             val method = request.string("method")

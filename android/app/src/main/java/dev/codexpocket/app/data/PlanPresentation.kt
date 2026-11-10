@@ -13,6 +13,13 @@ data class ProposedPlan(val turnId: String, val itemId: String, val content: Str
 }
 
 object PlanPresentation {
+    fun isWriting(item: TimelineItem, timeline: NativeTimeline?, online: Boolean): Boolean =
+        online && item.type == "plan" && !item.complete && timeline != null &&
+            timeline.activeTurn == item.turnId && item.turnId !in timeline.completedTurns &&
+            timeline.activeFlags.none { it in setOf("waitingOnApproval", "waitingOnUserInput") } &&
+            timeline.status in setOf("", "active", "inProgress", "running") &&
+            timeline.turns[item.turnId]?.status !in setOf("completed", "failed", "interrupted", "cancelled", "waiting")
+
     fun latest(timeline: NativeTimeline): ProposedPlan? {
         if (timeline.activeTurn != null) return null
         val items = timeline.items.values.toList()

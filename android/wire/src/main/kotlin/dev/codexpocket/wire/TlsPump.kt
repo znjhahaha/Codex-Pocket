@@ -32,18 +32,20 @@ internal fun pinnedEngine(pin: String): SSLEngine {
 /** All methods run on one owner. Transport chunks are unrelated to TLS record boundaries. */
 internal class TlsPump(
     private val engine: SSLEngine,
-    private val emit: (ByteArray) -> Unit,
+    private val emit: (ByteArray) -> TransportSendResult,
     private val plaintext: (ByteArray) -> Unit,
     private val ready: () -> Unit,
     private val ended: () -> Unit
 ) {
     private var input = ByteBuffer.allocate(32768)
-    private var output = ByteBuffer.allocate(32768)
+    private var output = ByteBuffer.allocate(32768).apply { limit(0) }
     private var application = ByteBuffer.allocate(32768)
     private var started = false
     private var established = false
     private var endedOnce = false
     private var peerClosed = false
+    private var writeBlocked = false
+    private var unaccepted: ByteArray? = null
     private val outgoing = java.util.ArrayDeque<ByteBuffer>()
     private var outgoingBytes = 0L
 
@@ -60,24 +62,47 @@ internal class TlsPump(
 
     fun write(bytes: ByteArray) {
         check(established && !endedOnce && !engine.isOutboundDone) { "TLS is not ready" }
-        if (outgoingBytes + bytes.size > 32L * 1024 * 1024) throw SSLException("TLS outbound capacity exceeded")
-        outgoing.add(ByteBuffer.wrap(bytes)); outgoingBytes += bytes.size
+        if (outgoingBytes + bytes.size > 32L * 1024 * 1024 || outgoing.size >= 1024)
+            throw WireException("backpressure", "TLS outbound capacity exceeded")
+        if (bytes.isEmpty()) return
+        outgoing.add(ByteBuffer.wrap(bytes.copyOf())); outgoingBytes += bytes.size
+        drive()
+    }
+
+    /** Owner-only. No timer/polling, and receive/write cannot retry a blocked ciphertext chunk. */
+    fun onWritable() {
+        if (endedOnce || !writeBlocked) return
+        writeBlocked = false
         drive()
     }
 
     fun close() {
         if (endedOnce) return
-        engine.closeOutbound()
-        drive()
-        finish()
+        // Local cancellation cannot wait indefinitely for a writable event. Already accepted
+        // bytes belong to the transport; discard all unaccepted bytes and never replay them.
+        try {
+            engine.closeOutbound()
+            if (!writeBlocked) drive()
+        } finally { finish() }
     }
 
-    private fun finish() { if (!endedOnce) { endedOnce = true; ended() } }
+    fun abort() {
+        endedOnce = true
+        outgoing.clear(); outgoingBytes = 0
+        input.clear(); output.clear(); output.limit(0); application.clear()
+        unaccepted = null; writeBlocked = false
+    }
+
+    private fun finish() { if (!endedOnce) { abort(); ended() } }
 
     private fun drive() {
+        if (writeBlocked) return
         var steps = 0
         while (!endedOnce) {
             if (++steps > 10000) throw SSLException("TLS progress limit")
+            // Wrapping consumes plaintext exactly once. Flush its retained ciphertext before
+            // another engine operation, advancing only after atomic transport acceptance.
+            if (!flushCiphertext()) return
             // Names avoid linking NEED_UNWRAP_AGAIN on older Android providers.
             when (engine.handshakeStatus.name) {
                 "NEED_TASK" -> {
@@ -117,13 +142,27 @@ internal class TlsPump(
             output.clear()
             val r = engine.wrap(source, output)
             output.flip()
-            while (output.hasRemaining()) {
-                val bytes = ByteArray(minOf(output.remaining(), 65536)); output.get(bytes); emit(bytes)
+            if (r.status == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+                if (r.bytesConsumed() != 0 || r.bytesProduced() != 0) throw SSLException("Invalid TLS wrap overflow")
+                output.clear(); output = grow(output); continue
             }
-            if (r.status == SSLEngineResult.Status.BUFFER_OVERFLOW) { output.clear(); output = grow(output); continue }
             if (r.status == SSLEngineResult.Status.BUFFER_UNDERFLOW) throw SSLException("Invalid TLS wrap")
             return r
         }
+    }
+
+    private fun flushCiphertext(): Boolean {
+        while (output.hasRemaining()) {
+            val bytes = unaccepted ?: ByteArray(minOf(output.remaining(), 65536)).also {
+                output.duplicate().get(it); unaccepted = it
+            }
+            when (emit(bytes)) {
+                TransportSendResult.ACCEPTED -> { output.position(output.position() + bytes.size); unaccepted = null }
+                TransportSendResult.WOULD_BLOCK -> { writeBlocked = true; return false }
+                TransportSendResult.CLOSED -> { abort(); throw WireException("disconnected", "Transport closed") }
+            }
+        }
+        return true
     }
 
     private fun unwrap(): Boolean {

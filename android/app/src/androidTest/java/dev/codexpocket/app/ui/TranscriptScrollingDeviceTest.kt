@@ -125,6 +125,45 @@ class TranscriptScrollingDeviceTest {
         }
     }
 
+    @Test fun streamingPlanKeepsPreviewGeometryAndOpenReaderPosition() {
+        content()
+        var proposal by mutableStateOf(ProposedPlan("stream-turn", "plan", "# 稳定计划\n\n" +
+            (1..32).joinToString("\n\n") { "## 步骤 $it\n\n保留正文、阅读位置和完整计划。" }))
+        var writing by mutableStateOf(true)
+        compose.activity.runOnUiThread { compose.activity.setContent {
+            PocketTheme("dark") { CompositionLocalProvider(LocalPocketGlass provides false,
+                LocalPocketGlassPreferences provides PocketGlassPreferences(false, false, false)) {
+                Surface { ProvideMarkdownRendering {
+                    PlanProposalCard(proposal, "stream-fixture", writing = writing)
+                } }
+            } }
+        } }
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("plan-initial-render").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithTag("plan-title").assertTextEquals("编写计划")
+        val height = compose.onNodeWithTag("plan-preview").fetchSemanticsNode().boundsInRoot.height
+        repeat(8) { update ->
+            compose.runOnIdle { proposal = proposal.copy(content = proposal.content + "\n\n增量 $update：保持格式。") }
+            compose.onNodeWithTag("plan-initial-render").assertDoesNotExist()
+            assertEquals(height, compose.onNodeWithTag("plan-preview").fetchSemanticsNode().boundsInRoot.height, 1f)
+        }
+        compose.onNodeWithContentDescription("展开完整计划").performClick()
+        compose.onNodeWithTag("plan-reader-scroll").performTouchInput { swipeUp() }
+        val position = compose.onNodeWithTag("plan-reader-scroll").fetchSemanticsNode()
+            .config[SemanticsProperties.VerticalScrollAxisRange].value()
+        assertTrue(position > 0f)
+        compose.runOnIdle { proposal = proposal.copy(content = proposal.content + "\n\n| 检查 | 结果 |\n| --- | --- |\n| 布局 | 稳定 |") }
+        compose.onNodeWithTag("plan-reader").assertIsDisplayed()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("markdown-table").fetchSemanticsNodes().isNotEmpty() }
+        assertEquals(position, compose.onNodeWithTag("plan-reader-scroll").fetchSemanticsNode()
+            .config[SemanticsProperties.VerticalScrollAxisRange].value(), 1f)
+        compose.runOnIdle { writing = false }
+        compose.onNodeWithTag("plan-reader").assertIsDisplayed()
+        screenshot("streaming-plan-reader")
+        compose.onNodeWithContentDescription("关闭计划阅读").performClick()
+        compose.onNodeWithTag("plan-title").assertTextEquals("计划")
+        screenshot("streaming-plan-preview")
+    }
+
     @Test fun cachedHomeReturnsWithoutDirectorySpinnerAndKeepsConnectionIndicator() {
         content()
         var mounted by mutableStateOf(true)

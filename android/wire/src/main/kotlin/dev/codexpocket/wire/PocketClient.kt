@@ -1,12 +1,14 @@
 package dev.codexpocket.wire
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.*
 
-class PocketClient internal constructor(private val connector: TransportConnector) : PocketConnection {
+class PocketClient internal constructor(private val connector: TransportConnector,
+                                        dispatcher: CoroutineDispatcher = Dispatchers.IO) : PocketConnection {
     constructor() : this(WssConnector())
 
     private val gate = Any()
@@ -21,7 +23,8 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     /** One ordered consumer; overflow disconnects and closes the flow with an error. */
     override val notifications: Flow<JsonObject> = notices.receiveAsFlow()
     private val events = Channel<Event>(128)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val writableQueued = AtomicBoolean(false)
     private val ready = CompletableDeferred<Unit>()
     private var started = false
     private var terminated = false
@@ -44,6 +47,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private sealed interface Event {
         data class Start(val config: ConnectionConfig) : Event
         data object Open : Event
+        data object Writable : Event
         data class Bytes(val bytes: ByteArray) : Event
         data class Send(val pending: Pending, val bytes: ByteArray) : Event
         data object Close : Event
@@ -52,21 +56,32 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     init {
         scope.launch {
             var tls: TlsPump? = null
+            var tlsClosing = false
             val frames = FrameCodec()
             try {
                 for (event in events) when (event) {
                     is Event.Start -> {
                         tls = TlsPump(pinnedEngine(event.config.certificateSha256), { bytes ->
-                            val transport = synchronized(gate) { socket }
-                            if (transport?.send(bytes) != true) throw BackpressureFailure("transport_send")
+                            val transport = synchronized(gate) {
+                                if (closing && !tlsClosing) throw WireException("closed", "Tunnel closed")
+                                if (terminated) null else socket
+                            }
+                            val result = when (transport) {
+                                null -> TransportSendResult.CLOSED
+                                is WritableBinaryTransport -> transport.trySend(bytes)
+                                else -> if (transport.send(bytes)) TransportSendResult.ACCEPTED
+                                    else throw BackpressureFailure("transport_send")
+                            }
+                            result
                         }, { bytes -> frames.feed(bytes).forEach(::receiveMessage) }, {
                             synchronized(gate) {
                                 if (!terminated && !closing) { mutableState.value = LinkState.ONLINE; ready.complete(Unit) }
                             }
-                        }, { terminate("disconnected", graceful = true) })
+                        }, { terminate(if (closing) "closed" else "disconnected", graceful = true) })
                         val transport = connector.open(event.config, object : TransportListener {
                             override fun onOpen() { offer(Event.Open) }
                             override fun onBinary(bytes: ByteArray) {
+                                if (synchronized(gate) { terminated || closing }) return
                                 if (bytes.size > 65536) { terminate("invalid_transport"); return }
                                 lastInboundNanos = System.nanoTime()
                                 // OkHttp invokes this on its dedicated reader, not the UI or
@@ -78,10 +93,17 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                                 }
                             }
                             override fun onFailure() { terminate("disconnected") }
+                            override fun onWritable() {
+                                synchronized(gate) {
+                                    if (!terminated && !closing && writableQueued.compareAndSet(false, true))
+                                        offer(Event.Writable)
+                                }
+                            }
                         })
                         synchronized(gate) { if (terminated) transport.close(false) else socket = transport }
                     }
                     Event.Open -> tls!!.begin()
+                    Event.Writable -> { writableQueued.set(false); tls?.onWritable() }
                     is Event.Bytes -> tls!!.receive(event.bytes)
                     is Event.Send -> {
                         val send = synchronized(gate) {
@@ -90,12 +112,16 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                         }
                         if (send) tls!!.write(event.bytes)
                     }
-                    Event.Close -> { tls?.close(); terminate("closed", graceful = true) }
+                    Event.Close -> {
+                        tlsClosing = true
+                        tls?.close()
+                        terminate("closed", graceful = true)
+                    }
                 }
             } catch (failure: Exception) {
                 if (failure is BackpressureFailure) terminate("backpressure", source = failure.source)
-                else terminate((failure as? WireException)?.code?.takeIf { it in setOf("backpressure", "invalid_frame", "invalid_reply", "invalid_notification", "invalid_transport", "disconnected") } ?: "transport_failed")
-            }
+                else terminate((failure as? WireException)?.code?.takeIf { it in setOf("closed", "backpressure", "invalid_frame", "invalid_reply", "invalid_notification", "invalid_transport", "disconnected") } ?: "transport_failed")
+            } finally { tls?.abort() }
         }
     }
 
@@ -151,15 +177,25 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             }
         }
         catch (e: CancellationException) {
+            if (synchronized(gate) { item.sent && socket is WritableBinaryTransport }) terminate("closed")
             if (synchronized(gate) { item.sent && commandId != null }) throw UnknownOutcomeException(commandId!!)
             throw e
         } finally { synchronized(gate) { pending.remove(item.id); replyChunks.discard(item.id) } }
     }
 
-    private fun failed(item: Pending, code: String): Exception = synchronized(gate) {
-        pending.remove(item.id)
-        if (item.sent && item.commandId != null) UnknownOutcomeException(item.commandId)
-        else WireException(code, "Request did not complete")
+    private fun failed(item: Pending, code: String): Exception {
+        val (failure, blocked) = synchronized(gate) {
+            pending.remove(item.id)
+            val failure = if (item.sent && item.commandId != null) UnknownOutcomeException(item.commandId)
+                else WireException(code, "Request did not complete")
+            failure to (item.sent && socket is WritableBinaryTransport && !terminated)
+        }
+        // A timed-out/cancelled request may occupy a partial TLS record, including during an
+        // active retry. Close an opt-in candidate after admission, regardless of writable state,
+        // to prevent its remainder (and requests behind it) from a later wakeup. Legacy WSS/LAN
+        // keep their existing request timeout behavior and transport_send diagnostics.
+        if (blocked) terminate(code)
+        return failure
     }
 
     private fun receiveMessage(message: JsonObject) {
@@ -214,6 +250,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     }
 
     private fun offer(event: Event) {
+        if (synchronized(gate) { terminated }) return
         if (!events.trySend(event).isSuccess) terminate("backpressure", source = "transport_events")
     }
 
@@ -223,6 +260,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             failureCode = code
             backpressureSource = source
             terminated = true; mutableState.value = LinkState.OFFLINE
+            writableQueued.set(false)
             ready.completeExceptionally(WireException(code, "Tunnel unavailable"))
             pending.values.toList().forEach { it.result.completeExceptionally(failed(it, code)) }
             pending.clear()

@@ -82,6 +82,7 @@ class PocketClientTest {
                         if (pacingMillis > 0) Thread.sleep(pacingMillis)
                         listener.onBinary(it.toByteArray())
                     }
+                    TransportSendResult.ACCEPTED
                 }, { bytes ->
                     frames.feed(bytes).forEach { request ->
                         requests += request

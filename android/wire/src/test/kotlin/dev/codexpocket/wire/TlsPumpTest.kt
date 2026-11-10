@@ -22,9 +22,9 @@ class TlsPumpTest {
         val toServer = ArrayDeque<ByteArray>(); val toClient = ArrayDeque<ByteArray>()
         val clientData = mutableListOf<Byte>(); val serverData = mutableListOf<Byte>()
         var clientReady = false; var serverReady = false; var clientClosed = false; var serverClosed = false
-        val client = TlsPump(pinnedEngine(pin), { require(it.size <= 65536); toServer.add(it) },
+        val client = TlsPump(pinnedEngine(pin), { require(it.size <= 65536); toServer.add(it); TransportSendResult.ACCEPTED },
             { clientData.addAll(it.toList()) }, { clientReady = true }, { clientClosed = true })
-        val server = TlsPump(serverEngine(cert, protocol), { toClient.add(it) },
+        val server = TlsPump(serverEngine(cert, protocol), { toClient.add(it); TransportSendResult.ACCEPTED },
             { serverData.addAll(it.toList()) }, { serverReady = true }, { serverClosed = true })
         fun drain(fragment: Int) {
             var rounds = 0

@@ -6,7 +6,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 
 internal interface BinaryTransport { fun send(bytes: ByteArray): Boolean; fun close(graceful: Boolean) }
-internal interface TransportListener { fun onOpen(); fun onBinary(bytes: ByteArray); fun onFailure() }
+internal interface TransportListener { fun onOpen(); fun onBinary(bytes: ByteArray); fun onFailure(); fun onWritable() {} }
 internal fun interface TransportConnector { fun open(config: ConnectionConfig, listener: TransportListener): BinaryTransport }
 
 /** Outer TLS uses platform trust and hostname verification, independently of the inner pin. */

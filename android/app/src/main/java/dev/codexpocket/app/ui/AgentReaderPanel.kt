@@ -273,7 +273,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                                 memory.detailKey = item.key
                             }, canFork = false, onPlan = null,
                             activityExpansions = memory.expansions, onActivityExpansion = memory::toggle,
-                            timeline = state.timeline)
+                            timeline = state.timeline, online = liveOnline)
                         changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary) {
                             memory.gesture.cancelResume(); memory.following = false; changeReview = it
                         } }

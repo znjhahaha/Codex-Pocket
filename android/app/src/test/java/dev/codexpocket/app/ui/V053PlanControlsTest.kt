@@ -94,6 +94,17 @@ class V053PlanControlsTest {
         }
     }
 
+    @Test fun streamingRevisionKeepsTheReaderOpen() {
+        var current by mutableStateOf(plan)
+        content { PlanProposalCard(current, "streaming-plan") }
+        compose.onNodeWithContentDescription("展开完整计划").performClick()
+        compose.onNodeWithTag("plan-reader").assertIsDisplayed()
+        compose.runOnIdle { current = current.copy(content = current.content + "\n\nNew tail paragraph.") }
+        compose.onNodeWithTag("plan-reader").assertIsDisplayed()
+        compose.onNodeWithContentDescription("关闭计划阅读").performClick()
+        compose.onNodeWithTag("proposed-plan").assertIsDisplayed()
+    }
+
     @Test fun fastIsTopRightAndPendingCannotToggle() {
         val key = ThreadKey("pc", "store", "chat")
         val model = NativeModel("a", "astra", "6 Astra", "", listOf("low", "high"), "high", false, true, serviceTiers = setOf("fast"))

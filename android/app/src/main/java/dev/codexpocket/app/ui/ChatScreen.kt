@@ -244,7 +244,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                                 onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline,
                                 onReopenPlan = proposedPlan?.takeIf { plan -> row.items.any { it.itemId == plan.itemId && it.turnId == plan.turnId } && PlanPresentation.unavailable(s, plan) == null }
                                     ?.let { plan -> { repo.reopenPlan(plan); following = true } },
-                                onEdit = { repo.beginMessageEdit(it); following = true })
+                                onEdit = { repo.beginMessageEdit(it); following = true }, online = s.online)
                             changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary, onDetail) }
                         }
                     }

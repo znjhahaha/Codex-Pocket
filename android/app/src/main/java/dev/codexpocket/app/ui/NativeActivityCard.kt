@@ -16,9 +16,9 @@ import dev.codexpocket.app.data.*
 /** Native proposals and execution checklists are separate presentations. */
 @Composable
 internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded: Boolean, onExpand: () -> Unit,
-    onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null, onReopenPlan: (() -> Unit)? = null) {
+    onDetail: () -> Unit, onPlan: ((Boolean) -> Unit)? = null, onReopenPlan: (() -> Unit)? = null, writingPlan: Boolean = false) {
     if (item.type == "plan") {
-        PlanProposalCard(ProposedPlan(item.turnId, item.itemId, item.text), messageKey, onReopenPlan)
+        PlanProposalCard(ProposedPlan(item.turnId, item.itemId, item.text), messageKey, onReopenPlan, writingPlan)
         return
     }
     val plan = remember(item.raw, item.type) { nativePlan(item) }

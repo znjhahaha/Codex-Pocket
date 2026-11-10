@@ -38,7 +38,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import dev.codexpocket.app.data.ProposedPlan
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -61,21 +63,20 @@ internal fun PlanIconAction(icon: ImageVector, label: String, enabled: Boolean =
 
 /** Native text and identity remain intact; opening this reader never submits a command. */
 @Composable
-internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPlan: (() -> Unit)? = null) {
+internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPlan: (() -> Unit)? = null, writing: Boolean = false) {
     val c = MaterialTheme.colorScheme
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
-    var readerOpen by rememberSaveable(messageKey, plan.revision) { mutableStateOf(false) }
-    var readerPosition by rememberSaveable(messageKey, plan.revision) { mutableIntStateOf(0) }
+    val identity = "$messageKey/${plan.turnId}/${plan.itemId}"
+    var readerOpen by rememberSaveable(identity) { mutableStateOf(false) }
+    var readerPosition by rememberSaveable(identity) { mutableIntStateOf(0) }
     var pendingExport by rememberSaveable { mutableStateOf<String?>(null) }
     var copied by remember(plan.revision) { mutableStateOf(false) }
     val renderer = checkNotNull(LocalMarkdownCache.current)
-    // Hoisted so reopening never clamps a restored position to a short loading placeholder.
-    val rendered by produceState<RenderedMarkdown?>(null, renderer, messageKey, plan.revision) {
-        value = null
-        value = renderer.render("$messageKey/proposal/${plan.revision}", plan.content)
-    }
+    // Retain the last formatted document while the next increment parses. The native
+    // item owns reading state; changing content is not a new reader or cache entry.
+    val rendered by rememberPlanRendering(identity, plan.content, renderer) { key, source -> renderer.render(key, source) }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
         val snapshot = pendingExport
         pendingExport = null
@@ -95,17 +96,18 @@ internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPl
         Column {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(PocketIcons.Lightbulb, null, Modifier.size(19.dp), tint = c.onSurface)
-                Text("计划", Modifier.weight(1f).padding(start = 8.dp), style = MaterialTheme.typography.titleSmall)
+                Text(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
+                    .testTag("plan-title").reasoningSweep(writing), style = MaterialTheme.typography.titleSmall)
                 PlanIconAction(PocketIcons.ArrowDownToLine, "保存计划 Markdown", pendingExport == null, save)
                 PlanIconAction(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, "复制完整计划", onClick = copy)
                 PlanIconAction(PocketIcons.OpenInFull, "展开完整计划") { readerOpen = true }
             }
             val limit = with(LocalDensity.current) { 240.dp.roundToPx() }
-            var overflowing by remember(plan.revision) { mutableStateOf(false) }
+            var overflowing by remember(identity) { mutableStateOf(false) }
             Box(Modifier.fillMaxWidth().heightIn(max = 240.dp).clipToBounds().testTag("plan-preview")) {
                 Column(Modifier.fillMaxWidth().wrapContentHeight(Alignment.Top, unbounded = true)
                     .onSizeChanged { overflowing = it.height > limit }.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
-                    PlanDocumentText(plan.content, rendered)
+                    PlanDocumentText(rendered)
                 }
                 if (overflowing) Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(40.dp)
                     .background(Brush.verticalGradient(listOf(Color.Transparent, c.surface))))
@@ -132,22 +134,42 @@ internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPl
             Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                 Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(PocketIcons.Lightbulb, null, Modifier.size(19.dp))
-                    Text("计划", Modifier.weight(1f).padding(start = 8.dp), style = MaterialTheme.typography.titleMedium)
+                    Text(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
+                        .reasoningSweep(writing), style = MaterialTheme.typography.titleMedium)
                     PlanIconAction(PocketIcons.ArrowDownToLine, "保存计划 Markdown", pendingExport == null, save)
                     PlanIconAction(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, "复制完整计划", onClick = copy)
                     PlanIconAction(PocketIcons.Close, "关闭计划阅读") { readerOpen = false }
                 }
-                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(scroll).padding(20.dp)) { PlanDocumentText(plan.content, rendered) }
+                Column(Modifier.weight(1f).fillMaxWidth().testTag("plan-reader-scroll").verticalScroll(scroll).padding(20.dp)) { PlanDocumentText(rendered) }
             }
         }
     }
 }
 
 @Composable
-private fun PlanDocumentText(source: String, rendered: RenderedMarkdown?) {
+internal fun rememberPlanRendering(identity: String, source: String, rendererKey: Any,
+    render: suspend (String, String) -> RenderedMarkdown): State<RenderedMarkdown?> {
+    val result = remember(identity, rendererKey) { mutableStateOf<RenderedMarkdown?>(null) }
+    val latestSource by rememberUpdatedState(source)
+    LaunchedEffect(identity, rendererKey) {
+        // Finish each bounded snapshot while retaining only the newest pending source.
+        // Cancelling on every token starves long documents; ordered publication does not.
+        snapshotFlow { latestSource }.conflate().collect { text ->
+            val next = render("$identity/proposal", text)
+            coroutineContext.ensureActive()
+            result.value = next
+        }
+    }
+    return result
+}
+
+@Composable
+private fun PlanDocumentText(rendered: RenderedMarkdown?) {
     val renderer = checkNotNull(LocalMarkdownCache.current)
     val c = MaterialTheme.colorScheme
-    if (rendered == null) Text(markdownPreview(source), style = MaterialTheme.typography.bodyLarge)
+    if (rendered == null) Box(Modifier.fillMaxWidth().height(72.dp).testTag("plan-initial-render")) {
+        Text("正在排版计划…", color = c.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+    }
     else Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         rendered.parts.forEach { part ->
             if (part.table != null) MarkdownTable(part.table)
