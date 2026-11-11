@@ -68,7 +68,13 @@ class TranscriptScrollingUiTest {
         } }
         compose.waitForIdle()
         if (!deferHistory) {
-            compose.onNodeWithTag("chat-transcript").performScrollToNode(hasTestTag("activity-toggle:${command.key}"))
+            val transcript = compose.onNodeWithTag("chat-transcript")
+            // Row projection runs on Dispatchers.Default, outside Compose idling.
+            // Wait for the fixture rows to reach the list before seeking its tail.
+            compose.waitUntil(5_000) {
+                transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].maxValue() > 20f
+            }
+            transcript.performScrollToNode(hasTestTag("activity-toggle:${command.key}"))
             compose.waitForIdle()
         }
         loaded

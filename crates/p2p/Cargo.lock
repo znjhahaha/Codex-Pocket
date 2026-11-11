@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-agent"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-network"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "serde",
  "windows-sys 0.61.2",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-runtime-ipc"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "pocket-core",

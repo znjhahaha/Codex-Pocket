@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-runtime-ipc"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "pocket-core",
