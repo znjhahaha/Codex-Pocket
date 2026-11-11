@@ -267,9 +267,12 @@ impl Coordinator {
                 previous.phase.terminal(),
                 "An upgrade operation is already pending; resume it"
             );
-            // Never overwrite rollback uncertainty with a fresh operation.
+            // Dispatch can fail before a coordinator even exists. Permit a fresh
+            // attempt only when the exact installation is unchanged and there is
+            // no evidence that any handoff action could have happened.
             ensure!(
-                previous.phase != Phase::Failed,
+                previous.phase != Phase::Failed
+                    || clean_dispatch_failure(&previous, from_generation, &to_generation)?,
                 "Failed operation requires manual recovery"
             );
         }
@@ -420,6 +423,25 @@ impl Coordinator {
     }
 }
 
+fn clean_dispatch_failure(previous: &UpgradeStatus, from: &str, to: &str) -> Result<bool> {
+    if previous.failure != Some(Failure::DispatchFailed)
+        || previous.checkpoint.is_some() || previous.verification.is_some()
+        || previous.from_generation != from || previous.to_generation != to {
+        return Ok(false);
+    }
+    // Conservatively retain even historical handoff evidence. Its absence is
+    // required; unreadable, redirected or partially written records never count
+    // as proof that retry is safe. A new coordinator re-verifies live ownership
+    // before it can fence writes or release anything.
+    for relative in ["desktop/upgrade-local.json", "desktop/maintenance.json",
+        "desktop/maintenance-request.json"] {
+        let path = previous.state_directory.join(relative);
+        storage::unredirected(&path)?;
+        if path.try_exists()? { return Ok(false); }
+    }
+    local::no_agent_handoff(&previous.state_directory)
+}
+
 /// Read-only API for the installation panel. Missing journal is not success.
 pub fn read_status(state: &Path) -> Result<Option<UpgradeStatus>> {
     let path = storage::control(state).join(JOURNAL);
@@ -438,7 +460,16 @@ pub fn request_upgrade(root: &Path, state: &Path, from_generation: &str) -> Resu
     let generation = installed(root, state)?;
     let executable =
         launcher::verified_exe(&root.join("bin").join(generation), "pocket-upgrade.exe")?;
-    let c = Coordinator::request(root, state, from_generation)?;
+    let mut c = Coordinator::request(root, state, from_generation)?;
+    // Legacy users need a normal next-login migration, even when the caller's
+    // Windows job forbids starting a detached coordinator. This is only a
+    // negative capability check: a complete payload still needs authenticated
+    // runtime/ownership checks in the independent coordinator.
+    if !local::has_runtime_payload(&verified_generation(root, from_generation)?)?
+        || !local::has_runtime_payload(&verified_generation(root, &c.status.to_generation)?)? {
+        c.save(Phase::WaitingRestart, Some(Failure::HandoffUnsupported))?;
+        return Ok(c.status.clone());
+    }
     let mut status = c.status().clone();
     drop(c);
     if spawn(&executable, root, state, &status.operation_id).is_err() {

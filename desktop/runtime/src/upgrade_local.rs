@@ -150,7 +150,7 @@ fn safe_inventory_path(name: &str) -> bool {
                     && matches!(stem.as_bytes()[3], b'1'..=b'9'))
         })
 }
-fn has_runtime_payload(bin: &Path) -> Result<bool> {
+pub(super) fn has_runtime_payload(bin: &Path) -> Result<bool> {
     let manifest: Value = storage::read(&bin.join("windows-manifest.json"))?;
     Ok(RUNTIME_PAYLOAD.iter().all(|name| {
         manifest["files"].as_array().is_some_and(|entries| {
@@ -376,6 +376,17 @@ fn agent_record(a: &mut impl Adapter, state: &Path) -> Result<AgentRecord> {
     let d: AgentRecord = decode(a, &state.join("handoff/state.json"), MAX_IMAGE)?;
     d.validate()?;
     Ok(d)
+}
+/// Normal agent startup persists an empty handoff journal. It proves no handoff
+/// side effect only after bounded physical read and full schema validation.
+pub(super) fn no_agent_handoff(state: &Path) -> Result<bool> {
+    let path = state.join("handoff/state.json");
+    storage::unredirected(&path)?;
+    if !path.try_exists()? { return Ok(true); }
+    let mut adapter = Windows;
+    let record: AgentRecord = decode(&mut adapter, &path, 65536)?;
+    record.validate()?;
+    Ok(record.operations.is_empty() && record.recovery_checkpoint.is_none())
 }
 fn startup_request_pending(a: &mut impl Adapter, state: &Path, cp: &CheckpointRef) -> Result<bool> {
     cp.validate()?;

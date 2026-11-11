@@ -39,6 +39,13 @@ pub struct Status {
     pub maintenance_protocol: u32,
     #[serde(default)]
     pub startup_failure: Option<startup_failure::StartupFailure>,
+    /// Optional tray dispatch attempts; process creation does not prove readiness.
+    #[serde(default)]
+    pub tray_startup_attempts: u32,
+    #[serde(default)]
+    pub tray_startup_failure: Option<startup_failure::LaunchFailure>,
+    #[serde(default)]
+    pub helper_spawn_failure: Option<startup_failure::LaunchFailure>,
 }
 /// Desired is phone ingress only; stopped may intentionally retain childPid.
 /// Only a fresh, authenticated helper response can confirm the remote gate.
@@ -137,6 +144,95 @@ fn agent_startup_command(
     }
     Ok(command)
 }
+fn tray_command(agent: &Path, state: &Path) -> Result<Command> {
+    let bin = agent.parent().context("Missing installed directory")?;
+    let mut ui = Command::new(crate::launcher::verified_exe(bin, "pocket-desktop.exe")?);
+    ui.arg("--state").arg(state).arg("--background");
+    process::hidden(&mut ui);
+    Ok(ui)
+}
+
+struct TrayStartup {
+    attempts: u32,
+    retry_at: Instant,
+    dispatched: bool,
+    failure: Option<startup_failure::LaunchFailure>,
+}
+impl TrayStartup {
+    const MAX_ATTEMPTS: u32 = 3;
+
+    fn new(now: Instant) -> Self {
+        Self {
+            attempts: 0,
+            retry_at: now,
+            dispatched: false,
+            failure: None,
+        }
+    }
+    fn poll(
+        &mut self,
+        now: Instant,
+        generation: Option<String>,
+        verify: impl FnOnce() -> Result<Command>,
+        spawn: impl FnOnce(&mut Command) -> std::io::Result<()>,
+    ) {
+        if self.dispatched || self.attempts >= Self::MAX_ATTEMPTS || now < self.retry_at {
+            return;
+        }
+        self.attempts += 1;
+        let failure = match verify() {
+            Ok(mut ui) => spawn(&mut ui).err().map(|e| {
+                (
+                    startup_failure::LaunchFailureCode::TraySpawnFailed,
+                    anyhow::Error::from(e),
+                )
+            }),
+            Err(e) => Some((
+                startup_failure::LaunchFailureCode::TrayVerificationFailed,
+                e,
+            )),
+        };
+        if let Some((code, error)) = failure {
+            self.failure = Some(startup_failure::LaunchFailure::new(
+                code,
+                uuid::Uuid::new_v4().to_string(),
+                generation,
+                error.as_ref(),
+                self.attempts < Self::MAX_ATTEMPTS,
+            ));
+            // At most three attempts, separated by five then ten seconds. A
+            // tray failure never returns out of the background ownership loop.
+            self.retry_at = now + Duration::from_secs(5 * u64::from(self.attempts));
+        } else {
+            self.dispatched = true; // Process creation only, not UI readiness.
+            self.failure = None;
+        }
+    }
+}
+
+fn spawn_agent(
+    command: &mut Command,
+    status: &mut Status,
+    operation_id: &str,
+    generation: Option<String>,
+) -> std::io::Result<Child> {
+    match command.spawn() {
+        Ok(child) => {
+            status.helper_spawn_failure = None;
+            Ok(child)
+        }
+        Err(error) => {
+            status.helper_spawn_failure = Some(startup_failure::LaunchFailure::new(
+                startup_failure::LaunchFailureCode::HelperSpawnFailed,
+                operation_id.into(),
+                generation,
+                &error,
+                true,
+            ));
+            Err(error)
+        }
+    }
+}
 pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Result<()> {
     storage::plain(state)?;
     storage::plain(agent)?;
@@ -160,15 +256,9 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
     storage::private_dir(&owner)?;
     let _user = Lock::acquire(&owner.join("supervisor.lock"))?;
     let _state = Lock::acquire(&control.join("supervisor.lock"))?;
-    // The supervisor owns tray startup so previously installed stable launchers
-    // pick up this behavior through the generation they already resolve.
-    if installed_owner {
-        let bin = agent.parent().context("Missing installed directory")?;
-        let mut ui = Command::new(crate::launcher::verified_exe(bin, "pocket-desktop.exe")?);
-        ui.arg("--state").arg(state).arg("--background");
-        process::hidden(&mut ui);
-        ui.spawn()?;
-    }
+    // The supervisor owns optional tray startup, including for stable launchers
+    // from earlier installations. It cannot gate local control or ownership.
+    let mut tray = installed_owner.then(|| TrayStartup::new(Instant::now()));
     // Never put the agent (and possible native runtime descendants) into a
     // kill-on-close job. Supervised agents pause ingress, not native work.
     let mut child: Option<Child> = None;
@@ -235,7 +325,8 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
                     let operation_id = uuid::Uuid::new_v4().to_string();
                     c.env(upgrade::local::STARTUP_OPERATION_ENV, &operation_id)
                         .stderr(Stdio::piped());
-                    match c.spawn() {
+                    startup_attempt = None;
+                    match spawn_agent(&mut c, &mut status, &operation_id, agent_generation.clone()) {
                         Ok(mut owned) => {
                             startup_attempt = Some(startup_failure::Attempt::new(
                                 operation_id,
@@ -288,6 +379,20 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
         }
         if startup_context_failed {
             status.upgrade_error = Some(upgrade::Failure::StartupContextInvalid);
+        }
+        if let Some(tray) = tray.as_mut() {
+            // Maintenance must not dispatch even an optional UI; keep the
+            // pending attempt for when the coordinator releases ownership.
+            if !maintenance.blocks_respawn() && !startup_context_failed {
+                tray.poll(
+                    Instant::now(),
+                    agent_generation.clone(),
+                    || tray_command(agent, state),
+                    |ui| ui.spawn().map(|_| ()),
+                );
+            }
+            status.tray_startup_attempts = tray.attempts;
+            status.tray_startup_failure = tray.failure.clone();
         }
         status.child_pid = child.as_ref().map(Child::id);
         status.updated_at = storage::now();
@@ -381,6 +486,9 @@ fn updated_tunnel_preferences(
     }
     Ok(prefs)
 }
+#[cfg(test)]
+#[path = "../tests/supervisor_startup/unit.rs"]
+mod startup_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

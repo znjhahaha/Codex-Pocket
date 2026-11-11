@@ -34,6 +34,11 @@ Name "Codex Pocket"
 OutFile "__OUTPUT__"
 !include "MUI2.nsh"
 !include "x64.nsh"
+!define MUI_FINISHPAGE_TITLE "安装文件已就绪"
+!define MUI_FINISHPAGE_TEXT "安装文件已经验证，已有配对和配置会保留。$\r$\n$\r$\n打开 Pocket 查看后台是否已生效。若旧版本不支持安全交接，请先保存工作，再退出并重新登录 Windows；只重开 Codex 不一定会更新常驻后台。$\r$\n$\r$\n后台未启动时，Pocket 会显示自动重试进度，也可以手动重试。"
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "打开 Pocket 检查后台状态"
+!define MUI_FINISHPAGE_RUN_FUNCTION OpenPocket
 !define MUI_WELCOMEPAGE_TEXT "将为当前 Windows 用户安装 Codex Pocket。$\r$\n$\r$\n安装前会检查 Codex 桌面、WebView2 与 Visual C++ x64 运行库，并验证现有配对和文件。$\r$\n$\r$\n已有配对和配置会保留。安装后从开始菜单打开唯一的 Codex Pocket 入口，在界面中打开 Codex。$\r$\n$\r$\n若发生错误，“显示详情”会给出阶段和持久诊断文件位置。"
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckWebView
 !insertmacro MUI_PAGE_WELCOME
@@ -46,6 +51,10 @@ Function .onInit
     SetErrorLevel 1
     Quit
   ${EndIf}
+FunctionEnd
+Function OpenPocket
+  SetShellVarContext current
+  Exec '"$LOCALAPPDATA\CodexPocket\pocket-launcher.exe" --pocket-ui'
 FunctionEnd
 Function CheckWebView
   InitPluginsDir

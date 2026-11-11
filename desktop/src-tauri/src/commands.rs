@@ -10,13 +10,14 @@ pub struct Context {
     pub action_failures:Arc<Mutex<Vec<Value>>>,
     pub control_start_request:Arc<Mutex<Option<Instant>>>,
     pub control_start_error:Arc<Mutex<Option<OperationError>>>,
+    pub background_recovery:Arc<Mutex<crate::background_recovery::BackgroundRecovery>>,
 }
 #[derive(Default)]
 pub struct StartupCache {
     enabled:Option<bool>,failure:Option<OperationError>,checked_at:Option<Instant>,in_flight:bool,revision:u64,
 }
 impl Context {
-    pub fn new(state:PathBuf,bin:PathBuf)->Self{Self{state,bin,operation:Arc::new(Mutex::new(())),startup_cache:Arc::new(Mutex::new(StartupCache::default())),action_failures:Arc::new(Mutex::new(Vec::new())),control_start_request:Arc::new(Mutex::new(None)),control_start_error:Arc::new(Mutex::new(None))}}
+    pub fn new(state:PathBuf,bin:PathBuf)->Self{Self{state,bin,operation:Arc::new(Mutex::new(())),startup_cache:Arc::new(Mutex::new(StartupCache::default())),action_failures:Arc::new(Mutex::new(Vec::new())),control_start_request:Arc::new(Mutex::new(None)),control_start_error:Arc::new(Mutex::new(None)),background_recovery:Arc::new(Mutex::new(Default::default()))}}
 }
 pub(crate) fn fail(stage:&str,error:anyhow::Error)->OperationError{OperationError::from_error(stage,&error)}
 pub(crate) fn join_error(_:impl std::fmt::Display)->OperationError{OperationError::new("desktop","unavailable",true)}
@@ -96,6 +97,15 @@ fn public_startup_failure(value:&Value)->Value{
     json!({"schema":1,"operationId":id,"pid":value["pid"],"runtimeGeneration":generation,"time":value["time"],"phase":value["phase"],"code":value["code"],
         "osCode":value["osCode"].as_i64().filter(|n|i32::try_from(*n).is_ok())})
 }
+fn public_launch_failure(value:&Value)->Value{
+    use supervisor::startup_failure::{LaunchFailure,LaunchFailureCode};
+    let Ok(failure)=serde_json::from_value::<LaunchFailure>(value.clone()) else{return Value::Null;};
+    let expected=match failure.code {LaunchFailureCode::TrayVerificationFailed=>"tray_verify",LaunchFailureCode::TraySpawnFailed=>"tray_spawn",LaunchFailureCode::HelperSpawnFailed=>"helper_spawn"};
+    if failure.schema!=1||failure.phase!=expected||failure.supervisor_pid==0||failure.time==0
+        ||!supervisor::upgrade::local::canonical_uuid(&failure.operation_id)
+        ||failure.runtime_generation.as_ref().is_some_and(|g|g.len()!=64||!g.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))){return Value::Null;}
+    json!(failure)
+}
 fn read_required_config(state:&Path)->Result<Value,OperationError>{
     let value=storage::read::<Value>(&state.join("config.json"));
     match value {
@@ -168,6 +178,8 @@ fn snapshot(c:&Context)->Value{
     }
     supervisor["upgrade"]=public_upgrade(&supervisor["upgrade"]);
     supervisor["startupFailure"]=public_startup_failure(&supervisor["startupFailure"]);
+    supervisor["trayStartupFailure"]=public_launch_failure(&supervisor["trayStartupFailure"]);
+    supervisor["helperSpawnFailure"]=public_launch_failure(&supervisor["helperSpawnFailure"]);
     let connectivity=if consistent {connectivity_status(c)}else{Value::Null};
     // Route catalog and readiness must come from the same response: a network
     // refresh can change a same-ID endpoint between status and routes/read.
@@ -183,11 +195,23 @@ fn snapshot(c:&Context)->Value{
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
     json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,"startupStatus":startup_cache_status(c),
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
+        "backgroundRecovery":c.background_recovery.lock().ok().map(|v|json!(*v)),
         "installation":installation,"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
         "issues":issues,"operationFailures":crate::operation_failures::history(c),"discoveryErrors":status["discoveryErrors"],"routes":routes,"cloudflareReceipt":if consistent {storage::read::<Value>(&storage::control(&c.state).join("connectivity/fixed-tunnel.json")).unwrap_or(Value::Null)}else{Value::Null},"connectivity":connectivity,"helperVersion":status["helperVersion"],"sessionPreferences":if consistent&&desired.enabled {process::local_control(&c.state,"session/preferences/read",json!({})).unwrap_or(Value::Null)}else{Value::Null}})
 }
 pub fn tray_status(c:&Context)->String{
-    let report=snapshot(c);
+    // Read-only probes may wait for a missing helper. Do not hold the action
+    // mutex during them: manual recovery must remain reachable. Re-read mutable
+    // intent under the mutex before dispatch; live duplicate ownership is also
+    // rejected by the supervisor's user/state locks.
+    let mut report=snapshot(c);
+    if let Ok(_guard)=c.operation.try_lock(){
+        if let (Ok(desired),Ok(upgrade))=(storage::read::<storage::Desired>(&storage::control(&c.state).join("desired.json")),supervisor::upgrade::read_status(&c.state)){
+            report["desired"]=json!(desired.enabled);
+            report["installation"]["upgrade"]=public_upgrade(&json!(upgrade));
+            advance_background_recovery(c,&report,storage::now(),||start_local_control(c,true));
+        }
+    }
     let label=match report["connection"]["phase"].as_str(){Some("connected")=>"连接线路已就绪",Some("ready")=>"可以扫码配对",Some("setup_required")=>"请选择连接方式",Some("stopped")=>"远程连接已暂停",Some("failed")=>"连接需要检查",Some("starting")=>"正在启动助手",_=>"正在准备连接"};
     format!("Codex Pocket · {label}")
 }
@@ -228,7 +252,7 @@ pub async fn set_remote(context:State<'_,Context>,enabled:bool)->Result<(),Opera
         let result=(||{
         let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;
         core_preflight(&c)?;
-        set_remote_desired(&c.state,enabled,|_|start_local_control(&c,true))
+        set_remote_desired(&c.state,enabled,|_|manual_control_attempt(&c,||start_local_control(&c,true)))
         })();crate::operation_failures::record_result(&c,result)
     }).await.map_err(join_error)?
 }
@@ -260,8 +284,22 @@ fn start_local_control(c:&Context,explicit_retry:bool)->anyhow::Result<Value>{
     anyhow::ensure!(bin==c.bin&&state==c.state,"Installation changed");
     start_control_with(c,explicit_retry,||launcher::start_supervisor(&bin,&state))
 }
+fn advance_background_recovery(c:&Context,report:&Value,now:u64,launch:impl FnOnce()->anyhow::Result<Value>){
+    let Ok(mut recovery)=c.background_recovery.lock() else{return;};
+    if !recovery.observe(report,now){return;}
+    let result=launch().map_err(control_start_failure);
+    if result.is_err(){recovery.spawn_failed();}
+    if let Ok(mut error)=c.control_start_error.lock(){*error=result.as_ref().err().cloned();}
+    let _=crate::operation_failures::record_result(c,result);
+}
+fn manual_control_attempt(c:&Context,launch:impl FnOnce()->anyhow::Result<Value>)->anyhow::Result<Value>{
+    let result=launch();
+    if let Ok(mut recovery)=c.background_recovery.lock(){recovery.manual_attempt(storage::now(),result.is_ok());}
+    result
+}
 pub fn manual_open(c:&Context){
-    let result=start_local_control(c,false).map_err(control_start_failure);
+    let Ok(_guard)=c.operation.try_lock() else{return;};
+    let result=manual_control_attempt(c,||start_local_control(c,false)).map_err(control_start_failure);
     if let Ok(mut error)=c.control_start_error.lock(){*error=result.as_ref().err().cloned();}
     let _=crate::operation_failures::record_result(c,result);
 }
@@ -414,6 +452,33 @@ mod tests {
         start_control_with(&c,false,||Ok(())).unwrap();
         assert!(start_control_with(&c,true,||anyhow::bail!("Fixture child already exited")).is_err());
         let result=start_control_with(&c,false,||Ok(())).unwrap();assert_eq!(result["requested"],true);
+    }
+    #[test]
+    fn automatic_recovery_dispatches_once_per_deadline_without_changing_preference(){
+        let state=crate::test_support::tempdir();let c=Context::new(state.path().into(),state.path().into());
+        storage::set_desired(state.path(),true).unwrap();
+        let path=storage::control(state.path()).join("desired.json");let before=std::fs::read(&path).unwrap();
+        let report=json!({"desired":true,"installation":{"consistent":true,"installedGeneration":"a".repeat(64)},"supervisor":{"updatedAt":0}});
+        let mut launches=0;
+        for now in [100,104,105,105,106,115,145,174,175,200]{
+            advance_background_recovery(&c,&report,now,||{launches+=1;Ok(json!({"requested":true}))});
+        }
+        assert_eq!(launches,3);assert_eq!(c.background_recovery.lock().unwrap().phase,"exhausted");
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+        manual_control_attempt(&c,||Ok(json!({"requested":true}))).unwrap();
+        assert_eq!(c.background_recovery.lock().unwrap().attempts,0);
+        assert_eq!(c.background_recovery.lock().unwrap().phase,"starting");
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+    }
+    #[test]
+    fn launch_failure_projection_validates_fixed_codes_and_never_leaks_raw_errors(){
+        for (phase,code) in [("tray_verify","tray_verification_failed"),("tray_spawn","tray_spawn_failed"),("helper_spawn","helper_spawn_failed")]{
+            let value=json!({"schema":1,"operationId":"12345678-1234-4234-8234-123456789abc","supervisorPid":42,"runtimeGeneration":"a".repeat(64),"time":1794316209000u64,"phase":phase,"code":code,"osCode":5,"retryable":true});
+            let safe=public_launch_failure(&value);assert_eq!(safe["code"],code);assert_eq!(safe["osCode"],5);
+            for (key,invalid) in [("phase",json!("PRIVATE")),("code",json!("PRIVATE")),("supervisorPid",json!(0)),("rawError",json!("PRIVATE"))]{
+                let mut bad=value.clone();bad[key]=invalid;assert_eq!(public_launch_failure(&bad),Value::Null);
+            }
+        }
     }
     #[test]
     fn startup_failure_projection_keeps_fixed_fields_without_liveness_claims(){

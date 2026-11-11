@@ -1,9 +1,73 @@
-//! Startup evidence from an owned child, never process-liveness evidence.
+//! Separate supervisor launch failures and owned-child startup evidence.
+//! Neither record is process-liveness evidence.
 use crate::storage;
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, process::ChildStderr, sync::mpsc};
 
 const LIMIT: usize = 4096;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchFailureCode {
+    TrayVerificationFailed,
+    TraySpawnFailed,
+    HelperSpawnFailed,
+}
+
+/// A supervisor-owned launch failure has no child PID or liveness claim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchFailure {
+    pub schema: u32,
+    pub operation_id: String,
+    pub supervisor_pid: u32,
+    pub runtime_generation: Option<String>,
+    /// Unix epoch milliseconds, unlike the supervisor heartbeat's seconds.
+    pub time: u64,
+    pub phase: String,
+    pub code: LaunchFailureCode,
+    pub os_code: Option<i32>,
+    /// The supervisor has another scheduled attempt; this is not an action grant.
+    pub retryable: bool,
+}
+impl LaunchFailure {
+    pub(super) fn new(
+        code: LaunchFailureCode,
+        operation_id: String,
+        runtime_generation: Option<String>,
+        error: &(dyn std::error::Error + 'static),
+        retryable: bool,
+    ) -> Self {
+        let mut source = Some(error);
+        let mut os_code = None;
+        while let Some(error) = source {
+            if let Some(code) = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|e| e.raw_os_error())
+            {
+                os_code = Some(code);
+                break;
+            }
+            source = error.source();
+        }
+        Self {
+            schema: 1,
+            operation_id,
+            supervisor_pid: std::process::id(),
+            runtime_generation,
+            time: now_ms(),
+            phase: match code {
+                LaunchFailureCode::TrayVerificationFailed => "tray_verify",
+                LaunchFailureCode::TraySpawnFailed => "tray_spawn",
+                LaunchFailureCode::HelperSpawnFailed => "helper_spawn",
+            }
+            .into(),
+            code,
+            os_code,
+            retryable,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartupFailure {

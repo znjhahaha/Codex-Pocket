@@ -31,6 +31,7 @@ test('a newer installation can recheck an older waiting-restart operation',async
    if(command==='dashboard')return {computerName:'Fixture',desired:true,supervisor:{phase:'waiting_restart',updatedAt:Date.now()/1000,failures:0},relay:{state:'ready',host:''},devices:[],processes:[],version:'0.6.3',startup:true,
     connection:{phase:'waiting_restart',connected:false,available:false,helperUpdatedAt:Date.now()/1000},issues:[],
     installation:{consistent:true,installedVersion:'0.6.3',installedGeneration:'c'.repeat(64),restartRequired:true,
+     ui:{version:'0.6.3',generation:'c'.repeat(64),runningVerified:true,state:'current'},
      supervisor:{version:'0.6.3',generation:'a'.repeat(64),runningVerified:true,state:'restart_required'},
      upgrade:{operationId:'previous',phase:'waiting_restart',fromGeneration:'a'.repeat(64),toGeneration:'b'.repeat(64),updatedAt:1}}};
    throw new Error('Unexpected command');

@@ -463,3 +463,77 @@ fn invalid_durable_success_and_malformed_journals_are_never_accepted() {
     assert!(read_status(&state).is_err());
     assert!(Coordinator::request(root.path(), &state, &old).is_err());
 }
+
+#[test]
+fn legacy_update_is_classified_before_any_coordinator_dispatch() {
+    // Fixture executables are inert bytes. A dispatch attempt would fail rather
+    // than produce the actionable legacy result. No process may be started.
+    let (root, old, _) = fixture();
+    let state = root.path().join("state");
+    let config = fs::read(state.join("config.json")).unwrap();
+    let result = request_upgrade(root.path(), &state, &old).unwrap();
+    assert_eq!(result.phase, Phase::WaitingRestart);
+    assert_eq!(result.failure, Some(Failure::HandoffUnsupported));
+    assert!(result.checkpoint.is_none());
+    assert!(!storage::control(&state).join("upgrade-local.json").exists());
+    assert_eq!(fs::read(state.join("config.json")).unwrap(), config);
+}
+
+fn failed_dispatch(root: &Path, state: &Path, old: &str) -> UpgradeStatus {
+    let c = Coordinator::request(root, state, old).unwrap();
+    let mut status = c.status().clone();
+    drop(c);
+    status.phase = Phase::Failed;
+    status.failure = Some(Failure::DispatchFailed);
+    storage::atomic(&storage::control(state).join("upgrade.json"), &status).unwrap();
+    status
+}
+
+#[test]
+fn clean_dispatch_failure_can_be_retried_for_the_same_installation() {
+    let (root, old, new) = fixture();
+    let state = root.path().join("state");
+    let previous = failed_dispatch(root.path(), &state, &old);
+    let retry = Coordinator::request(root.path(), &state, &old).unwrap();
+    assert_eq!(retry.status().phase, Phase::Requested);
+    assert_eq!(retry.status().to_generation, new);
+    assert_ne!(retry.status().operation_id, previous.operation_id);
+    assert!(retry.status().checkpoint.is_none());
+}
+
+#[test]
+fn normal_agent_empty_handoff_record_does_not_permanently_block_dispatch_retry() {
+    let (root, old, _) = fixture();
+    let state = root.path().join("state");
+    failed_dispatch(root.path(), &state, &old);
+    storage::private_dir(&state.join("handoff")).unwrap();
+    storage::atomic(&state.join("handoff/state.json"), &json!({"protocol":1,
+        "generation":uuid::Uuid::new_v4().to_string(),"operations":{},"recoveryCheckpoint":null})).unwrap();
+    Coordinator::request(root.path(), &state, &old).unwrap();
+}
+
+#[test]
+fn dispatch_retry_preserves_journal_when_handoff_or_generation_is_uncertain() {
+    for evidence in ["desktop/upgrade-local.json", "desktop/maintenance.json",
+        "desktop/maintenance-request.json", "handoff/state.json", "checkpoint", "verification", "generation"] {
+        let (root, old, _) = fixture();
+        let state = root.path().join("state");
+        let mut status = failed_dispatch(root.path(), &state, &old);
+        match evidence {
+            "checkpoint" => status.checkpoint = Some(Backend::default().quiesce(&status).unwrap()),
+            "verification" => status.verification = Some(Backend::default().verify_new(&status).unwrap()),
+            "generation" => {
+                let third = generation(root.path(), "third");
+                let mut installed: serde_json::Value = storage::read(&root.path().join("desktop-install.json")).unwrap();
+                installed["generation"] = json!(third);
+                installed["releaseHash"] = json!(third);
+                storage::atomic(&root.path().join("desktop-install.json"), &installed).unwrap();
+            },
+            path => { let path = state.join(path); fs::create_dir_all(path.parent().unwrap()).unwrap(); fs::write(path, "{}").unwrap(); },
+        }
+        storage::atomic(&storage::control(&state).join("upgrade.json"), &status).unwrap();
+        let before = fs::read(storage::control(&state).join("upgrade.json")).unwrap();
+        assert!(Coordinator::request(root.path(), &state, &old).is_err(), "{evidence}");
+        assert_eq!(fs::read(storage::control(&state).join("upgrade.json")).unwrap(), before);
+    }
+}

@@ -129,4 +129,9 @@ describe('background handoff and running Codex bridge presentation',()=>{
  it('does not add a bridge restart warning without a handoff record',()=>{
   expect(renderStatus({consistent:true})).not.toContain('完成当前Codex任务后重新打开Codex');
  });
+ it('labels an old waiting-restart record as history after verified startup',()=>{
+  const html=renderToStaticMarkup(<InstallationPanel status={handoffStatus('waiting_restart','handoff_unsupported')} upgradeHistorical onRefresh={()=>{}} onDiagnostics={()=>{}}/>);
+  expect(html).toContain('上次后台更新记录');expect(html).toContain('此为历史交接记录');
+  expect(html).not.toContain('重新登录 Windows');
+ });
 });
