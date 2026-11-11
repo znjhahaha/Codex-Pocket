@@ -1,5 +1,7 @@
 package dev.codexpocket.app.ui
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -8,9 +10,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -21,6 +20,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.ImageVector
 import dev.codexpocket.app.data.*
 import kotlinx.serialization.json.*
 import java.time.*
@@ -40,38 +40,64 @@ fun AssistantScreen(state: AssistantUiState, models: List<NativeModel>, runtimes
         result.onSuccess {localError=null;onAction(it)}.onFailure {localError=it.message ?: "请检查填写内容"}
     }
     val c = MaterialTheme.colorScheme
+    val palette = assistantPalette()
+    var more by remember { mutableStateOf(false) }
+    val navigate: (String) -> Unit = { more=false;tab=it }
+    BackHandler(tab != "Chat") { tab="Chat" }
+    MaterialTheme(colorScheme=c.copy(primary=palette.accent,onPrimary=palette.onAccent,secondary=palette.accent,
+        primaryContainer=palette.outgoing,onPrimaryContainer=palette.onOutgoing,surface=palette.surface,background=palette.background)) {
     ProvideMarkdownRendering {
-        Column(modifier.fillMaxSize().background(c.background).systemBarsPadding().imePadding().testTag("assistant-screen")) {
-            Row(Modifier.fillMaxWidth().padding(horizontal=16.dp,vertical=12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalAlignment=Alignment.CenterVertically) {
-                AssistantPocketButton({tab="Chat"},attention=snapshot?.operations.orEmpty().any {it.phase==AssistantOperationPhase.Waiting && !it.suspended})
-                Column(Modifier.weight(1f)) {
-                    Text("口袋助理",style=MaterialTheme.typography.titleLarge)
-                    Text(assistantStatus(state),style=MaterialTheme.typography.bodySmall,color=c.onSurfaceVariant)
+        Column(modifier.fillMaxSize().background(palette.background).systemBarsPadding().imePadding().testTag("assistant-screen")) {
+            Row(Modifier.fillMaxWidth().heightIn(min=64.dp).padding(horizontal=8.dp,vertical=4.dp),verticalAlignment=Alignment.CenterVertically) {
+                IconButton({if(tab=="Chat") onBack() else tab="Chat"},Modifier.testTag("assistant-back")) {
+                    Icon(AssistantIcons.Back,if(tab=="Chat") "返回原页面" else "返回助理对话")
                 }
-                IconButton({act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading && !state.busy("assistant/read")) {Icon(Icons.Rounded.Refresh,"刷新助理状态")}
-                IconButton(onBack) {Icon(Icons.AutoMirrored.Rounded.ArrowBack,"返回原页面")}
-            }
-            Row(Modifier.fillMaxWidth().padding(horizontal=16.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)) {
-                listOf("Chat" to "对话","Memory" to "记忆","Schedules" to "定时","Settings" to "设置").forEach { (id,label) ->
-                    PocketPill(label,tab==id,{tab=id},modifier=Modifier.weight(1f).testTag("assistant-tab:$id"))
+                if(tab=="Chat") { AssistantAvatar(size=32.dp); Spacer(Modifier.width(10.dp)) }
+                Column(Modifier.weight(1f).padding(vertical=4.dp)) {
+                    Text(when(tab) {"Memory"->"记忆";"Schedules"->"定时事项";"Settings"->"助理设置";"Tasks"->"全部任务";else->"口袋助理"},style=MaterialTheme.typography.titleMedium)
+                    if(tab=="Chat") Text(if(runtime.isNotBlank() && runtimes.none {it.id==runtime && it.available}) "电脑离线 · 可先写草稿" else assistantStatus(state),style=MaterialTheme.typography.labelSmall,color=palette.muted)
+                }
+                Box {
+                    IconButton({more=true},Modifier.testTag("assistant-more")) {Icon(AssistantIcons.More,"更多助理功能")}
+                    DropdownMenu(more,{more=false}) {
+                        assistantDestinations.forEach { (id,label,icon) ->
+                            DropdownMenuItem(text={Text(label)},leadingIcon={Icon(icon,null)},onClick={navigate(id)},modifier=Modifier.testTag("assistant-tab:$id"))
+                        }
+                        HorizontalDivider()
+                        snapshot?.coordinatorThreadId?.let { thread ->
+                            DropdownMenuItem(text={Text("打开原对话")},leadingIcon={Icon(PocketIcons.Link2,null)},onClick={more=false;onOpenThread(runtime,thread)},enabled=runtime.isNotBlank(),modifier=Modifier.testTag("assistant-original-thread"))
+                        }
+                        DropdownMenuItem(text={Text("刷新状态")},leadingIcon={Icon(PocketIcons.RefreshCw,null)},onClick={more=false;act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading && !state.busy("assistant/read"),modifier=Modifier.testTag("assistant-refresh"))
+                    }
                 }
             }
-            if(state.loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top=8.dp))
-            (state.error ?: localError)?.let {Text(it,Modifier.fillMaxWidth().padding(horizontal=20.dp,vertical=10.dp).testTag("assistant-error"),color=c.error,style=MaterialTheme.typography.bodyMedium)}
-            Box(Modifier.weight(1f).fillMaxWidth().padding(top=8.dp)) {
+            HorizontalDivider(color=palette.border)
+            if(state.loading) LinearProgressIndicator(Modifier.fillMaxWidth(),color=palette.accent)
+            (state.error ?: localError)?.let { error ->
+                Row(Modifier.fillMaxWidth().background(c.errorContainer).padding(start=16.dp,end=4.dp),verticalAlignment=Alignment.CenterVertically) {
+                    Text(error,Modifier.weight(1f).padding(vertical=8.dp).testTag("assistant-error"),color=c.onErrorContainer,style=MaterialTheme.typography.bodySmall)
+                    TextButton({act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading) {Text("重试",color=c.onErrorContainer)}
+                }
+            }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
                 holder.SaveableStateProvider("$runtime:$tab") {
                     when(tab) {
                         "Chat" -> if(snapshot?.enabled != true) {
                             LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(16.dp)) {
                                 item {AssistantCard {
-                                    Text(if(snapshot?.enabled==false) "让助理接住接下来的事" else "先读取电脑上的助理状态",style=MaterialTheme.typography.titleMedium)
-                                    Text(if(snapshot?.enabled==false) "启用后，你可以交办任务、回答问题，并查看电脑上的执行结果。" else "尚未确认入口是否启用。",style=MaterialTheme.typography.bodyMedium,color=c.onSurfaceVariant)
+                                    AssistantAvatar(size=48.dp)
+                                    Text(if(snapshot?.enabled==false) "你好，我是口袋助理" else "正在和电脑取得联系",style=MaterialTheme.typography.titleMedium)
+                                    Text(if(snapshot?.enabled==false) "连上电脑后，直接发消息给我。任务进度和结果都会回到这里。" else "读取状态后，就可以继续上次的对话。",style=MaterialTheme.typography.bodyMedium,color=c.onSurfaceVariant)
                                     PocketButton(if(snapshot?.enabled==false) "前往启用设置" else "读取状态",{
                                         if(snapshot?.enabled==false) tab="Settings" else act {AssistantActions.read(0)}
                                     },Modifier.fillMaxWidth().testTag("assistant-configure"),enabled=!state.loading)
                                 }}
                             }
-                        } else AssistantChat(state,workspaces,canAct,{make -> act(make)},onOpenThread)
+                        } else AssistantChat(state,workspaces,canAct,{make -> act(make)},onOpenThread,navigate)
+                        "Tasks" -> LazyColumn(Modifier.fillMaxSize().testTag("assistant-tasks-list"),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+                            if(snapshot?.tasks.isNullOrEmpty()) item {Text("还没有任务，发条消息开始吧。",color=palette.muted)}
+                            items(snapshot?.tasks.orEmpty().distinctBy {it.id},key={it.id}) {task -> AssistantTaskCard(task,state,canAct,{make -> act(make)},onOpenThread)}
+                        }
                         "Memory" -> AssistantMemories(state,canAct) {make -> act(make)}
                         "Schedules" -> AssistantSchedules(state,workspaces,canAct,nowMs) {make -> act(make)}
                         "Settings" -> AssistantSettingsPage(state,models,runtimes,canAct) {make -> act(make)}
@@ -80,32 +106,38 @@ fun AssistantScreen(state: AssistantUiState, models: List<NativeModel>, runtimes
             }
         }
     }
+    }
 }
 
-private fun AssistantUiState.busy(method: String, id: String? = null) = method in pendingActions || (id!=null && "$method:$id" in pendingActions)
+private data class AssistantDestination(val id:String,val label:String,val icon:ImageVector)
+private val assistantDestinations get() = listOf(
+    AssistantDestination("Tasks","全部任务",AssistantIcons.Tasks), AssistantDestination("Memory","记忆",AssistantIcons.Memory),
+    AssistantDestination("Schedules","定时事项",AssistantIcons.Schedule), AssistantDestination("Settings","助理设置",AssistantIcons.Settings))
+
+internal fun AssistantUiState.busy(method: String, id: String? = null) = method in pendingActions || (id!=null && "$method:$id" in pendingActions)
 private fun assistantStatus(state: AssistantUiState): String = when {
     state.loading -> "正在读取状态"; state.error != null -> "暂时无法确认状态"; state.snapshot?.enabled==null -> "状态尚未读取"
     state.snapshot.enabled==false -> "尚未启用"; state.snapshot.runtimeId.isNullOrBlank() -> "运行入口尚未提供"; state.snapshot.paused==true -> "助理已暂停"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Waiting && !it.suspended} -> "等待你确认"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Unknown && !it.suspended} -> "正在核对运行状态"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Running && !it.suspended} -> "正在处理"
-    state.snapshot.tasks.any {it.status==AssistantTaskStatus.Queued} -> "有任务在排队"; else -> "已启用"
+    state.snapshot.tasks.any {it.status==AssistantTaskStatus.Queued} -> "有任务在排队"; else -> "在线"
 }
-private fun taskLabel(status: AssistantTaskStatus) = when(status) {
+internal fun taskLabel(status: AssistantTaskStatus) = when(status) {
     AssistantTaskStatus.Queued -> "排队中"; AssistantTaskStatus.Running -> "运行中"; AssistantTaskStatus.WaitingUser -> "等你确认"; AssistantTaskStatus.Paused -> "已暂停"
     AssistantTaskStatus.Done -> "已完成"; AssistantTaskStatus.Failed -> "执行失败"; AssistantTaskStatus.Unknown -> "状态待确认"
 }
-@Composable private fun AssistantCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    PocketGlassSurface(modifier.fillMaxWidth(),shape=RoundedCornerShape(24.dp),dense=true) {
+@Composable internal fun AssistantCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Surface(modifier.fillMaxWidth(),shape=RoundedCornerShape(16.dp),color=assistantPalette().surface) {
         Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp),content=content)
     }
 }
-@Composable private fun AssistantBadge(text: String, failure: Boolean = false) {
+@Composable internal fun AssistantBadge(text: String, failure: Boolean = false) {
     val c=MaterialTheme.colorScheme
     Text(text,Modifier.background(if(failure) c.errorContainer else c.surfaceContainerHigh,RoundedCornerShape(10.dp)).padding(horizontal=10.dp,vertical=5.dp),
         color=if(failure) c.onErrorContainer else c.onSurfaceVariant,style=MaterialTheme.typography.labelMedium)
 }
-@Composable private fun AssistantChoice(label: String, selected: String, tag: String, choices: List<Pair<String,String>>, enabled: Boolean = true, onChoose: (String)->Unit) {
+@Composable internal fun AssistantChoice(label: String, selected: String, tag: String, choices: List<Pair<String,String>>, enabled: Boolean = true, onChoose: (String)->Unit) {
     var expanded by remember {mutableStateOf(false)}
     Column(verticalArrangement=Arrangement.spacedBy(6.dp)) {
         Text(label,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
@@ -118,71 +150,20 @@ private fun taskLabel(status: AssistantTaskStatus) = when(status) {
     }
 }
 
-@Composable private fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWorkspaceChoice>, canAct: Boolean, act: (() -> AssistantAction)->Unit, open: (String,String)->Unit) {
-    val snapshot=state.snapshot ?: return
-    val runtime=snapshot.runtimeId.orEmpty()
-    var message by rememberSaveable {mutableStateOf("")}
-    var sentDraft by rememberSaveable {mutableStateOf<String?>(null)}
-    var sentAck by rememberSaveable {mutableLongStateOf(state.sendAcknowledgement)}
-    var projectId by rememberSaveable {mutableStateOf<String?>(null)}
-    LaunchedEffect(state.sendAcknowledgement) {
-        if(state.sendAcknowledgement > sentAck && sentDraft != null) {if(message==sentDraft) message="";sentDraft=null;sentAck=state.sendAcknowledgement}
-    }
-    LaunchedEffect(state.error) {if(state.error!=null) sentDraft=null}
-    val projects=workspaces.filter {it.runtimeId==runtime && it.threadId.isNotBlank()}.distinctBy {it.threadId}
-    val project=projects.firstOrNull {it.threadId==projectId}
-    val missingProject=projectId!=null && project==null
-    val messages=remember(state.messages,snapshot) {
-        (state.messages.filter {it.role in setOf("User","Assistant")} + snapshot.coordinatorReplies.filter {reply ->
-            state.messages.none {it.role=="Assistant" && it.operationId==reply.operationId && it.text==reply.text}
-        }).distinctBy {it.id}
-    }
-    Column(Modifier.fillMaxSize()) {
-        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("assistant-chat-list"),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-            snapshot.coordinatorThreadId?.let {thread -> item {
-                PocketTextButton({open(runtime,thread)},enabled=runtime.isNotBlank()) {Text("打开原协调对话")}
-            }}
-            if(messages.isEmpty()) item {Text("这里还没有收到真实消息记录。你可以交办新任务，或先查看下面的执行状态。",style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}
-            items(messages,key={"message:${it.id}"}) {m ->
-                AssistantCard(Modifier.testTag("assistant-message:${m.id}")) {
-                    Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween) {
-                        Text(if(m.role=="User") "你" else "助理",style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.secondary)
-                        m.atMs?.let {Text(assistantTime(it,snapshot.settings?.timezone ?: "UTC"),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)}
-                    }
-                    if(m.role=="User") SelectionContainer {Text(m.text,style=MaterialTheme.typography.bodyLarge)} else MarkdownText(m.text,"assistant:$runtime:message:${m.id}")
-                }
-            }
-            items(snapshot.operations.filter {it.question!=null}.distinctBy {it.id},key={"question:${it.id}"}) {op -> AssistantHumanQuestion(op,runtime,state,canAct,act)}
-            if(snapshot.tasks.isNotEmpty()) item {PocketSectionLabel("任务 · ${snapshot.tasks.size}")}
-            items(snapshot.tasks.distinctBy {it.id},key={"task:${it.id}"}) {task -> AssistantTaskCard(task,state,canAct,act,open)}
-            items(snapshot.operations.filter {it.role=="Execution" && it.phase in setOf(AssistantOperationPhase.Completed,AssistantOperationPhase.Failed) && !it.result.isNullOrBlank()}.distinctBy {it.id},key={"result:${it.id}"}) {op ->
-                AssistantCard(Modifier.testTag("assistant-result:${op.id}")) {
-                    AssistantBadge(if(op.phase==AssistantOperationPhase.Completed) "执行结果" else "失败原因",op.phase==AssistantOperationPhase.Failed)
-                    MarkdownText(op.result!!,"assistant:$runtime:result:${op.id}")
-                    op.threadId?.let {thread -> PocketButton("查看原对话",{open(runtime,thread)},Modifier.fillMaxWidth().testTag("assistant-thread:${op.id}"),enabled=runtime.isNotBlank(),secondary=true)}
-                }
-            }
-        }
-        Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(horizontal=16.dp,vertical=10.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
-            AssistantChoice("项目",project?.label ?: if(missingProject) "项目已不可用，请重新选择" else "不选择项目", "assistant-workspace",
-                listOf("none" to "不选择项目")+projects.map {it.threadId to it.label},enabled=canAct) {projectId=it.takeUnless {it=="none"}}
-            PocketTextField(message,{message=it},Modifier.testTag("assistant-message-input"),placeholder="把接下来的事交给助理…",enabled=canAct,minLines=1,maxLines=4)
-            Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-                Text(if(state.busy("assistant/send") || sentDraft!=null && sentDraft==message) "等待电脑确认，草稿已保留" else if(missingProject) "请重新确认项目" else if(snapshot.paused==true) "助理暂停中；新消息仍需电脑确认" else "使用所选运行入口",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                PocketButton("发送",{val text=message;act {AssistantActions.send(runtime,text,project)};sentDraft=text;sentAck=state.sendAcknowledgement},Modifier.testTag("assistant-send"),
-                    enabled=canAct && !missingProject && !state.busy("assistant/send") && message.isNotBlank() && message.toByteArray().size<=65536 && !(sentDraft!=null && message==sentDraft))
-            }
-        }
-    }
-}
-@Composable private fun AssistantTaskCard(task: AssistantTask, state: AssistantUiState, canAct: Boolean, act: (() -> AssistantAction)->Unit, open:(String,String)->Unit) {
+@Composable internal fun AssistantTaskCard(task: AssistantTask, state: AssistantUiState, canAct: Boolean, act: (() -> AssistantAction)->Unit, open:(String,String)->Unit) {
     val runtime=state.snapshot?.runtimeId.orEmpty()
     val operation=state.snapshot?.operations?.firstOrNull {it.id==task.activeRunId}
     var expanded by rememberSaveable(task.id) {mutableStateOf(false)}
-    AssistantCard(Modifier.testTag("assistant-task:${task.id}")) {
-        AssistantBadge(taskLabel(task.status),task.status==AssistantTaskStatus.Failed)
-        Text(task.prompt,style=MaterialTheme.typography.titleSmall,maxLines=if(expanded) Int.MAX_VALUE else 3,overflow=TextOverflow.Ellipsis)
-        PocketTextButton({expanded=!expanded}) {Text(if(expanded) "收起描述" else "展开描述")}
+    AssistantCard {
+        Column(Modifier.fillMaxWidth().clickable(onClickLabel=if(expanded) "收起任务详情" else "展开任务详情") {expanded=!expanded}.testTag("assistant-task:${task.id}"),verticalArrangement=Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
+                Icon(AssistantIcons.Tasks,null,Modifier.size(18.dp),tint=assistantPalette().accent)
+                Text(taskLabel(task.status),Modifier.weight(1f).padding(start=8.dp),style=MaterialTheme.typography.labelMedium,color=if(task.status==AssistantTaskStatus.Failed) MaterialTheme.colorScheme.error else assistantPalette().accent)
+                Text(if(expanded) "收起" else "详情",style=MaterialTheme.typography.labelSmall,color=assistantPalette().muted)
+            }
+            Text(task.prompt,style=MaterialTheme.typography.bodyLarge,maxLines=if(expanded) Int.MAX_VALUE else 2,overflow=TextOverflow.Ellipsis)
+        }
+        if(expanded) {
         task.detail?.takeIf {it.isNotBlank()}?.let {Text(it,style=MaterialTheme.typography.bodyMedium)}
         if(task.reconciliationRequired) Text("运行状态待电脑核对",style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
         Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
@@ -190,9 +171,10 @@ private fun taskLabel(status: AssistantTaskStatus) = when(status) {
             if(task.status in setOf(AssistantTaskStatus.Paused,AssistantTaskStatus.WaitingUser) && !task.reconciliationRequired && task.activeRunId==null) PocketButton("继续",{act {AssistantActions.task(runtime,task.id,true)}},Modifier.weight(1f).testTag("assistant-task-resume:${task.id}"),enabled=canAct && !state.busy("assistant/task/resume",task.id),secondary=true)
             operation?.threadId?.let {thread -> PocketButton("原对话",{open(runtime,thread)},Modifier.weight(1f).testTag("assistant-task-thread:${task.id}"),enabled=runtime.isNotBlank(),secondary=true)}
         }
+        }
     }
 }
-@Composable private fun AssistantHumanQuestion(op: AssistantOperation, runtime:String, state:AssistantUiState, canAct:Boolean, act:(()->AssistantAction)->Unit) {
+@Composable internal fun AssistantHumanQuestion(op: AssistantOperation, runtime:String, state:AssistantUiState, canAct:Boolean, act:(()->AssistantAction)->Unit) {
     val q=op.question ?: return
     var answer by rememberSaveable(op.id,q.requestId) {mutableStateOf("")}
     val allowed=canAct && op.phase==AssistantOperationPhase.Waiting && !op.suspended && !state.busy("assistant/respond",op.id)
@@ -384,7 +366,7 @@ private fun taskLabel(status: AssistantTaskStatus) = when(status) {
     },Modifier.testTag("assistant-schedule-save"),enabled=canAct && project!=null && prompt.isNotBlank() && !state.busy("assistant/schedule/create"))},dismissButton={PocketTextButton(dismiss) {Text("取消")}})
 }
 private val assistantWeekdays=listOf("周一","周二","周三","周四","周五","周六","周日")
-private fun assistantTime(ms:Long,zone:String):String = runCatching {DateTimeFormatter.ofPattern("MM-dd HH:mm").format(Instant.ofEpochMilli(ms).atZone(ZoneId.of(zone)))}.getOrDefault("时间待确认")
+internal fun assistantTime(ms:Long,zone:String):String = runCatching {DateTimeFormatter.ofPattern("MM-dd HH:mm").format(Instant.ofEpochMilli(ms).atZone(ZoneId.of(zone)))}.getOrDefault("时间待确认")
 private fun assistantScheduleLabel(s:AssistantSchedule):String = when(val type=s.kind.keys.singleOrNull()) {
     "Once" -> "一次 · ${s.kind.obj(type).number("at_ms").let {assistantTime(it,s.timezone)}}"
     "Daily" -> s.kind.obj(type).let {"每天 · %02d:%02d".format(it.number("hour"),it.number("minute"))}

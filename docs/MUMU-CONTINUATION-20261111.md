@@ -54,3 +54,13 @@
 已准备 `.local/windows-install-followup-20261111/install-final-safe.ps1`，需要用户从 Windows 开始菜单打开的独立 PowerShell 执行 `-Apply`。脚本固定 final manifest、保留原安装器保护、核对既有身份和配置，不启动或终止现有 Pocket/Codex 进程。安装成功也需要在正常生命周期切换后另行核对 bridge/helper/supervisor，不把单独重启 Codex 当成全部组件更新。
 
 Windows 诊断的 14 项文件哈希不变，18 个现有进程 PID/创建时间保持不变。主控早期快捷方式恢复尝试在安装预检停止后已经撤回；最终未切换安装记录。详细证据：`.local/windows-install-followup-20261111/REPORT.md`、`verification.json`。
+
+## 13:32 独立 Windows 安装更新
+
+后续验收提交 `dbc7b253c425ea61badcc2670d7e321c5c9d3d9c` 的 CI 全部通过。
+
+用户从独立 PowerShell 执行已复核安全包装后，final 核心已安装并通过物理路径校验，generation 为 `c9d7fccdb667d38179899f23af6c4f9c5081f053616aca231a0f7078a5526a5e`。可选集成 pending 为空，身份、配置、配对哈希前后保持一致，既有进程保持。未迁移状态或重新配对。
+
+当前逐项证据显示 root/cache 证书、computerId 和完整手机连接指纹一致，差异为配置中的 relayUrl、runtimeDirectories、routePreferences。此前合并报错没有记录具体差异；新版移除了历史配置整文件哈希这一过宽门槛，保留当前身份、私钥和 helper 物理归属检查。
+
+正在运行的旧 helper/bridge/supervisor 尚未切换；要在正常生命周期重启后单独核验。此结果不等于真实冷开机首发验收。原始证据：`.local/windows-install-followup-20261111/run-20261111-133244-652e17f5/result.json`。

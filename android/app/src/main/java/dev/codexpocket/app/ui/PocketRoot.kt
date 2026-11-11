@@ -118,6 +118,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     val openAgent: (String) -> Unit = { id -> repo.clearSourcePreview(); repo.openAgentReader(id); detail = null }
     val holder = rememberSaveableStateHolder()
     val homeHolder = rememberSaveableStateHolder()
+    val assistantHolder = rememberSaveableStateHolder()
     val conversation = !home && s.selected != null && !settings
     val canListFiles = s.paired && s.online && s.selected != null && s.supports("workspace/list")
     val canReadFiles = s.paired && s.online && s.selected != null && s.supports("workspace/read")
@@ -158,7 +159,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     }
     run {
         when {
-            assistantOpen -> PocketPageEntrance("assistant") {
+            assistantOpen -> assistantHolder.SaveableStateProvider("assistant:${s.computerId}") { PocketPageEntrance("assistant") {
                 val assistantRuntime=s.assistant.snapshot?.runtimeId
                 val store=s.runtimes.firstOrNull { it.id==assistantRuntime }?.configStoreId
                 val threadLinks = ThreadLinkBinding(repo, if (store == null || assistantRuntime == null) null
@@ -178,6 +179,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                     } }, onBack = {assistantOpen=false})
                 }
                 }
+            }
             }
             repairPairing -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { repairPairing = false })
             projectFiles -> PocketPageEntrance("files") { ProjectFilesScreen(s.advanced.projectFiles, s.advanced.projectFilesLoading, s.advanced.projectFilesError,

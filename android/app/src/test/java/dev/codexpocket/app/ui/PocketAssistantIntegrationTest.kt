@@ -109,22 +109,25 @@ class PocketAssistantIntegrationTest {
 
     @Test fun offlineEntryKeepsCachedMemoryReadableAndAllSaveControlsDisabled()=fixture(true) {repo,_->
         compose.onNodeWithTag("assistant-pocket-button").performClick()
+        // Commit the entry composition so PocketRoot's LaunchedEffect can start its real read.
+        compose.waitForIdle()
         compose.waitUntil(5_000) {repo.state.value.assistant.error!=null}
         compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
-        compose.onNodeWithTag("assistant-tab:Memory").performClick()
+        compose.openAssistantPage("Memory")
         compose.onNodeWithText("实际快照记忆").assertExists()
         scroll("assistant-memory-add").assertIsNotEnabled()
         scroll("assistant-memory-edit:memory").assertIsNotEnabled()
         scroll("assistant-memory-delete:memory").assertIsNotEnabled()
-        compose.onNodeWithTag("assistant-tab:Schedules").performClick()
+        compose.openAssistantPage("Schedules")
         scroll("assistant-schedule-add").assertIsNotEnabled()
-        compose.onNodeWithTag("assistant-tab:Settings").performClick()
+        compose.openAssistantPage("Settings")
         scroll("assistant-save-settings").assertIsNotEnabled()
         scroll("assistant-global-pause").assertIsNotEnabled()
     }
 
-    @Test fun offlineTransitionDisablesSendEvenBeforeTheNextReadCanFinish()=fixture(true) {repo,_->
+    @Test fun offlineTransitionDisablesSendEvenBeforeTheNextReadCanFinish()=fixture(true) {repo,db->
         compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.waitForIdle()
         compose.waitUntil(5_000) {repo.state.value.assistant.error!=null}
         val readGate=field(repo,"assistantRead") as Mutex
         runBlocking {readGate.lock()}
@@ -135,7 +138,88 @@ class PocketAssistantIntegrationTest {
             compose.runOnIdle {state(repo).update {it.copy(online=false)}}
             compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
             compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留离线草稿")
+            compose.onNodeWithTag("assistant-message-input").assertIsEnabled().performTextReplacement("离线仍可修改草稿")
+            compose.onNodeWithTag("assistant-message-input").assertTextEquals("离线仍可修改草稿")
+            compose.onNodeWithTag("assistant-send").assertIsNotEnabled().performTouchInput {click()}
+            db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
+            assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
         } finally {readGate.unlock()}
+    }
+
+    @Test fun childPageBackButtonReturnsToChatBeforeClosingToAttentionTab()=fixture(true) {_,_->
+        compose.onNodeWithTag("home-tab-attention").performClick().assertIsSelected()
+        compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.onNodeWithTag("assistant-message-input").performTextInput("往返后继续填写")
+        listOf("Memory","Settings").forEach {page->
+            compose.openAssistantPage(page)
+            compose.onNodeWithContentDescription("返回原页面").assertDoesNotExist()
+            compose.returnToAssistantChat()
+            compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
+            compose.onNodeWithTag("assistant-message-input").assertTextEquals("往返后继续填写")
+        }
+        compose.onNodeWithContentDescription("返回原页面").performClick()
+        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("home-tab-attention").assertIsSelected()
+    }
+
+    @Test fun offlineCachedDraftSurvivesClosingAndReopeningTheRealAssistantWithoutDispatch()=fixture(true) {repo,db->
+        val transport=RecordingOfflineConnection()
+        assign(repo,"client",transport)
+        compose.onNodeWithTag("home-tab-attention").performClick().assertIsSelected()
+        compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.waitForIdle()
+        compose.waitUntil(5_000) {repo.state.value.assistant.error!=null}
+        assertFalse(repo.state.value.online)
+        assertEquals(snapshot,repo.state.value.assistant.snapshot)
+
+        val draft="离线修改后的草稿\n回到首页后继续写"
+        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().performTextInput("离线第一稿")
+        compose.onNodeWithTag("assistant-message-input").performTextReplacement(draft)
+        compose.onNodeWithTag("assistant-message-input").assertTextEquals(draft)
+        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("返回原页面").performClick()
+        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-message-input").assertDoesNotExist()
+        compose.onNodeWithTag("home-tab-attention").assertIsSelected()
+
+        compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().assertTextEquals(draft)
+        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+
+        // Save the latest edit again through Android Back, rather than only retaining the first draft.
+        val revised="$draft，再核对一次"
+        compose.onNodeWithTag("assistant-message-input").performTextReplacement(revised)
+        compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
+        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("home-tab-attention").assertIsSelected()
+        compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().assertTextEquals(revised)
+        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+
+        assertEquals("Editing and reopening an offline draft must not call the transport",emptyList<String>(),transport.calls.toList())
+        db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
+        assertTrue(repo.state.value.assistant.pendingActions.isEmpty())
+        assertTrue(repo.state.value.assistant.messages.isEmpty())
+        assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
+        assertEquals(snapshot,repo.state.value.assistant.snapshot)
+    }
+
+    @Test fun androidBackFromChildPagesRetainsDraftThenReturnsToManagementTab()=fixture(true) {_,_->
+        compose.onNodeWithTag("home-tab-devices").performClick().assertIsSelected()
+        compose.onNodeWithTag("assistant-pocket-button").performClick()
+        compose.onNodeWithTag("assistant-message-input").performTextInput("系统返回保留草稿")
+        listOf("Memory","Settings").forEach {page->
+            compose.openAssistantPage(page)
+            compose.onNodeWithContentDescription("返回助理对话").assertIsDisplayed()
+            compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
+            compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
+            compose.onNodeWithTag("assistant-message-input").assertTextEquals("系统返回保留草稿")
+            compose.onNodeWithContentDescription("返回原页面").assertIsDisplayed()
+        }
+        compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
+        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("home-tab-devices").assertIsSelected()
     }
 
     @Test fun repositoryRejectsEveryOfflineAssistantMutationWithARetainedTransport()=fixture(true) {repo,db->

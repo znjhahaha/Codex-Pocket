@@ -3,14 +3,12 @@ package dev.codexpocket.app.ui
 import android.graphics.Bitmap
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.MainActivity
 import dev.codexpocket.app.data.*
 import kotlinx.serialization.json.*
@@ -83,8 +81,9 @@ class AssistantScreenTest {
             operations=listOf(AssistantOperation("execution","Execution","t",AssistantOperationPhase.Completed,false,"native-task",null,"**结果**：已整理两项待办")))
         val messages = listOf(AssistantChatMessage("u","User","请整理这个项目的待办",now), AssistantChatMessage("a","Assistant","我会先核对现有记录。",now+1))
         content({AssistantUiState(done,messages)},actions,opens)
+        scroll("assistant-message:u")
         compose.onNodeWithText("请整理这个项目的待办").assertExists()
-        compose.onNodeWithTag("assistant-message:a").assertExists()
+        scroll("assistant-message:a").assertExists()
         screenshot("chat-overview")
         scroll("assistant-result:execution").assertIsDisplayed()
         scroll("assistant-thread:execution").performClick()
@@ -97,8 +96,7 @@ class AssistantScreenTest {
         var state by mutableStateOf(AssistantUiState(snapshot()))
         content({state},actions)
         compose.onNodeWithTag("assistant-message-input").performTextInput("真实消息")
-        compose.onNodeWithTag("assistant-workspace").performClick()
-        compose.onNodeWithTag("assistant-workspace:authorized-thread").performClick()
+        compose.selectAssistantWorkspace("authorized-thread")
         compose.onNodeWithTag("assistant-send").performClick()
         assertEquals("真实消息",actions.last().params.string("message"))
         assertEquals("authorized-thread",actions.last().params.string("threadId"))
@@ -127,7 +125,7 @@ class AssistantScreenTest {
     @Test fun settingsUsePassedModelDirectoryAndNotificationTimezoneDrafts() {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot())},actions)
-        compose.onNodeWithTag("assistant-tab:Settings").performClick()
+        compose.openAssistantPage("Settings")
         scroll("assistant-personality").performTextReplacement("耐心核对")
         scroll("assistant-model").performClick()
         compose.onNodeWithTag("assistant-model:model:actual-model").performClick()
@@ -145,7 +143,7 @@ class AssistantScreenTest {
     @Test fun memoriesCreateEditDeleteOnlyAfterExplicitControls() {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot().copy(memories=listOf(AssistantMemory("m","记忆原文"))))},actions)
-        compose.onNodeWithTag("assistant-tab:Memory").performClick()
+        compose.openAssistantPage("Memory")
         compose.onNodeWithTag("assistant-memory-add").performClick()
         compose.onNodeWithTag("assistant-memory-text").performTextInput("新的记忆")
         compose.onNodeWithTag("assistant-memory-save").performClick()
@@ -165,7 +163,7 @@ class AssistantScreenTest {
         val actions = mutableListOf<AssistantAction>()
         val schedule = AssistantSchedule("s","错过的事项",buildJsonObject {put("Daily",buildJsonObject {put("hour",9);put("minute",0)})},"UTC",now+3600000,true,null)
         content({AssistantUiState(snapshot().copy(schedules=listOf(schedule)))},actions)
-        compose.onNodeWithTag("assistant-tab:Schedules").performClick()
+        compose.openAssistantPage("Schedules")
         compose.onNodeWithTag("assistant-schedule-add").performClick()
         compose.onNodeWithTag("assistant-schedule-prompt").performTextInput("新的定时事项")
         compose.onNodeWithTag("assistant-schedule-workspace").performClick()
@@ -182,21 +180,26 @@ class AssistantScreenTest {
         screenshot("schedules")
     }
 
-    @Test fun originalPocketButtonIsSixtyDpAndLargeFontDarkScreenRemainsInteractive() {
+    @Test fun largeFontDarkScreenKeepsChatAndMoreMenuInteractive() {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot())},actions,fontScale=1.6f,theme="dark")
-        compose.onNodeWithTag("assistant-pocket-button").assertWidthIsEqualTo(60.dp).assertHeightIsEqualTo(60.dp).assertHasClickAction()
-        compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-tab:Settings").performClick()
+        compose.onNodeWithTag("assistant-pocket-button").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-message-input").performTextInput("大字模式草稿")
+        compose.onNodeWithTag("assistant-send").assertIsDisplayed().assertIsEnabled()
+        compose.openAssistantPage("Settings")
         scroll("assistant-save-settings").assertIsDisplayed()
         screenshot("dark-large-font")
+        compose.returnToAssistantChat()
+        compose.onNodeWithTag("assistant-message-input").assertTextEquals("大字模式草稿")
+        compose.onNodeWithTag("assistant-send").assertIsDisplayed().assertIsEnabled()
+        assertTrue(actions.isEmpty())
     }
 
     @Test fun aNativeModelNamedDefaultDoesNotBecomeTheHostDefaultSentinel() {
         val directory=listOf(models.single().copy(model="default",name="电脑的 default 模型"))
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot())},actions,modelDirectory=directory)
-        compose.onNodeWithTag("assistant-tab:Settings").performClick()
+        compose.openAssistantPage("Settings")
         scroll("assistant-model").performClick()
         compose.onNodeWithTag("assistant-model:model:default").performClick()
         scroll("assistant-save-settings").performClick()
@@ -212,14 +215,23 @@ class AssistantScreenTest {
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot().copy(tasks=tasks,operations=listOf(op)))},actions)
         scroll("assistant-deny:paused-input").assertIsNotEnabled()
+        scroll("assistant-task:queued").assertHasClickAction()
+        compose.onNodeWithTag("assistant-task-pause:queued").assertDoesNotExist()
+        compose.expandAssistantTask("queued")
         scroll("assistant-task-pause:queued").performClick()
         assertEquals("assistant/task/pause",actions.last().method)
+        assertEquals("queued",actions.last().params.string("taskId"))
+        compose.expandAssistantTask("paused")
         scroll("assistant-task-resume:paused").performClick()
         assertEquals("assistant/task/resume",actions.last().method)
+        assertEquals("paused",actions.last().params.string("taskId"))
         scroll("assistant-task:uncertain").assertExists()
+        compose.expandAssistantTask("uncertain")
         compose.onNodeWithTag("assistant-task-resume:uncertain").assertDoesNotExist()
         scroll("assistant-task:failed").assertExists()
+        compose.expandAssistantTask("failed")
         compose.onNodeWithTag("assistant-task-resume:failed").assertDoesNotExist()
+        assertEquals(2,actions.size)
     }
 
     @Test fun emptyInitialDirectoryAllowsExplicitHostDefaultAndEnable() {
@@ -240,7 +252,7 @@ class AssistantScreenTest {
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot().copy(memories=listOf(AssistantMemory("m","记忆")))))
         content({state},actions)
-        compose.onNodeWithTag("assistant-tab:Memory").performClick()
+        compose.openAssistantPage("Memory")
         scroll("assistant-memory-delete:m").performClick()
         compose.runOnIdle {state=state.copy(error="连接电脑后可继续使用助理")}
         compose.onNodeWithTag("assistant-confirm-delete").assertIsNotEnabled()
