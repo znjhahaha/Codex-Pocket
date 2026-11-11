@@ -3,7 +3,7 @@ resolver = "2"
 
 [package]
 name = "pocket-runtime-ipc"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 license = "MIT"
 description = "Agent-independent trusted local Runtime Host client and protocol"

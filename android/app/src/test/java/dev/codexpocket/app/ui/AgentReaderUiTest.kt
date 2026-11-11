@@ -150,6 +150,7 @@ class AgentReaderUiTest {
                 { state = state.copy(child = null, timeline = NativeTimeline()) }, {},
                 { state = state.copy(fullScreen = it) }, {}, {})
         }
+        waitForReaderRow(items.last().key, displayed = true)
         val list = compose.onNodeWithTag("agent-reader-transcript")
         val host = compose.onNodeWithTag("pocket-overlay-host").fetchSemanticsNode().boundsInRoot
         val preview = compose.onNodeWithTag("pocket-modal-surface").fetchSemanticsNode().boundsInRoot
@@ -196,6 +197,7 @@ class AgentReaderUiTest {
         content {
             AgentReaderPanel(state, listOf(current), emptyMap(), online, {}, {}, {}, {}, { older++ }, { retries++ })
         }
+        waitForReaderRow(original.key, displayed = true)
         compose.onNodeWithTag("agent-reader-row:${original.key}").assertIsDisplayed()
         compose.onNodeWithText("离线 · 缓存内容").assertIsDisplayed()
         compose.onNodeWithTag("agent-reader-retry").assertIsNotEnabled()
@@ -294,8 +296,15 @@ class AgentReaderUiTest {
             completedTurns = setOf("done"), turns = mapOf("done" to NativeTurnInfo("done", status = "completed")))
         content { AgentReaderPanel(AgentReaderState(parent, child = child, timeline = timeline),
             listOf(current), emptyMap(), true, {}, {}, {}, {}, {}, {}) }
+        waitForReaderRow("process:done")
         compose.onNodeWithText("上 1 条消息").performScrollTo().performClick()
+        // Expansion is projected on Dispatchers.Default. The collapsed preview
+        // still contains an unmerged tool tag until the real activity row arrives.
+        waitForReaderRow("activity:${tool.key}")
         compose.onNodeWithTag("activity-toggle:${tool.key}").performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText(compose.activity.getString(R.string.full_details)).fetchSemanticsNodes().size == 1
+        }
         compose.onNodeWithText(compose.activity.getString(R.string.full_details)).performScrollTo().performClick()
         compose.onNodeWithTag("agent-reader-detail:${tool.key}").performScrollTo().assertIsDisplayed()
         compose.onAllNodesWithTag("agent-reader-detail:${tool.key}").assertCountEquals(1)

@@ -64,6 +64,11 @@ class NativeTraceDensityUiTest {
         compose.onNodeWithTag("activity-group-toggle:group").performClick()
         compose.onNodeWithTag("inline-diff:file:1").assertDoesNotExist()
         compose.onNodeWithTag("activity-group-toggle:group").performClick()
+        // Reopening remounts the tool descriptor, which parses on Dispatchers.Default.
+        // Assert the retained file choice after that presentation is available again.
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithTag("inline-diff:file:1").fetchSemanticsNodes().size == 1
+        }
         compose.onNodeWithTag("inline-diff:file:1").assertExists()
     }
 
