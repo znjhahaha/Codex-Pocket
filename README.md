@@ -122,4 +122,8 @@
 - [CI 与发布流程](docs/V06-RELEASE.md) · [0.6 验收记录](docs/V06-ACCEPTANCE.md)
 - [项目状态](docs/STATUS.md) · [第三方授权](THIRD_PARTY_NOTICES.md)
 
-MuMu 已覆盖安装 0.6.0：已有会话数据切换 20 次与 120 秒停留期间连接中断 0 次；另完成真实界面 20 次进入／返回、50 次本地导航回归和 30 个带录屏阅读阶段。没有新增真实模型请求。长列表性能仍待优化；新版 Windows 桥接、真实 Windows 登录、Cloudflare／SSH 公网集成、Mate 70 Pro、HMS 与 24 小时稳定性单独记录，详细范围见验收记录。
+
+
+## 社区认可
+
+本项目认可 [LINUX DO](https://linux.do/) 社区倡导的「真诚、友善、团结、专业」，支持开源分享与技术交流。
