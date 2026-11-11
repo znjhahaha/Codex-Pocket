@@ -1,11 +1,13 @@
 import {test,expect} from '@playwright/test';
 
-async function fixture(page:import('@playwright/test').Page,supported=true,unknown=false) {
- await page.addInitScript(({supported,unknown})=>{
+async function fixture(page:import('@playwright/test').Page,supported=true,unknown=false,verifiedUi=true) {
+ await page.addInitScript(({supported,unknown,verifiedUi})=>{
   const w=window as unknown as {__TAURI_INTERNALS__:unknown;repairCalls:unknown[]};w.repairCalls=[];
   w.__TAURI_INTERNALS__={invoke:async(command:string,args:Record<string,unknown>)=>{
    if(command==='dashboard')return {computerName:'Fixture',desired:false,supervisor:{phase:'stopped',updatedAt:0,failures:0},relay:{state:'stopped',host:''},devices:[],processes:[],version:'fixture',startup:false,
-    installation:{consistent:true,installedGeneration:'a'.repeat(64),optionalIntegrations:{recordState:'available',repairSupported:supported,recoveryState:'clear',installationState:'installed_incomplete',steps:[
+    installation:{consistent:true,installedGeneration:'a'.repeat(64),
+     ui:verifiedUi?{generation:'a'.repeat(64),runningVerified:true,state:'current'}:undefined,
+     optionalIntegrations:{recordState:'available',repairSupported:supported,recoveryState:'clear',installationState:'installed_incomplete',steps:[
      {step:'shortcut_0',state:'completed'},{step:'shortcut_1',state:'pending',stage:'shortcut_verify',code:'shortcut_integration_failed',hresult:'0x80004005'},
      {step:'shortcut_2',state:'completed'},{step:'startup',state:'pending',stage:'startup_read',code:'startup_snapshot_unknown'}]}}};
    if(command==='repair_installed_integration'){
@@ -16,7 +18,7 @@ async function fixture(page:import('@playwright/test').Page,supported=true,unkno
    if(command==='export_diagnostics')return 'fixture-diagnostics.json';
    throw Error('Unexpected fixture command');
   }};
- },{supported,unknown});
+ },{supported,unknown,verifiedUi});
  await page.goto('/');await page.getByRole('button',{name:'查看详情',exact:true}).click();
 }
 test('verified current capability enables only pending steps and keeps truthful failure',async({page})=>{
@@ -36,6 +38,12 @@ test('old installed scripts stay read-only',async({page})=>{
  await fixture(page,false);
  for(const name of ['重试开始菜单入口','重试旧桌面入口清理','重试旧登录快捷方式清理','重试登录后台任务'])await expect(page.getByRole('button',{name,exact:true})).toBeDisabled();
  await expect(page.getByText(/当前安装器尚不支持分项修复/)).toBeVisible();
+});
+
+test('unverified current UI cannot repair an otherwise supported installation',async({page})=>{
+ await fixture(page,true,false,false);
+ for(const name of ['重试旧桌面入口清理','重试登录后台任务'])await expect(page.getByRole('button',{name,exact:true})).toBeDisabled();
+ expect(await page.evaluate(()=> (window as unknown as {repairCalls:unknown[]}).repairCalls)).toEqual([]);
 });
 test('unknown operation survives remount and checks the same ID without a fresh repair',async({page})=>{
  await fixture(page,true,true);
