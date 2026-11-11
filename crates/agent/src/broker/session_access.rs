@@ -324,7 +324,7 @@ impl Broker {
                 state
                     .runtimes
                     .iter()
-                    .find(|(_, r)| r.source == "cli" && r.rpc.online())
+                    .find(|(_, r)| r.source == "cli" && r.rpc.online() && !matches!(r.role,crate::native::NativeRole::ManagedHost{..}))
                     .map(|(id, _)| id.clone())
             }
         };

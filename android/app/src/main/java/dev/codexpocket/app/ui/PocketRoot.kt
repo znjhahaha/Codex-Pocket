@@ -61,7 +61,7 @@ fun PocketRoot(s: PocketState, repo: PocketRepository) { CompositionLocalProvide
                 if (child?.key?.nativeId == media.threadId && child.runtimeId == media.runtimeId) child else main)
             override suspend fun refresh(media: ToolMediaRef, manual: Boolean) { repo.refreshToolMedia(media, manual) }
         }
-    }) { ProvideMarkdownRendering { PocketBackdrop { PocketContent(s, repo) } } } }
+    }) { ProvideMarkdownRendering(ThreadLinkBinding(repo, s.selected?.key)) { PocketBackdrop { PocketContent(s, repo) } } } }
 
 @Composable
 internal fun PocketBackdrop(content: @Composable () -> Unit) {
@@ -75,6 +75,12 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var runtimeFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var tab by rememberSaveable { mutableStateOf(HomeTab.Chats) }
     var settings by rememberSaveable { mutableStateOf(false) }
+    var assistantOpen by rememberSaveable { mutableStateOf(false) }
+    val assistantScope = rememberCoroutineScope()
+    LaunchedEffect(assistantOpen, s.online, s.computerId) {
+        if (assistantOpen) while (true) { repo.loadAssistant().join(); kotlinx.coroutines.delay(2000) }
+    }
+    LaunchedEffect(home, tab, s.online, s.computerId) { if (home && tab == HomeTab.Devices) repo.loadUsage() }
     var repairPairing by rememberSaveable { mutableStateOf(false) }
     var newChat by rememberSaveable { mutableStateOf(false) }
     var modelSheet by rememberSaveable { mutableStateOf(false) }
@@ -93,6 +99,19 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var rename by rememberSaveable { mutableStateOf(false) }
     var detail by remember { mutableStateOf<TimelineItem?>(null) }
     var previousSelection by remember { mutableStateOf(s.selected?.key) }
+    LaunchedEffect(repo) {
+        repo.threadLinkOpened.collect {
+            assistantOpen = false
+            home = false
+            settings = false
+            projectFiles = false
+            detail = null
+            modelSheet = false
+            conversationMenu = false
+            repo.clearSourcePreview()
+            repo.closeAgentReader()
+        }
+    }
     var createOrigin by remember { mutableStateOf<ThreadKey?>(null) }
     LaunchedEffect(home) { if (home) { repo.clearSourcePreview(); repo.closeAgentReader() } }
     val backToParent: () -> Unit = { repo.clearSourcePreview(); repo.closeAgentReader(); home = true }
@@ -134,11 +153,32 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
         }
         previousSelection = s.selected?.key
     }
-    BackHandler(repairPairing || !home || settings || projectFiles || detail != null || s.advanced.sourcePreview != null) {
-        when { repairPairing -> repairPairing = false; s.advanced.sourcePreview != null -> repo.clearSourcePreview(); projectFiles -> { repo.clearSourcePreview(); projectFiles = false }; detail != null -> { repo.clearSourcePreview(); detail = null }; settings -> settings = false; else -> backToParent() }
+    BackHandler(assistantOpen || repairPairing || !home || settings || projectFiles || detail != null || s.advanced.sourcePreview != null) {
+        when { assistantOpen -> assistantOpen = false; repairPairing -> repairPairing = false; s.advanced.sourcePreview != null -> repo.clearSourcePreview(); projectFiles -> { repo.clearSourcePreview(); projectFiles = false }; detail != null -> { repo.clearSourcePreview(); detail = null }; settings -> settings = false; else -> backToParent() }
     }
     run {
         when {
+            assistantOpen -> PocketPageEntrance("assistant") {
+                val assistantRuntime=s.assistant.snapshot?.runtimeId
+                val store=s.runtimes.firstOrNull { it.id==assistantRuntime }?.configStoreId
+                val threadLinks = ThreadLinkBinding(repo, if (store == null || assistantRuntime == null) null
+                    else ThreadKey(s.computerId, store, s.assistant.snapshot?.coordinatorThreadId.orEmpty()))
+                CompositionLocalProvider(LocalThreadLinkBinding provides threadLinks) {
+                Column {
+                s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
+                AssistantScreen(s.assistant, s.assistantModels,
+                    s.runtimes.filter { it.role != "managedHost" || it.id == assistantRuntime }.map { AssistantRuntimeChoice(it.id, "${if (it.role == "managedHost") "助理 CLI" else it.source} · ${it.version}", it.online && s.online) },
+                    s.chats.filter { store==null || it.key.configStoreId==store }.map {
+                        AssistantWorkspaceChoice(assistantRuntime ?: it.runtimeId, it.key.nativeId, it.title,
+                            canWrite = s.online && !it.isSubagent)
+                    }.distinctBy { it.threadId }, repo::assistantAction,
+                    onOpenThread = { runtime, thread -> assistantScope.launch {
+                        repo.openAssistantThread(runtime, thread).join()
+                        if (repo.state.value.selected?.key?.nativeId == thread) { assistantOpen=false;home=false }
+                    } }, onBack = {assistantOpen=false})
+                }
+                }
+            }
             repairPairing -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { repairPairing = false })
             projectFiles -> PocketPageEntrance("files") { ProjectFilesScreen(s.advanced.projectFiles, s.advanced.projectFilesLoading, s.advanced.projectFilesError,
                 onNavigate = navigateFiles, onOpen = openSource, onBack = { repo.clearSourcePreview(); projectFiles = false },
@@ -150,7 +190,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
             s.initialized && s.paired && !settings && !conversation -> PocketPageEntrance("home", back = true) { PocketHomeFrame(s, tab,
                 s.approvals.count { !it.submitted && !ConversationPresentation.hookType(it.method) } + s.pendingQuestions.values.sumOf { values -> values.count { !it.flag("submitted") } },
                 homeScrolled && tab == HomeTab.Chats, hostSheet, { hostSheet = true }, { newChat = true },
-                { settings = true; if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }) {
+                { settings = true; if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }, onAssistant = { assistantOpen=true }) {
                 val insets = LocalHomeContentPadding.current
                 val hasNotice = s.error != null
                 Column(Modifier.fillMaxSize()) {
@@ -167,7 +207,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                                 when (shownTab) {
                                     HomeTab.Chats -> ChatsHome(s, { repo.markRead(it); repo.select(it); home = false }, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention }, onEnsureDirectory = { q, a -> repo.ensureDirectory(q, a) })
                                     HomeTab.Attention -> AttentionHome(s, repo) { repo.markRead(it); repo.select(it); home = false }
-                                    HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true)
+                                    HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true, usageState = s.usage, onUsageRefresh = { repo.loadUsage() }, onUsageFilter = { repo.loadUsage(it) })
                                 }
                             }
                         }
@@ -184,7 +224,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 Column(Modifier.fillMaxSize().padding(if (conversation) PaddingValues(0.dp) else padding)) {
                     if (!conversation && (s.paired || settings)) s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                     when {
-                        settings -> PocketPageEntrance("settings") { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }) }
+                        settings -> PocketPageEntrance("settings") { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, usageState = s.usage, onUsageRefresh = { repo.loadUsage() }, onUsageFilter = { repo.loadUsage(it) }) }
                         !s.initialized -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PocketProgressStatus("正在准备") }
                         !s.paired -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { settings = true })
                         conversation -> holder.SaveableStateProvider(s.selected!!.key.encoded) {

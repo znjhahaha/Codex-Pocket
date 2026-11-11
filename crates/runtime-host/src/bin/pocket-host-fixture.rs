@@ -2,9 +2,39 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 fn main() {
+    // Give lifecycle tests a real Host process identity, independent of the test runner.
+    let mut args = std::env::args().skip(1);
+    let mode = args.next();
+    if mode.as_deref() == Some("--host-test-driver") {
+        let root = std::path::PathBuf::from(args.next().expect("fixture root"));
+        assert!(args.next().is_none());
+        let config = pocket_runtime_host::HostConfig {
+            state: root.join("state"),
+            descriptor: root.join("registry/host.json"),
+            binary: std::env::current_exe().unwrap(),
+            native_args: vec!["--exit-file".into(), root.join("native-exit").to_string_lossy().into_owned()],
+            config_home: root,
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(pocket_runtime_host::run(config)).unwrap();
+        return;
+    }
+    let exit_file = (mode.as_deref() == Some("--exit-file"))
+        .then(|| std::path::PathBuf::from(args.next().expect("exit sentinel")));
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if send.send(line).is_err() { break; }
+        }
+    });
     let mut writes = 0u64;
     let mut answers = 0u64;
-    for line in std::io::stdin().lock().lines() {
+    loop {
+        if exit_file.as_ref().is_some_and(|path| path.exists()) { break; }
+        let line = match receive.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        };
         let Ok(line) = line else {
             break;
         };
@@ -39,6 +69,7 @@ fn main() {
                 json!({"writes":writes})
             }
             "fixture/count" => json!({"writes":writes,"answers":answers}),
+            "thread/read" => json!({"thread":{"id":value["params"]["threadId"],"turns":[]},"writes":writes,"answers":answers}),
             "fixture/question" => {
                 emit(
                     json!({"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":"fixture-thread","command":"fixture only"}}),

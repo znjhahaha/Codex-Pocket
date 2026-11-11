@@ -1,5 +1,5 @@
 #requires -Version 7.0
-param([Parameter(Mandatory)][string]$NativeDir)
+param([Parameter(Mandatory)][string]$NativeDir, [string]$RustToolchain='1.93.1', [string]$RustTargetDir)
 $ErrorActionPreference='Stop'
 $NativeDir=[IO.Path]::GetFullPath($NativeDir)
 $env:PATH=$NativeDir+';'+$env:PATH
@@ -20,22 +20,25 @@ $compiler=@((CachedJar 'org.jetbrains.kotlin/kotlin-compiler-embeddable' '2.2.21
     (CachedJar 'org.jetbrains.kotlin/kotlin-reflect' '2.2.21'),
     (CachedJar 'org.jetbrains.kotlinx/kotlinx-coroutines-core-jvm'),
     (CachedJar 'org.jetbrains/annotations')) -join ';'
-# Extract the actual BinaryTransport/TransportListener declarations without compiling unrelated
-# production code or invoking Gradle. The only stand-in is their source file's other dependencies.
-$outer=Get-Content (Join-Path $root 'android/wire/src/main/kotlin/dev/codexpocket/wire/OuterTransport.kt')
-$contracts=@('package dev.codexpocket.wire')+@($outer | Where-Object {$_ -match '^internal interface (BinaryTransport|TransportListener) '})
-if($contracts.Count -ne 3){throw 'Wire transport declarations changed; inspect fixture compatibility'}
-$contracts | Set-Content -LiteralPath (Join-Path $out 'Contracts.kt') -Encoding utf8
+$classpath=@($stdlib,(CachedJar 'org.jetbrains/annotations' '13.0'),
+    (CachedJar 'org.jetbrains.kotlinx/kotlinx-coroutines-core-jvm' '1.10.2'),
+    (CachedJar 'org.jetbrains.kotlinx/kotlinx-serialization-json-jvm' '1.9.0'),
+    (CachedJar 'org.jetbrains.kotlinx/kotlinx-serialization-core-jvm' '1.9.0'),
+    (CachedJar 'com.squareup.okhttp3/okhttp' '4.12.0'),
+    (CachedJar 'com.squareup.okio/okio-jvm' '3.6.0')) -join ';'
+# Compile the actual wire sources: copied interface lines missed the writable contract
+# and the authenticated relay metadata type after product integration.
+$sources=@(Get-ChildItem -LiteralPath (Join-Path $root 'android/wire/src/main/kotlin') -Recurse -File -Filter '*.kt' | ForEach-Object FullName)
+$sources+=(Join-Path $PSScriptRoot 'kotlin/DataChannelFixture.kt')
 $jar=Join-Path $out 'fixture.jar'
-& java -cp $compiler org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -jvm-target 17 -classpath $stdlib -d $jar `
-    (Join-Path $out 'Contracts.kt') (Join-Path $PSScriptRoot 'kotlin/DataChannelFixture.kt') `
-    (Join-Path $root 'android/wire/src/main/kotlin/dev/codexpocket/wire/DataChannelTransport.kt')
+& java -cp $compiler org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -jvm-target 17 -classpath $classpath -d $jar @sources
 if($LASTEXITCODE -ne 0){throw 'Kotlin adapter compile failed'}
-$classpath=$jar+';'+$stdlib
+$classpath=$jar+';'+$classpath
 & java "-XX:ErrorFile=$out/hs_err_pid%p.log" "-Djava.library.path=$NativeDir" -cp $classpath dev.codexpocket.wire.DataChannelFixtureKt
 if($LASTEXITCODE -ne 0){throw "Kotlin host JNI fixture failed (exit $LASTEXITCODE)"}
 $env:P2P_NATIVE_DIR=$NativeDir
 $env:P2P_KOTLIN_CLASSPATH=$classpath
 $env:PATH=$NativeDir+';'+$env:PATH
-& cargo test --offline --manifest-path (Join-Path $root 'crates/p2p/Cargo.toml') --target-dir (Join-Path $root 'crates/p2p/target-step1') --test mixed_host -- --ignored
+if(-not $RustTargetDir){$RustTargetDir=Join-Path $out 'rust-target'}
+& cargo "+$RustToolchain" test --locked --offline --manifest-path (Join-Path $root 'crates/p2p/Cargo.toml') --target-dir $RustTargetDir --test mixed_host -- --ignored --nocapture --test-threads=1
 if($LASTEXITCODE -ne 0){throw 'Rust/Kotlin host interop failed'}

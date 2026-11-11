@@ -62,7 +62,8 @@ internal fun PairScreen(
 ) = EmbeddedPairingScreen(busy, onPair, phase, error, onDismiss)
 
 internal enum class SettingsPage(val label: String) {
-    Connection("电脑连接"), Extensions("扩展管理"), App("应用设置"),
+    // Keep the saveable page identity while replacing its displayed product content.
+    Connection("电脑连接"), Extensions("用量"), App("应用设置"),
 }
 
 /** Scroll and saveable child state outlive each page's brief content transition. */
@@ -152,7 +153,9 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
 }
 
 @Composable
-internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() -> Unit)? = null, modifier: Modifier = Modifier, management: Boolean = false) {
+internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() -> Unit)? = null, modifier: Modifier = Modifier,
+    management: Boolean = false, usageState: UsageScreenState? = null, onUsageRefresh: (() -> Unit)? = null,
+    onUsageFilter: ((UsageFilter) -> Unit)? = null) {
     val context = LocalContext.current
     var forget by rememberSaveable { mutableStateOf(false) }
     var clear by rememberSaveable { mutableStateOf(false) }
@@ -171,14 +174,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     }
     SettingsPageLayout(if (management) SettingsPage.Connection else SettingsPage.App, modifier,
         extensionContent = { pageModifier, padding ->
-            if (s.paired) ExtensionManagementPanel(s, { repo.loadExtensions(it) },
-                { id, enabled -> repo.setExtensionEnabled(id, enabled) }, { repo.refreshExtensions() }, pageModifier, padding)
-            else Column(pageModifier.padding(padding)) {
-                SettingsSection("连接电脑后管理扩展") {
-                    Text("先在“电脑连接”中配对电脑，再选择要管理的运行时。", Modifier.padding(12.dp))
-                    if (onPair != null) PocketActionRow("扫码配对电脑", PocketIcons.QrCodeScanner, onPair)
-                }
-            }
+            val wired = usageState != null && onUsageRefresh != null && onUsageFilter != null
+            UsageScreen(if (wired) usageState!! else UsageScreenState(), onUsageRefresh ?: {}, onUsageFilter ?: {}, pageModifier, padding)
         }) { page ->
         when (page) {
             SettingsPage.Connection -> {
@@ -209,6 +206,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                         if (onPair != null) PocketActionRow("重新扫码配对", PocketIcons.QrCodeScanner, onPair,
                             subtitle = "更新此电脑的授权，保留会话缓存与草稿")
                     }
+                    UpstreamVersionPanel(s, repo)
                     SettingsSection("新会话默认模式") {
                         SessionModeChoices(s.sessionPreferences.defaultMode, s.online && s.preferencesFresh &&
                             s.supports(BrokerCapability.PreferencesUpdate) && s.actionStatus["preferences"]?.loading != true, repo::setDefaultSessionMode)

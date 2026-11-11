@@ -112,6 +112,27 @@ impl Server {
                         ) {
                             bail!("Local authentication required");
                         }
+                        let method=request["method"].as_str().unwrap_or_default();
+                        if method.starts_with("upgrade/") {
+                            let Some(handoff)=broker.handoff.get() else {
+                                write(&mut stream,&failure("unsupported","Safe handoff is unsupported")).await?;
+                                return Ok::<(),anyhow::Error>(());
+                            };
+                            let params=request.get("params").cloned().unwrap_or(json!({}));
+                            let result=broker.upgrade_local(handoff,method,params.clone()).await;
+                            let successful=result.is_ok();
+                            let response=match result{Ok(value)=>json!({"result":value}),Err(error)=>json!({"error":error.wire()})};
+                            write(&mut stream,&response).await?;
+                            stream.flush().await?;
+                            if successful && method=="upgrade/release" {broker.upgrade_release_flushed(handoff,&params)?;}
+                            return Ok(());
+                        }
+                        let guard=if matches!(method,"routes/configure"|"session/preferences/update"|"pair"|"revoke") {
+                            match broker.handoff.get().map(|h|h.admit_write()).transpose() {
+                                Ok(guard)=>guard,
+                                Err(error)=>{write(&mut stream,&json!({"error":error.wire()})).await?;return Ok(());}
+                            }
+                        }else{None};
                         let result = match request["method"].as_str() {
                             Some("status") => {
                                 let mut v = broker.diagnostics().await;
@@ -154,6 +175,7 @@ impl Server {
                             }
                             _ => Err(anyhow::anyhow!("Unsupported local command")),
                         };
+                        if let Some(guard)=guard {guard.confirm()?;}
                         let reply = match result {
                             Ok(v) => json!({"result":v}),
                             Err(e) => {

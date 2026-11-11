@@ -161,7 +161,7 @@ pub fn read_physical(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if bytes.len() as u64 > limit { bail!("State file exceeds limit"); }
     Ok(bytes)
 }
-pub(crate) fn verify_physical_file(path: &Path, file: &fs::File) -> Result<()> {
+pub fn verify_physical_file(path: &Path, file: &fs::File) -> Result<()> {
     #[cfg(not(windows))] let _ = (path, file);
     #[cfg(windows)] unsafe {
         use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
@@ -209,14 +209,19 @@ mod tests {
     fn physical_read_accepts_windows_short_names_but_not_a_different_handle() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
-        let directory = tempfile::Builder::new().prefix("pocket physical path fixture ").tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("pocket physical path fixture ")
+            .tempdir()
+            .unwrap();
         let path = directory.path().join("long state name.json");
         fs::write(&path, b"preserved").unwrap();
         let input: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut output = vec![0u16; 32768];
-        let count = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32) };
+        let count =
+            unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32) };
         assert!(count > 0 && (count as usize) < output.len());
-        let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&output[..count as usize]));
+        let short =
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(&output[..count as usize]));
         assert_eq!(read_physical(&short, 1024).unwrap(), b"preserved");
         let other = directory.path().join("other.json");
         fs::write(&other, b"wrong").unwrap();

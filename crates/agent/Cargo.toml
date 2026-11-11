@@ -34,7 +34,10 @@ pocket-runtime-ipc = {path="../runtime-ipc"}
 codex-cli-adapter = {path="../cli-adapter"}
 pocket-tunnel = {path="../tunnel"}
 pocket-network = {path="../network"}
+pocket-p2p = {path="../p2p"}
 mdns-sd = "=0.21.7"
+chrono = "0.4"
+chrono-tz = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

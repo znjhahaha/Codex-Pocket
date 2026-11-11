@@ -90,7 +90,7 @@ $script:fakePackage = [pscustomobject]@{InstallLocation=$native;PackageFamilyNam
 $binarySource = Join-Path $testRoot 'binaries'
 Put (Join-Path $binarySource 'pocket-agent.exe') 'agent fixture; never execute'
 Put (Join-Path $binarySource 'pocket-bridge.exe') 'bridge fixture; never execute'
-foreach($name in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')) { Put (Join-Path $binarySource $name) ($name+' fixture; never execute') }
+foreach($name in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe','pocket-runtime-host.exe','pocket-p2p.dll','datachannel.dll')) { Put (Join-Path $binarySource $name) ($name+' fixture; never execute') }
 Put (Join-Path $binarySource 'private-key.der') 'must never ship'
 $apk = Join-Path $testRoot 'synthetic.apk'
 Put $apk 'unsigned fixture; never install'
@@ -98,7 +98,7 @@ $packageRoot = Join-Path $testRoot 'release'
 $packageInputs=Join-Path $testRoot 'package-inputs'
 foreach($name in Get-PocketWindowsFiles) {
     if($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')){Put (Join-Path $packageInputs ('.local\tools\'+$name)) ('fixture '+$name)}
-    elseif($name -notlike '*.exe') {
+    elseif($name -notlike '*.exe' -and $name -notlike '*.dll') {
         $folder=if($name -like '*.md'){'docs'}else{'scripts'}
         Put (Join-Path $packageInputs ($folder+'\'+$name)) ([IO.File]::ReadAllText((Join-Path $PSScriptRoot ('..\'+$folder+'\'+$name))))
     }
@@ -555,6 +555,11 @@ $global:LASTEXITCODE = 0
     function script:Get-PocketKeytoolPath { return $script:fakeKeytool }
     function script:cargo { $script:cargoArguments = @($args); $global:LASTEXITCODE = $script:cargoExit }
     Put (Join-Path $buildRoot 'scripts\fetch-cloudflared.ps1') '$global:LASTEXITCODE=0'
+    Put (Join-Path $buildRoot 'scripts\build-p2p-product.ps1') '$global:LASTEXITCODE=0'
+    foreach($library in @('pocket-p2p.dll','datachannel.dll')) {
+        Put (Join-Path $buildRoot ('.local\p2p\product-windows\Release\'+$library)) ('native fixture '+$library)
+    }
+    [void][IO.Directory]::CreateDirectory((Join-Path $buildRoot 'target\x86_64-pc-windows-msvc\release'))
     $script:cargoExit = 17
     $script:cargoArguments = @()
     $environment = @{}
@@ -582,7 +587,7 @@ $global:LASTEXITCODE = 0
         foreach($file in Get-PocketWindowsFiles) {
             if($file -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$targetFile=Join-Path $buildRoot ('.local\tools\'+$file)}
             elseif($file -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')){$targetFile=Join-Path $buildRoot ('desktop\target\release\'+$file)}
-            elseif($file -like '*.exe'){$targetFile=Join-Path $buildRoot ('target\x86_64-pc-windows-msvc\release\'+$file)}
+            elseif($file -like '*.exe' -or $file -like '*.dll'){$targetFile=Join-Path $buildRoot ('target\x86_64-pc-windows-msvc\release\'+$file)}
             elseif($file -like '*.md'){$targetFile=Join-Path $buildRoot ('docs\'+$file)}
             else{$targetFile=Join-Path $buildRoot ('scripts\'+$file)}
             Put $targetFile ('synthetic '+$file)
@@ -593,6 +598,9 @@ $global:LASTEXITCODE = 0
         Assert ($published.build.frontendTestsPassed -and $script:desktopBuilt) 'Desktop build evidence missing'
         Assert ($published.build.desktopProfile -eq 'release') 'Desktop release profile absent'
         Assert ((Get-PocketFileHash (Join-Path $releaseOutput 'windows\pocket-desktop.exe')) -eq (Get-PocketFileHash (Join-Path $buildRoot 'desktop\target\release\pocket-desktop.exe'))) 'Wrong desktop output packaged'
+        foreach($library in @('pocket-p2p.dll','datachannel.dll')) {
+            Assert ((Get-PocketFileHash (Join-Path $releaseOutput ('windows\'+$library))) -eq (Get-PocketFileHash (Join-Path $buildRoot ('.local\p2p\product-windows\Release\'+$library)))) 'Wrong native transport library packaged'
+        }
         foreach ($name in $names) { Assert ([Environment]::GetEnvironmentVariable($name,'Process') -eq ('sentinel-' + $name)) 'Successful build did not restore signing environment' }
     } finally {
         foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$environment[$name],'Process') }

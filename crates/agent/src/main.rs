@@ -278,30 +278,54 @@ async fn execute(args: Args) -> Result<()> {
             )?);
             let (broker, events) =
                 startup.step(Phase::Broker, Broker::open(c.clone(), state.clone()))?;
-            broker.connection.set_remote_enabled(!args.supervised);
-            let controller =
-                routes::Controller::open(state.clone(), c.clone(), broker.connection.clone());
-            let _control = startup.step(
-                Phase::ControlBind,
-                local::Server::start_with_routes(&state, broker.clone(), controller.clone()).await,
-            )?;
-            let _ = startup.clear_own();
-            drop(startup);
-            let mut tasks = tokio::task::JoinSet::new();
-            tasks.spawn(broker.clone().discover());
+            let desired_remote=!args.supervised || pocket_agent::remote::desired(&state);
+            let request=startup.step(Phase::Handoff,pocket_agent::handoff::StartupRequest::from_env().map_err(Into::into))?;
+            let checkpoint=match request {Some(r)=>Some(r.checkpoint),None=>startup.step(Phase::Handoff,pocket_agent::handoff::Handoff::recovery_checkpoint(&state).map_err(Into::into))?};
+            let run_generation=uuid::Uuid::new_v4();
+            let handoff=startup.step(Phase::Handoff,match &checkpoint {
+                Some(cp)=>pocket_agent::handoff::Handoff::open_fenced(&state,run_generation,true,desired_remote,cp),
+                None=>pocket_agent::handoff::Handoff::open(&state,run_generation,true,desired_remote),
+            }.map_err(Into::into))?;
+            broker.install_handoff(handoff.clone())?;
+            handoff.sync_remote_gate(|enabled|broker.connection.set_remote_enabled(enabled));
+            let mut tasks=tokio::task::JoinSet::new();
             tasks.spawn(broker.clone().receive_events(events));
+            tasks.spawn(broker.clone().discover());
+            // Restoring a Host attaches its independent process and durable service; it never
+            // launches a replacement model task merely because the agent was upgraded.
+            let restored=broker.restore_assistant().await;
+            if checkpoint.is_some(){startup.step(Phase::AssistantRestore,restored)?;}
+            tasks.spawn(broker.clone().assistant_notifications());
+            if let Some(cp)=&checkpoint {
+                let until=tokio::time::Instant::now()+std::time::Duration::from_secs(30);
+                loop {
+                    match broker.activate_handoff_successor(&handoff,cp).await {
+                        Ok(_)=>break,
+                        Err(error) if tokio::time::Instant::now()>=until=>return startup.step(Phase::Handoff,Err(error.into())),
+                        Err(_)=>tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+                    }
+                }
+            }
+            let controller=routes::Controller::open(state.clone(),c.clone(),broker.connection.clone());
+            let _control=startup.step(Phase::ControlBind,local::Server::start_with_routes(&state,broker.clone(),controller.clone()).await)?;
+            let _=startup.clear_own();drop(startup);
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
             let b = broker.clone();
+            let session_identity=identity.clone();
             tasks.spawn(async move {
                 let mut sessions=tokio::task::JoinSet::new();
                 loop {tokio::select! {
-                    incoming=rx.recv()=>{let Some(tls)=incoming else{break;};let b=b.clone();sessions.spawn(async move {let _=session::serve(tls,b).await;});},
+                    incoming=rx.recv()=>{let Some(tls)=incoming else{break;};let b=b.clone();let identity=session_identity.clone();sessions.spawn(async move {let _=session::serve_with_identity(tls,b,identity).await;});},
                     Some(_)=sessions.join_next(),if !sessions.is_empty()=>{},
                 }}
             });
             tasks.spawn(pocket_agent::remote::run(state.clone(), args.supervised, controller, identity, tx, broker.clone()));
             println!("Codex Pocket helper running. Provider credentials stay on this computer.");
-            tokio::signal::ctrl_c().await?;
+            let mut shutdown=handoff.shutdown_receiver();
+            tokio::select! {
+                signal=tokio::signal::ctrl_c()=>signal?,
+                _=async {while !*shutdown.borrow_and_update(){if shutdown.changed().await.is_err(){break;}}}=>{},
+            }
             tasks.abort_all();
             broker.connection.stop_routes();
         }

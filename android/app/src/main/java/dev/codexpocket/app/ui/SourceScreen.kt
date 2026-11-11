@@ -37,7 +37,8 @@ internal fun SourceScreen(
     canRead: Boolean = true, initialLine: Int? = null,
 ) {
     // Identical paths in a parent and child must not share reading/comment state.
-    key(source.owner, source.path, source.readOnly) { ProvideMarkdownRendering {
+    val threadLinks = LocalThreadLinkBinding.current?.let { it.copy(origin = source.owner ?: it.origin) }
+    key(source.owner, source.path, source.readOnly) { ProvideMarkdownRendering(threadLinks) {
         val clipboard = LocalClipboardManager.current
         var scrolled by remember(source.path) { mutableStateOf(false) }
         val markdown = sourceLanguage(source.path) == "markdown"

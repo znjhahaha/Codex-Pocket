@@ -14,6 +14,18 @@ fn config(dir: &std::path::Path) -> HostConfig {
     }
 }
 
+fn spawn_host(dir: &std::path::Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pocket-host-fixture"));
+    command.arg("--host-test-driver").arg(dir).kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn().unwrap();
+    tokio::spawn(async move {
+        anyhow::ensure!(child.wait().await?.success(), "fixture host failed");
+        Ok(())
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_discovers_same_native_and_answers_a_pending_question_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -22,7 +34,7 @@ async fn client_discovers_same_native_and_answers_a_pending_question_once() {
         HostClient::discover(&path, dir.path()).await.unwrap(),
         Discovery::Missing
     ));
-    let host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let host = spawn_host(dir.path());
     let d = descriptor(&path).await;
     let mut first = HostClient::attach(&d).await.unwrap();
     let started = first
@@ -122,7 +134,7 @@ async fn client_discovers_same_native_and_answers_a_pending_question_once() {
 async fn stale_generation_pid_and_config_home_are_rejected_without_launching() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("registry/host.json");
-    let host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let host = spawn_host(dir.path());
     let d = descriptor(&path).await;
     let mut stale = d.clone();
     stale.generation = uuid::Uuid::new_v4().to_string();
@@ -168,7 +180,7 @@ async fn stale_generation_pid_and_config_home_are_rejected_without_launching() {
 async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("registry/host.json");
-    let host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let host = spawn_host(dir.path());
     let d = descriptor(&path).await;
     let mut raw = BufReader::new(TcpStream::connect(("127.0.0.1", d.port)).await.unwrap());
     write_frame(
@@ -214,7 +226,7 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
     })
     .await
     .unwrap();
-    let mut host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let mut host = spawn_host(dir.path());
     let next = tokio::select! {
         result=&mut host=>panic!("restart returned before discovery: {result:?}"),
         next=tokio::time::timeout(Duration::from_secs(5),async {loop {let next=descriptor(&path).await;if next.generation!=d.generation {break next;}tokio::task::yield_now().await;}})=>next.unwrap(),
@@ -233,7 +245,7 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
     let mut client = HostClient::attach(&next).await.unwrap();
     assert_eq!(
         client
-            .request(json!("new-count"), "fixture/count", json!({}))
+            .request(json!("new-count"), "thread/read", json!({"threadId":"fixture-thread","includeTurns":true}))
             .await
             .unwrap()["result"]["writes"],
         0
@@ -245,7 +257,8 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
             .unwrap()
             .snapshot_required
     );
-    client.shutdown_idle().await.unwrap();
+    assert!(client.shutdown_idle().await.is_err());
+    std::fs::write(dir.path().join("native-exit"), b"exit fixture only").unwrap();
     tokio::time::timeout(Duration::from_secs(5), host)
         .await
         .unwrap()
@@ -257,7 +270,7 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
 async fn cancelled_client_request_detaches_and_its_receipt_remains_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("registry/host.json");
-    let host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let host = spawn_host(dir.path());
     let d = descriptor(&path).await;
     let mut first = HostClient::attach(&d).await.unwrap();
     let mut second = HostClient::attach(&d).await.unwrap();
@@ -319,7 +332,7 @@ async fn private_native_content_stays_in_memory_and_cold_receipts_never_dispatch
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("registry/host.json");
     let recovery = dir.path().join("state/recovery.json");
-    let host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let host = spawn_host(dir.path());
     let d = descriptor(&path).await;
     let mut client = HostClient::attach(&d).await.unwrap();
     let private = json!({"text":"fixture-private-output","token":d.token});
@@ -408,7 +421,7 @@ async fn private_native_content_stays_in_memory_and_cold_receipts_never_dispatch
     })
     .await
     .unwrap();
-    let mut host = tokio::spawn(pocket_runtime_host::run(config(dir.path())));
+    let mut host = spawn_host(dir.path());
     let next = tokio::select! {
         result=&mut host=>panic!("restart returned before discovery: {result:?}"),
         next=tokio::time::timeout(Duration::from_secs(5),async {loop {let next=descriptor(&path).await;if next.generation!=d.generation {break next;}tokio::task::yield_now().await;}})=>next.unwrap(),
@@ -454,12 +467,13 @@ async fn private_native_content_stays_in_memory_and_cold_receipts_never_dispatch
     assert!(client.respond(json!(77), answer).await.is_err());
     let mut client = HostClient::attach(&next).await.unwrap();
     let count = client
-        .request(json!("new-count"), "fixture/count", json!({}))
+        .request(json!("new-count"), "thread/read", json!({"threadId":"fixture-thread","includeTurns":true}))
         .await
         .unwrap();
     assert_eq!(count["result"]["writes"], 0);
     assert_eq!(count["result"]["answers"], 0);
-    client.shutdown_idle().await.unwrap();
+    assert!(client.shutdown_idle().await.is_err());
+    std::fs::write(dir.path().join("native-exit"), b"exit fixture only").unwrap();
     tokio::time::timeout(Duration::from_secs(5), host)
         .await
         .unwrap()

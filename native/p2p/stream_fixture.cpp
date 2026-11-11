@@ -74,9 +74,14 @@ int main(){try{
     wait([&]{
         if(!resumed){int r=p2p_write(a.handle,&tail,1);check(r==1 || r==P2P_AGAIN,"resume write");
             if(r==1){p2p_stats st{};p2p_get_stats(a.handle,&st);check(st.tx_bytes<=P2P_LOW+1,"low watermark");resumed=true;}}
-        int r=p2p_read(b.handle,small.data(),int(small.size()));check(r>0 || r==P2P_AGAIN,"resume read");
-        for(int i=0;i<std::max(r,0);++i)check(small[i]==uint8_t((resumed_received+i)%251),"resume stream");
-        if(r>0)resumed_received+=size_t(r);
+        // Drain available bytes before wait() sleeps. Sleep(1) can take a full Windows
+        // timer tick; sleeping after every successful 997-byte read consumes the deadline.
+        while(resumed_received<P2P_HIGH+1){
+            int r=p2p_read(b.handle,small.data(),int(small.size()));check(r>0 || r==P2P_AGAIN,"resume read");
+            if(r==P2P_AGAIN)break;
+            for(int i=0;i<r;++i)check(small[i]==uint8_t((resumed_received+i)%251),"resume stream");
+            resumed_received+=size_t(r);
+        }
         return resumed && resumed_received==P2P_HIGH+1;
     },"low-water resume timeout");
     transfer(a,b,2*P2P_HIGH+733);transfer(b,a,2*P2P_HIGH+271);

@@ -21,7 +21,7 @@ function New-PocketReleasePackage {
     foreach ($name in Get-PocketWindowsFiles) {
         $source = if ($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')) { Join-Path $Root ('.local\tools\' + $name) }
             elseif ($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')) { Join-Path $DesktopBinaryDirectory $name }
-            elseif ($name -like '*.exe') { Join-Path $BinaryDirectory $name }
+            elseif ($name -like '*.exe' -or $name -like '*.dll') { Join-Path $BinaryDirectory $name }
             elseif ($name -like '*.md') { Join-Path $Root ('docs\' + $name) }
             else { Join-Path $Root ('scripts\' + $name) }
         if (-not (Get-PocketFileHash $source)) { throw ('Missing delivery input: ' + $name) }
@@ -135,9 +135,15 @@ function Invoke-PocketReleaseBuild {
     try {
         # Public entry always builds current sources. No debug/probe/package-only fallback.
         & (Join-Path $Root 'scripts\fetch-cloudflared.ps1')
+        & (Join-Path $Root 'scripts\build-p2p-product.ps1')
         $target = 'x86_64-pc-windows-msvc'
         & cargo build --release --locked --target $target --target-dir (Join-Path $Root 'target') -p pocket-agent -p pocket-bridge
         if ($LASTEXITCODE -ne 0) { throw 'Windows Release build failed; no package published.' }
+        & cargo build --release --locked --manifest-path (Join-Path $Root 'crates/runtime-host/Cargo.toml') --target $target --target-dir (Join-Path $Root 'target') --bin pocket-runtime-host
+        if ($LASTEXITCODE -ne 0) { throw 'Runtime Host Release build failed; no package published.' }
+        foreach($library in @('pocket-p2p.dll','datachannel.dll')) {
+            Copy-Item -LiteralPath (Join-Path $Root ('.local/p2p/product-windows/Release/'+$library)) -Destination (Join-Path $Root ('target/'+$target+'/release/'+$library)) -Force
+        }
         Invoke-PocketDesktopBuild $Root $target
         $env:POCKET_KEYSTORE = $keystore
         $env:POCKET_STORE_PASSWORD = [IO.File]::ReadAllText($passwordFile)

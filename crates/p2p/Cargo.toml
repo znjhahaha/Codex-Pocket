@@ -10,6 +10,7 @@ rust-version = "1.88"
 
 [dependencies]
 tokio = { version = "1", features = ["io-util"] }
+libloading = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }

@@ -17,28 +17,9 @@ const OPEN: i32 = 1;
 const END: i32 = 4;
 const ERROR: i32 = 5;
 type Callback = unsafe extern "C" fn(*mut c_void, u64, u64, i32, *const c_char, *const c_char);
-unsafe extern "C" {
-    fn p2p_create(generation: u64, bind: *const c_char, cb: Callback, user: *mut c_void) -> u64;
-    fn p2p_start(handle: u64, generation: u64, offerer: i32) -> i32;
-    fn p2p_remote_description(
-        handle: u64,
-        generation: u64,
-        sdp: *const c_char,
-        kind: *const c_char,
-    ) -> i32;
-    fn p2p_remote_candidate(
-        handle: u64,
-        generation: u64,
-        candidate: *const c_char,
-        mid: *const c_char,
-    ) -> i32;
-    fn p2p_read(handle: u64, bytes: *mut u8, capacity: i32) -> i32;
-    fn p2p_write(handle: u64, bytes: *const u8, length: i32) -> i32;
-    fn p2p_flush(handle: u64) -> i32;
-    fn p2p_close(handle: u64, graceful: i32) -> i32;
-    fn p2p_status(handle: u64) -> i32;
-    fn p2p_destroy(handle: u64);
-}
+mod ffi;
+use ffi::*;
+pub use ffi::available;
 #[derive(Debug, Clone)]
 pub enum Signal {
     Description {
@@ -216,15 +197,24 @@ impl DataChannelStream {
         bind: Option<&str>,
         signal: impl Fn(Signal) + Send + Sync + 'static,
     ) -> io::Result<(Self, DataChannelControl)> {
+        Self::new_with_stun(generation, bind, None, signal)
+    }
+    pub fn new_with_stun(
+        generation: u64, bind: Option<&str>, stun: Option<&str>,
+        signal: impl Fn(Signal) + Send + Sync + 'static,
+    ) -> io::Result<(Self, DataChannelControl)> {
+        if !available() { return Err(io::Error::new(io::ErrorKind::Unsupported, "DataChannel adapter unavailable")); }
+        let stun = stun.map(string).transpose()?;
         let mut callbacks = Box::new(Callbacks {
             waiters: Mutex::new(Waiters::default()),
             signal: Box::new(signal),
         });
         let addr = bind.map(string).transpose()?;
         let handle = unsafe {
-            p2p_create(
+            p2p_create_config(
                 generation,
                 addr.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                stun.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 callback,
                 (&mut *callbacks as *mut Callbacks).cast(),
             )

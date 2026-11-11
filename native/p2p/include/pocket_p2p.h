@@ -29,6 +29,8 @@ enum { P2P_OPEN=1, P2P_READABLE=2, P2P_WRITABLE=3, P2P_END=4, P2P_ERROR=5, P2P_D
  */
 typedef void (*p2p_callback)(void*, uint64_t handle, uint64_t generation, int event, const char *first, const char *second);
 P2P_API uint64_t p2p_create(uint64_t generation, const char *bind_address, p2p_callback cb, void *user);
+/* Optional single STUN URL; nullptr disables discovery. TURN/credentials are not accepted. */
+P2P_API uint64_t p2p_create_config(uint64_t generation, const char *bind_address, const char *stun_url, p2p_callback cb, void *user);
 P2P_API int p2p_start(uint64_t handle, uint64_t generation, int offerer);
 P2P_API int p2p_remote_description(uint64_t handle, uint64_t generation, const char *sdp, const char *type);
 P2P_API int p2p_remote_candidate(uint64_t handle, uint64_t generation, const char *candidate, const char *mid);

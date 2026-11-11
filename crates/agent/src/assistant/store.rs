@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS assistant_runs (
 "#;
 
 pub struct AssistantStore {
-    db: Connection,
-    assistant_id: String,
+    pub(super) db: Connection,
+    pub(super) assistant_id: String,
 }
 
 impl AssistantStore {
@@ -252,19 +252,39 @@ impl AssistantStore {
         if active >= MAX_CONCURRENT_TASKS {
             return Ok(None);
         }
-        let data: Option<String> = tx.query_row(
-            "SELECT t.data FROM assistant_tasks t
-             WHERE t.assistant_id=?1 AND t.status='queued' AND t.active_run_id IS NULL AND t.not_before_ms<=?2
-             AND (t.writes=0 OR NOT EXISTS (
-                 SELECT 1 FROM assistant_tasks busy WHERE busy.assistant_id=t.assistant_id
-                 AND busy.writes=1 AND busy.directory_key=t.directory_key AND busy.active_run_id IS NOT NULL))
-             ORDER BY t.not_before_ms,t.sequence LIMIT 1",
-            params![self.assistant_id, now_ms], |row| row.get(0),
-        ).optional()?;
-        let Some(data) = data else {
+        let busy = {
+            let mut stmt = tx.prepare("SELECT directory_key FROM assistant_tasks WHERE writes=1 AND active_run_id IS NOT NULL")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let candidates = {
+            let mut stmt = tx.prepare("SELECT data FROM assistant_tasks WHERE assistant_id=?1 AND status='queued' AND active_run_id IS NULL AND not_before_ms<=?2 ORDER BY not_before_ms,sequence")?;
+            stmt.query_map(params![self.assistant_id, now_ms], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut selected = None;
+        for data in candidates {
+            let mut task: Task = serde_json::from_str(&data)?;
+            // Resolve aliases again at reservation time, including replaced junctions.
+            let directory = dunce::canonicalize(&task.directory)?;
+            ensure!(directory.is_dir(), "Task directory no longer exists");
+            let key = directory_key(&directory)?;
+            if task.writes && busy.iter().any(|other| directories_overlap(&key, other)) {
+                continue;
+            }
+            task.directory = directory;
+            tx.execute(
+                "UPDATE assistant_tasks SET directory_key=?1 WHERE id=?2",
+                params![key, task.id],
+            )?;
+            selected = Some(task);
+            break;
+        }
+        let Some(mut task) = selected else {
             return Ok(None);
         };
-        let mut task: Task = serde_json::from_str(&data)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         task.status = TaskStatus::Running;
         task.active_run_id = Some(run_id.clone());
@@ -335,7 +355,8 @@ impl AssistantStore {
             );
         } else if !matches!(result, Reconciliation::Resolved(RunOutcome::Unknown)) {
             ensure!(
-                task.status == TaskStatus::Running && !task.reconciliation_required,
+                matches!(task.status, TaskStatus::Running | TaskStatus::WaitingUser)
+                    && !task.reconciliation_required,
                 "Reconcile paused run before recording a result"
             );
         }
@@ -350,7 +371,9 @@ impl AssistantStore {
                 (TaskStatus::WaitingUser, Some(detail.clone()), false)
             }
             Reconciliation::Resolved(RunOutcome::Unknown) => (TaskStatus::Paused, None, true),
-            Reconciliation::NotDispatched => (TaskStatus::Paused, None, false),
+            Reconciliation::NotDispatched | Reconciliation::Stopped => {
+                (TaskStatus::Paused, None, false)
+            }
         };
         task.status = status;
         task.detail = detail;
@@ -377,6 +400,28 @@ impl AssistantStore {
         tx.commit()?;
         Ok(paused)
     }
+
+    /// Native pending input retains the live lease and directory/capacity slot.
+    pub(super) fn waiting(&mut self, task_id: &str, run_id: &str, detail: &str) -> Result<()> {
+        let mut task = self.task(task_id)?;
+        ensure!(
+            task.active_run_id.as_deref() == Some(run_id) && !task.reconciliation_required,
+            "Stale waiting run"
+        );
+        task.status = TaskStatus::WaitingUser;
+        task.detail = Some(detail.into());
+        save_task(&self.db, &task)
+    }
+
+    pub(super) fn running(&mut self, task_id: &str, run_id: &str) -> Result<()> {
+        let mut task = self.task(task_id)?;
+        ensure!(
+            task.active_run_id.as_deref() == Some(run_id) && !task.reconciliation_required,
+            "Stale running run"
+        );
+        task.status = TaskStatus::Running;
+        save_task(&self.db, &task)
+    }
 }
 
 fn bounded_text(value: &str, max: usize) -> Result<()> {
@@ -394,6 +439,9 @@ fn directory_key(directory: &Path) -> Result<String> {
     #[cfg(windows)]
     let key = key.to_lowercase();
     Ok(key)
+}
+fn directories_overlap(a: &str, b: &str) -> bool {
+    Path::new(a).starts_with(Path::new(b)) || Path::new(b).starts_with(Path::new(a))
 }
 fn takeover(db: &Connection, assistant_id: &str) -> Result<bool> {
     Ok(db.query_row(
@@ -434,7 +482,10 @@ fn save_task(db: &Connection, task: &Task) -> Result<()> {
     Ok(())
 }
 fn pause_running(db: &Connection, assistant_id: &str) -> Result<Vec<Task>> {
-    let mut tasks = read_tasks(db, assistant_id, Some("running"))?;
+    let mut tasks: Vec<_> = read_tasks(db, assistant_id, None)?
+        .into_iter()
+        .filter(|t| t.active_run_id.is_some() && !t.reconciliation_required)
+        .collect();
     for task in &mut tasks {
         task.status = TaskStatus::Paused;
         task.reconciliation_required = true;
@@ -446,6 +497,26 @@ fn pause_running(db: &Connection, assistant_id: &str) -> Result<Vec<Task>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_child_writers_share_reservation_across_handles() {
+        let mut f = Fixture::new();
+        std::fs::create_dir(f.root.path().join("work/child")).unwrap();
+        f.create("parent", true, 0);
+        f.store
+            .apply(
+                "child",
+                Command::CreateTask {
+                    prompt: "child".into(),
+                    directory: f.root.path().join("work/child"),
+                    writes: true,
+                    not_before_ms: 0,
+                },
+            )
+            .unwrap();
+        f.store.claim_next(0).unwrap().unwrap();
+        assert!(f.second().claim_next(0).unwrap().is_none());
+    }
 
     struct Fixture {
         root: tempfile::TempDir,

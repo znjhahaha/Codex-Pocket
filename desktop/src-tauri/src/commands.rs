@@ -81,13 +81,15 @@ fn public_upgrade(value:&Value)->Value {
     if !value.is_object(){return Value::Null}
     json!({"schema":value["schema"],"operationId":value["operationId"],
         "fromGeneration":value["fromGeneration"],"toGeneration":value["toGeneration"],
-        "phase":value["phase"],"updatedAt":value["updatedAt"],"failure":value["failure"]})
+        "phase":value["phase"],"updatedAt":value["updatedAt"],"failure":value["failure"],
+        "bridgeRestartRequired":value["bridgeRestartRequired"].as_bool()})
 }
 fn public_startup_failure(value:&Value)->Value{
     let valid_pair=matches!((value["phase"].as_str(),value["code"].as_str()),
         (Some("state_path"),Some("state_path_invalid"))|(Some("state_access"),Some("state_access_failed"))|
         (Some("state_lock"),Some("state_lock_failed"|"state_lock_contended"))|(Some("config"),Some("config_load_failed"))|
-        (Some("identity"),Some("identity_load_failed"))|(Some("broker"),Some("broker_open_failed"))|(Some("control_bind"),Some("control_bind_failed")));
+        (Some("identity"),Some("identity_load_failed"))|(Some("broker"),Some("broker_open_failed"))|(Some("control_bind"),Some("control_bind_failed"))|
+        (Some("handoff"),Some("handoff_recovery_failed"))|(Some("assistant_restore"),Some("assistant_restore_failed")));
     let id=value["operationId"].as_str().filter(|s|s.len()==36&&s.bytes().enumerate().all(|(i,b)|if [8,13,18,23].contains(&i){b==b'-'}else{b.is_ascii_digit()||(b'a'..=b'f').contains(&b)}));
     if value["schema"]!=1||!valid_pair||id.is_none()||!value["pid"].as_u64().is_some_and(|pid|pid>0&&pid<=u32::MAX as u64)||!value["time"].as_u64().is_some_and(|time|time>0){return Value::Null;}
     let generation=value["runtimeGeneration"].as_str().filter(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)));
@@ -419,6 +421,30 @@ mod tests {
         let safe=public_startup_failure(&value);assert_eq!(safe["code"],"config_load_failed");assert_eq!(safe["osCode"],5);
         assert!(!safe.to_string().contains("fixture-private"));
         let mut bad=value;bad["phase"]=json!("private-phase");assert_eq!(public_startup_failure(&bad),Value::Null);
+    }
+
+    #[test]
+    fn upgrade_projection_preserves_only_boolean_bridge_restart_evidence(){
+        for expected in [true,false]{
+            let safe=public_upgrade(&json!({"phase":"complete","bridgeRestartRequired":expected,"privatePath":"fixture-private"}));
+            assert_eq!(safe["bridgeRestartRequired"],expected);
+            assert!(!safe.to_string().contains("fixture-private"));
+        }
+        for invalid in [Value::Null,json!("true"),json!(1),json!({"required":true})]{
+            assert_eq!(public_upgrade(&json!({"bridgeRestartRequired":invalid}))["bridgeRestartRequired"],Value::Null);
+        }
+        assert_eq!(public_upgrade(&json!({}))["bridgeRestartRequired"],Value::Null);
+    }
+
+    #[test]
+    fn startup_failure_projection_keeps_handoff_and_assistant_restore_pairs(){
+        for (phase,code) in [("handoff","handoff_recovery_failed"),("assistant_restore","assistant_restore_failed")]{
+            let mut value=json!({"schema":1,"operationId":"12345678-1234-4234-8234-123456789abc","pid":42,"time":1794316209000u64,"phase":phase,"code":code,"privatePath":"fixture-private"});
+            let safe=public_startup_failure(&value);
+            assert_eq!(safe["phase"],phase);assert_eq!(safe["code"],code);
+            assert!(!safe.to_string().contains("fixture-private"));
+            value["code"]=json!("config_load_failed");assert_eq!(public_startup_failure(&value),Value::Null);
+        }
     }
 
     #[test]

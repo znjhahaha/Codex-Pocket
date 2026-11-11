@@ -44,7 +44,7 @@ private enum class HomeFrameSlot { Header, Dock, Content }
 /** Only the content is sampled: the floating controls never capture themselves. */
 @Composable
 internal fun PocketHomeFrame(s: PocketState, tab: HomeTab, attention: Int, compact: Boolean, hostExpanded: Boolean,
-    onHost: () -> Unit, onNew: () -> Unit, onSettings: () -> Unit, onTab: (HomeTab) -> Unit, content: @Composable () -> Unit) {
+    onHost: () -> Unit, onNew: () -> Unit, onSettings: () -> Unit, onTab: (HomeTab) -> Unit, onAssistant: (() -> Unit)? = null, content: @Composable () -> Unit) {
     val background = MaterialTheme.colorScheme.background
     val backdrop = rememberLayerBackdrop { drawRect(background); drawContent() }
     val search = remember { HomeSearchCoordinator() }
@@ -59,7 +59,7 @@ internal fun PocketHomeFrame(s: PocketState, tab: HomeTab, attention: Int, compa
         val dock = subcompose(HomeFrameSlot.Dock) {
             CompositionLocalProvider(LocalPocketBackdrop provides backdrop) {
                 PocketHomeNavigation(tab, attention,
-                    canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { it.online && s.supports("thread/start", it) }), onSelect = onTab)
+                    canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { it.online && s.supports("thread/start", it) }), onAssistant = onAssistant, onSelect = onTab)
             }
         }.map { it.measure(loose) }
         val top = header.maxOfOrNull { it.height } ?: 0
@@ -84,7 +84,8 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
     val arrow by animateFloatAsState(if (hostExpanded) 180f else 0f, tween(pocketMotionMillis(140)), label = "host-chevron")
     val search = LocalHomeSearchCoordinator.current
     val context = LocalContext.current
-    val connection = context.stateLabel(if (s.online) "online" else "offline")
+    val restoring = s.restoringConnection
+    val connection = if (restoring) "正在恢复连接" else context.stateLabel(if (s.online) "online" else "offline")
     Column(Modifier.fillMaxWidth().statusBarsPadding().padding(start = 20.dp, end = 20.dp, top = padding, bottom = 4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PocketGlassSurface(onClick = onHost, shape = PocketOval, modifier = Modifier.weight(1f).testTag("home-host")
@@ -94,7 +95,10 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" },
                         Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                    Box(Modifier.size(6.dp).testTag("home-connectivity").background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
+                    Box(Modifier.width(26.dp).height(18.dp), contentAlignment = Alignment.Center) {
+                        if (restoring) PocketLoader(Modifier.testTag("home-reconnecting").semantics { contentDescription = "正在恢复连接" }, dot = 4.dp)
+                        else Box(Modifier.size(6.dp).testTag("home-connectivity").background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
+                    }
                     Text(s.computerName.ifBlank { stringResource(R.string.v03_home_computer) }, Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Icon(PocketIcons.ExpandMore, null, Modifier.size(14.dp).graphicsLayer { rotationZ = arrow }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -117,8 +121,8 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
 
 /** Navigation holds its geometry while icons respond to selection; motion never changes hit targets. */
 @Composable
-internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Unit)? = null, canCreate: Boolean = true, onSelect: (HomeTab) -> Unit) {
-    Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 18.dp, end = 88.dp, top = 10.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Unit)? = null, canCreate: Boolean = true, onAssistant: (() -> Unit)? = null, onSelect: (HomeTab) -> Unit) {
+    Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 18.dp, end = if (onAssistant == null) 88.dp else 18.dp, top = 10.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
     // Dense: list text scrolls right under the dock and showed through its rounded end as a gray patch.
     PocketGlassSurface(modifier = Modifier.weight(1f).testTag("home-navigation"), shape = PocketOval, dense = true) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(6.dp)) {
@@ -157,7 +161,8 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
             }
         }
     }
-    if (onNew != null) {
+    if (onAssistant != null) AssistantPocketButton(onAssistant)
+    else if (onNew != null) {
         PocketGlassSurface(onClick = onNew.takeIf { canCreate }, shape = CircleShape, modifier = Modifier.size(60.dp).testTag("home-new-chat").semantics { if (!canCreate) disabled() }) {
             Box(Modifier.fillMaxSize().padding(5.dp).clip(CircleShape)
                 .background(if (canCreate) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh), contentAlignment = Alignment.Center) {

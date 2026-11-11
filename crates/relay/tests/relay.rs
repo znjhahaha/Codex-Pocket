@@ -54,6 +54,21 @@ async fn start_with_config(config: RelayConfig) -> Server {
 }
 
 #[tokio::test]
+async fn version_metadata_is_bound_to_authenticated_websocket_upgrade() {
+    let server = start().await;
+    let mut request = format!("{}/v1/tunnel/room-1/helper", server.base).into_client_request().unwrap();
+    request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Bearer {HELPER}")).unwrap());
+    let (_socket, response) = connect_async(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(response.headers().get("x-pocket-relay-version").unwrap(), env!("CARGO_PKG_VERSION"));
+    assert_eq!(response.headers().get("x-pocket-relay-protocol").unwrap(), "1");
+    let denied = connect_async(format!("{}/v1/tunnel/room-1/phone", server.base)).await.unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(response) = denied else { panic!("expected unauthorized response") };
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get("x-pocket-relay-version").is_none());
+}
+
+#[tokio::test]
 async fn full_duplex_bursts_preserve_order_with_one_slot_queues() {
     let mut config = config();
     config.queue_capacity = 1;

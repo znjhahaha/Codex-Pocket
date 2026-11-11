@@ -215,10 +215,10 @@ private fun ColumnScope.HomeProjectSessions(
 private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (s.online && s.directoryLoading && s.directoryError == null) PocketLoader()
+        if (s.restoringConnection || (s.online && s.directoryLoading && s.directoryError == null)) PocketLoader()
         else Icon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
             tint = if (s.directoryError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(when { s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
+        Text(when { s.restoringConnection -> "正在恢复连接 · 已保留本机记录"; s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
             Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (s.online && s.directoryError != null) PocketTextButton(onRetry, enabled = !s.directoryRefreshing) { Text(stringResource(R.string.v03_home_retry)) }
     }

@@ -27,7 +27,8 @@ internal class DataChannelTransport(
     private val signal: (DataChannelSignal) -> Unit,
     private val onWritable: () -> Unit = {},
     bindAddress: String? = null,
-) : BinaryTransport {
+    stunUrl: String? = null,
+) : WritableBinaryTransport {
     @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private val gate = java.lang.Object()
     private var handle = 0L
@@ -46,7 +47,7 @@ internal class DataChannelTransport(
         // Explicit construction loads the library; importing the wire module does not.
         loadNative()
         synchronized(gate) {
-            handle = nativeCreate(generation, bindAddress)
+            handle = nativeCreate(generation, bindAddress, stunUrl)
             check(handle != 0L) { "DataChannel peer creation failed" }
         }
         Thread(::deliver, "pocket-dc-delivery").apply { isDaemon = true; start() }
@@ -67,8 +68,13 @@ internal class DataChannelTransport(
             nativeCandidate(handle, generation, candidate, mid) == 0
     }
 
-    override fun send(bytes: ByteArray): Boolean = synchronized(gate) {
-        bytes.size <= 65536 && !closing && handle != 0L && nativeWrite(handle, bytes) == bytes.size
+    override fun trySend(bytes: ByteArray): TransportSendResult = synchronized(gate) {
+        if (bytes.size > 65536 || closing || handle == 0L) TransportSendResult.CLOSED
+        else when (nativeWrite(handle, bytes)) {
+            bytes.size -> TransportSendResult.ACCEPTED
+            -1 -> TransportSendResult.WOULD_BLOCK
+            else -> TransportSendResult.CLOSED
+        }
     }
 
     override fun close(graceful: Boolean) {
@@ -152,7 +158,7 @@ internal class DataChannelTransport(
         }
     }
 
-    private external fun nativeCreate(generation: Long, bindAddress: String?): Long
+    private external fun nativeCreate(generation: Long, bindAddress: String?, stunUrl: String?): Long
     private external fun nativeStart(handle: Long, generation: Long, offerer: Boolean): Int
     private external fun nativeDescription(handle: Long, generation: Long, sdp: String, type: String): Int
     private external fun nativeCandidate(handle: Long, generation: Long, candidate: String, mid: String): Int
@@ -164,6 +170,7 @@ internal class DataChannelTransport(
     companion object {
         private val loadGate = Any()
         private var loaded = false
+        fun available(): Boolean = try { loadNative(); true } catch (_: UnsatisfiedLinkError) { false }
         private fun loadNative() = synchronized(loadGate) {
             if (!loaded) { System.loadLibrary("pocket-p2p-jni"); loaded = true }
         }

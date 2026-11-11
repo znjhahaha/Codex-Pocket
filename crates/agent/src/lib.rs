@@ -23,6 +23,7 @@ pub mod permission_policy;
 pub mod permissions;
 pub mod questions;
 pub mod push;
+pub mod p2p;
 pub mod session;
 #[path = "../../bridge/src/settings.rs"]
 pub mod settings;
@@ -32,3 +33,9 @@ pub mod transport;
 pub mod workspace;
 
 pub mod quota;
+pub mod usage_stats;
+pub mod upstream_versions;
+pub mod handoff;
+pub mod managed_runtime;
+pub mod assistant_executor;
+pub mod assistant_product;

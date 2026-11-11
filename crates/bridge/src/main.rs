@@ -21,6 +21,7 @@ enum Input {
     Gone(Client),
     RuntimeGone,
     Connected(String, Peer),
+    Schema(Option<pocket_bridge::capabilities::Capabilities>),
 }
 
 fn main() {
@@ -204,28 +205,18 @@ async fn run() -> Result<i32> {
     let mut router = Router::default();
     // Probe asynchronously so the original desktop's initialize is never delayed.
     let schema_binary = original.clone();
-    let schema_task =
-        tokio::spawn(async move { pocket_bridge::capabilities::discover(&schema_binary).await });
-    let mut schema_task = Some(schema_task);
+    let schema_tx = tx.clone();
+    tokio::spawn(async move {
+        let capabilities = pocket_bridge::capabilities::discover(&schema_binary).await.ok();
+        let _ = schema_tx.send(Input::Schema(capabilities)).await;
+    });
+    let mut schema_pending = true;
     let mut schema_state = "initializing";
     let mut remotes = HashMap::<String, Peer>::new();
     let mut desktop = tokio::io::stdout();
     let mut native_eof = false;
     let mut failure = None;
     'messages: while let Some(input) = rx.recv().await {
-        if schema_task.as_ref().is_some_and(|t| t.is_finished())
-            && let Some(task) = schema_task.take()
-        {
-            match task.await {
-                Ok(Ok(capabilities)) => {
-                    router.capabilities = capabilities;
-                    schema_state = "ready";
-                }
-                _ => {
-                    schema_state = "error";
-                }
-            }
-        }
         let routes = match input {
             Input::Message(c, v) => {
                 if let Client::Remote(id) = &c
@@ -236,13 +227,28 @@ async fn run() -> Result<i32> {
                 if matches!(c, Client::Remote(_)) && v["method"] == "pocket/status" {
                     vec![Route::Client(
                         c,
-                        json!({"id":v["id"],"result":{"runtimeId":runtime_id,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_task.is_some(),"schemaState":schema_state,"bridgeVersion":env!("CARGO_PKG_VERSION"),"permissionProtocol":pocket_bridge::capabilities::PERMISSION_PROTOCOL}}),
+                        json!({"id":v["id"],"result":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)}),
                     )]
                 } else {
-                    router.from_client(c, v)
+                    let initialized = router.initialized;
+                    let mut routes = router.from_client(c, v);
+                    if router.initialized != initialized {
+                        routes.push(Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)})));
+                    }
+                    routes
                 }
             }
             Input::Runtime(v) => router.from_runtime(v),
+            Input::Schema(capabilities) => {
+                schema_pending = false;
+                if let Some(capabilities) = capabilities {
+                    router.capabilities = capabilities;
+                    schema_state = "ready";
+                } else {
+                    schema_state = "error";
+                }
+                vec![Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)}))]
+            }
             Input::Gone(Client::Desktop) => break,
             Input::RuntimeGone => {
                 native_eof = true;
@@ -318,6 +324,15 @@ async fn run() -> Result<i32> {
     } else {
         0
     })
+}
+fn runtime_status(
+    router: &Router,
+    runtime_id: &str,
+    native_process: &Option<pocket_core::native_process::NativeProcess>,
+    schema_pending: bool,
+    schema_state: &str,
+) -> Value {
+    json!({"runtimeId":runtime_id,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_pending,"schemaState":schema_state,"bridgeVersion":env!("CARGO_PKG_VERSION"),"permissionProtocol":pocket_bridge::capabilities::PERMISSION_PROTOCOL})
 }
 async fn write_json<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, v: &Value) -> Result<()> {
     let mut b = serde_json::to_vec(v)?;

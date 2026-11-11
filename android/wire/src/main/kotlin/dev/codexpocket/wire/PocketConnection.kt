@@ -6,6 +6,7 @@ import kotlinx.serialization.json.*
 
 /** Authenticated application channel; implementations retain mutation outcome semantics. */
 interface PocketConnection : AutoCloseable {
+    val relayVersion: RelayVersion? get() = null
     val state: StateFlow<LinkState>
     val notifications: Flow<JsonObject>
     /** Fixed local transport failure code, never peer text or payload. */

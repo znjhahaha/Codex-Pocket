@@ -6,7 +6,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 
 internal interface BinaryTransport { fun send(bytes: ByteArray): Boolean; fun close(graceful: Boolean) }
-internal interface TransportListener { fun onOpen(); fun onBinary(bytes: ByteArray); fun onFailure(); fun onWritable() {} }
+internal interface TransportListener { fun onOpen(); fun onBinary(bytes: ByteArray); fun onFailure(); fun onWritable() {}; fun onRelayVersion(value: RelayVersion?) {} }
 internal fun interface TransportConnector { fun open(config: ConnectionConfig, listener: TransportListener): BinaryTransport }
 
 /** Outer TLS uses platform trust and hostname verification, independently of the inner pin. */
@@ -17,7 +17,10 @@ internal class WssConnector(private val endpoint: String? = null) : TransportCon
             .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(45, TimeUnit.SECONDS).build()
         val request = Request.Builder().url(endpoint ?: config.phoneUrl()).header("Authorization", "Bearer ${config.phoneToken}").build()
         val socket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) { listener.onOpen() }
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                listener.onRelayVersion(RelayVersion.parse(response.header("x-pocket-relay-version"), response.header("x-pocket-relay-protocol"), response.header("x-pocket-relay-build")))
+                listener.onOpen()
+            }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (bytes.size > 65536) { listener.onFailure(); webSocket.cancel() }
                 else listener.onBinary(bytes.toByteArray())

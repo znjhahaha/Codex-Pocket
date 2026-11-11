@@ -14,6 +14,21 @@ pub async fn serve<S>(stream: S, broker: Arc<Broker>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_options(stream, broker, None, None).await
+}
+pub async fn serve_with_identity<S>(stream:S, broker:Arc<Broker>, identity:Arc<pocket_tunnel::ServerIdentity>)->Result<()>
+where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
+    serve_options(stream,broker,Some(identity),None).await
+}
+pub fn serve_bound<S>(stream:S,broker:Arc<Broker>,binding:crate::p2p::Binding)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send>>
+where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
+    Box::pin(serve_options(stream,broker,None,Some(binding)))
+}
+async fn serve_options<S>(stream:S,broker:Arc<Broker>,identity:Option<Arc<pocket_tunnel::ServerIdentity>>,binding:Option<crate::p2p::Binding>)->Result<()>
+where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
+    let p2p=Arc::new(tokio::sync::Mutex::new(crate::p2p::SessionP2p::default()));
+    let mut p2p_enabled=false;
     if !broker.connection.remote_enabled() { bail!("Remote access paused"); }
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (incoming, mut requests) = mpsc::channel::<Value>(16);
@@ -46,14 +61,23 @@ where
     let Some(v)=request else{break};let id=v["id"].clone();let method=v["method"].as_str().unwrap_or_default().to_owned();let p=v.get("params").cloned().unwrap_or_else(||json!({}));
     if id.as_str().is_none_or(|s|s.is_empty()||s.len()>128)||!p.is_object(){bail!("Malformed request")}
     if device.is_none(){attempts+=1;if attempts>3{bail!("Authentication retry limit")}
-     let result=match method.as_str(){"pair"=>broker.pair(&p).await,"hello"=>match broker.authenticate(&p).await{Ok(d)=>{device=Some(d);_authenticated_phone=Some(broker.connection.authenticated_phone());Ok(broker.hello().await)},Err(e)=>Err(e)},_=>Err(classify(anyhow::anyhow!("Pair or authenticate this device first"),Code::Unauthorized))};
+     let result=match method.as_str(){"pair"=>broker.pair(&p).await,"hello"=>match broker.authenticate(&p).await{Ok(d)=>{if binding.as_ref().is_some_and(|binding|!binding.matches(&d,&p)){Err(classify(anyhow::anyhow!("P2P identity differs"),Code::Unauthorized))}else{
+      p2p_enabled=identity.is_some() && pocket_p2p::available() && p["capabilities"].as_array().is_some_and(|caps|caps.iter().any(|v|v==crate::p2p::CAPABILITY));
+      if let Some(binding)=&binding{binding.authenticated();}
+      device=Some(d);_authenticated_phone=Some(broker.connection.authenticated_phone());let mut hello=broker.hello().await;
+      if p2p_enabled{if let Some(caps)=hello["capabilities"].as_array_mut(){caps.push(json!(crate::p2p::CAPABILITY));}}
+      Ok(hello)}},Err(e)=>Err(e)},_=>Err(classify(anyhow::anyhow!("Pair or authenticate this device first"),Code::Unauthorized))};
      if method=="hello"&&result.is_ok(){chunking=p["capabilities"].as_array().is_some_and(|caps|caps.iter().any(|c|c==crate::chunks::CAPABILITY));}
      write_json(&mut writer,&reply(id,result)).await?;continue
     }
     let permit=permits.clone().try_acquire_owned();let Ok(permit)=permit else{write_json(&mut writer,&json!({"id":id,"error":{"code":"busy","message":"Too many pending requests"}})).await?;continue};
     let d=device.clone().unwrap();let b=broker.clone();let tx=finished.clone();
     // Tasks finish the durable command ledger even when the phone disconnects.
-    tokio::spawn(async move{let _permit=permit;let result=b.request(&d,&method,p).await;let _=tx.send(reply(id,result)).await;});
+    let signal=p2p.clone();let identity=identity.clone();let supports_p2p=p2p_enabled;
+    tokio::spawn(async move{let _permit=permit;let result=if method.starts_with("p2p/") {
+      if supports_p2p {signal.lock().await.request(&method,p,&d,b,identity.unwrap()).await}
+      else {Err(classify(anyhow::anyhow!("P2P not negotiated"),Code::Unsupported))}
+    } else {b.request(&d,&method,p).await};let _=tx.send(reply(id,result)).await;});
    }
    // A history page can be several MB; over a home uplink it legitimately takes longer than
    // 10s. A stalled relay is still detected per chunk by the transport's 5s write timeout.

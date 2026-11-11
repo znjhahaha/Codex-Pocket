@@ -24,12 +24,12 @@ data class ThreadKey(val computerId: String, val configStoreId: String, val nati
 
 data class RuntimeInfo(val id: String, val source: String, val version: String, val configStoreId: String, val online: Boolean, val loadedThreadIds: Set<String>, val capabilities: Set<String>?,
     val capabilityFields: Map<String, Set<String>> = emptyMap(), val bridgeVersion: String? = null,
-    val helperVersion: String? = null, val bridgeUpdatePending: Boolean = false) {
+    val helperVersion: String? = null, val bridgeUpdatePending: Boolean = false, val role: String = "ordinary") {
     val supportsServiceTier get() = "serviceTier" in capabilityFields["thread/settings/update"].orEmpty()
     companion object {
         fun from(o: JsonObject) = RuntimeInfo(o.string("id"), o.string("source"), o.string("version"), o.string("configStoreId"), o.flag("online"), o.array("loadedThreadIds").mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.toSet(), (o["capabilities"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet(),
             o.obj("capabilityFields").mapValues { (_, value) -> (value as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet().orEmpty() },
-            o.string("bridgeVersion").takeIf(String::isNotBlank), o.string("helperVersion").takeIf(String::isNotBlank), o.flag("bridgeUpdatePending"))
+            o.string("bridgeVersion").takeIf(String::isNotBlank), o.string("helperVersion").takeIf(String::isNotBlank), o.flag("bridgeUpdatePending"), o.obj("role").string("kind", "ordinary"))
     }
 }
 

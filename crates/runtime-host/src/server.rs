@@ -117,7 +117,7 @@ async fn actor_loop(
             _ = clients.join_next(), if !clients.is_empty() => {},
             event = incoming.recv() => match event {
                 Some(Event::Native(value)) => {
-                    let envelope=store.state.push(value)?;
+                    let envelope=store.observe_native(value)?;
                     store.save()?; // Native receipt is durable before publication to a broker.
                     let _=broadcast.send(envelope);
                 },
@@ -203,6 +203,15 @@ async fn submit(
         deliver(reply, fail(id, "unsupported"));
         return Ok(());
     }
+    // Cold recovery never authorizes a fresh write to resolve an unknown run.
+    // These existing native reads can supply evidence without model inference.
+    if store.state.reconciliation_required
+        && !["thread/read", "thread/turns/list"].contains(&method)
+        && store.state.receipt(&command_key, false).state == "missing"
+    {
+        deliver(reply, fail(id, "reconciliation_required"));
+        return Ok(());
+    }
     match store.state.reserve(command_key, &value, false) {
         Err(error) => {
             deliver(
@@ -229,6 +238,7 @@ async fn submit(
         }
         Ok(None) => {
             store.save()?;
+            store.note_read(&value);
             write_frame(writer, &value).await?;
             if outer.is_some() {
                 deliver(
@@ -355,16 +365,22 @@ pub async fn run(config: HostConfig) -> Result<()> {
     if config.descriptor.try_exists()? {
         let bytes = pocket_agent::storage::read_physical(&config.descriptor, 16384)
             .context("Read earlier host descriptor")?;
-        let previous: Descriptor = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid host descriptor data"))?;
-        ensure!(
-            previous
-                .native_process
-                .as_ref()
-                .is_some_and(|process| process.pid == previous.native_pid && process.terminated()),
-            "Previous native process has not verifiably exited"
-        );
+        let _ = bytes;
+        let previous =
+            pocket_runtime_ipc::load_descriptor(&config.descriptor, &config.config_home)?;
+        for (pid, process) in [
+            (previous.pid, &previous.host_process),
+            (previous.native_pid, &previous.native_process),
+        ] {
+            ensure!(
+                process.as_ref().is_some_and(|process| process.pid == pid
+                    && process.created_at != 0
+                    && process.terminated()),
+                "Previous Host/native process has not verifiably exited; inspect original creation identities"
+            );
+        }
     }
+    verify_reservation(&config).await?;
     let parent = config
         .descriptor
         .parent()
@@ -418,7 +434,9 @@ pub async fn run(config: HostConfig) -> Result<()> {
                 .context("Native closed while initializing")?;
             if value["id"] == "pocket-host-initialize" {
                 ensure!(
-                    value.get("result").is_some(),
+                    value.get("result").is_some()
+                        && value.get("error").is_none()
+                        && value.get("method").is_none(),
                     "Native initialization rejected"
                 );
                 ensure!(
@@ -433,6 +451,10 @@ pub async fn run(config: HostConfig) -> Result<()> {
         bail!("Native initialization exceeded budget")
     })
     .await??;
+    if config.native_args == ["app-server", "--listen", "stdio://"] {
+        // Same native initialize contract as agent::native::cli. No second initialize.
+        codex_initialize_identity(&config.config_home, &initialized)?;
+    }
     write_frame(&mut writer, &json!({"method":"initialized"})).await?;
     let token = Arc::new(descriptor.token.clone());
     let mut clients = tokio::task::JoinSet::new();
@@ -473,4 +495,71 @@ pub async fn run(config: HostConfig) -> Result<()> {
         let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
     }
     Ok(())
+}
+
+fn codex_initialize_identity(home: &std::path::Path, result: &Value) -> Result<()> {
+    let actual = result["codexHome"]
+        .as_str()
+        .context("Native initialize lacks codexHome")?;
+    ensure!(
+        std::path::Path::new(actual).is_absolute()
+            && crate::client::normalized_home(std::path::Path::new(actual))?
+                == crate::client::normalized_home(home)?,
+        "Native initialize config home mismatch"
+    );
+    for key in ["userAgent", "platformFamily", "platformOs"] {
+        ensure!(
+            result[key].as_str().is_some_and(|v| !v.is_empty()),
+            "Native initialize identity metadata missing"
+        );
+    }
+    ensure!(
+        result["userAgent"]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .is_some_and(|(_, rest)| !rest.trim().is_empty()),
+        "Native initialize version missing"
+    );
+    Ok(())
+}
+
+/// Launcher owns the durable startup record. Native spawn waits for its exact
+/// CreateProcess identity publication; a launcher crash in that window is closed.
+async fn verify_reservation(config: &HostConfig) -> Result<()> {
+    let path = config.state.join("startup.json");
+    if !path.try_exists()? {
+        return Ok(());
+    } // Direct in-process test fixture.
+    let identity = pocket_core::native_process::NativeProcess::capture(std::process::id())?;
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let value: Value = serde_json::from_slice(&crate::client::read_private(&path, 16384)?)
+            .map_err(|_| anyhow::anyhow!("Invalid startup ownership"))?;
+        ensure!(
+            value["schema"] == 1
+                && value["configHome"]
+                    .as_str()
+                    .is_some_and(
+                        |p| crate::client::normalized_home(std::path::Path::new(p)).ok()
+                            == crate::client::normalized_home(&config.config_home).ok()
+                    )
+                && value["nativeBinary"]
+                    .as_str()
+                    .is_some_and(|p| std::fs::canonicalize(p).ok()
+                        == std::fs::canonicalize(&config.binary).ok()),
+            "Startup profile ownership mismatch"
+        );
+        if value["phase"] == "spawned" {
+            let host: pocket_core::native_process::NativeProcess =
+                serde_json::from_value(value["hostProcess"].clone())?;
+            ensure!(host == identity, "Startup Host process identity mismatch");
+            return Ok(());
+        }
+        ensure!(
+            value["phase"] == "reserved" && tokio::time::Instant::now() < until,
+            "Startup identity not published; no native process will be launched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

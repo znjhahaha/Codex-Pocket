@@ -96,6 +96,7 @@ internal class MarkdownRenderCache(context: Context, foreground: Int, keyword: I
         cache[messageKey]?.takeIf { it.source == source }?.let { return@withContext it }
         ensureActive()
         val document = markwon.parse(source)
+        decorateThreadLinks(document)
         val blocks = mutableListOf<String>()
         val images = mutableListOf<String>()
         val lists = mutableListOf<Pair<OrderedList, Int>>()
@@ -183,7 +184,7 @@ internal class MarkdownRenderCache(context: Context, foreground: Int, keyword: I
 internal val LocalMarkdownCache = staticCompositionLocalOf<MarkdownRenderCache?> { null }
 
 @Composable
-internal fun ProvideMarkdownRendering(content: @Composable () -> Unit) {
+internal fun ProvideMarkdownRendering(threadLinks: ThreadLinkBinding? = LocalThreadLinkBinding.current, content: @Composable () -> Unit) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val foreground = MaterialTheme.colorScheme.onSurface.toArgb()
@@ -192,7 +193,7 @@ internal fun ProvideMarkdownRendering(content: @Composable () -> Unit) {
     val renderer = remember(context, density.density, density.fontScale, foreground, keyword, literal) {
         MarkdownRenderCache(context, foreground, keyword, literal)
     }
-    CompositionLocalProvider(LocalMarkdownCache provides renderer, content = content)
+    CompositionLocalProvider(LocalMarkdownCache provides renderer, LocalThreadLinkBinding provides threadLinks, content = content)
 }
 
 private class MarkdownView(context: Context) : TextView(context) {
@@ -247,6 +248,7 @@ internal fun MarkdownText(text: String, messageKey: String) {
 
 @Composable
 internal fun MarkdownSpans(spans: Spanned, renderer: MarkdownRenderCache, color: Int, link: Int, tableColumns: Int = 0, onLink: ((String) -> Unit)? = null) {
+    val linkHandler = rememberMarkdownLinkHandler(onLink)
     if (tableColumns > 0) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
             val tableWidth = maxOf(maxWidth, (tableColumns * 112).dp)
@@ -268,7 +270,7 @@ internal fun MarkdownSpans(spans: Spanned, renderer: MarkdownRenderCache, color:
             setPadding(0, 0, 0, 0)
         } },
         update = { view ->
-            view.onLink = onLink
+            view.onLink = linkHandler
             view.codeBackground = codeBackground
             val padding = if (spans.getSpans(0, spans.length, io.noties.markwon.core.spans.CodeSpan::class.java).isNotEmpty())
                 (4 * view.resources.displayMetrics.density).toInt() else 0

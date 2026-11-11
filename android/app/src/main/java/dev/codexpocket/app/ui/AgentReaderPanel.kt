@@ -115,7 +115,9 @@ internal fun AgentReaderPanel(
                 transcriptStates.SaveableStateProvider(child.key.encoded) {
                     val preview: ((String) -> Unit)? = if (onSource != null && online && !state.loading &&
                         state.error == null && state.updatedAt > 0) { path -> onSource(child.key, path) } else null
-                    CompositionLocalProvider(LocalInlineDiffComment provides null, LocalAttachmentFilePreview provides preview) {
+                    val threadLinks = LocalThreadLinkBinding.current?.copy(origin = child.key)
+                    CompositionLocalProvider(LocalInlineDiffComment provides null, LocalAttachmentFilePreview provides preview,
+                        LocalThreadLinkBinding provides threadLinks) {
                         AgentReaderTranscript(state, online, memory, onOlder, onRetry, Modifier.fillMaxWidth().weight(1f))
                     }
                 }

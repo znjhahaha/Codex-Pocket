@@ -182,6 +182,11 @@ class QuestionSession(initial: QuestionBatch) {
         return result
     }
 
+    /** Local encoding or size validation failed before the repository received an action. */
+    fun rejectBeforeDispatch() {
+        if (phase == QuestionPhase.Submitting && !sawSubmission) phase = QuestionPhase.Waiting
+    }
+
     /** A callback dispatch is not an acknowledgement. Reopen only after observed processing ends in refusal. */
     fun observe(submitted: Boolean, submitting: Boolean, pendingConfirmed: Boolean = true) {
         if (submitting) {

@@ -5,6 +5,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY vendor ./vendor
 COPY .cargo ./.cargo
+ARG POCKET_BUILD_REVISION
+ENV POCKET_BUILD_REVISION=${POCKET_BUILD_REVISION}
 RUN cargo build --release --locked --offline --jobs 1
 
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3

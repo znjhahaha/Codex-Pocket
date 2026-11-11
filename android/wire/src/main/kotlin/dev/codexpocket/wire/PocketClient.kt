@@ -14,6 +14,8 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private val gate = Any()
     private val mutableState = MutableStateFlow(LinkState.OFFLINE)
     override val state: StateFlow<LinkState> = mutableState.asStateFlow()
+    @Volatile override var relayVersion: RelayVersion? = null
+        private set
     @Volatile override var failureCode: String? = null
         private set
     /** Fixed local source for diagnostics; error mapping still uses "backpressure". */
@@ -79,6 +81,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
                             }
                         }, { terminate(if (closing) "closed" else "disconnected", graceful = true) })
                         val transport = connector.open(event.config, object : TransportListener {
+                            override fun onRelayVersion(value: RelayVersion?) { relayVersion = value }
                             override fun onOpen() { offer(Event.Open) }
                             override fun onBinary(bytes: ByteArray) {
                                 if (synchronized(gate) { terminated || closing }) return
@@ -142,10 +145,13 @@ class PocketClient internal constructor(private val connector: TransportConnecto
         require(method.isNotBlank() && method.length <= 256) { "Invalid request method" }
         require(commandId == null || commandId.isNotBlank()) { "Invalid command ID" }
         val nativeMethod = (params["method"] as? JsonPrimitive)?.content
-        if (commandId == null && (method in MUTATIONS || (method == "codex/request" && nativeMethod !in NATIVE_READS)))
+        if (commandId == null && (method in MUTATIONS || method.startsWith("assistant/") && method != "assistant/read" || (method == "codex/request" && nativeMethod !in NATIVE_READS)))
             throw WireException("invalid_request", "Mutating requests require a command ID")
         val item = Pending(UUID.randomUUID().toString(), commandId, method == "hello")
-        val wireParams = if (item.hello) JsonObject(params + ("capabilities" to buildJsonArray { add(ReplyChunks.CAPABILITY) })) else params
+        val wireParams = if (item.hello) JsonObject(params + ("capabilities" to buildJsonArray {
+            add(ReplyChunks.CAPABILITY)
+            if (DataChannelTransport.available()) add(P2pCandidate.CAPABILITY)
+        })) else params
         val bytes = FrameCodec.encode(buildJsonObject {
             put("id", item.id); put("method", method)
             put("params", if (commandId == null) wireParams else JsonObject(wireParams + ("commandId" to JsonPrimitive(commandId))))
@@ -260,6 +266,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
             failureCode = code
             backpressureSource = source
             terminated = true; mutableState.value = LinkState.OFFLINE
+            relayVersion = null
             writableQueued.set(false)
             ready.completeExceptionally(WireException(code, "Tunnel unavailable"))
             pending.values.toList().forEach { it.result.completeExceptionally(failed(it, code)) }

@@ -26,6 +26,7 @@ pub enum Action {
     Enter,
     Cancel,
     Recover,
+    Release,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,7 @@ pub enum Phase {
     Owned,
     Cancelled,
     Recovered,
+    Released,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +58,7 @@ pub struct Journal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Presence {
+pub(crate) enum Presence {
     Alive,
     Gone,
     Unknown,
@@ -133,6 +135,22 @@ fn transition(
     }
     match r.action {
         Action::Enter => {
+            if journal
+                .as_ref()
+                .is_some_and(|j| j.phase == Phase::Released && j.request.supervisor != r.supervisor)
+            {
+                let old = journal.as_ref().unwrap();
+                ensure!(
+                    probe(&old.request.supervisor) == Presence::Gone
+                        && old
+                            .request
+                            .child
+                            .as_ref()
+                            .is_some_and(|p| probe(p) == Presence::Gone),
+                    "Previous owner not released"
+                );
+                *journal = None;
+            }
             if let Some(j) = journal
                 .as_ref()
                 .filter(|j| j.request.operation_id == r.operation_id)
@@ -160,6 +178,7 @@ fn transition(
         Action::Cancel => {
             let j = journal.as_mut().context("No owned operation")?;
             ensure!(same_owner(&j.request, r), "Stale cancellation");
+            ensure!(j.phase != Phase::Released, "Release cannot be cancelled");
             if j.phase == Phase::Owned {
                 j.phase = Phase::Cancelled;
             }
@@ -175,18 +194,56 @@ fn transition(
             if j.phase == Phase::Owned && same_owner(&j.request, r) {
                 return Ok(());
             }
+            if j.phase == Phase::Cancelled {
+                // Explicit recovery by the same verified coordinator is distinct
+                // from replaying Enter; only the active upgrade can submit it.
+                ensure!(r.child.as_ref() == observed.child, "Recovery child changed");
+                ensure!(
+                    same_owner(&j.request, r) || probe(&j.request.coordinator) == Presence::Gone,
+                    "Previous coordinator is not proven gone"
+                );
+                j.request = r.clone();
+                j.request.action = Action::Enter;
+                j.phase = Phase::Owned;
+                return Ok(());
+            }
             ensure!(
-                j.phase != Phase::Cancelled && probe(&j.request.coordinator) == Presence::Gone,
+                probe(&j.request.coordinator) == Presence::Gone,
                 "Previous coordinator is not proven gone"
             );
-            ensure!(r.child.as_ref() == observed.child, "Recovery child changed");
             ensure!(
-                r.child.as_ref().is_none_or(|p| probe(p) == Presence::Alive),
+                r.child.as_ref() == observed.child
+                    || (observed.child.is_none()
+                        && r.child == j.request.child
+                        && r.child.as_ref().is_some_and(|p| probe(p) == Presence::Gone)),
+                "Recovery child changed"
+            );
+            ensure!(
+                r.child.as_ref().is_none_or(|p| probe(p)
+                    == if observed.child.is_none() {
+                        Presence::Gone
+                    } else {
+                        Presence::Alive
+                    }),
                 "Recovery child unverified"
             );
             j.request = r.clone();
             j.request.action = Action::Enter;
             j.phase = Phase::Owned;
+        }
+        Action::Release => {
+            let j = journal.as_mut().context("No owned operation")?;
+            ensure!(same_owner(&j.request, r), "Stale release");
+            ensure!(
+                matches!(j.phase, Phase::Owned | Phase::Released),
+                "Maintenance not owned"
+            );
+            ensure!(
+                observed.child.is_none()
+                    && r.child.as_ref().is_some_and(|p| probe(p) == Presence::Gone),
+                "Child has not exited"
+            );
+            j.phase = Phase::Released;
         }
     }
     Ok(())
@@ -199,10 +256,37 @@ fn same_owner(a: &Request, b: &Request) -> bool {
         && a.coordinator == b.coordinator
         && a.child == b.child
 }
+fn recover_released_predecessor(
+    journal: &mut Option<Journal>,
+    supervisor: &ProcessIdentity,
+    probe: impl Fn(&ProcessIdentity) -> Presence,
+    proof: impl Fn(&Request) -> Result<()>,
+) -> Result<()> {
+    if let Some(j) = journal
+        .as_mut()
+        .filter(|j| j.phase == Phase::Owned && j.request.supervisor != *supervisor)
+    {
+        ensure!(
+            probe(&j.request.supervisor) == Presence::Gone
+                && j.request
+                    .child
+                    .as_ref()
+                    .is_some_and(|p| probe(p) == Presence::Gone),
+            "Previous ownership is uncertain"
+        );
+        let mut release = j.request.clone();
+        release.action = Action::Release;
+        proof(&release)?;
+        // This is recovery from independently checked flushed release evidence,
+        // not an acknowledgement fabricated on behalf of a live supervisor.
+        j.phase = Phase::Released;
+    }
+    Ok(())
+}
 
 fn validate(r: &Request) -> Result<()> {
     ensure!(
-        r.protocol == PROTOCOL && uuid::Uuid::parse_str(&r.operation_id).is_ok(),
+        r.protocol == PROTOCOL && super::upgrade::local::canonical_uuid(&r.operation_id),
         "Invalid maintenance request"
     );
     ensure!(
@@ -252,6 +336,15 @@ impl Gate {
     pub fn respawn_ready(&self, child_present: bool, retry_due: bool) -> bool {
         !child_present && retry_due && !self.blocks_respawn()
     }
+    /// Only a durable Release acknowledgement lets the ownership loop return.
+    pub fn release_ready(&self) -> bool {
+        self.error.is_none()
+            && self.journal.as_ref().is_some_and(|j| {
+                j.phase == Phase::Released
+                    && j.request.supervisor.pid == std::process::id()
+                    && presence(&j.request.supervisor) == Presence::Alive
+            })
+    }
 
     /// Never propagate maintenance errors out of the supervisor's ownership loop.
     pub fn poll(&mut self, state: &Path, generation: Option<&str>, child_pid: Option<u32>) {
@@ -273,7 +366,12 @@ impl Gate {
     ) {
         match self.poll_inner(state, generation, child_pid, capture, probe) {
             Ok((journal, error)) => {
-                self.blocked = journal.as_ref().is_some_and(|j| j.phase == Phase::Owned);
+                self.blocked = journal.as_ref().is_some_and(|j| {
+                    j.phase == Phase::Owned
+                        || (j.phase == Phase::Released
+                            && j.request.supervisor.pid == std::process::id()
+                            && presence(&j.request.supervisor) != Presence::Gone)
+                });
                 self.journal = journal;
                 self.error = error;
             }
@@ -331,16 +429,42 @@ impl Gate {
             child: child.as_ref(),
         };
         let before = journal.clone();
-        transition(&mut journal, None, &observed, &probe).map_err(|_| Failure::JournalInvalid)?;
+        recover_released_predecessor(&mut journal, &supervisor, &probe, |r| {
+            super::upgrade::local::predecessor_release_proven(state, r)
+        })
+        .map_err(|_| Failure::JournalInvalid)?;
+        // An interrupted upgrade must retain the fence; only its replacement
+        // coordinator may recover/cancel it after inspecting the agent.
+        let previous_coordinator = journal.as_ref().map(|j| j.request.coordinator.clone());
+        transition(&mut journal, None, &observed, |p| {
+            if operation.as_ref().is_some_and(|s| !s.phase.terminal())
+                && previous_coordinator.as_ref() == Some(p)
+            {
+                Presence::Unknown
+            } else {
+                probe(p)
+            }
+        })
+        .map_err(|_| Failure::JournalInvalid)?;
         let mut error = None;
         let has_request = present(&mailbox)?;
         if has_request {
             let request: Request = read_private(&mailbox).map_err(|_| Failure::RequestRejected)?;
             let mut next = journal.clone();
-            if operation
-                .as_ref()
-                .is_none_or(|s| s.from_generation != request.from_generation || s.phase.terminal())
-                && request.action != Action::Cancel
+            if operation.as_ref().is_none_or(|s| {
+                (s.from_generation != request.from_generation
+                    && !(matches!(
+                        s.phase,
+                        super::upgrade::Phase::Starting
+                            | super::upgrade::Phase::Verifying
+                            | super::upgrade::Phase::RollingBack
+                    ) && s.to_generation == request.from_generation))
+                    || s.phase.terminal()
+            }) && request.action != Action::Cancel
+            {
+                error = Some(Failure::RequestRejected);
+            } else if request.action == Action::Release
+                && super::upgrade::local::release_proven(state, &request).is_err()
             {
                 error = Some(Failure::RequestRejected);
             } else if transition(&mut next, Some(&request), &observed, probe).is_err() {
@@ -409,7 +533,7 @@ fn lock(control: &Path) -> Result<storage::Lock> {
     open_private(&path)?;
     Ok(lock)
 }
-fn read_private<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_private<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let mut file = open_private(path)?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
@@ -418,7 +542,7 @@ fn read_private<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     ensure!(bytes.len() <= 16384, "Maintenance file exceeds limit");
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if path.try_exists()? {
         open_private(path)?;
     }
@@ -426,14 +550,26 @@ fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     open_private(path)?;
     Ok(())
 }
-fn open_private(path: &Path) -> Result<File> {
+pub(crate) fn open_private(path: &Path) -> Result<File> {
     storage::unredirected(path)?;
     let file = File::open(path)?;
     ensure!(
         file.metadata()?.is_file(),
         "Maintenance capability must be a file"
     );
-    authenticate_file(&file)?;
+    authenticate_file(&file, false)?;
+    Ok(file)
+}
+/// Agent-owned files follow agent storage's current-user + LocalSystem ACL.
+/// Mailbox/journal authentication continues to require only the current user.
+pub(crate) fn open_agent_private(path: &Path) -> Result<File> {
+    storage::unredirected(path)?;
+    let file = File::open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Agent capability must be a file"
+    );
+    authenticate_file(&file, true)?;
     Ok(file)
 }
 
@@ -443,7 +579,7 @@ impl ProcessIdentity {
         inspect(pid)?.context("Process is no longer running")
     }
 }
-fn presence(expected: &ProcessIdentity) -> Presence {
+pub(crate) fn presence(expected: &ProcessIdentity) -> Presence {
     match inspect(expected.pid) {
         Ok(Some(actual)) if actual == *expected => Presence::Alive,
         Ok(_) => Presence::Gone,
@@ -481,7 +617,7 @@ fn token_user(process: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<usi
 /// Only current-user-owned files with exclusively current-user allow ACEs are
 /// capabilities. Broad, null or foreign ACLs are refused without repairing them.
 #[cfg(windows)]
-fn authenticate_file(file: &File) -> Result<()> {
+fn authenticate_file(file: &File, allow_system: bool) -> Result<()> {
     use std::{
         os::windows::io::AsRawHandle,
         ptr::{addr_of_mut, null_mut},
@@ -537,8 +673,10 @@ fn authenticate_file(file: &File) -> Result<()> {
                 "Unsupported private ACE"
             );
             let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            let principal = addr_of_mut!((*allowed).SidStart).cast();
             ensure!(
-                EqualSid(addr_of_mut!((*allowed).SidStart).cast(), sid) != 0,
+                EqualSid(principal, sid) != 0
+                    || (allow_system && IsWellKnownSid(principal, WinLocalSystemSid) != 0),
                 "Maintenance file grants another principal access"
             );
         }
@@ -608,7 +746,7 @@ fn inspect(pid: u32) -> Result<Option<ProcessIdentity>> {
     }
 }
 #[cfg(not(windows))]
-fn authenticate_file(_: &File) -> Result<()> {
+fn authenticate_file(_: &File, _: bool) -> Result<()> {
     bail!("Private maintenance protocol requires Windows")
 }
 #[cfg(not(windows))]
@@ -644,6 +782,89 @@ mod tests {
             supervisor: &r.supervisor,
             child: r.child.as_ref(),
         }
+    }
+    #[test]
+    fn release_requires_exact_owned_child_gone_and_cannot_be_cancelled() {
+        let r = request();
+        let mut release = r.clone();
+        release.action = Action::Release;
+        for presence in [Presence::Alive, Presence::Unknown] {
+            let mut j = Some(Journal {
+                request: r.clone(),
+                phase: Phase::Owned,
+            });
+            let mut obs = observed(&r);
+            obs.child = None;
+            assert!(transition(&mut j, Some(&release), &obs, |p| {
+                if r.child.as_ref() == Some(p) {
+                    presence
+                } else {
+                    Presence::Alive
+                }
+            })
+            .is_err());
+            assert_eq!(j.unwrap().phase, Phase::Owned);
+        }
+        let mut j = Some(Journal {
+            request: r.clone(),
+            phase: Phase::Owned,
+        });
+        let mut obs = observed(&r);
+        obs.child = None;
+        let probe = |p: &ProcessIdentity| {
+            if r.child.as_ref() == Some(p) {
+                Presence::Gone
+            } else {
+                Presence::Alive
+            }
+        };
+        transition(&mut j, Some(&release), &obs, probe).unwrap();
+        transition(&mut j, Some(&release), &obs, probe).unwrap();
+        assert_eq!(j.as_ref().unwrap().phase, Phase::Released);
+        let mut cancel = r.clone();
+        cancel.action = Action::Cancel;
+        assert!(transition(&mut j, Some(&cancel), &obs, probe).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn released_gate_never_grants_exit_to_a_reused_supervisor_pid() {
+        let mut r = request();
+        r.supervisor = ProcessIdentity::capture(std::process::id()).unwrap();
+        let mut gate = Gate {
+            journal: Some(Journal {
+                request: r,
+                phase: Phase::Released,
+            }),
+            ..Default::default()
+        };
+        assert!(gate.release_ready());
+        gate.journal.as_mut().unwrap().request.supervisor.created_at += 1;
+        assert!(!gate.release_ready());
+    }
+    #[test]
+    fn crashed_supervisor_release_requires_both_gone_and_independent_flush_proof() {
+        let r = request();
+        let successor = identity(5);
+        let original = Some(Journal {
+            request: r.clone(),
+            phase: Phase::Owned,
+        });
+        for p in [Presence::Alive, Presence::Unknown] {
+            let mut j = original.clone();
+            assert!(recover_released_predecessor(&mut j, &successor, |_| p, |_| Ok(())).is_err());
+            assert_eq!(j, original);
+        }
+        let mut j = original.clone();
+        assert!(recover_released_predecessor(
+            &mut j,
+            &successor,
+            |_| Presence::Gone,
+            |_| bail!("missing proof")
+        )
+        .is_err());
+        assert_eq!(j, original);
+        recover_released_predecessor(&mut j, &successor, |_| Presence::Gone, |_| Ok(())).unwrap();
+        assert_eq!(j.unwrap().phase, Phase::Released);
     }
     #[test]
     fn maintenance_duplicate_clicks_keep_one_owner() {
@@ -897,6 +1118,7 @@ mod tests {
             checkpoint: None,
             verification: None,
             failure: None,
+            bridge_restart_required: true,
         };
         storage::atomic(&storage::control(dir.path()).join("upgrade.json"), &status).unwrap();
         (dir, r)
@@ -958,7 +1180,7 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
-    fn maintenance_loop_gates_respawn_and_crash_recovers_live_child() {
+    fn maintenance_loop_retains_owned_gate_until_upgrade_recovery() {
         let (dir, r) = fixture();
         let mut gate = Gate::default();
         assert!(gate.respawn_ready(false, true));
@@ -971,13 +1193,13 @@ mod tests {
         assert!(!gate.respawn_ready(false, true));
         poll_fixture(&mut gate, dir.path(), &r, true, Presence::Gone);
         assert_eq!(gate.error, None);
-        assert_eq!(gate.journal.as_ref().unwrap().phase, Phase::Recovered);
+        assert_eq!(gate.journal.as_ref().unwrap().phase, Phase::Owned);
         assert!(!gate.respawn_ready(true, true));
-        assert!(gate.respawn_ready(false, true));
+        assert!(!gate.respawn_ready(false, true));
         assert_eq!(gate.journal.as_ref().unwrap().request.child, r.child);
         let mut reopened = Gate::default();
         poll_fixture(&mut reopened, dir.path(), &r, true, Presence::Gone);
-        assert!(!reopened.blocks_respawn());
+        assert!(reopened.blocks_respawn());
     }
     #[cfg(windows)]
     #[test]

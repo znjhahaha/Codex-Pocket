@@ -18,17 +18,18 @@ data class ConnectionRoute(val id: String, val kind: String, val url: String, va
                            val expiresAt: Long? = null) {
     init {
         require(id.matches(Regex("[A-Za-z0-9_-]{1,128}"))) { "Invalid route ID" }
-        require(kind in setOf("lan", "cloudflare", "relay") && priority >= 0) { "Invalid route" }
+        require(kind in setOf("lan", "cloudflare", "relay", "p2p") && priority >= 0) { "Invalid route" }
         require(expiresAt == null || expiresAt >= 0) { "Invalid route expiry" }
         validateRouteUrl(url, kind)
     }
     fun toJson(): JsonObject = buildJsonObject {
+        require(kind != "p2p") { "Negotiated routes cannot be persisted" }
         put("id", id); put("kind", kind); put("url", url); put("priority", priority)
         expiresAt?.let { put("expiresAt", it) }
     }
     override fun toString(): String = "ConnectionRoute(id=$id, kind=$kind)"
     companion object {
-        fun parse(obj: JsonObject): ConnectionRoute = ConnectionRoute(obj.string("id"), obj.string("kind"),
+        fun parse(obj: JsonObject): ConnectionRoute = ConnectionRoute(obj.string("id"), obj.string("kind").also { require(it != "p2p") },
             obj.string("url"), obj.integer("priority").also { require(it <= Int.MAX_VALUE) }.toInt(),
             obj["expiresAt"]?.takeUnless { it == JsonNull }?.let { obj.integer("expiresAt") })
     }
@@ -59,6 +60,7 @@ internal fun validateWssUrl(url: String): URI {
 
 private fun validateRouteUrl(url: String, kind: String) {
     try {
+        if (kind == "p2p") { require(url.matches(Regex("p2p://[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}"))); return }
         if (kind != "lan") { validateWssUrl(url); return }
         require(url.length in 1..8192)
         val uri = URI(url)

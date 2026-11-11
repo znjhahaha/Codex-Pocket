@@ -2,6 +2,9 @@
 #[cfg(test)]
 #[path = "broker/history_compat_tests.rs"]
 mod history_compat_tests;
+#[cfg(test)]
+#[path = "broker/session_lifecycle_tests.rs"]
+mod session_lifecycle_tests;
 use crate::{
     access,
     attachments::{self, Attachment},
@@ -31,6 +34,12 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc};
 mod v051;
 mod session_access;
+#[path = "broker_usage.rs"]
+mod usage_backend;
+#[path = "broker_handoff.rs"]
+mod broker_handoff;
+#[path = "broker_assistant.rs"]
+mod broker_assistant;
 
 #[cfg(test)]
 mod management_tests {
@@ -504,12 +513,18 @@ mod management_tests {
 pub(crate) const NOTIFICATION_CAPACITY: usize = 4096;
 
 struct Runtime {
+    role: crate::native::NativeRole,
     bridge_version: Option<String>,
     usage: crate::context_usage::UsageCache,
     config_home: PathBuf,
     settings: crate::settings::SettingsCache,
+    // Earlier connections' cached permissions cannot authorize assistant work.
+    assistant_permission_floor: u64,
     fast_models: BTreeSet<String>,
     capabilities: crate::capabilities::Capabilities,
+    // Only authenticated status proves false; empty capabilities or a timeout do not.
+    // This evidence belongs to this connection and is never persisted as a release.
+    desktop_initialized: Option<bool>,
     rpc: Rpc,
     native_process: Option<NativeProcess>,
     connection_id: String,
@@ -553,6 +568,11 @@ struct State {
     ownership_persist_failed: bool,
 }
 pub struct Broker {
+    assistant_permission_reader: std::sync::OnceLock<Arc<dyn crate::assistant_executor::ProjectPermissionReader>>,
+    assistant_permission_handle: std::sync::OnceLock<tokio::runtime::Handle>,
+    assistant: Mutex<Option<crate::assistant_product::Actor>>,
+    assistant_error: Mutex<Option<&'static str>>,
+    pub(crate) handoff: std::sync::OnceLock<Arc<crate::handoff::Handoff>>,
     access: Mutex<session_access::AccessStore>,
     access_drive: Mutex<()>,
     desktop_launch: Mutex<Option<u64>>,
@@ -950,6 +970,17 @@ fn trim_history_outputs(value: &mut Value) {
 
 fn cursor_value(c: &Cursor) -> Value {
     json!({"epoch":c.epoch,"sequence":c.sequence})
+}
+impl Broker {
+    pub fn install_handoff(&self, handoff:Arc<crate::handoff::Handoff>)->Result<()> {
+        self.handoff.set(handoff).map_err(|_|anyhow::anyhow!("Handoff already installed"))
+    }
+    pub fn check_write_fence(&self)->Result<()> {
+        if self.handoff.get().is_some_and(|h|!h.accepting_writes()) {
+            return Err(classify(anyhow::anyhow!("Computer helper updating"),Code::OperationInProgress));
+        }
+        Ok(())
+    }
 }
 impl Broker {
     async fn read_media(&self, device: &str, p: &Value) -> Result<Value> {
@@ -1760,8 +1791,12 @@ impl Broker {
         }
         RuntimeDirectory::new(ownership.iter().map(|claim| claim.advertisement.clone()))
             .map_err(|e| anyhow::anyhow!("Invalid ownership state: {e:?}"))?;
-        Ok((
-            Arc::new(Self {
+        let broker = Arc::new(Self {
+                assistant_permission_reader: std::sync::OnceLock::new(),
+                assistant_permission_handle: std::sync::OnceLock::new(),
+                handoff: std::sync::OnceLock::new(),
+                assistant: Mutex::new(None),
+                assistant_error: Mutex::new(None),
                 access: Mutex::new(session_access::AccessStore::open(&state_dir, &config.computer_id)?),
                 access_drive: Mutex::new(()),
                 desktop_launch: Mutex::new(None),
@@ -1798,9 +1833,9 @@ impl Broker {
                 writes: Mutex::new(()),
                 notifications,
                 native_events,
-            }),
-            rx,
-        ))
+            });
+        broker.register_assistant_permission_reader()?;
+        Ok((broker, rx))
     }
     fn save_ledger(&self, state: &State) -> Result<()> {
         storage::atomic_write(
@@ -1846,12 +1881,20 @@ impl Broker {
             if r.capabilities.supports("thread/read",&json!({"threadId":"probe","includeTurns":false})) {
                 capabilities.extend(["workspace/list","workspace/read","workspace/image","references/list"].into_iter().map(str::to_owned));
             }
-            json!({"id":id,"source":r.source,"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models})
+            json!({"id":id,"source":r.source,"role":r.role,"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models})
         }).collect()
     }
     pub async fn diagnostics(&self) -> Value {
+        let upstream_versions = self.upstream_version_snapshot().await;
+        let assistant_error = *self.assistant_error.lock().await;
         let s = self.state.lock().await;
         let mut value = self.connection.snapshot();
+        value["upstreamVersions"] = upstream_versions;
+        value["assistantRestoreError"] = json!(assistant_error);
+        if let Some(handoff) = self.handoff.get() {
+            value["handoffCapabilities"] = handoff.capabilities(&json!({})).unwrap_or(Value::Null);
+            value["acceptingWrites"] = json!(handoff.accepting_writes());
+        }
         value["protocol"] = json!(1);
         value["helperRuntime"] = crate::installation::current();
         value["updatedAt"] = json!(crate::connection::now());
@@ -1880,11 +1923,13 @@ impl Broker {
     }
     pub async fn local_pair(&self) -> Result<Value> {
         let _state = self.state.lock().await;
+        self.check_write_fence()?;
         crate::local::pair_files(&self.state_dir)
     }
     pub async fn local_revoke(&self, id: &str) -> Result<Value> {
         let _delivery = self.push_delivery.lock().await;
         let _write = self.writes.lock().await;
+        self.check_write_fence()?;
         let mut s = self.state.lock().await;
         let result = self.revoke_locked(&mut s, id)?;
         drop(s);
@@ -2084,6 +2129,12 @@ impl Broker {
                 "thread/access/cancel",
                 "quota/sources",
                 "quota/read",
+                "usage/read",
+                "usage/sources",
+                "usage.v1",
+                "upstream.versions.v1",
+                "assistant.v1",
+                "assistant/read",
                 "push/status",
                 "push/register",
                 "push/unregister",
@@ -2098,6 +2149,7 @@ impl Broker {
     }
     pub async fn pair(&self, p: &Value) -> Result<Value> {
         let mut state = self.state.lock().await;
+        self.check_write_fence()?;
         let path = self.state_dir.join("pairing.json");
         let pair: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
@@ -2198,7 +2250,7 @@ impl Broker {
         let loaded = known
             .map(|a| a.advertisement.loaded_native_thread_ids)
             .unwrap_or_default();
-        let settings = s
+        let mut settings = s
             .runtimes
             .get(&c.runtime_id)
             .filter(|r| {
@@ -2206,6 +2258,7 @@ impl Broker {
             })
             .map(|r| r.settings.clone())
             .unwrap_or_default();
+        let assistant_permission_floor = settings.checkpoint();
         let usage = s
             .runtimes
             .get(&c.runtime_id)
@@ -2217,11 +2270,15 @@ impl Broker {
         s.runtimes.insert(
             c.runtime_id,
             Runtime {
+                role: c.role,
                 bridge_version: c.bridge_version,
                 usage,
                 config_home: c.config_home,
                 settings,
+                assistant_permission_floor,
                 fast_models: BTreeSet::new(),
+                desktop_initialized: (c.source == "desktop" && !c.capabilities.0.is_empty())
+                    .then_some(true),
                 capabilities: c.capabilities,
                 rpc: c.rpc,
                 native_process,
@@ -2240,6 +2297,7 @@ impl Broker {
             .notifications
             .send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&s)}}));
         drop(s);
+        rpc.activate_events();
         if recover_pending {
             rpc.call("pocket/approvals/list", json!({})).await?;
         }
@@ -2387,6 +2445,7 @@ impl Broker {
                     }
                 }
             }
+            self.refresh_desktop_capabilities().await;
             if self.refresh_loaded().await.is_err() {
                 errors.insert(("native".into(), "inventory_unavailable".into()));
             }
@@ -2394,6 +2453,89 @@ impl Broker {
             self.drive_access_operations().await;
             self.state.lock().await.discovery_errors = errors;
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    // Capability discovery can finish after authenticated registration. Keep it
+    // independent of conversation writes and bind every reply to its connection.
+    fn apply_desktop_status(
+        state: &mut State,
+        runtime: &str,
+        generation: &str,
+        status: &Value,
+    ) -> bool {
+        let Some(r) = state.runtimes.get_mut(runtime).filter(|r| {
+            r.source == "desktop" && r.connection_id == generation && r.rpc.online()
+        }) else {
+            return false;
+        };
+        if status["runtimeId"] != runtime
+            || (r.native_process.is_some()
+                && serde_json::from_value::<Option<NativeProcess>>(status["nativeProcess"].clone())
+                    .ok() != Some(r.native_process.clone()))
+        {
+            return false;
+        }
+        // The desktop handshake only advances on a connection. Do not let an older
+        // negative status erase a successful initial status or ready notification.
+        if r.desktop_initialized == Some(true) && status["initialized"] == false {
+            return false;
+        }
+        let previous_initialized = r.desktop_initialized;
+        if let Some(initialized) = status["initialized"].as_bool() {
+            r.desktop_initialized = Some(initialized);
+            if !initialized && previous_initialized != Some(false) {
+                // Keep loaded claims, but no longer advertise their inventory as
+                // authoritative. Skipping startup reads must not release ownership.
+                r.inventory_ready = false;
+                r.inventory_revision = uuid::Uuid::new_v4();
+            }
+        }
+        let capabilities = if status["initialized"] == true
+            && status["schemaState"] == "ready"
+            && status["schemaPending"] != true
+        {
+            let Some(caps) = status.get("nativeCapabilities").and_then(|v| {
+                serde_json::from_value::<crate::capabilities::Capabilities>(v.clone()).ok()
+            }) else {
+                return false;
+            };
+            if !caps.supports("thread/read", &json!({"threadId":"probe","includeTurns":false})) {
+                return false;
+            }
+            caps
+        } else {
+            Default::default()
+        };
+        let changed = r.capabilities.0 != capabilities.0
+            || previous_initialized != r.desktop_initialized;
+        r.capabilities = capabilities;
+        if let Some(version) = status["nativeVersion"].as_str().filter(|v| {
+            !v.is_empty() && v.len() <= 512 && !v.chars().any(char::is_control)
+        }) {
+            r.version = version.into();
+        }
+        changed
+    }
+    async fn refresh_desktop_capabilities(&self) {
+        let pending: Vec<_> = self.state.lock().await.runtimes.iter()
+            .filter(|(_, r)| r.source == "desktop" && r.rpc.online() && r.capabilities.0.is_empty())
+            .map(|(id, r)| (id.clone(), r.connection_id.clone(), r.rpc.clone()))
+            .collect();
+        for (id, generation, rpc) in pending {
+            // A slow/old helper must not hold discovery or the phone list for 90s.
+            if let Ok(Ok(status)) = tokio::time::timeout(
+                Duration::from_secs(3), rpc.call("pocket/status", json!({})),
+            ).await {
+                let mut state = self.state.lock().await;
+                // A ready notification may have arrived while this older read
+                // was in flight. Initialization only advances on a connection.
+                let still_pending = state.runtimes.get(&id).is_some_and(|r| {
+                    r.connection_id == generation && r.capabilities.0.is_empty()
+                });
+                if still_pending && Self::apply_desktop_status(&mut state, &id, &generation, &status) {
+                    let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&state)}}));
+                }
+            }
         }
     }
     async fn refresh_fast_capabilities(&self) {
@@ -2550,7 +2692,10 @@ impl Broker {
                 .await
                 .runtimes
                 .get(id)
-                .filter(|r| r.connection_id == *connection_id)
+                .filter(|r| {
+                    r.connection_id == *connection_id
+                        && !(r.source == "desktop" && r.desktop_initialized == Some(false))
+                })
                 .map(|r| r.inventory_revision)
             else {
                 continue;
@@ -2783,6 +2928,12 @@ impl Broker {
                         continue;
                     }
                     let method = value["method"].as_str().unwrap_or_default().to_owned();
+                    if method == "pocket/runtimeStatus" {
+                        if Self::apply_desktop_status(&mut state, &runtime_id, &connection_id, &value["params"]) {
+                            let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&state)}}));
+                        }
+                        continue;
+                    }
                     if method == "account/updated" {
                         drop(state);
                         if let Some(result) =
@@ -2807,6 +2958,7 @@ impl Broker {
                         continue;
                     }
                     if push_event(&value)
+                        && !state.runtimes.get(&runtime_id).is_some_and(|r|matches!(r.role,crate::native::NativeRole::ManagedHost{..}))
                         && self.push.configured()
                         && let Some(thread) = value["params"]["threadId"].as_str()
                     {
@@ -2902,6 +3054,7 @@ impl Broker {
                         }
                     }
                     if value.get("id").is_some()
+                        && !state.runtimes.get(&runtime_id).is_some_and(|r|matches!(r.role,crate::native::NativeRole::ManagedHost { .. }))
                         && matches!(
                             method.as_str(),
                             "item/commandExecution/requestApproval"
@@ -2986,6 +3139,8 @@ impl Broker {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
         match method {
+            "usage/read" | "usage/sources" => return self.usage_request(device, method, &p).await,
+            "assistant/read" => return self.assistant_read(&p).await,
             "routes/list" => return Ok(crate::config::routes::snapshot(&self.config,&self.state_dir)),
             "session/preferences/read" => {
                 session_access::validate(method, &p)?;
@@ -3103,6 +3258,7 @@ impl Broker {
                 return self.workspace_request(device, method, &p).await;
             }
             "runtimes/list" => {
+                self.refresh_desktop_capabilities().await;
                 return Ok(json!({"data":Self::runtime_values(&*self.state.lock().await)}));
             }
             "devices/list" => {
@@ -3128,6 +3284,7 @@ impl Broker {
             _ => {}
         }
         let mutation = match method {
+            method if method.starts_with("assistant/") => {Self::validate_assistant(method,&p)?;true},
             "session/preferences/update" | "runtime/ensure" | "thread/access/update" | "thread/access/cancel" => {
                 session_access::validate(method, &p)?;
                 true
@@ -3185,6 +3342,7 @@ impl Broker {
             None
         };
         let _write = self.writes.lock().await;
+        self.check_write_fence()?;
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
@@ -3237,6 +3395,7 @@ impl Broker {
             }
         }
         let result = match method {
+            method if method.starts_with("assistant/") => self.assistant_write(device,method,&p).await,
             "session/preferences/update" => self.update_access_preferences(&p).await,
             "runtime/ensure" => self.ensure_runtime(&p).await,
             "thread/access/update" => self.update_access(device, &p).await,
@@ -3713,6 +3872,9 @@ impl Broker {
         } else {
             access::validate(method, &params).map_err(access::AccessError::into_request_error)?
         };
+        if method == "thread/start" {
+            self.refresh_desktop_capabilities().await;
+        }
         // Catalog and workspace proofs must remain bound to this connection,
         // including the interval before ownership refresh and native dispatch.
         let proof_generation = self
@@ -3834,6 +3996,26 @@ impl Broker {
             .await?;
         }
         if mutation {
+            // Reject an unready target before sending any business inventory RPC.
+            {
+                let state = self.state.lock().await;
+                let r = state
+                    .runtimes
+                    .get(runtime)
+                    .filter(|r| r.rpc.online() && r.connection_id == proof_generation)
+                    .ok_or_else(|| {
+                        classify(anyhow::anyhow!("Runtime offline"), Code::RuntimeOffline)
+                    })?;
+                if r.source == "desktop"
+                    && (r.desktop_initialized == Some(false)
+                        || (method == "thread/start" && r.capabilities.0.is_empty()))
+                {
+                    return Err(classify(
+                        anyhow::anyhow!("Native initialization or schema discovery is not ready"),
+                        Code::RuntimeUnavailable,
+                    ));
+                }
+            }
             self.refresh_loaded().await?;
         }
         let (rpc, connection_id, resume_probe) = {
@@ -3843,6 +4025,12 @@ impl Broker {
                 .get(runtime)
                 .filter(|r| r.rpc.online() && r.connection_id == proof_generation)
                 .ok_or_else(||classify(anyhow::anyhow!("Runtime offline"),Code::RuntimeOffline))?;
+            if method == "thread/start" && r.source == "desktop" && r.capabilities.0.is_empty() {
+                return Err(classify(
+                    anyhow::anyhow!("Native initialization or schema discovery is not ready"),
+                    Code::RuntimeUnavailable,
+                ));
+            }
             let mut resume_probe = None;
             if mutation && let Some(thread) = params["threadId"].as_str() {
                 let key = ThreadKey {
@@ -3879,6 +4067,11 @@ impl Broker {
             attachments::translate(&mut params, device, &s.attachments)?;
             if method == "thread/start" {
                 crate::native_history_compat::prepare_creation(&mut params, &r.capabilities);
+            }
+            if method == "thread/resume"
+                && r.capabilities.supports("thread/resume", &json!({"threadId":"probe","excludeTurns":true}))
+            {
+                params["excludeTurns"] = json!(true);
             }
             (r.rpc.clone(), r.connection_id.clone(), resume_probe)
         };
@@ -3947,6 +4140,10 @@ impl Broker {
             self.state.lock().await.edits.consume(token);
         }
         let watched_thread=params["threadId"].as_str().map(str::to_owned);
+        if mutation {
+            self.assistant_before_manual_write(runtime, method, &params, p["commandId"].as_str().unwrap_or("manual")).await?;
+            self.check_generation(runtime, &connection_id).await?;
+        }
         let result = crate::native_history_compat::call(&rpc, method, params, &history_cursor).await?;
         if matches!(method,"thread/read"|"thread/resume"|"thread/turns/list") {
             if let Some(thread)=watched_thread.as_deref() { self.watch_cli(runtime,thread).await; }

@@ -397,9 +397,8 @@ mod tests {
     impl Fixture {
         async fn start() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let home = dir.path().join("home");
-            std::fs::create_dir(&home).unwrap();
-            let descriptor = dir.path().join("state/runtime-host/registry/fixture.json");
+            let home = dir.path().to_path_buf();
+            let descriptor = dir.path().join("registry/host.json");
             let bins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime-host/target/debug");
             let host = bins.join("pocket-runtime-host.exe");
             let native = bins.join("pocket-host-fixture.exe");
@@ -407,15 +406,11 @@ mod tests {
                 host.is_file() && native.is_file(),
                 "build the scoped Runtime Host --bins before these integration tests"
             );
-            let mut command = tokio::process::Command::new(host);
+            // The fixture driver runs the real Host in its own process; the product
+            // executable requires the managed launcher's persisted reservation.
+            let mut command = tokio::process::Command::new(native);
             command
-                .args(["--state"])
-                .arg(dir.path().join("host-state"))
-                .arg("--descriptor")
-                .arg(&descriptor)
-                .arg("--binary")
-                .arg(native)
-                .arg("--config-home")
+                .arg("--host-test-driver")
                 .arg(&home)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

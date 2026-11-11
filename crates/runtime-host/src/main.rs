@@ -37,6 +37,9 @@ async fn start() -> Result<()> {
         config_home: path("--config-home")?,
         native_args: vec!["app-server".into(), "--listen".into(), "stdio://".into()],
     };
+    if !config.state.join("startup.json").try_exists()? {
+        bail!("Managed launcher startup ownership is required");
+    }
     if config.descriptor.try_exists()? {
         match HostClient::discover(&config.descriptor, &config.config_home).await? {
             Discovery::Attached(_) => return Ok(()),

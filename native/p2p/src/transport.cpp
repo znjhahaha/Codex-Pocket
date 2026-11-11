@@ -37,7 +37,7 @@ bool valid_string(const char *s,size_t limit) {
 struct Item { int kind; std::string a,b; int channel=-1; };
 struct Peer:std::enable_shared_from_this<Peer> {
     uint64_t handle,generation;
-    std::string bind;
+    std::string bind,stun;
     p2p_callback callback;void *user;
     std::mutex mutex;std::condition_variable cv;std::thread worker;
     int pc=-1,dc=-1,state=0,end=0;bool ready=false,initialized=false,started=false,offerer=false;
@@ -48,8 +48,8 @@ struct Peer:std::enable_shared_from_this<Peer> {
     std::deque<std::vector<uint8_t>> tx,rx;
     std::deque<Item> commands,signals;
     Clock::time_point close_deadline;
-    Peer(uint64_t h,uint64_t g,const char *addr,p2p_callback cb,void *u):
-        handle(h),generation(g),bind(addr?addr:""),callback(cb),user(u){}
+    Peer(uint64_t h,uint64_t g,const char *addr,const char *stun_url,p2p_callback cb,void *u):
+        handle(h),generation(g),bind(addr?addr:""),stun(stun_url?stun_url:""),callback(cb),user(u){}
     void fail() noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         if(state==P2P_END || state==P2P_ERROR)return;
@@ -126,6 +126,8 @@ struct Peer:std::enable_shared_from_this<Peer> {
     }
     bool initialize() {
         rtcConfiguration config{};
+        const char *server=stun.c_str();
+        if(!stun.empty()){config.iceServers=&server;config.iceServersCount=1;}
         config.bindAddress=bind.empty()?nullptr:bind.c_str();config.maxMessageSize=P2P_CHUNK;
         config.disableAutoNegotiation=true; // controller owns start and offer/answer role
         pc=rtcCreatePeerConnection(&config);if(pc<0)return false;
@@ -259,10 +261,18 @@ int queue_command(uint64_t h,uint64_t g,int kind,const char *a,const char *b,int
 }
 extern "C" {
 uint64_t p2p_create(uint64_t gen,const char *bind,p2p_callback cb,void *user){
+    return p2p_create_config(gen,bind,nullptr,cb,user);
+}
+uint64_t p2p_create_config(uint64_t gen,const char *bind,const char *stun,p2p_callback cb,void *user){
     if(!gen || (bind && !valid_string(bind,128)))return 0;
+    if(stun){
+        if(!valid_string(stun,256) || std::strncmp(stun,"stun:",5))return 0;
+        std::string s(stun+5);
+        if(s.empty() || s.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]")!=std::string::npos)return 0;
+    }
     std::shared_ptr<Peer> p;
     try{
-        {std::lock_guard<std::mutex> lock(registry_mutex);uint64_t h=++next_handle;p=std::make_shared<Peer>(h,gen,bind,cb,user);peers[h]=p;}
+        {std::lock_guard<std::mutex> lock(registry_mutex);uint64_t h=++next_handle;p=std::make_shared<Peer>(h,gen,bind,stun,cb,user);peers[h]=p;}
         p->worker=std::thread([p]{p->run();});
         std::unique_lock<std::mutex> lock(p->mutex);p->cv.wait(lock,[&]{return p->ready;});
         bool ok=p->initialized;lock.unlock();if(!ok){p2p_destroy(p->handle);return 0;}return p->handle;

@@ -57,6 +57,7 @@ pub struct Router {
     active: HashSet<String>,
     pub loaded: HashSet<String>,
     pub initialized: bool,
+    initialize_received: bool,
     pub native_version: Option<String>,
     settings: crate::settings::SettingsCache,
 }
@@ -79,6 +80,7 @@ impl Default for Router {
             active: HashSet::new(),
             loaded: HashSet::new(),
             initialized: false,
+            initialize_received: false,
             native_version: None,
             settings: Default::default(),
         }
@@ -406,6 +408,9 @@ impl Router {
                     );
                 }
             }
+            if client == Client::Desktop && method == "initialized" && self.initialize_received {
+                self.initialized = true;
+            }
             if let Some(id) = value.get("id").cloned() {
                 let Some(next) = self.next.checked_add(1) else {
                     return Self::reject(client, &value, "Routing ID space exhausted");
@@ -727,7 +732,7 @@ impl Router {
                     }
                 }
                 if p.method == "initialize" {
-                    self.initialized = true;
+                    self.initialize_received = true;
                     self.native_version = value["result"]["version"]
                         .as_str()
                         .or_else(|| value["result"]["userAgent"].as_str())

@@ -58,10 +58,15 @@ data class PocketState(
     val sendBusy: Boolean = false, val submittingApprovalKeys: Set<String> = emptySet(),
     val nativeQueue: List<JsonObject> = emptyList(), val queueSupported: Boolean? = null,
     val connectionPhase: String = "offline", val connectionDetail: String = "",
+    val activeRouteKind: String? = null, val routePhase: String = "offline", val routeFallback: String? = null,
+    val relayVersion: RelayVersion? = null, val upstreamVersions: JsonObject? = null,
+    val versionsObservedAt: Long = 0, val p2pEnabled: Boolean = true, val publicStunEnabled: Boolean = true,
     val lastSyncAt: Long = 0, val unreadKeys: Set<String> = emptySet(),
     val pendingQuestions: Map<String, List<JsonObject>> = emptyMap(),
     val advanced: AdvancedConversationState = AdvancedConversationState(),
     val quota: QuotaState = QuotaState(),
+    val usage: UsageScreenState = UsageScreenState(),
+    val assistant: AssistantUiState = AssistantUiState(), val assistantModels: List<NativeModel> = emptyList(),
     val agentChats: List<ChatEntity> = emptyList(),
     val agentStatuses: Map<ThreadKey, AgentLiveStatus> = emptyMap(),
     val resolvedRequests: Map<String, Set<String>> = emptyMap(),
@@ -86,7 +91,7 @@ data class PocketState(
         val advertised = runtime.capabilities ?: capabilities
         return method in advertised || "native:$method" in advertised
     }
-    val unresolvedCommands get() = commands.filter { (it.chatKey == selected?.key || it.chatKey == null) && CommandPolicy.blocksNewSend(it.status) }
+    val unresolvedCommands get() = commands.filter { !it.method.startsWith("assistant/") && (it.chatKey == selected?.key || it.chatKey == null) && CommandPolicy.blocksNewSend(it.status) }
     val uncertainSend get() = unresolvedCommands.any { it.method != "approvals/respond" }
     fun currentAgents(): List<AgentRosterEntry> {
         val parent = selected ?: return emptyList()
@@ -116,6 +121,7 @@ class PocketRepository(
     val state: StateFlow<PocketState> = _state.asStateFlow()
     val alerts = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val conversationAlerts = MutableSharedFlow<ConversationAlert>(extraBufferCapacity = 32)
+    val threadLinkOpened = MutableSharedFlow<ThreadKey>(extraBufferCapacity = 1)
     private var pair: PairedComputer? = null
     @Volatile private var client: PocketConnection? = null
     private val connectionGate = Any()
@@ -125,7 +131,204 @@ class PocketRepository(
     private val routeManager = RouteManager()
     private var routeDiscovery: Job? = null
     private var discoveryComputer: String? = null
-    private fun newConnection(): PocketConnection = connectionFactory?.invoke() ?: RoutingPocketConnection(routeManager)
+    private var usageJob: Job? = null
+    private var usageComputer: String? = null
+    private val assistantRead = Mutex()
+    private var assistantComputer: String? = null
+    private var assistantModelRuntime: String? = null
+    fun loadAssistant(): Job = scope.launch {
+        if (!assistantRead.tryLock()) return@launch
+        val computer = pair?.computerId
+        val transport = client
+        try {
+            if (assistantComputer != computer) {
+                assistantComputer = computer; assistantModelRuntime = null
+                _state.update { it.copy(assistant = AssistantUiState(), assistantModels = emptyList()) }
+            }
+            if (!_state.value.online || transport == null) {
+                _state.update { it.copy(assistant = it.assistant.copy(loading = false, error = "连接电脑后可继续使用助理")) }; return@launch
+            }
+            if ("assistant.v1" !in _state.value.capabilities) {
+                _state.update { it.copy(assistant = it.assistant.copy(loading = false, error = "电脑助手尚不支持此功能，请更新 Windows 端")) }; return@launch
+            }
+            if (_state.value.assistant.snapshot == null) _state.update { it.copy(assistant = it.assistant.copy(loading = true)) }
+            val raw = transport.request("assistant/read", buildJsonObject { put("after", 0) }, timeoutMillis = 8000).asObject()
+            if (client !== transport || pair?.computerId != computer) return@launch
+            val snapshot = AssistantSnapshot.from(raw)
+            val messages = raw.array("messages").mapNotNull { item ->
+                val value = item.asObject(); val role = value.string("role")
+                if (value.string("id").isBlank() || role !in setOf("User", "Assistant") || value.string("text").isBlank()) null
+                else AssistantChatMessage(value.string("id"), role, value.string("text"), value["atMs"]?.jsonPrimitive?.longOrNull,
+                    value["operationId"]?.jsonPrimitive?.contentOrNull)
+            }
+            _state.update { it.copy(assistant = it.assistant.copy(snapshot = snapshot, messages = messages, loading = false,
+                error = when { raw.string("error")=="assistant_restore_failed" -> "助理恢复未完成，请选择当前运行入口后重试启用"; raw.flag("enabled") && !raw.flag("ready") -> "助理运行时尚未就绪，正在核对电脑状态"; else -> null })) }
+            val runtime = snapshot.runtimeId
+            if (runtime != null && runtime != assistantModelRuntime) {
+                val found = linkedMapOf<String, NativeModel>(); var cursor: JsonElement? = null
+                val seen = mutableSetOf<JsonElement>()
+                do {
+                    val response = transport.request("codex/request", buildJsonObject { put("runtimeId", runtime); put("method", "model/list");
+                        put("params", buildJsonObject { put("limit", 100); cursor?.let { put("cursor", it) } }) }, timeoutMillis = 8000).asObject()
+                    response.array("data").map { it.asObject() }.filterNot { it.flag("hidden") }.map(NativeModel::from).forEach { found[it.model] = it }
+                    cursor = response["nextCursor"]?.takeUnless { it == JsonNull }
+                    if (cursor != null && !seen.add(cursor!!)) throw WireException("invalid_reply", "Model cursor repeated")
+                } while (cursor != null && found.size < 1000)
+                if (client === transport && pair?.computerId == computer) {
+                    assistantModelRuntime = runtime; _state.update { it.copy(assistantModels = found.values.toList()) }
+                }
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { if (client === transport && pair?.computerId == computer) _state.update { it.copy(assistant = it.assistant.copy(loading = false, error = "助理状态暂未读取，可重试；任务不会重复提交")) } }
+        finally { assistantRead.unlock() }
+    }
+    fun assistantAction(action: AssistantAction): Job = scope.launch {
+        if (action.method == "assistant/read") { loadAssistant().join(); return@launch }
+        if (!_state.value.online || client == null) {
+            _state.update { it.copy(assistant = it.assistant.copy(error = "连接电脑后可继续使用助理")) }
+            return@launch
+        }
+        if (_state.value.assistant.pendingActions.contains(action.method)) return@launch
+        if (_state.value.commands.any { it.method == action.method && CommandPolicy.blocksNewSend(it.status) }) {
+            _state.update { it.copy(assistant = it.assistant.copy(error = "这项操作正在自动核对，请稍候")) }; checkCommands(); return@launch
+        }
+        _state.update { it.copy(assistant = it.assistant.copy(pendingActions = it.assistant.pendingActions + action.method, error = null)) }
+        try {
+            mutate(action.method, action.params)
+            _state.update { it.copy(assistant = it.assistant.copy(sendAcknowledgement = it.assistant.sendAcknowledgement + if (action.method == "assistant/send") 1 else 0)) }
+            loadAssistant().join()
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: Exception) { _state.update { it.copy(assistant = it.assistant.copy(error = if (error is UnknownOutcomeException) "结果正在同步，已保留内容，不会重复提交" else safeError(error))) } }
+        finally { _state.update { it.copy(assistant = it.assistant.copy(pendingActions = it.assistant.pendingActions - action.method)) } }
+    }
+    fun openAssistantThread(runtimeId: String, threadId: String): Job = scope.launch {
+        refreshDirectory()
+        val chat = dao.allChats().firstOrNull { it.key.computerId == pair?.computerId && it.key.nativeId == threadId && it.runtimeId == runtimeId }
+            ?: dao.allChats().firstOrNull { it.key.computerId == pair?.computerId && it.key.nativeId == threadId }
+        if (chat != null) select(chat).join() else _state.update { it.copy(assistant = it.assistant.copy(error = "原会话尚未同步，请稍后重试")) }
+    }
+    /** Read-only link routing. The URI cannot supply a runtime, profile, method or command. */
+    fun openThreadLink(url: String, origin: ThreadKey? = _state.value.selected?.key): Job {
+        val selected = _state.value.selected?.key
+        val selection = selectionGeneration.get()
+        val connection = connectionGeneration.get()
+        val transport = client
+        val computer = pair?.computerId
+        fun current() = selected == _state.value.selected?.key && selection == selectionGeneration.get() &&
+            connection == connectionGeneration.get() && transport === client && computer == pair?.computerId
+        return scope.launch {
+            fun reject(message: String) { _state.update { if (current()) it.copy(error = message) else it } }
+            val parsed = ThreadDeepLink.parse(url)
+            if (parsed == null) { reject("会话链接格式无效，仅支持 codex://threads/原生会话ID"); return@launch }
+            if (computer.isNullOrBlank() || !_state.value.paired) { reject("请先配对链接所属的电脑"); return@launch }
+            if (origin?.computerId?.let { it != computer } == true) { reject("此链接的来源电脑与当前配对不一致，请切回原电脑"); return@launch }
+            if (!_state.value.online || transport == null) { reject("电脑离线；会话链接可复制，连接后再打开"); return@launch }
+            try {
+                var chats = dao.allChats()
+                if (!current()) return@launch
+                var resolution = resolveThreadDeepLink(parsed.nativeId, computer, origin, chats, _state.value.runtimes)
+                if (resolution is ThreadLinkResolution.Rejected && resolution.missing) {
+                    // Query the authenticated directory only. Never try arbitrary IDs against every native runtime.
+                    val found = mutableListOf<ChatEntity>()
+                    for (archived in listOf(false, true)) {
+                        var cursor: JsonElement? = null
+                        val seen = mutableSetOf<JsonElement>()
+                        for (page in 0 until 4) {
+                            if (!current()) return@launch
+                            val response = transport.request("threads/list", buildJsonObject {
+                                put("limit", 100); put("archived", archived); put("search", "")
+                                cursor?.let { put("cursor", it) }
+                            }, timeoutMillis = directoryTimeoutMillis).asObject()
+                            if (!current()) return@launch
+                            for (value in response.array("data")) {
+                                val row = value.asObject()
+                                if (row.string("id") != parsed.nativeId) continue
+                                val runtime = _state.value.runtimes.firstOrNull { it.id == row.string("runtimeId") } ?: continue
+                                val store = row.string("configStoreId", runtime.configStoreId)
+                                if (store != runtime.configStoreId || row.string("source", runtime.source) != runtime.source) continue
+                                val parent = row.string("parentThreadId").takeIf(String::isNotBlank)
+                                found += ChatEntity(ThreadKey(computer, store, parsed.nativeId), runtime.id, runtime.source,
+                                    row.string("name").ifBlank { "会话" }, row.string("preview"), row.string("cwd"), row.number("updatedAt"),
+                                    row.string("status"), row.flag("conflict"), archived, isSubagent = row.flag("isSubagent") || parent != null,
+                                    parentThreadId = parent, relationSource = if (parent != null || row.flag("isSubagent")) "native" else null)
+                            }
+                            cursor = response["nextCursor"]?.takeUnless { it is JsonNull }
+                            if (cursor == null || !seen.add(cursor)) break
+                        }
+                    }
+                    chats = chats + found
+                    resolution = resolveThreadDeepLink(parsed.nativeId, computer, origin, chats, _state.value.runtimes)
+                }
+                if (!current()) return@launch
+                if (resolution is ThreadLinkResolution.Rejected) { reject(resolution.message); return@launch }
+                val chat = (resolution as ThreadLinkResolution.Open).chat
+                if (!_state.value.supports("thread/read", _state.value.runtimes.firstOrNull { it.id == chat.runtimeId })) {
+                    reject("此会话的运行入口不支持读取，请更新电脑助手"); return@launch
+                }
+                val proof = transport.request("codex/request", buildJsonObject {
+                    put("runtimeId", chat.runtimeId); put("method", "thread/read")
+                    put("params", buildJsonObject { put("threadId", parsed.nativeId); put("includeTurns", false) })
+                }, timeoutMillis = directoryTimeoutMillis).asObject().obj("thread")
+                if (!current()) return@launch
+                if (proof.string("id") != parsed.nativeId) { reject("电脑返回的会话身份不一致，未打开目标"); return@launch }
+                val latest = resolveThreadDeepLink(parsed.nativeId, computer, origin, dao.allChats() + chat, _state.value.runtimes)
+                if (!current()) return@launch
+                if (latest !is ThreadLinkResolution.Open || latest.chat.runtimeId != chat.runtimeId) {
+                    reject("会话归属已变化，请刷新列表后重试"); return@launch
+                }
+                val verified = chat.copy(cwd = proof.string("cwd", chat.cwd),
+                    title = proof.string("agentNickname").ifBlank { proof.string("name").ifBlank { chat.title } })
+                dao.putChat(verified)
+                if (!current()) return@launch
+                select(verified).join()
+                if (_state.value.selected?.key == verified.key && computer == pair?.computerId && connection == connectionGeneration.get())
+                    threadLinkOpened.emit(verified.key)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { reject("此会话暂不可读取，请确认当前电脑的原运行入口和配置档案后重试") }
+        }
+    }
+    private val usageRevision = AtomicLong(0)
+    private val usageCache = object : LinkedHashMap<UsageFilter, UsageSnapshot>(16, .75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<UsageFilter, UsageSnapshot>?): Boolean = size > 16
+    }
+    fun loadUsage(filter: UsageFilter = _state.value.usage.filter): Job {
+        val selected = pair?.computerId
+        val transport = client
+        val revision = usageRevision.incrementAndGet()
+        usageJob?.cancel()
+        val cached = synchronized(usageCache) {
+            if (usageComputer != selected) { usageCache.clear(); usageComputer = selected }
+            usageCache[filter]
+        }
+        val canQuery = selected != null && _state.value.online && "usage/read" in _state.value.capabilities
+        _state.update { it.copy(usage = UsageScreenState(filter, cached,
+            phase = when { selected == null -> UsagePhase.NotConnected; !it.online -> UsagePhase.Offline;
+                !canQuery -> UsagePhase.UnsupportedHelper; cached == null -> UsagePhase.Loading; else -> UsagePhase.Ready },
+            refreshing = canQuery, canQuery = canQuery, cached = cached != null)) }
+        return scope.launch {
+            if (!canQuery || transport == null) return@launch
+            try {
+                val raw = transport.request("usage/read", buildJsonObject { put("source_id", "cc_switch"); put("query", filter.toJson()) }, timeoutMillis = 8000).asObject()
+                val response = UsageResponse.fromJson(raw)
+                if (client !== transport || pair?.computerId != selected || revision != usageRevision.get()) return@launch
+                val sampled = response.cache?.sampledAt ?: (System.currentTimeMillis() / 1000)
+                val snapshot = response.data?.let { UsageSnapshot(filter, response, sampled) }
+                if (snapshot != null) synchronized(usageCache) { usageCache[filter] = snapshot }
+                _state.update { it.copy(usage = UsageScreenState(filter, snapshot ?: cached, response.phase,
+                    refreshing = false, canQuery = true, cached = response.cache?.state == "stale" || snapshot == null && cached != null)) }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (client === transport && pair?.computerId == selected && revision == usageRevision.get())
+                    _state.update { it.copy(usage = it.usage.copy(refreshing = false,
+                        phase = if (!it.online) UsagePhase.Offline else if ((error as? WireException)?.code == "unsupported") UsagePhase.UnsupportedHelper else UsagePhase.Failed,
+                        cached = cached != null)) }
+            }
+        }.also { usageJob = it }
+    }
+    private fun newConnection(): PocketConnection = connectionFactory?.invoke() ?: RoutingPocketConnection(routeManager).apply {
+        p2pEnabled = preferences.getBoolean("p2pEnabled", true)
+        usePublicStun = preferences.getBoolean("publicStunEnabled", true)
+    }
     private fun startRouteDiscovery(restart: Boolean = false) {
         val id = pair?.computerId
         if (connectionFactory != null || id == null || (!foreground && !_state.value.watch)) return
@@ -441,6 +644,8 @@ class PocketRepository(
                         val restoredSelection = _state.value.selected
                         val restoredSelectionGeneration = selectionGeneration.get()
                         _state.update { it.copy(online = true, mediaConnectionEpoch = generation, connection = "Connected", connectionPhase = "ready", connectionDetail = "", lastSyncAt = System.currentTimeMillis(), error = null, pairingPhase = if (it.pairingPhase == PairingPhase.Synchronizing) PairingPhase.Paired else it.pairingPhase) }
+                        updateRouteEvidence(transport)
+                        inspectConnection()
                         stage = "connected"
                         connectionDiagnostics.record(generation, stage, "ready")
                         attempt = 0
@@ -493,7 +698,7 @@ class PocketRepository(
                                 } else {
                                     missed = 0
                                 }
-                                if (client === transport) _state.update { it.copy(lastSyncAt = System.currentTimeMillis()) }
+                                if (client === transport) { _state.update { it.copy(lastSyncAt = System.currentTimeMillis()) }; updateRouteEvidence(transport) }
                             }
                         }
                         launch {
@@ -534,7 +739,7 @@ class PocketRepository(
         job.start()
     }
 
-    private fun disconnect() = synchronized(connectionGate) { connectionJob?.cancel(); connectionJob = null; client?.close(); client = null; _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) } }
+    private fun disconnect() = synchronized(connectionGate) { connectionJob?.cancel(); connectionJob = null; client?.close(); client = null; _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", connectionPhase = "offline", activeRouteKind = null, relayVersion = null, modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) } }
 
     fun reloadConversation(): Job = _state.value.selected?.let { select(it, forceRefresh = true) } ?: scope.launch {}
 
@@ -562,7 +767,7 @@ class PocketRepository(
             dao.cursors(saved.computerId).forEach { cursors[it.runtimeId] = Cursor(it.epoch, it.sequence) }
             val cachedChats = dao.allChats().filter { it.key.computerId == saved.computerId }
             val cachedCommands = dao.uncertain(saved.computerId)
-            _state.update { it.copy(paired = true, pairingPhase = PairingPhase.Synchronizing, computerId = saved.computerId, computerName = saved.computerName, selected = null, timeline = NativeTimeline(), chats = cachedChats.filterNot { c -> c.isSubagent }, agentChats = cachedChats.filter { c -> c.isSubagent }, agentReader = null, contextSnapshot = ContextSnapshot(), permissions = PermissionState(), commands = cachedCommands, approvals = emptyList(), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, mode = null,
+            _state.update { it.copy(paired = true, pairingPhase = PairingPhase.Synchronizing, usage = UsageScreenState(), assistant = AssistantUiState(), assistantModels = emptyList(), upstreamVersions = null, versionsObservedAt = 0, relayVersion = null, capabilities = emptySet(), runtimes = emptyList(), computerId = saved.computerId, computerName = saved.computerName, selected = null, timeline = NativeTimeline(), chats = cachedChats.filterNot { c -> c.isSubagent }, agentChats = cachedChats.filter { c -> c.isSubagent }, agentReader = null, contextSnapshot = ContextSnapshot(), permissions = PermissionState(), commands = cachedCommands, approvals = emptyList(), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, mode = null,
                 nativeSettings = NativeSettings(), settingsFresh = false, pendingSettings = emptySet()) }
         } catch (cancelled: CancellationException) {
             _state.update { it.copy(pairingPhase = PairingPhase.Failed) }; throw cancelled
@@ -592,7 +797,9 @@ class PocketRepository(
         catch (_: Exception) { /* A directory refresh is not a connection failure. */ }
     }
     private suspend fun tryRouteChange(transport: RoutingPocketConnection) {
-        if (transport.tryPreferredRoute { candidate -> sync(candidate, transport) }) restoreAfterRouteChange(transport)
+        val changed = transport.tryPreferredRoute { candidate -> sync(candidate, transport) } ||
+            transport.tryPublicDirect { candidate -> sync(candidate, transport) }
+        if (changed) restoreAfterRouteChange(transport)
         // A candidate needing snapshots cannot advance our cursor. Recover through
         // the retained healthy delegate, outside the route's dispatch mutex.
         else if (client === transport && resyncRequested) resyncInBand(transport)
@@ -603,6 +810,7 @@ class PocketRepository(
         resyncCount = 0 // A deliberate authenticated migration is not backlog loss.
         connectionDiagnostics.record(connectionGeneration.get(), "route_switch", "completed")
         refreshRoutes(transport)
+        updateRouteEvidence(transport)
     }
 
     private suspend fun request(method: String, params: JsonObject = buildJsonObject {}) = (client ?: throw WireException("offline", "Offline")).request(method, params)
@@ -2675,6 +2883,7 @@ class PocketRepository(
                 }
             }
             "codex/event" -> consumeEvent(notification.obj("params"))
+            "assistant/changed" -> loadAssistant()
             "pocket/resync" -> { invalidateHistoryVerification(); resyncRequested = true }
             "runtimes/changed" -> {
                 _state.update { it.copy(runtimes = notification.obj("params").array("data").map { r -> RuntimeInfo.from(r.asObject()) }) }
@@ -3509,8 +3718,25 @@ class PocketRepository(
         _state.update { state -> state.copy(unreadKeys = keys.filterTo(mutableSetOf()) { runCatching { ThreadKey.decode(it).computerId == state.computerId }.getOrDefault(false) }) }
     }
     fun inspectConnection() = action(lock = null) {
-        val status = request("diagnostics").asObject()
-        _state.update { it.copy(connectionDetail = if (status.flag("connected")) "电脑助手已连接 · ${status.array("runtimes").size} 个运行时" else "电脑助手正在恢复连接") }
+        val transport = client ?: return@action
+        val computer = pair?.computerId
+        val status = transport.request("diagnostics", timeoutMillis = 5000).asObject()
+        if (client !== transport || pair?.computerId != computer) return@action
+        _state.update { it.copy(upstreamVersions = status["upstreamVersions"] as? JsonObject,
+            versionsObservedAt = System.currentTimeMillis(), connectionDetail = "手机业务会话已建立 · ${status.array("runtimes").size} 个运行时") }
+        updateRouteEvidence(transport)
+    }
+    private fun updateRouteEvidence(transport: PocketConnection) {
+        if (client !== transport) return
+        val routing = transport as? RoutingPocketConnection
+        _state.update { it.copy(activeRouteKind = routing?.activeRoute?.kind, routePhase = routing?.routePhase ?: "session_established",
+            routeFallback = routing?.directFailure, relayVersion = transport.relayVersion,
+            p2pEnabled = preferences.getBoolean("p2pEnabled", true), publicStunEnabled = preferences.getBoolean("publicStunEnabled", true)) }
+    }
+    fun configureDirectConnection(enabled: Boolean, publicStun: Boolean) {
+        preferences.edit().putBoolean("p2pEnabled", enabled).putBoolean("publicStunEnabled", publicStun).apply()
+        _state.update { it.copy(p2pEnabled = enabled, publicStunEnabled = publicStun) }
+        (client as? RoutingPocketConnection)?.apply { p2pEnabled = enabled; usePublicStun = publicStun }
     }
     fun registerPush(): Job = scope.launch {
         if (!_state.value.pushConfigured) { _state.update { it.copy(pushStatus = "未配置华为推送") }; return@launch }

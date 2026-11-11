@@ -13,6 +13,9 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -125,6 +128,8 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
         else -> ""
     }) }
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     var submitting by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
     val runtime = s.selected?.runtimeId
@@ -185,6 +190,11 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
                     { showAccess = true; repo.refreshThreadAccess() },
                     hint = if (!s.supports(BrokerCapability.AccessRead)) "电脑助手待更新" else null)
                 PocketMenuItem(if (s.selected?.pinned == true) "取消置顶" else "置顶", PocketIcons.PushPin, { s.selected?.let(repo::pin) })
+                CopyConversationLinkItem(s.selected) { url ->
+                    clipboard.setText(AnnotatedString(url))
+                    android.widget.Toast.makeText(context, "已复制会话链接", android.widget.Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                }
                 PocketMenuItem("项目文件", PocketIcons.FolderOpen, { onDismiss(); onFiles?.invoke() }, enabled = onFiles != null)
                 listOf(Triple("重命名", "thread/name/set", ConversationEditor.Rename), Triple("分支聊天", "thread/fork", ConversationEditor.Fork),
                     Triple("旁支讨论", "thread/fork", ConversationEditor.SideChat), Triple("目标", "thread/goal/set", ConversationEditor.Goal)).forEach { (label, method, page) ->
@@ -201,6 +211,13 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
             }
         }
     }
+}
+
+@Composable
+internal fun CopyConversationLinkItem(chat: ChatEntity?, onCopy: (String) -> Unit) {
+    val url = ThreadDeepLink.copyUrl(chat)
+    PocketMenuItem("复制会话链接", PocketIcons.ChatBubbleOutline, { url?.let(onCopy) }, enabled = url != null,
+        hint = if (url == null) "会话尚无有效原生 ID" else null)
 }
 
 @Composable

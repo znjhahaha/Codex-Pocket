@@ -15,6 +15,9 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     private var sticky: ConnectionRoute? = null
     private var recent: ConnectionRoute? = null
     private var stickyUntil = 0L
+    private var direct: ConnectionRoute? = null
+    internal fun registerDirect(route: ConnectionRoute) = synchronized(this) { require(route.kind == "p2p"); direct = route }
+    internal fun discardDirect(route: ConnectionRoute) = synchronized(this) { if (direct == route) direct = null }
 
     val networkGeneration: Long @Synchronized get() = generation
     val routes: List<ConnectionRoute> @Synchronized get() = configured.toList()
@@ -53,7 +56,7 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     @Synchronized fun networkGenerationChanged(networkGeneration: Long): Boolean {
         require(networkGeneration >= 0) { "Invalid network generation" }
         if (networkGeneration <= generation) return false
-        generation = networkGeneration; discovered = emptyList(); sticky = null; failures.clear()
+        generation = networkGeneration; discovered = emptyList(); sticky = null; direct = null; failures.clear()
         return true
     }
 
@@ -78,7 +81,7 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
         (route.expiresAt == null || route.expiresAt > nowSeconds()) &&
             (selectedPolicy != ConnectionPolicy.LAN_ONLY || route.kind == "lan") &&
             (selectedPolicy != ConnectionPolicy.PUBLIC_ONLY || route.kind != "lan") &&
-            directory().any { it == route }
+            (if (route.kind == "p2p") direct == route else directory().any { it == route })
 
     @Synchronized internal fun failed(route: ConnectionRoute) {
         val count = ((failures[key(route)]?.count ?: 0) + 1).coerceAtMost(6)
@@ -89,11 +92,22 @@ class RouteManager internal constructor(private val nowSeconds: () -> Long, priv
     @Synchronized internal fun authenticated(route: ConnectionRoute, computerId: String) {
         require(computerId.isNotBlank() && computerId.length <= 256) { "Invalid computer identity" }
         if (identity != null && identity != computerId) throw WireException("identity_mismatch", "Computer identity differs")
-        identity = computerId; failures.remove(key(route)); sticky = route; recent = route; stickyUntil = nowMillis() + 30_000
+        identity = computerId; failures.remove(key(route)); sticky = route
+        if (route.kind != "p2p") recent = route
+        stickyUntil = nowMillis() + 30_000
     }
 
     @Synchronized internal fun checkIdentity(computerId: String) {
         if (identity != null && identity != computerId) throw WireException("identity_mismatch", "Computer identity differs")
+    }
+    /** Evaluate the candidate's authenticated directory before changing the live delegate. */
+    @Synchronized internal fun mayAdopt(route: ConnectionRoute, routes: List<ConnectionRoute>?, policy: ConnectionPolicy?): Boolean {
+        val effective = policy ?: selectedPolicy
+        if (effective == ConnectionPolicy.LAN_ONLY && route.kind != "lan" || effective == ConnectionPolicy.PUBLIC_ONLY && route.kind == "lan") return false
+        if (route.kind == "p2p") return direct == route
+        if (routes == null) return eligible(route)
+        validateRoutes(routes)
+        return routes.any { it == route } || discovered.any { it == route } || config?.let { it.relayUrl.isNotEmpty() && it.phoneUrl() == route.url } == true
     }
 
     private fun key(route: ConnectionRoute) = route.kind + ":" + route.url

@@ -17,10 +17,13 @@ pub async fn run(state: PathBuf, supervised: bool, controller: Arc<routes::Contr
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        let enabled = !supervised || desired(&state);
+        let desired_enabled = !supervised || desired(&state);
         // Fence new phone requests before tearing down transport; already-dispatched
         // commands finish their original durable ledger entries, never get replayed.
-        broker.connection.set_remote_enabled(enabled);
+        if let Some(handoff)=broker.handoff.get() {
+            handoff.apply_remote_preference(desired_enabled,|enabled|broker.connection.set_remote_enabled(enabled));
+        }else{broker.connection.set_remote_enabled(desired_enabled);}
+        let enabled=broker.connection.remote_enabled();
         if enabled && runtime.is_none() {
             controller.resume().await;
             runtime = Some(routes::Runtime::start(controller.clone(), identity.clone(), sessions.clone()));

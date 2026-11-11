@@ -59,7 +59,8 @@ impl Attempt {
             ("state_path", "state_path_invalid") | ("state_access", "state_access_failed") |
             ("state_lock", "state_lock_failed" | "state_lock_contended") |
             ("config", "config_load_failed") | ("identity", "identity_load_failed") |
-            ("broker", "broker_open_failed") | ("control_bind", "control_bind_failed"));
+            ("broker", "broker_open_failed") | ("control_bind", "control_bind_failed") |
+            ("handoff", "handoff_recovery_failed") | ("assistant_restore", "assistant_restore_failed"));
         (value.schema == 1 && value.pid == self.pid && value.operation_id == self.operation_id &&
             value.runtime_generation == self.generation && phase_matches &&
             value.time >= self.started_ms.saturating_sub(2_000) && value.time <= now_ms().saturating_add(2_000))

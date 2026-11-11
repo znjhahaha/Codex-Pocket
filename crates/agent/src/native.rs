@@ -287,9 +287,10 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         bail!("Invalid native process identity");
     }
     // Keep the authenticated runtime visible while discovery initializes.
-    // Permission reads refresh pocket/status before claiming native support.
+    // Ready notifications and discovery refresh this initial status in the broker.
     let capabilities = status
         .get("nativeCapabilities")
+        .filter(|_| status["initialized"] == true && status["schemaState"] == "ready" && status["schemaPending"] != true)
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let version = status["nativeVersion"]
@@ -381,7 +382,7 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
 }
 
 #[cfg(windows)]
-fn native_binary(pid: u32) -> Result<PathBuf> {
+pub(crate) fn native_binary(pid: u32) -> Result<PathBuf> {
     use std::{ffi::c_void, os::windows::ffi::OsStringExt};
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -410,7 +411,7 @@ fn native_binary(pid: u32) -> Result<PathBuf> {
     )))
 }
 #[cfg(not(windows))]
-fn native_binary(_pid: u32) -> Result<PathBuf> {
+pub(crate) fn native_binary(_pid: u32) -> Result<PathBuf> {
     bail!("Native executable identity unavailable")
 }
 

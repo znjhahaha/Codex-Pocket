@@ -63,6 +63,15 @@ pub(crate) struct Recovery {
 pub(crate) struct Store {
     pub state: Recovery,
     path: PathBuf,
+    // Trusted correlation lives only in this Host generation, never on disk.
+    reads: BTreeMap<String, ReadEvidence>,
+}
+
+struct ReadEvidence {
+    runtime_id: String,
+    generation: String,
+    thread_id: String,
+    runs: Vec<(String, RunRecord)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -238,6 +247,7 @@ impl Store {
         let store = Self {
             state,
             path: path.into(),
+            reads: BTreeMap::new(),
         };
         // Replace legacy plaintext before any new native child can be launched.
         // Never back up the private bodies or reset their uncertain reservations.
@@ -275,6 +285,91 @@ impl Store {
         let data = serde_json::to_vec(&Evidence::capture(&self.state))?;
         ensure!(data.len() as u64 <= MAX_STATE, "Recovery capacity exceeded");
         pocket_agent::storage::atomic_write(&self.path, &data)
+    }
+    pub fn note_read(&mut self, value: &Value) {
+        if value["method"] != "thread/read"
+            || value["params"]["includeTurns"] != true
+            || self.reads.len() >= 128
+        {
+            return;
+        }
+        let (Some(id), Some(thread_id)) = (key(&value["id"]), value["params"]["threadId"].as_str())
+        else {
+            return;
+        };
+        let runs = self
+            .state
+            .runs
+            .iter()
+            .filter(|(_, run)| run.thread_id == thread_id && run.state == "unknown")
+            .map(|(key, run)| (key.clone(), run.clone()))
+            .collect();
+        self.reads.insert(
+            id,
+            ReadEvidence {
+                runtime_id: self.state.runtime_id.clone(),
+                generation: self.state.generation.clone(),
+                thread_id: thread_id.into(),
+                runs,
+            },
+        );
+    }
+    pub fn observe_native(&mut self, value: Value) -> Result<Value> {
+        let read = if value.get("method").is_none() {
+            key(&value["id"]).and_then(|id| self.reads.remove(&id))
+        } else {
+            None
+        };
+        let event = self.state.push(value.clone())?;
+        if let Some(read) = read {
+            if read.runtime_id == self.state.runtime_id
+                && read.generation == self.state.generation
+                && value.get("error").is_none()
+                && value["result"]["thread"]["id"] == read.thread_id
+            {
+                if let Some(turns) = value["result"]["thread"]["turns"].as_array() {
+                    for (key, expected) in read.runs {
+                        let matches: Vec<_> = turns
+                            .iter()
+                            .filter(|turn| turn["id"] == expected.turn_id)
+                            .collect();
+                        if matches.len() != 1
+                            || !matches!(
+                                matches[0]["status"].as_str(),
+                                Some("completed" | "interrupted" | "failed")
+                            )
+                        {
+                            continue;
+                        }
+                        if let Some(run) = self.state.runs.get_mut(&key) {
+                            if run.generation == expected.generation
+                                && run.thread_id == expected.thread_id
+                                && run.turn_id == expected.turn_id
+                                && run.state == "unknown"
+                            {
+                                run.state = "completed".into();
+                            }
+                        }
+                    }
+                }
+            }
+            // Reads resolve only their exactly matched runs. Unknown commands,
+            // answers and old pending questions remain fenced without proof.
+            self.state.reconciliation_required =
+                self.state.runs.values().any(|r| r.state == "unknown")
+                    || self
+                        .state
+                        .pending
+                        .values()
+                        .any(|p| p.generation != self.state.generation)
+                    || self
+                        .state
+                        .commands
+                        .values()
+                        .chain(self.state.answers.values())
+                        .any(|c| c.generation != self.state.generation && !c.completed);
+        }
+        Ok(event)
     }
 }
 
@@ -461,13 +556,14 @@ impl Recovery {
             .count()
     }
     pub fn busy(&self) -> bool {
-        self.active_count() > 0
-            || self.pending_count() > 0
+        self.reconciliation_required
+            || self.runs.values().any(|r| r.state != "completed")
+            || !self.pending.is_empty()
             || self
                 .commands
                 .values()
                 .chain(self.answers.values())
-                .any(|c| c.generation == self.generation && !c.completed)
+                .any(|c| !c.completed)
     }
 
     pub fn push(&mut self, value: Value) -> Result<Value> {
@@ -588,6 +684,87 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cold_run_requires_correlated_native_identity_and_keeps_unknown_commands_answers() {
+        for variant in [
+            "wrong-id",
+            "wrong-thread",
+            "active",
+            "duplicate-turn",
+            "native-error",
+            "valid",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let old = uuid::Uuid::new_v4().to_string();
+            let current = uuid::Uuid::new_v4().to_string();
+            let mut store =
+                Store::open(&dir.path().join("evidence"), "fixture-runtime", &old).unwrap();
+            store.state.push(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"turn"}}})).unwrap();
+            store.begin_generation(&current).unwrap();
+            let read = json!({"id":"read","method":"thread/read","params":{"threadId":"thread","includeTurns":true}});
+            store.state.reserve("s:read".into(), &read, false).unwrap();
+            store.note_read(&read);
+            let mut response = json!({"id":"read","result":{"thread":{"id":"thread","turns":[{"id":"turn","status":"completed"}]}}});
+            match variant {
+                "wrong-id" => response["id"] = json!("unrelated"),
+                "wrong-thread" => response["result"]["thread"]["id"] = json!("other"),
+                "active" => {
+                    response["result"]["thread"]["turns"][0]["status"] = json!("inProgress")
+                }
+                "duplicate-turn" => response["result"]["thread"]["turns"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"turn","status":"completed"})),
+                "native-error" => response = json!({"id":"read","error":{"code":"read_failed"}}),
+                _ => {}
+            }
+            store.observe_native(response).unwrap();
+            assert_eq!(
+                store.state.runs.values().next().unwrap().state,
+                if variant == "valid" {
+                    "completed"
+                } else {
+                    "unknown"
+                },
+                "{variant}"
+            );
+            assert_eq!(
+                store.state.reconciliation_required,
+                variant != "valid",
+                "{variant}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        let path = dir.path().join("evidence");
+        let mut store = Store::open(&path, "runtime", &old).unwrap();
+        store.state.push(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"turn"}}})).unwrap();
+        store
+            .state
+            .reserve(
+                "s:unknown-command".into(),
+                &json!({"id":"unknown-command"}),
+                false,
+            )
+            .unwrap();
+        store
+            .state
+            .reserve("n:77".into(), &json!({"id":77,"result":{}}), true)
+            .unwrap();
+        store.begin_generation(&new).unwrap();
+        let request = json!({"id":"read","method":"thread/read","params":{"threadId":"thread","includeTurns":true}});
+        store
+            .state
+            .reserve("s:read".into(), &request, false)
+            .unwrap();
+        store.note_read(&request);
+        store.observe_native(json!({"id":"read","result":{"thread":{"id":"thread","turns":[{"id":"turn","status":"completed"}]}}})).unwrap();
+        assert_eq!(store.state.runs.values().next().unwrap().state, "completed");
+        assert!(store.state.reconciliation_required && store.state.busy());
+        store.save().unwrap();
+        assert!(Store::open(&path, "runtime", &new).unwrap().state.busy());
+    }
     #[test]
     fn persisted_evidence_omits_private_content_and_all_body_digests() {
         let dir = tempfile::tempdir().unwrap();

@@ -259,7 +259,8 @@ function Get-PocketWindowsFiles {
     return @('codex-pocket.ico','cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
         'windows-launch-desktop.ps1','windows-tray.ps1','windows-verify-release.ps1',
         'cli-install.ps1','cli-wrapper.mjs','windows-user-guide.md','cli-install-implementation.md',
-        'resume-windows-report.md','cli-native-probe-result.md','V02-WINDOWS-INSTALL.md')
+        'resume-windows-report.md','cli-native-probe-result.md','V02-WINDOWS-INSTALL.md',
+        'pocket-runtime-host.exe','pocket-p2p.dll','datachannel.dll','P2P-THIRD-PARTY.txt')
 }
 function Get-PocketInventory([string]$Root, [string[]]$Names) {
     return @($Names | Sort-Object | ForEach-Object {
@@ -301,7 +302,11 @@ function Test-PocketWindowsDirectory([string]$Directory) {
     $path = Join-Path $Directory 'windows-manifest.json'
     Assert-PocketPlainPath $path
     $manifest = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
-    Test-PocketInventory $Directory $manifest (Get-PocketWindowsFiles) 'windows-manifest.json'
+    $optional=@('pocket-runtime-host.exe','pocket-p2p.dll','datachannel.dll','P2P-THIRD-PARTY.txt')
+    $present=@($manifest.files | Where-Object {$_.path -in $optional})
+    if($present.Count -ne 0 -and $present.Count -ne $optional.Count){throw 'Incomplete runtime/transport delivery inventory.'}
+    $expected=if($present.Count){Get-PocketWindowsFiles}else{@(Get-PocketWindowsFiles | Where-Object {$_ -notin $optional})}
+    Test-PocketInventory $Directory $manifest $expected 'windows-manifest.json'
     return $manifest
 }
 function Test-PocketReleaseDirectory([string]$Directory) {
@@ -309,9 +314,9 @@ function Test-PocketReleaseDirectory([string]$Directory) {
     Assert-PocketPlainPath $path
     $manifest = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.version -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') { throw 'Invalid release version.' }
-    $names = @((Get-PocketWindowsFiles) | ForEach-Object { 'windows/' + $_ }) + @('windows/windows-manifest.json',('codex-pocket-' + $manifest.version + '.apk'),('codex-pocket-' + $manifest.version + '-windows.zip'))
-    Test-PocketInventory $Directory $manifest $names 'release-manifest.json'
     $windows = Test-PocketWindowsDirectory (Join-Path $Directory 'windows')
+    $names = @($windows.files | ForEach-Object { 'windows/' + $_.path }) + @('windows/windows-manifest.json',('codex-pocket-' + $manifest.version + '.apk'),('codex-pocket-' + $manifest.version + '-windows.zip'))
+    Test-PocketInventory $Directory $manifest $names 'release-manifest.json'
     if ($windows.version -ne $manifest.version) { throw 'Release version mismatch.' }
     return $manifest
 }

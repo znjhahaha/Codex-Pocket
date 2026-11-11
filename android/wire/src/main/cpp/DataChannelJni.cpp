@@ -38,7 +38,7 @@ void event(void *user,uint64_t handle,uint64_t gen,int kind,const char *a,const 
 }
 }
 extern "C" {
-JNIEXPORT jlong JNICALL Java_dev_codexpocket_wire_DataChannelTransport_nativeCreate(JNIEnv *env,jobject self,jlong gen,jstring bind){
+JNIEXPORT jlong JNICALL Java_dev_codexpocket_wire_DataChannelTransport_nativeCreate(JNIEnv *env,jobject self,jlong gen,jstring bind,jstring stun){
     try{
         auto ctx=std::make_shared<Context>();
         if(env->GetJavaVM(&ctx->vm)!=JNI_OK)return 0;
@@ -48,7 +48,9 @@ JNIEXPORT jlong JNICALL Java_dev_codexpocket_wire_DataChannelTransport_nativeCre
         ctx->object=env->NewGlobalRef(self);if(!ctx->object)return 0;
         Utf addr(env,bind);
         if(bind && !addr.bytes){env->DeleteGlobalRef(ctx->object);return 0;}
-        uint64_t h=p2p_create(uint64_t(gen),addr.bytes,event,ctx.get());
+        Utf server(env,stun);
+        if(stun && !server.bytes){env->DeleteGlobalRef(ctx->object);return 0;}
+        uint64_t h=p2p_create_config(uint64_t(gen),addr.bytes,server.bytes,event,ctx.get());
         if(!h){env->DeleteGlobalRef(ctx->object);return 0;}
         try{std::lock_guard<std::mutex> lock(mutex);contexts[h]=ctx;}
         catch(...){p2p_destroy(h);env->DeleteGlobalRef(ctx->object);return 0;}

@@ -13,9 +13,10 @@ class RoutingPocketConnection internal constructor(
     private val attemptTimeoutMillis: Long = 20000,
     private val upgradeStabilityMillis: Long = 30000,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val directFactory: DirectCandidateFactory = P2pCandidate,
     private val create: (ConnectionRoute) -> PocketConnection,
 ) : PocketConnection {
-    constructor(manager: RouteManager = RouteManager()) : this(manager, 20000, 30000, Dispatchers.IO, { route ->
+    constructor(manager: RouteManager = RouteManager()) : this(manager, 20000, 30000, Dispatchers.IO, create = { route ->
         PocketClient(if (route.kind == "lan") LanConnector(route.url) else WssConnector(route.url))
     })
     private val gate = Any()
@@ -26,6 +27,9 @@ class RoutingPocketConnection internal constructor(
     private val link = MutableStateFlow(LinkState.OFFLINE)
     override val state: StateFlow<LinkState> = link.asStateFlow()
     override val notifications: Flow<JsonObject> = notices.receiveAsFlow()
+    override val relayVersion: RelayVersion? get() = synchronized(gate) {
+        if (activeRoute?.kind in setOf("relay", "cloudflare")) delegate?.relayVersion else null
+    }
     override val lastApplicationActivityMillis: Long get() = synchronized(gate) { delegate?.lastApplicationActivityMillis ?: 0 }
     @Volatile override var failureCode: String? = null
         private set
@@ -35,6 +39,22 @@ class RoutingPocketConnection internal constructor(
     private var candidateRoute: ConnectionRoute? = null
     private var config: ConnectionConfig? = null
     private var hello: JsonObject? = null
+    private val directPreferenceVersion = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile var p2pEnabled: Boolean = true
+        set(value) { synchronized(gate) { if (field != value) { field = value; directPreferenceVersion.incrementAndGet() } } }
+    @Volatile var usePublicStun: Boolean = true
+        set(value) { synchronized(gate) { if (field != value) { field = value; directPreferenceVersion.incrementAndGet() } } }
+    @Volatile var routePhase: String = "offline"
+        private set
+    @Volatile var directFailure: String? = null
+        private set
+    @Volatile var directAttempts: Int = 0
+        private set
+    @Volatile var directSuccesses: Int = 0
+        private set
+    private var supportsP2p = false
+    private var nextP2pAttempt = 0L
+    private var p2pFailures = 0
     private var inFlight = 0
     private var closed = false
     private var collectors: Job? = null
@@ -219,7 +239,9 @@ class RoutingPocketConnection internal constructor(
         manager.authenticated(route, id)
         if (value.containsKey("routes")) manager.updateRoutes(value.routes(),
             value["routePolicy"]?.jsonPrimitive?.content?.let(ConnectionPolicy::parse))
-        hello = params
+        if (route.kind != "p2p") supportsP2p = value["capabilities"]?.jsonArray?.any { it.jsonPrimitive.content == P2pCandidate.CAPABILITY } == true
+        routePhase = "session_established"
+        hello = JsonObject(params - "p2pNegotiationId" - "p2pNetworkGeneration")
     }
 
     /** One continuous reader: discard the stabilization prefix, retain everything from before sync. */
@@ -266,16 +288,58 @@ class RoutingPocketConnection internal constructor(
         val old = synchronized(gate) { if (closed || inFlight != 0) null else delegate } ?: return@withLock false
         val route = manager.candidates().firstOrNull() ?: return@withLock false
         if (activeRoute?.let { it.url == route.url && it.kind == route.kind } == true) return@withLock false
+        if (activeRoute?.kind == "p2p" && route.kind != "lan") return@withLock false
+        adoptCandidate(old, create(route), route, saved, credentials, manager.networkGeneration, false, null, prepare)
+    }
+
+    /** A usable relay continues carrying business traffic during ICE/TLS/stabilization. */
+    suspend fun tryPublicDirect(prepare: suspend (PocketConnection) -> Unit): Boolean = switching.withLock {
+        if (!p2pEnabled || !supportsP2p || manager.policy == ConnectionPolicy.LAN_ONLY ||
+            activeRoute?.kind in setOf(null, "lan", "p2p") || !directFactory.available() ||
+            System.nanoTime() / 1_000_000 < nextP2pAttempt) return@withLock false
+        val saved = config ?: return@withLock false
+        val credentials = hello ?: return@withLock false
+        val old = synchronized(gate) { if (closed) null else delegate } ?: return@withLock false
         val generation = manager.networkGeneration
-        val candidate = create(route)
+        val preferences = directPreferenceVersion.get()
+        directAttempts++
+        routePhase = "direct_negotiating"
+        try {
+            val adopted = watchCandidate({ !closed && generation == manager.networkGeneration && p2pEnabled && directPreferenceVersion.get() == preferences }) {
+                val candidate = directFactory.open(old, saved, credentials, generation, usePublicStun)
+                manager.registerDirect(candidate.route)
+                val adopted = adoptCandidate(old, candidate.client, candidate.route, saved, candidate.hello, generation, true, preferences, prepare)
+                if (!adopted) manager.discardDirect(candidate.route)
+                adopted
+            }
+            if (adopted) { directSuccesses++; p2pFailures = 0; directFailure = null }
+            else { directFailure = "direct_not_stable" }
+            adopted
+        } catch (e: CancellationException) { if (e !is TimeoutCancellationException) throw e; directFailure = "direct_timeout"; false }
+        catch (_: Exception) { directFailure = "direct_unavailable"; false }
+        finally {
+            if (activeRoute?.kind != "p2p") p2pFailures = (p2pFailures + 1).coerceAtMost(6)
+            nextP2pAttempt = System.nanoTime() / 1_000_000 + (1000L shl p2pFailures).coerceAtMost(30_000)
+            routePhase = if (activeRoute == null) "offline" else "session_established"
+        }
+    }
+
+    private suspend fun <T> watchCandidate(valid: () -> Boolean, block: suspend () -> T): T = coroutineScope {
+        val monitor = launch { while (isActive) { if (!valid()) throw WireException("candidate_invalidated", "Candidate changed"); delay(50) } }
+        try { block() } finally { monitor.cancel() }
+    }
+
+    private suspend fun adoptCandidate(old: PocketConnection, candidate: PocketConnection, route: ConnectionRoute,
+        saved: ConnectionConfig, credentials: JsonObject, generation: Long, connected: Boolean, preferenceVersion: Long?,
+        prepare: suspend (PocketConnection) -> Unit): Boolean {
         var adopted = false
         var events: CandidateEvents? = null
         synchronized(gate) {
-            if (closed) { candidate.close(); return@withLock false }
+            if (closed) { candidate.close(); return false }
             connecting += candidate
         }
         try {
-            withTimeout(12000) { candidate.connect(saved) }
+            if (!connected) withTimeout(12000) { candidate.connect(saved) }
             val candidateEvents = CandidateEvents(candidate, scope)
             events = candidateEvents
             val result = candidate.request("hello", credentials, timeoutMillis = 5000).jsonObject
@@ -284,7 +348,7 @@ class RoutingPocketConnection internal constructor(
             while (stable < upgradeStabilityMillis) {
                 val interval = minOf(5000, upgradeStabilityMillis - stable)
                 delay(interval); stable += interval
-                if (generation != manager.networkGeneration || closed || !manager.eligible(route) || candidateEvents.failed || candidate.state.value != LinkState.ONLINE) return@withLock false
+                if (generation != manager.networkGeneration || closed || !manager.eligible(route) || candidateEvents.failed || candidate.state.value != LinkState.ONLINE) return false
                 withTimeout(2000) { candidate.request("ping", timeoutMillis = 2000) }
             }
             dispatch.withLock {
@@ -294,12 +358,19 @@ class RoutingPocketConnection internal constructor(
                 }
                 if (canPrepare) {
                     candidateEvents.retain()
-                    prepare(candidate)
+                    watchCandidate({ !closed && generation == manager.networkGeneration && manager.eligible(route) &&
+                        candidate.state.value == LinkState.ONLINE && (route.kind != "p2p" || p2pEnabled) }) {
+                        withTimeout(5000) { prepare(candidate) }
+                    }
                     currentCoroutineContext().ensureActive()
                     synchronized(gate) {
                         if (!closed && inFlight == 0 && delegate === old && generation == manager.networkGeneration && manager.eligible(route) &&
                             !candidateEvents.failed && candidate.state.value == LinkState.ONLINE) {
+                            val policy = result["routePolicy"]?.jsonPrimitive?.content?.let(ConnectionPolicy::parse)
+                            if (!manager.mayAdopt(route, if (result.containsKey("routes")) result.routes() else null, policy) ||
+                                route.kind == "p2p" && (!p2pEnabled || preferenceVersion != directPreferenceVersion.get())) return false
                             acceptHello(result, credentials, route)
+                            if (!manager.eligible(route)) return false
                             collectors?.cancel()
                             delegate = candidate; candidateRoute = route; activeRoute = route; adopted = true
                             connecting -= candidate
@@ -310,11 +381,11 @@ class RoutingPocketConnection internal constructor(
                 }
             }
             if (adopted) old.close()
-            adopted
+            return adopted
         } catch (e: CancellationException) {
             if (e !is TimeoutCancellationException) throw e
-            manager.failed(route); false
-        } catch (_: Exception) { manager.failed(route); false }
+            manager.failed(route); return false
+        } catch (_: Exception) { manager.failed(route); return false }
         finally {
             synchronized(gate) { connecting -= candidate }
             if (!adopted) { events?.close(); candidate.close() }

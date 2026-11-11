@@ -23,6 +23,8 @@ pub enum Phase {
     Config,
     Identity,
     Broker,
+    Handoff,
+    AssistantRestore,
     ControlBind,
 }
 
@@ -36,6 +38,8 @@ pub enum Code {
     ConfigLoadFailed,
     IdentityLoadFailed,
     BrokerOpenFailed,
+    HandoffRecoveryFailed,
+    AssistantRestoreFailed,
     ControlBindFailed,
 }
 impl Phase {
@@ -47,6 +51,8 @@ impl Phase {
             Self::Config => Code::ConfigLoadFailed,
             Self::Identity => Code::IdentityLoadFailed,
             Self::Broker => Code::BrokerOpenFailed,
+            Self::Handoff => Code::HandoffRecoveryFailed,
+            Self::AssistantRestore => Code::AssistantRestoreFailed,
             Self::ControlBind => Code::ControlBindFailed,
         }
     }

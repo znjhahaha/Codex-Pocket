@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/bridge", "crates/core", "crates/cli-adapter", "crates/tunnel", "crates/relay", "crates/agent", "crates/network"]
-exclude = ["crates/runtime-host", "crates/runtime-ipc"]
+exclude = ["crates/runtime-host", "crates/runtime-ipc", "crates/p2p"]
 
 [workspace.package]
 version = "0.6.3"

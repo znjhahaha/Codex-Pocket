@@ -5,6 +5,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class QuestionFormsTest {
+    @Test fun localRejectionAllowsCorrectionButCannotResetAnObservedDispatch() {
+        val batch=blocking(first)
+        val session=QuestionSession(batch)
+        session.selectOption("client","Phone (Recommended)")
+        assertNotNull(session.beginSubmission(QuestionPhase.Waiting))
+        session.rejectBeforeDispatch()
+        assertEquals(QuestionPhase.Waiting,session.phase)
+        assertTrue(session.selectOption("client","Desktop"))
+        assertEquals(listOf("client" to "Desktop"),session.beginSubmission(QuestionPhase.Waiting))
+        session.observe(false,true)
+        session.rejectBeforeDispatch()
+        assertEquals(QuestionPhase.Submitting,session.phase)
+    }
     private fun blocking(vararg questions: String) = QuestionBatches.blocking("rpc-1", Json.parseToJsonElement(
         """{"questions":[${questions.joinToString(",") }]}"""
     ).jsonObject)

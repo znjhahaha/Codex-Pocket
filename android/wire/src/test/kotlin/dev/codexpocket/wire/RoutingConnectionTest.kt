@@ -128,7 +128,9 @@ class RoutingConnectionTest {
             val migration = async { c.tryPreferredRoute { entered.complete(Unit); release.await() } }
             runCurrent(); entered.await()
             val heartbeat = async { c.heartbeat("ping", timeoutMillis = 2000) }
-            runCurrent(); advanceTimeBy(20_000); runCurrent()
+            // Stay inside migration's five-second hard deadline. Queued time still
+            // exceeds heartbeat's two-second response budget and must not consume it.
+            runCurrent(); advanceTimeBy(4_000); runCurrent()
             assertFalse(heartbeat.isCompleted)
             assertEquals(LinkState.ONLINE, old.state.value)
             assertTrue(old.requests.none { it.first == "ping" })
@@ -140,6 +142,39 @@ class RoutingConnectionTest {
             runCurrent(); advanceTimeBy(2000); runCurrent()
             assertTrue(timed.await() is TimeoutCancellationException)
         } finally { release.complete(Unit); c.close() }
+    }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun heartbeatQueuedBehindExpiredMigrationUsesHealthyOldRoute() = runTest {
+        val manager = RouteManager({ testScheduler.currentTime / 1000 }, { testScheduler.currentTime })
+        val old = Fake(); val candidate = Fake(); var first = true
+        val c = RoutingPocketConnection(manager, upgradeStabilityMillis = 0, dispatcher = StandardTestDispatcher(testScheduler)) {
+            if (it.kind != "lan") old else if (first) { first = false; Fake(true) } else candidate
+        }
+        val entered = CompletableDeferred<Unit>(); var prepareCancelled = false
+        try {
+            c.connectAuthenticated(config(), buildJsonObject {}); advanceTimeBy(31_000); runCurrent()
+            val migration = async { c.tryPreferredRoute {
+                entered.complete(Unit)
+                try { awaitCancellation() } finally { prepareCancelled = true }
+            } }
+            runCurrent(); entered.await()
+            val heartbeat = async { c.heartbeat("ping", timeoutMillis = 2000) }
+            runCurrent(); advanceTimeBy(4_999); runCurrent()
+            assertFalse(heartbeat.isCompleted)
+            assertTrue(old.requests.none { it.first == "ping" })
+            advanceTimeBy(1); runCurrent()
+            assertFalse(migration.await()); heartbeat.await()
+            assertTrue(prepareCancelled)
+            assertEquals(relay, c.activeRoute); assertEquals(LinkState.ONLINE, old.state.value)
+            assertEquals(LinkState.OFFLINE, candidate.state.value)
+            assertEquals(1, old.requests.count { it.first == "ping" })
+            assertTrue(candidate.requests.none { it.first == "ping" })
+            old.hold = CompletableDeferred()
+            val timed = async { runCatching { c.heartbeat("ping", timeoutMillis = 2000) }.exceptionOrNull() }
+            runCurrent(); advanceTimeBy(1_999); runCurrent(); assertFalse(timed.isCompleted)
+            advanceTimeBy(1); runCurrent()
+            assertTrue(timed.await() is TimeoutCancellationException)
+        } finally { c.close() }
     }
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun overflowingCandidateBufferFailsClosedWithoutReplacingOldRoute() = runTest {

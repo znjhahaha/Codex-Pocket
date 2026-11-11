@@ -6,7 +6,7 @@ use axum::{
         OriginalUri, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -66,13 +66,23 @@ async fn upgrade(
         } else {
             0
         };
-    ws.max_message_size(max_size)
+    let mut response = ws.max_message_size(max_size)
         .max_frame_size(max_size)
         .read_buffer_size(4096)
         .write_buffer_size(0)
         .max_write_buffer_size(2 * (MAX_CHUNK + ENVELOPE_HEADER))
         .on_upgrade(move |socket| serve_socket(socket, state, lease, rx))
-        .into_response()
+        .into_response();
+    // Metadata belongs to this authenticated outer transport. It is a relay
+    // self-report, not inner Pocket identity verification or a phone session.
+    response.headers_mut().insert("x-pocket-relay-version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
+    response.headers_mut().insert("x-pocket-relay-protocol", HeaderValue::from_static("1"));
+    if let Some(revision) = option_env!("POCKET_BUILD_REVISION").or(option_env!("GITHUB_SHA"))
+        .filter(|v| matches!(v.len(), 40 | 64) && v.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        response.headers_mut().insert("x-pocket-relay-build", HeaderValue::from_static(revision));
+    }
+    response
 }
 
 async fn serve_socket(

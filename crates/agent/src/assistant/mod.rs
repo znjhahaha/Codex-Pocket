@@ -1,4 +1,6 @@
-//! Durable local assistant scheduling, independent of native RPC and the broker.
+//! Executable local assistant coordinator, task service and civil-time scheduler,
+//! independent of native RPC and the broker. `AssistantService` owns a serialized
+//! worker and delegates all native effects to the narrow `Executor` boundary.
 //!
 //! Open one store in the computer's private state directory using its existing
 //! stable computer ID. SQLite serializes claims across handles. Use `apply` for
@@ -17,11 +19,19 @@
 //!
 //! This synchronous API belongs on a dedicated worker or `spawn_blocking`. The
 //! host owns filesystem permissions, executor cancellation and reconciliation
-//! evidence. This module does not invoke models, write workspaces or infer
-//! memories from conversations.
+//! evidence. The Store itself does not invoke models. The Service dispatches
+//! entrusted turns through Executor; it never infers memories or writes projects.
 
 mod store;
 pub use store::AssistantStore;
+mod executor;
+mod schedule;
+mod service;
+mod settings;
+pub use executor::*;
+pub use schedule::*;
+pub use service::*;
+pub use settings::*;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -129,4 +139,8 @@ pub enum Reconciliation {
     /// The host has evidence that the reserved execution never dispatched.
     /// Leaves the task paused; another user command is needed to requeue it.
     NotDispatched,
+    /// Host proved that the actual native turn stopped after interruption.
+    /// Leaves the task paused and releases its reservation without claiming
+    /// that the execution never ran.
+    Stopped,
 }

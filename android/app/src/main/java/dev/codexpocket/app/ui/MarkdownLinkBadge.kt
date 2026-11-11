@@ -8,11 +8,13 @@ import android.text.Spanned
 import android.text.TextPaint
 import android.text.style.ReplacementSpan
 import kotlin.math.ceil
+import dev.codexpocket.app.data.ThreadDeepLink
 
 internal data class MarkdownLinkMetadata(val destination: String)
-internal data class LinkBadge(val label: String, val web: Boolean = false)
+internal data class LinkBadge(val label: String, val web: Boolean = false, val conversation: Boolean = false)
 
 internal fun markdownLinkBadge(destination: String): LinkBadge? {
+    if (ThreadDeepLink.parse(destination) != null) return LinkBadge("", conversation = true)
     if (destination.startsWith("https://", true) || destination.startsWith("http://", true)) return LinkBadge("", web = true)
     if (destination.startsWith('#') || destination.isBlank()) return null
     if (Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(destination) &&
@@ -50,6 +52,11 @@ internal class MarkdownLinkBadgeSpan(val badge: LinkBadge, private val leading: 
             canvas.drawOval(rect, icon)
             canvas.drawOval(RectF(left + size * .28f, rect.top, left + size * .72f, rect.bottom), icon)
             canvas.drawLine(left, cy, left + size, cy, icon)
+        } else if (badge.conversation) {
+            canvas.drawRoundRect(RectF(left, rect.top, left + size, rect.bottom - size * .18f), size * .16f, size * .16f, icon)
+            canvas.drawLine(left + size * .2f, rect.bottom - size * .18f, left + size * .2f, rect.bottom, icon)
+            canvas.drawLine(left + size * .2f, rect.bottom, left + size * .43f, rect.bottom - size * .18f, icon)
+            canvas.drawLine(left + size * .23f, cy - size * .16f, left + size * .77f, cy - size * .16f, icon)
         } else {
             canvas.drawRoundRect(rect, size * .2f, size * .2f, icon)
             if (badge.label.isBlank()) {
