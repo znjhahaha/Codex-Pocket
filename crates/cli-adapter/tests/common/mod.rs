@@ -1,5 +1,9 @@
 pub fn home() -> tempfile::TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/cli-test-temp");
-    std::fs::create_dir_all(&root).unwrap();
-    tempfile::tempdir_in(dunce::canonicalize(root).unwrap()).unwrap()
+    // AF_UNIX addresses are limited to 108 bytes on Windows. A checkout under
+    // the desktop app's managed worktree directory can already exceed that
+    // limit before the socket suffix is appended.
+    tempfile::Builder::new()
+        .prefix("pcli-")
+        .tempdir()
+        .unwrap()
 }

@@ -34,7 +34,7 @@ class AssistantScreenTest {
     private fun snapshot() = AssistantSnapshot(true,"r","coordinator",false,
         AssistantSettings("认真协助", "简洁", "actual-model", "UTC"),
         listOf(AssistantTask("t","整理项目待办",AssistantTaskStatus.Running,"execution",false,null)),
-        listOf(AssistantOperation("execution","Execution","t",AssistantOperationPhase.Running,false,"native-task",null,null)))
+        listOf(AssistantOperation("execution","Execution","t",AssistantOperationPhase.Running,false,"native-task",null,null)),ready=true)
     private fun content(state: () -> AssistantUiState, actions: MutableList<AssistantAction>, opens: MutableList<Pair<String,String>> = mutableListOf(), fontScale: Float = 1f, theme: String = "light", modelDirectory: List<NativeModel> = models) {
         compose.activity.runOnUiThread { compose.activity.setContent {
             PocketTheme(theme) {
@@ -63,16 +63,17 @@ class AssistantScreenTest {
         assertTrue(bitmap.width > 0 && bitmap.height > 0)
     }
 
-    @Test fun disabledEntryShowsEnableSettingsAndNeverClaimsReady() {
+    @Test fun disabledEntryRetainsComposerAndOffersPreparationWithoutRuntimeSelection() {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(AssistantSnapshot(enabled=false))},actions)
-        compose.onNodeWithTag("assistant-configure").performClick()
-        scroll("assistant-enable").performClick()
-        assertEquals("assistant/enable",actions.single().method)
-        assertEquals("r",actions.single().params.string("runtimeId"))
-        compose.onNodeWithTag("assistant-send").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-message-input").performTextInput("保留草稿")
+        compose.onNodeWithTag("assistant-prepare").performClick()
+        assertEquals("assistant/prepare",actions.single().method)
+        assertTrue(actions.single().params.isEmpty())
+        compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留草稿")
+        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
         compose.onNodeWithText("服务已就绪").assertDoesNotExist()
-        screenshot("disabled-settings")
+        screenshot("disabled-prepare")
     }
 
     @Test fun rendersRealMessagesTaskResultsAndOriginalThreadCallbacks() {
@@ -238,7 +239,7 @@ class AssistantScreenTest {
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(AssistantSnapshot(enabled=false)))
         content({state},actions,modelDirectory=emptyList())
-        compose.onNodeWithTag("assistant-configure").performClick()
+        compose.openAssistantPage("Settings")
         scroll("assistant-model").performClick()
         compose.onNodeWithTag("assistant-model:host-default").performClick()
         scroll("assistant-enable").performClick()
@@ -262,7 +263,7 @@ class AssistantScreenTest {
     @Test fun offlineErrorBlocksEnableEvenWithCachedAvailableRuntime() {
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(AssistantSnapshot(enabled=false),error="连接电脑后可继续使用助理")},actions,modelDirectory=emptyList())
-        compose.onNodeWithTag("assistant-configure").performClick()
+        compose.openAssistantPage("Settings")
         scroll("assistant-enable").assertIsNotEnabled()
         assertTrue(actions.isEmpty())
     }

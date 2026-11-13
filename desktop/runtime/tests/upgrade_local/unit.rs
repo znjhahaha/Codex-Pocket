@@ -168,6 +168,7 @@ struct Fake {
     identities: BTreeMap<u32, ProcessIdentity>,
     live: BTreeMap<u32, maintenance::Presence>,
     receipts: BTreeMap<String, Receipt>,
+    prior_remotes: BTreeMap<String, bool>,
     journal: Option<Journal>,
     remote: bool,
     events: Vec<String>,
@@ -179,12 +180,18 @@ struct Fake {
     fenced_health: bool,
     require_owned_inventory: bool,
     unknown_inventory: bool,
+    blocked_quiesce: bool,
+    draining_quiesce: bool,
+    cancel_reply_fault: Option<&'static str>,
+    maintenance_cancel_error: bool,
+    rpc_requests: Vec<(String, Value)>,
 }
 impl Fake {
     fn new() -> Self {
         let root = state();
         storage::private_dir(root.path()).unwrap();
         storage::private_dir(&storage::control(root.path())).unwrap();
+        storage::private_dir(&root.path().join("handoff")).unwrap();
         let old = generation(root.path(), "old-fixture");
         let new = generation(root.path(), "new-fixture");
         let s = UpgradeStatus {
@@ -229,6 +236,7 @@ impl Fake {
             identities,
             live,
             receipts: BTreeMap::new(),
+            prior_remotes: BTreeMap::new(),
             journal: None,
             remote: false,
             events: vec![],
@@ -240,6 +248,11 @@ impl Fake {
             fenced_health: false,
             require_owned_inventory: false,
             unknown_inventory: false,
+            blocked_quiesce: false,
+            draining_quiesce: false,
+            cancel_reply_fault: None,
+            maintenance_cancel_error: false,
+            rpc_requests: vec![],
         };
         f.heartbeat();
         f
@@ -274,7 +287,7 @@ impl Fake {
             .map(|(id, r)| {
                 (
                     id,
-                    json!({"receipt":r,"priorRemote":false,"releaseInput":null}),
+                    json!({"receipt":r,"priorRemote":self.prior_remotes.get(id).copied().unwrap_or(false),"releaseInput":null}),
                 )
             })
             .collect();
@@ -328,6 +341,9 @@ impl Adapter for Fake {
     }
     fn submit(&mut self, _: &Path, r: &Request) -> Result<()> {
         self.events.push(format!("maintenance/{:?}", r.action));
+        if r.action == Action::Cancel && self.maintenance_cancel_error {
+            bail!("fixture maintenance cancel unavailable");
+        }
         let mut enter = r.clone();
         enter.action = Action::Enter;
         let phase = match r.action {
@@ -354,6 +370,7 @@ impl Adapter for Fake {
     }
     fn rpc(&mut self, _: &Path, method: &str, p: Value) -> Result<Value> {
         self.events.push(method.into());
+        self.rpc_requests.push((method.into(), p.clone()));
         match method {
             "status" => {
                 let run = if self.stale_status_generation {
@@ -387,21 +404,44 @@ impl Adapter for Fake {
                     p["checkpoint"].is_null() && p["fromGeneration"] == self.current.run,
                     "wire"
                 );
-                let cp = self.cp();
+                let cp = if self.blocked_quiesce {
+                    None
+                } else {
+                    Some(self.cp())
+                };
                 let r = Receipt {
                     protocol: 1,
                     id: p["id"].as_str().unwrap().into(),
                     generation: self.current.run.clone(),
-                    phase: "ready".into(),
-                    safe_to_exit: true,
-                    native_tasks_preserved: true,
+                    phase: if self.draining_quiesce {
+                        "draining"
+                    } else if self.blocked_quiesce {
+                        "failed"
+                    } else {
+                        "ready"
+                    }
+                    .into(),
+                    safe_to_exit: !self.blocked_quiesce,
+                    native_tasks_preserved: !self.blocked_quiesce,
                     remote_enabled: false,
                     accepting_writes: false,
-                    unconfirmed_writes: 0,
-                    blockers: vec![],
-                    checkpoint: Some(cp),
+                    unconfirmed_writes: u64::from(self.blocked_quiesce),
+                    blockers: if self.blocked_quiesce {
+                        let mut blockers = vec![
+                            "unconfirmed_writes".into(),
+                            "runtime_inventory_unverified".into(),
+                        ];
+                        if !self.draining_quiesce {
+                            blockers.push("checkpoint_failed".into());
+                        }
+                        blockers
+                    } else {
+                        vec![]
+                    },
+                    checkpoint: cp,
                     shutdown_requested: false,
                 };
+                self.prior_remotes.insert(r.id.clone(), self.remote);
                 self.receipts.insert(r.id.clone(), r.clone());
                 self.remote = false;
                 self.persist_agent();
@@ -429,10 +469,17 @@ impl Adapter for Fake {
                 Ok(json!(r))
             }
             "upgrade/cancel" => {
-                let r = self
-                    .receipts
-                    .get_mut(p["id"].as_str().unwrap())
-                    .context("missing")?;
+                ensure!(
+                    p["fromGeneration"] == self.current.run,
+                    "stale cancel owner"
+                );
+                let id = p["id"].as_str().unwrap();
+                let prior_remote = self.prior_remotes.get(id).copied().unwrap_or(false);
+                let r = self.receipts.get_mut(id).context("missing")?;
+                ensure!(
+                    p["checkpoint"].is_null() || p["checkpoint"] == json!(r.checkpoint),
+                    "wrong cancel checkpoint"
+                );
                 ensure!(
                     !matches!(r.phase.as_str(), "released" | "release_pending"),
                     "late cancel"
@@ -440,10 +487,25 @@ impl Adapter for Fake {
                 r.phase = "cancelled".into();
                 r.safe_to_exit = false;
                 r.accepting_writes = true;
-                r.remote_enabled = false;
-                self.remote = false;
-                let reply = json!(r);
+                r.remote_enabled = prior_remote;
+                self.remote = prior_remote;
+                let mut reply = json!(r);
                 self.persist_agent();
+                // Only the newly fenced recovery operation has this fault;
+                // the initial cancellation really did restore admission.
+                if id != self.s.operation_id {
+                    match self.cancel_reply_fault {
+                        Some("lost") => bail!("fixture cancel reply lost"),
+                        Some("id") => reply["id"] = json!(uuid::Uuid::new_v4().to_string()),
+                        Some("owner") => {
+                            reply["generation"] = json!(uuid::Uuid::new_v4().to_string())
+                        }
+                        Some("gate") => reply["acceptingWrites"] = json!(false),
+                        Some("safe") => reply["safeToExit"] = json!(true),
+                        Some("shutdown") => reply["shutdownRequested"] = json!(true),
+                        _ => {}
+                    }
+                }
                 Ok(reply)
             }
             _ => bail!("unexpected method"),
@@ -758,11 +820,202 @@ fn recovery_rechecks_live_unknown_writes_instead_of_reusing_a_ready_snapshot() {
         rollback(&mut f, &s).is_err(),
         "stale ready image cannot prove current safety"
     );
-    assert_eq!(f.journal.as_ref().unwrap().phase, maintenance::Phase::Owned);
+    assert_eq!(
+        f.journal.as_ref().unwrap().phase,
+        maintenance::Phase::Cancelled
+    );
+    assert_eq!(
+        f.rpc(&s.state_directory, "status", json!({})).unwrap()["acceptingWrites"],
+        true
+    );
+    let failed = load(&mut f, &s).unwrap();
+    assert_eq!(
+        failed.ready, d.ready,
+        "retain the earlier checkpoint without declaring recovery verified"
+    );
+    assert_eq!(failed.stage, "recovery_verifying");
     assert!(!f
         .events
         .iter()
         .any(|v| v.starts_with("spawn/") || v == "upgrade/release"));
+}
+#[test]
+fn timed_out_recovery_inventory_cancels_draining_operation_and_maintenance() {
+    let mut f = Fake::new();
+    f.remote = true;
+    let s = f.s.clone();
+    let mut d = begin(&mut f, &s).unwrap();
+    ack(&mut f, &s, &d, Action::Enter).unwrap();
+    save_stage(&mut f, &s, &mut d, "quiescing").unwrap();
+    f.blocked_quiesce = true;
+    f.draining_quiesce = true;
+    assert!(ready(&mut f, &s, &d).is_err());
+    assert_eq!(f.receipts[&d.active_id].phase, "draining");
+    assert!(!f.remote);
+    assert!(rollback(&mut f, &s).is_err());
+    let failed = load(&mut f, &s).unwrap();
+    assert_eq!(failed.stage, "recovery_verifying");
+    assert!(failed.ready.is_none() && failed.final_checkpoint.is_none());
+    assert_eq!(
+        f.journal.as_ref().unwrap().phase,
+        maintenance::Phase::Cancelled
+    );
+    let restored = f.rpc(&s.state_directory, "status", json!({})).unwrap();
+    assert_eq!(restored["acceptingWrites"], true);
+    assert_eq!(restored["remoteEnabled"], true);
+    for receipt in f.receipts.values() {
+        assert_eq!(receipt.phase, "cancelled");
+        assert_eq!(receipt.unconfirmed_writes, 1);
+        assert_eq!(
+            receipt.blockers,
+            vec!["unconfirmed_writes", "runtime_inventory_unverified"]
+        );
+        assert!(
+            !receipt.safe_to_exit && !receipt.shutdown_requested && receipt.checkpoint.is_none()
+        );
+    }
+    assert!(!f
+        .events
+        .iter()
+        .any(|e| e.starts_with("spawn/") || e == "upgrade/release" || e == "maintenance/Release"));
+}
+#[test]
+fn failed_recovery_inventory_restores_gates_without_claiming_handoff() {
+    for remote in [false, true] {
+        let mut f = Fake::new();
+        f.remote = remote;
+        let s = f.s.clone();
+        let mut d = begin(&mut f, &s).unwrap();
+        ack(&mut f, &s, &d, Action::Enter).unwrap();
+        save_stage(&mut f, &s, &mut d, "quiescing").unwrap();
+        f.blocked_quiesce = true;
+        assert!(ready(&mut f, &s, &d).is_err());
+        let original = f.receipts[&d.active_id].clone();
+        assert_eq!(original.unconfirmed_writes, 1);
+        assert!(original.checkpoint.is_none());
+
+        assert!(rollback(&mut f, &s).is_err());
+        let failed = load(&mut f, &s).unwrap();
+        assert_eq!(failed.stage, "recovery_verifying");
+        assert!(failed.ready.is_none() && failed.final_checkpoint.is_none());
+        assert!(s.checkpoint.is_none() && s.verification.is_none());
+        assert_ne!(failed.active_id, d.active_id);
+        for id in [&d.active_id, &failed.active_id] {
+            let receipt = &f.receipts[id];
+            assert_eq!(receipt.phase, "cancelled", "fence {id} must be restored");
+            assert!(
+                receipt.accepting_writes && !receipt.safe_to_exit && !receipt.shutdown_requested
+            );
+            assert_eq!(receipt.remote_enabled, remote);
+            assert_eq!(receipt.unconfirmed_writes, original.unconfirmed_writes);
+            assert_eq!(receipt.blockers, original.blockers);
+            assert!(receipt.checkpoint.is_none());
+        }
+        let restored = f.rpc(&s.state_directory, "status", json!({})).unwrap();
+        assert_eq!(restored["acceptingWrites"], true);
+        assert_eq!(restored["remoteEnabled"], remote);
+        let journal = f.journal.as_ref().unwrap();
+        assert_eq!(journal.phase, maintenance::Phase::Cancelled);
+        assert_eq!(journal.request, request(&s, &failed, Action::Enter));
+        assert!(f.rpc_requests.iter().any(|(method, p)| {
+            method == "upgrade/cancel" && *p == params(&failed.active_id, &failed.current.run, None)
+        }));
+        let persisted = agent_record(&mut f, &s.state_directory).unwrap();
+        assert_eq!(
+            persisted.operations[&failed.active_id].receipt.blockers,
+            original.blockers
+        );
+        assert_eq!(
+            persisted.operations[&failed.active_id]
+                .receipt
+                .unconfirmed_writes,
+            1
+        );
+        assert!(!f.events.iter().any(|e| e.starts_with("spawn/")
+            || e == "upgrade/release"
+            || e == "maintenance/Release"));
+        // Another failed recovery also restores gates and keeps every receipt.
+        assert!(rollback(&mut f, &s).is_err());
+        assert_eq!(f.receipts.len(), 3);
+        assert!(f
+            .receipts
+            .values()
+            .all(|r| r.phase == "cancelled" && r.unconfirmed_writes == 1));
+        assert_eq!(
+            f.journal.as_ref().unwrap().phase,
+            maintenance::Phase::Cancelled
+        );
+    }
+}
+#[test]
+fn failed_recovery_inventory_cancellation_uncertainty_remains_failure() {
+    for fault in [
+        "lost",
+        "id",
+        "owner",
+        "gate",
+        "safe",
+        "shutdown",
+        "maintenance",
+    ] {
+        let mut f = Fake::new();
+        let s = f.s.clone();
+        let mut d = begin(&mut f, &s).unwrap();
+        ack(&mut f, &s, &d, Action::Enter).unwrap();
+        save_stage(&mut f, &s, &mut d, "quiescing").unwrap();
+        f.blocked_quiesce = true;
+        assert!(ready(&mut f, &s, &d).is_err());
+        f.cancel_reply_fault = Some(fault);
+        f.maintenance_cancel_error = fault == "maintenance";
+        let error = rollback(&mut f, &s).unwrap_err();
+        let details = format!("{error:#}");
+        assert!(
+            details.contains("Agent is not safe to release"),
+            "{fault}: {details}"
+        );
+        assert!(
+            details.contains("cancel"),
+            "{fault}: cancellation uncertainty must be reported: {details}"
+        );
+        assert!(
+            f.events.iter().any(|e| e == "maintenance/Cancel"),
+            "{fault}: maintenance cleanup must still be attempted"
+        );
+        assert_eq!(load(&mut f, &s).unwrap().stage, "recovery_verifying");
+        assert!(!f.events.iter().any(|e| e.starts_with("spawn/")
+            || e == "upgrade/release"
+            || e == "maintenance/Release"));
+    }
+}
+#[test]
+fn recovery_cancellation_uncertainty_cannot_claim_verified_inventory() {
+    for fault in [
+        "lost",
+        "id",
+        "owner",
+        "gate",
+        "safe",
+        "shutdown",
+        "maintenance",
+    ] {
+        let mut f = Fake::new();
+        let s = f.s.clone();
+        begin(&mut f, &s).unwrap();
+        f.cancel_reply_fault = Some(fault);
+        f.maintenance_cancel_error = fault == "maintenance";
+        assert!(
+            rollback(&mut f, &s).is_err(),
+            "{fault}: cancellation must be confirmed even after a valid inventory"
+        );
+        let failed = load(&mut f, &s).unwrap();
+        assert_eq!(failed.stage, "recovery_verifying");
+        assert!(failed.ready.is_some() && failed.final_checkpoint.is_none());
+        assert!(s.checkpoint.is_none() && s.verification.is_none());
+        assert!(f.events.iter().any(|e| e == "maintenance/Cancel"));
+        assert!(!f.events.iter().any(|e| e.starts_with("spawn/")
+            || e == "upgrade/release"
+            || e == "maintenance/Release"));
+    }
 }
 #[test]
 fn lost_release_recovery_checks_final_snapshot_against_the_ready_snapshot() {

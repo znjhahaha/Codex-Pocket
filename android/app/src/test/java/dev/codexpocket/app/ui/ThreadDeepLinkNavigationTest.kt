@@ -23,6 +23,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")
@@ -35,9 +36,15 @@ class ThreadDeepLinkNavigationTest {
         else -> emptyList()
     }
 
+    @Test fun clickingCurrentConversationInsideAssistantClosesOverlay() = currentConversationClosesOverlay(false)
+    // Physical inline-icon clicks need real text metrics; legacy graphics gives a zero-size icon.
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test fun userConversationReferenceMenuOpensCurrentConversation() = currentConversationClosesOverlay(true)
+
     @Suppress("UNCHECKED_CAST")
-    @Test fun clickingCurrentConversationInsideAssistantClosesOverlay() {
-        val chat = ChatEntity(ThreadKey("pc", "store", "01a1c7fb-7bda-7a71-a782-a020229c9573"), "runtime", "cli", "Fixture", "", "D:/work", 0, "idle", false)
+    private fun currentConversationClosesOverlay(userMessage: Boolean) {
+        val title = if (userMessage) "重设计助理界面并默认 CLI 静默启动" else "Fixture"
+        val chat = ChatEntity(ThreadKey("pc", "store", "01a1c7fb-7bda-7a71-a782-a020229c9573"), "runtime", "cli", title, "", "D:/work", 0, "idle", false)
         val db = Room.inMemoryDatabaseBuilder(compose.activity.application, PocketDatabase::class.java).build()
         val storage = object : PairingStorage {
             override fun load(): PairedComputer? = null
@@ -71,17 +78,24 @@ class ThreadDeepLinkNavigationTest {
             state.update { it.copy(paired = true, online = true, selected = chat, computerId = "pc", glassEffects = false,
                 runtimes = listOf(RuntimeInfo("runtime", "cli", "fixture", "store", true, setOf(chat.key.nativeId), setOf("thread/read"))),
                 assistant = AssistantUiState(snapshot = AssistantSnapshot(enabled = true, runtimeId = "runtime"),
-                    messages = listOf(AssistantChatMessage("message", "Assistant", "[当前会话](codex://threads/${chat.key.nativeId})")))) }
+                    messages = listOf(if (userMessage) AssistantChatMessage("message", "User", "[$title](codex://threads/${chat.key.nativeId}) 继续完成任务")
+                        else AssistantChatMessage("message", "Assistant", "[当前会话](codex://threads/${chat.key.nativeId})")))) }
             compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
                 val current by repo.state.collectAsState(); PocketRoot(current, repo)
             } } }
             compose.onNodeWithTag("assistant-pocket-button").performClick()
             compose.onNodeWithTag("assistant-screen").assertExists()
-            compose.waitUntil(10_000) { textViews(compose.activity.window.decorView).any { it.text.toString() == "当前会话" } }
-            compose.runOnIdle {
-                val view = textViews(compose.activity.window.decorView).first { it.text.toString() == "当前会话" }
-                val text = view.text as Spanned
-                text.getSpans(0, text.length, ClickableSpan::class.java).single().onClick(view)
+            if (userMessage) {
+                compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-message:message"))
+                compose.onNodeWithContentDescription("会话链接", useUnmergedTree = true).assertIsDisplayed().performClick()
+                compose.onNodeWithTag("thread-reference-open").assertIsEnabled().performClick()
+            } else {
+                compose.waitUntil(10_000) { textViews(compose.activity.window.decorView).any { it.text.toString() == "当前会话" } }
+                compose.runOnIdle {
+                    val view = textViews(compose.activity.window.decorView).first { it.text.toString() == "当前会话" }
+                    val text = view.text as Spanned
+                    text.getSpans(0, text.length, ClickableSpan::class.java).single().onClick(view)
+                }
             }
             compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-screen").fetchSemanticsNodes().isEmpty() }
             assertEquals(chat.key, repo.state.value.selected?.key)

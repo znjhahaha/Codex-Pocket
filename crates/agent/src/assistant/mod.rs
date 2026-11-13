@@ -62,6 +62,8 @@ pub struct Task {
     pub reconciliation_required: bool,
     /// Last known result, failure explanation or question for the user.
     pub detail: Option<String>,
+    #[serde(default)]
+    pub assignment: Option<TaskAssignment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +75,12 @@ pub struct Memory {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Command {
+    CreateAssignedTask {
+        prompt: String,
+        directory: PathBuf,
+        writes: bool,
+        assignment: TaskAssignment,
+    },
     CreateTask {
         prompt: String,
         directory: PathBuf,
@@ -84,6 +92,13 @@ pub enum Command {
     },
     ResumeTask {
         task_id: String,
+    },
+    /// Retains logical task identity and its dependency/group contract. The
+    /// prior native execution must already be confirmed stopped.
+    ReassignTask {
+        task_id: String,
+        member_id: String,
+        message: String,
     },
     TakeOver,
     ReleaseTakeover,

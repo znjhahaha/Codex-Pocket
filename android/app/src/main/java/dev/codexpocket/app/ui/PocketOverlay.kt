@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.rememberCanvasBackdrop
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -70,7 +71,12 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
     val registry = remember { OverlayRegistry() }
     val preferences = rememberPocketGlassPreferences()
     val page = rememberLayerBackdrop()
-    val base = rememberLayerBackdrop()
+    val background = MaterialTheme.colorScheme.background
+    // The default backdrop is a constant color, not page content. Recording a render layer
+    // here lets nested glass consumers re-enter that layer when Android rebuilds display lists.
+    // Drawing the color directly keeps this leaf acyclic; page/transcript glass still samples
+    // its real content layers.
+    val base = rememberCanvasBackdrop { drawRect(background) }
     val blocked = registry.entries.isNotEmpty()
     val pageFocus = remember { FocusRequester() }
     var wasBlocked by remember { mutableStateOf(false) }
@@ -86,7 +92,7 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
                 .focusRestorer().focusGroup()
                 .then(if (blocked) Modifier.clearAndSetSemantics {} else Modifier)) {
                 // Default controls sample this base; Home/Chat keep their local content overrides.
-                Box(Modifier.matchParentSize().layerBackdrop(base).background(MaterialTheme.colorScheme.background))
+                Box(Modifier.matchParentSize().background(background))
                 CompositionLocalProvider(LocalPocketBackdrop provides base,
                     LocalPocketInputActive provides { registry.entries.isEmpty() }) { content() }
             }

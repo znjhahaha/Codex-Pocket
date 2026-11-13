@@ -64,7 +64,7 @@ class AssistantActorRepositoryTest {
 
     @Test fun disabledActorHasEmptyDirectoryUntilARealManagedRuntimeIsReturned()=runBlocking<Unit> {
         transport.snapshot=buildJsonObject {put("enabled",false);put("ready",false)}
-        repo.loadAssistant().join()
+        repo.loadAssistant(automaticPrepare=false).join()
         assertEquals(false,repo.state.value.assistant.snapshot!!.enabled)
         assertTrue(repo.state.value.assistantModels.isEmpty())
         assertEquals(listOf("assistant/read"),transport.calls.map {it.first})
@@ -83,16 +83,126 @@ class AssistantActorRepositoryTest {
         assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
     }
 
+    @Test fun unpreparedAssistantIsPreparedOnceWithoutARunningRuntimeSelection()=runBlocking<Unit> {
+        transport.snapshot=buildJsonObject {put("enabled",false);put("ready",false)}
+        transport.preparation=actorSnapshot()
+        repo.loadAssistant().join()
+        assertEquals(listOf("assistant/read","assistant/prepare","codex/request"),transport.calls.map {it.first})
+        assertTrue(transport.calls.single {it.first=="assistant/prepare"}.second.isEmpty())
+        assertEquals(true,repo.state.value.assistant.snapshot?.ready)
+        assertNull(repo.state.value.assistant.error)
+    }
+
+    @Test fun staleUnpreparedReadCannotPrepareAReplacementConnection()=runBlocking<Unit> {
+        transport.snapshot=buildJsonObject {put("enabled",false);put("ready",false)}
+        transport.readStarted=CompletableDeferred()
+        transport.readRelease=CompletableDeferred()
+        val poll=repo.loadAssistant()
+        withTimeout(5000) {transport.readStarted!!.await()}
+        val replacement=ActorConnection().apply {preparation=actorSnapshot()}
+        val replacementState=AssistantUiState(error="replacement connection state")
+        assign("client",replacement)
+        state().update {it.copy(assistant=replacementState)}
+        transport.readRelease!!.complete(Unit)
+        withTimeout(5000) {poll.join()}
+
+        assertTrue("A stale read must not send preparation to the new connection",replacement.calls.isEmpty())
+        assertEquals(replacementState,repo.state.value.assistant)
+        assertEquals(listOf("assistant/read"),transport.calls.map {it.first})
+    }
+
+    @Test fun preparationDuringOlderReadPreservesTheRequestedPageAndCursor()=runBlocking<Unit> {
+        repo.loadAssistant().join()
+        val newer=repo.state.value.assistant.messages
+        val page=pocketJson.parseToJsonElement("""{"messages":[{"id":"older","role":"User","text":"更早的消息","atMs":100}],"nextBefore":1}""")
+        transport.olderPage=page
+        transport.snapshot=JsonObject(actorSnapshot()+mapOf("ready" to JsonPrimitive(false)))
+        transport.preparation=actorSnapshot()
+
+        repo.assistantAction(AssistantActions.read(17,before=2,limit=1)).join()
+
+        assertEquals(listOf("older")+newer.map {it.id},repo.state.value.assistant.messages.map {it.id})
+        assertEquals(1L,repo.state.value.assistant.nextBefore)
+        assertTrue(repo.state.value.assistant.historyPaged)
+        assertTrue(repo.state.value.assistant.snapshot!!.prepared)
+        assertTrue(transport.calls.single {it.first=="assistant/prepare"}.second.isEmpty())
+    }
+
+    @Test fun olderConversationPageMergesWithoutDroppingNewerMessagesOrAuthorship()=runBlocking<Unit> {
+        repo.loadAssistant().join()
+        val newer=repo.state.value.assistant.messages
+        transport.snapshot=JsonObject(actorSnapshot()+mapOf("conversationPage" to pocketJson.parseToJsonElement("""{"messages":[{"id":"older","role":"Assistant","text":"研究结果","at_ms":100,"authorName":"研究员","member_id":"m","source_thread_id":"native"}],"nextBefore":null}""")))
+        repo.assistantAction(AssistantActions.read(17,before=2,limit=1)).join()
+        assertEquals(listOf("older")+newer.map {it.id},repo.state.value.assistant.messages.map {it.id})
+        assertEquals("研究员",repo.state.value.assistant.messages.first().authorName)
+        assertEquals("native",repo.state.value.assistant.messages.first().sourceThreadId)
+        assertNull(repo.state.value.assistant.nextBefore)
+        assertEquals(2L,transport.calls.last {it.first=="assistant/read"}.second.number("before"))
+        transport.snapshot=actorSnapshot()
+        repo.loadAssistant().join()
+        assertTrue(repo.state.value.assistant.messages.any {it.id=="older"})
+        assertNull(repo.state.value.assistant.nextBefore)
+    }
+
+    @Test fun initialSnapshotExposesProductSequenceCursorWithoutAConversationPage()=runBlocking<Unit> {
+        transport.snapshot=JsonObject(actorSnapshot()+mapOf("nextBefore" to JsonPrimitive(321)))
+        repo.loadAssistant().join()
+        assertEquals(321L,repo.state.value.assistant.nextBefore)
+        assertFalse(repo.state.value.assistant.historyPaged)
+    }
+
+    @Test fun explicitPageAndTaskReadQueueBehindDelayedPollInsteadOfDisappearing()=runBlocking<Unit> {
+        transport.readStarted=CompletableDeferred()
+        transport.readRelease=CompletableDeferred()
+        val poll=repo.loadAssistant()
+        withTimeout(5000) {transport.readStarted!!.await()}
+        val page=repo.assistantAction(AssistantActions.read(0,before=123,limit=50))
+        val task=repo.assistantAction(AssistantActions.read(0,taskId="task"))
+        delay(100)
+        assertFalse("Explicit reads must wait for the poll",page.isCompleted || task.isCompleted)
+        transport.readRelease!!.complete(Unit)
+        withTimeout(5000) {joinAll(poll,page,task)}
+        val reads=transport.calls.filter {it.first=="assistant/read"}
+        assertEquals(3,reads.size)
+        assertEquals(123L,reads.single {it.second.containsKey("before")}.second.number("before"))
+        assertEquals("task",reads.single {it.second.containsKey("taskId")}.second.string("taskId"))
+    }
+
+    @Test fun accountAndConfigurationPreparationFailuresNeverClearErrorDespiteReadyWorker()=runBlocking<Unit> {
+        for((status,code,hint) in listOf(Triple("needs_login","assistant_needs_login","登录"),Triple("missing_cli","assistant_missing_cli","CLI"),
+            Triple("missing_config","assistant_missing_config","配置"),Triple("recoverable_error","assistant_prepare_failed","重试"))) {
+            transport.snapshot=JsonObject(actorSnapshot()+mapOf("preparationStatus" to JsonPrimitive(status),"error" to JsonPrimitive(code)))
+            repo.loadAssistant().join()
+            val current=repo.state.value.assistant
+            assertEquals(true,current.snapshot!!.ready)
+            assertFalse(current.snapshot!!.prepared)
+            assertTrue(current.error!!.contains(hint))
+            repo.assistantAction(AssistantActions.send("managed","暂不可发送",null)).join()
+            assertTrue(transport.calls.none {it.first=="assistant/send"})
+        }
+    }
+
     private class ActorConnection:PocketConnection {
         override val state=MutableStateFlow(LinkState.ONLINE)
         override val notifications=emptyFlow<JsonObject>()
         var snapshot=actorSnapshot()
+        var preparation: JsonObject? = null
+        var olderPage: JsonElement? = null
+        var readStarted:CompletableDeferred<Unit>?=null
+        var readRelease:CompletableDeferred<Unit>?=null
         val calls=CopyOnWriteArrayList<Pair<String,JsonObject>>()
         override suspend fun connect(config:ConnectionConfig):Unit=error("Fixture must never connect")
         override suspend fun request(method:String,params:JsonObject,commandId:String?,timeoutMillis:Long):JsonElement {
             calls+=method to params
             return when(method) {
-                "assistant/read"->snapshot
+                "assistant/read"->{
+                    readStarted?.complete(Unit);readRelease?.await()
+                    if(params.containsKey("before") && olderPage!=null) JsonObject(snapshot+mapOf("conversationPage" to olderPage!!)) else snapshot
+                }
+                "assistant/prepare"-> {
+                    assertFalse(params.containsKey("runtimeId"))
+                    preparation?.also {snapshot=it} ?: throw WireException("unsupported", "Preparation unavailable")
+                }
                 "codex/request"->{require(params.string("method")=="model/list");buildJsonObject {
                     put("data",buildJsonArray {
                         add(buildJsonObject {put("id","directory-id");put("model","default");put("displayName","实际目录模型");put("isDefault",true)})

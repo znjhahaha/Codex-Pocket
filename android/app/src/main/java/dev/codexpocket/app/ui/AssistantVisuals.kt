@@ -34,31 +34,12 @@ data class AssistantPalette(
     val border: Color,
 )
 
-private val LightAssistantPalette = AssistantPalette(
-    background = Color(0xFFF3F4F2),
-    surface = Color(0xFFFFFFFF),
-    outgoing = Color(0xFFD5EBCD),
-    onOutgoing = Color(0xFF243B2B),
-    accent = Color(0xFF28583F),
-    onAccent = Color(0xFFFFFFFF),
-    muted = Color(0xFF5B675E),
-    border = Color(0xFFDCE2DA),
-)
-
-private val DarkAssistantPalette = AssistantPalette(
-    background = Color(0xFF171C19),
-    surface = Color(0xFF232B25),
-    outgoing = Color(0xFF334E3B),
-    onOutgoing = Color(0xFFEDF7E9),
-    accent = Color(0xFFB3D9A5),
-    onAccent = Color(0xFF1C3626),
-    muted = Color(0xFFAFBBAF),
-    border = Color(0xFF3D4A40),
-)
-
 @Composable
-fun assistantPalette(): AssistantPalette =
-    if (MaterialTheme.colorScheme.background.luminance() < .3f) DarkAssistantPalette else LightAssistantPalette
+fun assistantPalette(): AssistantPalette {
+    val c = MaterialTheme.colorScheme
+    return AssistantPalette(c.background, c.surfaceContainerLow, c.surfaceContainerHigh, c.onSurface,
+        c.secondary, c.onSecondary, c.onSurfaceVariant, c.outlineVariant)
+}
 
 /** Decorative identity only. The surrounding chat row or control supplies its semantics. */
 @Composable

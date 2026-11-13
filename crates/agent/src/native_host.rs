@@ -77,14 +77,63 @@ fn accept(
     Ok(value.get("method").is_some().then_some(value))
 }
 
-async fn replay(client: &mut HostClient, cursor: &mut Cursor) -> Result<Vec<(u64, Option<Value>)>> {
+struct ReplayBatch {
+    messages: Vec<(u64, Option<Value>)>,
+    reconciliation_required: bool,
+}
+
+async fn replay(
+    client: &mut HostClient,
+    cursor: &mut Cursor,
+    fresh_attachment: bool,
+) -> Result<ReplayBatch> {
     let mut messages = Vec::new();
     let mut count = 0;
     let mut bytes = 0;
-    for _ in 0..8 {
+    for page_index in 0..8 {
         let before = cursor.after;
         let page = client.replay(&cursor.generation, before).await?;
-        ensure!(!page.snapshot_required, "Host event snapshot required");
+        if page.snapshot_required {
+            // A new observer has no applied event history. The same actor reply
+            // supplies an atomic cursor and live pending snapshot, even when a
+            // cold Host retained only durable evidence rather than event bodies.
+            // Explicit handoff cursors and running observers must never skip gaps.
+            ensure!(
+                fresh_attachment && page_index == 0 && before == 0,
+                "Host event snapshot required"
+            );
+            ensure!(
+                page.generation == cursor.generation
+                    && page.next_after == page.sequence
+                    && !page.has_more
+                    && page.events.is_empty()
+                    && page.pending_requests.len() <= 128
+                    && serde_json::to_vec(&page.pending_requests)?.len() <= 1024 * 1024,
+                "Invalid host recovery snapshot"
+            );
+            let mut ids = std::collections::BTreeSet::new();
+            for request in page.pending_requests {
+                let id = pocket_runtime_ipc::support::key(&request["id"])
+                    .context("Invalid pending host request")?;
+                ensure!(
+                    ids.insert(id)
+                        && request["method"]
+                            .as_str()
+                            .is_some_and(|method| !method.is_empty()),
+                    "Invalid pending host request"
+                );
+                messages.push((0, Some(request)));
+            }
+            // Acknowledge the baseline only after ALL pending requests are queued.
+            // Unknown receipts/runs and old-generation questions remain in the
+            // Host ledger and are reconciled by their existing owners, never replayed.
+            messages.push((page.sequence, None));
+            cursor.after = page.sequence;
+            return Ok(ReplayBatch {
+                messages,
+                reconciliation_required: page.reconciliation_required,
+            });
+        }
         for event in page.events {
             count += 1;
             bytes += serde_json::to_vec(&event.event)?.len();
@@ -101,7 +150,10 @@ async fn replay(client: &mut HostClient, cursor: &mut Cursor) -> Result<Vec<(u64
             "Invalid host replay cursor"
         );
         if !page.has_more {
-            return Ok(messages);
+            return Ok(ReplayBatch {
+                messages,
+                reconciliation_required: page.reconciliation_required,
+            });
         }
         ensure!(cursor.after > before, "Host replay made no progress");
     }
@@ -116,13 +168,15 @@ async fn connect(
     cursor: Option<Cursor>,
 ) -> Result<Connected> {
     let mut subscription = event_client.subscribe(); // Exactly one event subscription, before replay.
-    let health = event_client.health().await?;
+    event_client.health().await?;
+    let fresh_attachment = cursor.is_none();
     let mut cursor = cursor.unwrap_or_else(|| Cursor {
         generation: descriptor.generation.clone(),
         after: 0,
     });
     let committed = cursor.after;
-    let initial = replay(&mut event_client, &mut cursor).await?;
+    let initial = replay(&mut event_client, &mut cursor, fresh_attachment).await?;
+    let reconciliation_required = initial.reconciliation_required;
     let mut requests = Vec::new();
     for _ in 0..REQUEST_CLIENTS {
         requests.push(HostClient::attach(&descriptor).await?);
@@ -166,7 +220,7 @@ async fn connect(
             let result: Result<()> = async {
                 tokio::select! { _ = start.notified() => {}, _ = stopped.changed() => bail!("Host adapter detached") }
                 let send = |value| NativeEvent::Message { runtime_id: runtime_id.clone(), connection_id: connection_id.clone(), value };
-                for (next, value) in initial {
+                for (next, value) in initial.messages {
                     if let Some(value) = value {
                         tokio::select! { result = events.send(send(value)) => { result?; }, _ = stopped.changed() => bail!("Host adapter detached") }
                     }
@@ -190,8 +244,8 @@ async fn connect(
                                     let value = accept(&mut cursor, generation, next, value["params"]["event"].clone())?;
                                     messages.push((next, value));
                                 }
-                                Ok(value) if value["method"] == "host/resync" => { messages = replay(&mut event_client, &mut cursor).await?; }
-                                Err(broadcast::error::RecvError::Lagged(_)) => { messages = replay(&mut event_client, &mut cursor).await?; }
+                                Ok(value) if value["method"] == "host/resync" => { messages = replay(&mut event_client, &mut cursor, false).await?.messages; }
+                                Err(broadcast::error::RecvError::Lagged(_)) => { messages = replay(&mut event_client, &mut cursor, false).await?.messages; }
                                 _ => bail!("Host event connection unavailable"),
                             }
                             for (next, value) in messages {
@@ -221,7 +275,7 @@ async fn connect(
     Ok(Connected {
         role: NativeRole::ManagedHost {
             generation: descriptor.generation.clone(),
-            reconciliation_required: health.reconciliation_required,
+            reconciliation_required,
         },
         bridge_version: None,
         capabilities,
@@ -372,6 +426,17 @@ mod tests {
         fn drop(&mut self) {
             // Panic cleanup addresses only this test's own authenticated fixture.
             // Never kill a process or inspect an external registry.
+            // The native sentinel also works when recovery correctly fences RPC.
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            let _ = std::fs::write(self.home.join("native-exit"), b"exit");
+            for _ in 0..100 {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             use std::io::Write;
             if self.child.try_wait().ok().flatten().is_some() {
                 return;
@@ -397,6 +462,9 @@ mod tests {
     impl Fixture {
         async fn start() -> Self {
             let dir = tempfile::tempdir().unwrap();
+            Self::start_in(dir).await
+        }
+        async fn start_in(dir: tempfile::TempDir) -> Self {
             let home = dir.path().to_path_buf();
             let descriptor = dir.path().join("registry/host.json");
             let bins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime-host/target/debug");
@@ -437,11 +505,23 @@ mod tests {
                 identity,
             }
         }
+        async fn cold_restart(mut self) -> Self {
+            // Stop only this fixture's native through its own sentinel. A Host
+            // command here would itself leave an unrelated unknown receipt.
+            std::fs::write(self.home.join("native-exit"), b"exit").unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), self.child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::remove_file(self.home.join("native-exit")).unwrap();
+            let dir = std::mem::replace(&mut self._dir, tempfile::tempdir().unwrap());
+            Self::start_in(dir).await
+        }
         async fn exit(mut self) {
-            let mut control = HostClient::attach(&self.identity).await.unwrap();
-            let _ = control
-                .request(json!("fixture-exit"), "fixture/exit", json!({}))
-                .await;
+            std::fs::write(self.home.join("native-exit"), b"exit").unwrap();
             assert!(
                 tokio::time::timeout(Duration::from_secs(10), self.child.wait())
                     .await
@@ -473,6 +553,287 @@ mod tests {
             succeeded,
             "Managed Host must return the real Connected adapter"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_attachment_recovers_nonzero_cold_sequence_without_reissuing_history() {
+        let fixture = Fixture::start().await;
+        let old_generation = fixture.identity.generation.clone();
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        control
+            .request(json!("before-cold-count"), "fixture/count", json!({}))
+            .await
+            .unwrap();
+        drop(control);
+        let fixture = fixture.cold_restart().await;
+        assert_ne!(fixture.identity.generation, old_generation);
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        let before = control.recovery().await.unwrap();
+        assert!(before["sequence"].as_u64().unwrap() > 0);
+        assert!(
+            control
+                .replay(&fixture.identity.generation, 0)
+                .await
+                .unwrap()
+                .snapshot_required
+        );
+        assert!(!control.health().await.unwrap().reconciliation_required);
+        let (events, mut rx) = mpsc::channel(32);
+        let result = attach_fixture(&fixture.descriptor, &fixture.home, events).await;
+        let connected = result
+            .unwrap_or_else(|e| panic!("fresh cold attachment must use current snapshot: {e:#}"));
+        assert!(rx.try_recv().is_err());
+        connected.rpc.activate_events();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while connected.rpc.managed_host_cursor().unwrap().after
+                < before["sequence"].as_u64().unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "completed history must not become new native events"
+        );
+        assert_eq!(
+            control.recovery().await.unwrap(),
+            before,
+            "attachment must not mutate the Host ledger"
+        );
+        let count = connected
+            .rpc
+            .call("fixture/count", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(count, json!({"writes":0,"answers":0}));
+        let receipt = control.receipt(json!("before-cold-count")).await.unwrap();
+        assert_eq!(receipt.state, "completed");
+        assert_eq!(receipt.generation, old_generation);
+        assert!(receipt.response.is_none());
+        connected.rpc.detach_managed_host();
+        drop(connected);
+        drop(control);
+        fixture.exit().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_attachment_preserves_unknown_evidence_and_explicit_cursor_fences() {
+        let fixture = Fixture::start().await;
+        let old_generation = fixture.identity.generation.clone();
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        control
+            .request(json!("old-turn"), "turn/start", json!({}))
+            .await
+            .unwrap();
+        control
+            .request(
+                json!("old-question"),
+                "fixture/private-question",
+                json!({"requestId":78}),
+            )
+            .await
+            .unwrap();
+        let mut deferred_client = HostClient::attach(&fixture.identity).await.unwrap();
+        let deferred = tokio::spawn(async move {
+            deferred_client
+                .request(json!("old-unknown"), "fixture/deferred", json!({}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while control.receipt(json!("old-unknown")).await.unwrap().state != "unknown" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        deferred.abort();
+        let _ = deferred.await;
+        drop(control);
+        let fixture = fixture.cold_restart().await;
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        let before = control.recovery().await.unwrap();
+        assert_eq!(before["pendingRequests"][0]["state"], "unknown");
+        assert_eq!(before["pendingRequests"][0]["generation"], old_generation);
+        assert_eq!(before["runs"][0]["state"], "unknown");
+        assert_eq!(
+            control.receipt(json!("old-unknown")).await.unwrap().state,
+            "unknown"
+        );
+        for cursor in [
+            Cursor {
+                generation: old_generation,
+                after: before["sequence"].as_u64().unwrap(),
+            },
+            Cursor {
+                generation: fixture.identity.generation.clone(),
+                after: 0,
+            },
+            Cursor {
+                generation: fixture.identity.generation.clone(),
+                after: u64::MAX,
+            },
+        ] {
+            let (events, _) = mpsc::channel(32);
+            let client = HostClient::attach(&fixture.identity).await.unwrap();
+            let result = connect(
+                fixture.identity.clone(),
+                client,
+                fixture_capabilities(),
+                events,
+                Some(cursor),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "an explicit cursor must never skip missing history"
+            );
+        }
+        let (events, mut rx) = mpsc::channel(32);
+        let connected = attach_fixture(&fixture.descriptor, &fixture.home, events)
+            .await
+            .unwrap();
+        assert!(matches!(
+            connected.role,
+            NativeRole::ManagedHost {
+                reconciliation_required: true,
+                ..
+            }
+        ));
+        connected.rpc.activate_events();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while connected.rpc.managed_host_cursor().unwrap().after
+                < before["sequence"].as_u64().unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "old unknown questions are not current approvals"
+        );
+        assert_eq!(control.recovery().await.unwrap(), before);
+        assert!(
+            control
+                .request(json!("old-turn"), "turn/start", json!({}))
+                .await
+                .is_err()
+        );
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        assert!(
+            control
+                .request(json!("old-unknown"), "fixture/deferred", json!({}))
+                .await
+                .is_err()
+        );
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        assert_eq!(
+            control.receipt(json!("old-unknown")).await.unwrap().state,
+            "unknown"
+        );
+        assert_eq!(
+            control.receipt(json!("old-turn")).await.unwrap().state,
+            "completed"
+        );
+        let count = control
+            .request(
+                json!("new-count"),
+                "thread/read",
+                json!({"threadId":"fixture-thread","includeTurns":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count["result"]["writes"], 0);
+        assert_eq!(count["result"]["answers"], 0);
+        connected.rpc.detach_managed_host();
+        drop(connected);
+        drop(control);
+        fixture.exit().await;
+    }
+
+    fn fixture_capabilities() -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::from_schema(
+            &serde_json::from_str(include_str!(
+                "../../bridge/tests/fixtures/ClientRequest.json"
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_pending_snapshot_commits_after_all_requests_and_preserves_later_events() {
+        let fixture = Fixture::start().await;
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        control
+            .request(json!("cold-sequence"), "fixture/count", json!({}))
+            .await
+            .unwrap();
+        drop(control);
+        let fixture = fixture.cold_restart().await;
+        let mut control = HostClient::attach(&fixture.identity).await.unwrap();
+        for id in [77, 78] {
+            control
+                .request(
+                    json!(format!("pending-{id}")),
+                    "fixture/private-question",
+                    json!({"requestId":id}),
+                )
+                .await
+                .unwrap();
+        }
+        let baseline = control.recovery().await.unwrap()["sequence"]
+            .as_u64()
+            .unwrap();
+        let (events, mut rx) = mpsc::channel(1);
+        let connected = attach_fixture(&fixture.descriptor, &fixture.home, events)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(connected.rpc.managed_host_cursor().unwrap().after, 0);
+        control
+            .request(json!("after-snapshot"), "fixture/finish", json!({}))
+            .await
+            .unwrap();
+        connected.rpc.activate_events();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            connected.rpc.managed_host_cursor().unwrap().after,
+            0,
+            "second pending request is still blocked behind the first"
+        );
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while received.len() < 3 {
+                if let Some(NativeEvent::Message { value, .. }) = rx.recv().await {
+                    received.push(value);
+                }
+            }
+            while connected.rpc.managed_host_cursor().unwrap().after <= baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received[0]["id"], 77);
+        assert_eq!(received[1]["id"], 78);
+        assert_eq!(received[2]["method"], "turn/completed");
+        assert!(
+            rx.try_recv().is_err(),
+            "snapshot/live overlap must not duplicate pending requests"
+        );
+        connected.rpc.detach_managed_host();
+        drop(connected);
+        drop(control);
+        fixture.exit().await;
     }
 
     async fn question(rx: &mut mpsc::Receiver<NativeEvent>) -> Value {

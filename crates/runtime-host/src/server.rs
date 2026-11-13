@@ -206,7 +206,16 @@ async fn submit(
     // Cold recovery never authorizes a fresh write to resolve an unknown run.
     // These existing native reads can supply evidence without model inference.
     if store.state.reconciliation_required
-        && !["thread/read", "thread/turns/list"].contains(&method)
+        && ![
+            "model/list",
+            "thread/list",
+            "thread/loaded/list",
+            "thread/read",
+            "thread/turns/list",
+            "thread/items/list",
+        ]
+        .contains(&method)
+        && !(method == "account/read" && value["params"]["refreshToken"] == false)
         && store.state.receipt(&command_key, false).state == "missing"
     {
         deliver(reply, fail(id, "reconciliation_required"));

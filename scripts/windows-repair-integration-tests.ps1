@@ -41,7 +41,7 @@ function New-Object {
     . ([scriptblock]::Create($source))
     exit 0
 }
-$testRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('..\.local\integration-repair-tests\run-'+[guid]::NewGuid().ToString('N'))))
+$testRoot=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('pocket-repair-'+[guid]::NewGuid().ToString('N'))))
 [void][IO.Directory]::CreateDirectory($testRoot)
 $script:passed=0
 function Assert($Condition,[string]$Message) { if(-not $Condition){throw $Message} }

@@ -50,6 +50,32 @@ impl<R: RuntimeIo> SharedHostExecutor<R> {
     }
 }
 impl<R: RuntimeIo> Executor for SharedHostExecutor<R> {
+    fn needs_tool_upgrade(&self,thread:&str)->Result<bool> {self.lock()?.needs_tool_upgrade(thread)}
+    fn append(
+        &mut self,
+        id: &str,
+        mapping: &NativeMapping,
+        message: &str,
+    ) -> Result<AppendOutcome> {
+        self.lock()?.append(id, mapping, message)
+    }
+    fn append_status(
+        &mut self,
+        id: &str,
+        mapping: &NativeMapping,
+        message: &str,
+    ) -> Result<AppendOutcome> {
+        self.lock()?.append_status(id, mapping, message)
+    }
+    fn can_resume(
+        &mut self,
+        thread: &str,
+        role: Role,
+        directory: Option<&Path>,
+        writes: bool,
+    ) -> Result<bool> {
+        self.lock()?.can_resume(thread, role, directory, writes)
+    }
     fn start(&mut self, r: StartRequest) -> Result<NativeMapping> {
         self.lock()?.start(r)
     }

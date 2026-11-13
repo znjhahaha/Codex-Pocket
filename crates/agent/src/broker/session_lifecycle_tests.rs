@@ -2,6 +2,57 @@ use super::tests::{finish, fixture, loaded, peer};
 use super::*;
 use crate::native::test_peer;
 
+#[tokio::test]
+async fn owner_conflict_projection_distinguishes_uncertain_multiple_and_recovered() {
+    for (competitor, expected) in [(false, "owner_uncertain"), (true, "multiple_owners")] {
+        let (dir, b) = fixture().await;
+        let mut native = peer(&b, "a", "desktop").await;
+        let mut other = if competitor { Some(peer(&b, "b", "desktop").await) } else { None };
+        {
+            let mut state = b.state.lock().await;
+            for runtime in state.runtimes.values_mut() {
+                runtime.loaded.insert("t".into());
+                runtime.inventory_ready = competitor;
+            }
+            // A connected transport with an unconfirmed native initialization
+            // retains its claim, but is not an established online owner.
+            if !competitor { state.runtimes.get_mut("a").unwrap().desktop_initialized = Some(false); }
+            b.save_ownership(&mut state).unwrap();
+        }
+        let before = std::fs::read(dir.path().join("ownership.json")).unwrap();
+        let list = tokio::spawn({ let b = b.clone(); async move { b.threads(&json!({})).await } });
+        if competitor {
+            loaded(&mut native, &["t"]).await;
+            loaded(other.as_mut().unwrap(), &["t"]).await;
+        }
+        let request = native.recv().await;
+        assert_eq!(request["method"], "thread/list");
+        native.reply(&request, json!({"data":[{"id":"t"}],"nextCursor":null})).await;
+        let rows = finish(list).await.unwrap();
+        assert_eq!(rows["data"][0]["conflict"], true);
+        assert_eq!(rows["data"][0]["ownershipReason"], expected);
+        let access = b.access_snapshot(&json!({"runtimeId":"a","threadId":"t"})).await.unwrap();
+        assert_eq!(access["ownershipReason"], expected);
+        assert_eq!(access["reason"], expected);
+        assert_eq!(access["canSend"], false);
+        assert!(access["ownerRuntimeId"].is_null());
+        if !competitor {
+            assert_eq!(std::fs::read(dir.path().join("ownership.json")).unwrap(), before);
+            // Only a complete fresh inventory restores this exact runtime.
+            b.state.lock().await.runtimes.get_mut("a").unwrap().desktop_initialized = Some(true);
+            let refresh = tokio::spawn({ let b = b.clone(); async move { b.refresh_loaded().await } });
+            loaded(&mut native, &["t"]).await;
+            refresh.await.unwrap().unwrap();
+            let recovered = b.access_snapshot(&json!({"runtimeId":"a","threadId":"t"})).await.unwrap();
+            assert_eq!(recovered["canSend"], true);
+            assert_eq!(recovered["ownerRuntimeId"], "a");
+            assert!(recovered["ownershipReason"].is_null());
+        }
+        native.assert_idle().await;
+        if let Some(other) = other.as_mut() { other.assert_idle().await; }
+    }
+}
+
 fn ready(caps: &crate::capabilities::Capabilities) -> Value {
     json!({"runtimeId":"a","initialized":true,"schemaPending":false,"schemaState":"ready","nativeCapabilities":caps})
 }

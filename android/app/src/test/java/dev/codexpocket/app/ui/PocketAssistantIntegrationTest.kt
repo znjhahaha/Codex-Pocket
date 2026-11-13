@@ -32,7 +32,7 @@ import org.robolectric.annotation.GraphicsMode
 class PocketAssistantIntegrationTest {
     @get:Rule val compose=createAndroidComposeRule<MainActivity>()
     private val runtime=RuntimeInfo("managed","assistant","fixture","store",true,emptySet(),emptySet())
-    private val snapshot=AssistantSnapshot(true,"managed","coordinator",false,AssistantSettings("认真协助","简洁",null,"UTC"),
+    private val snapshot=AssistantSnapshot(true,"managed","coordinator",false,AssistantSettings("认真协助","简洁",null,"UTC"),ready=true,
         memories=listOf(AssistantMemory("memory","实际快照记忆")))
 
     private fun field(repo: PocketRepository, name: String): Any? = PocketRepository::class.java.getDeclaredField(name)
@@ -55,7 +55,7 @@ class PocketAssistantIntegrationTest {
             assign(repo,"assistantComputer","pc")
             assign(repo,"pair",PairedComputer(ConnectionConfig("wss://fixture.invalid","room","fixture-token","00".repeat(32)),"phone","fixture-secret","pc","本地 fixture"))
             state(repo).update {it.copy(initialized=true,paired=true,online=false,computerId="pc",computerName="本地 fixture",glassEffects=false,
-                runtimes=listOf(runtime),capabilities=setOf("assistant.v1"),assistant=AssistantUiState(if(enabled) snapshot else AssistantSnapshot(enabled=false)))}
+                runtimes=listOf(runtime),capabilities=setOf("assistant.v1"),assistant=AssistantUiState(if(enabled) snapshot.copy(ready=true) else AssistantSnapshot(enabled=false)))}
             compose.activity.runOnUiThread {compose.activity.setContent {
                 PocketTheme("light") {val current by repo.state.collectAsState();PocketRoot(current,repo)}
             }}

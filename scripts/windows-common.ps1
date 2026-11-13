@@ -70,8 +70,10 @@ function Invoke-PocketInstallStep([string]$Stage,[string]$Call,[scriptblock]$Act
         $failure=$_; $exception=$_.Exception
         while ($null -ne $exception.InnerException) { $exception=$exception.InnerException }
         $hresult='0x'+$exception.HResult.ToString('X8')
+        $osCode=if($exception -is [ComponentModel.Win32Exception]){$exception.NativeErrorCode}else{$null}
         # Original messages can contain paths, commands and credentials; retain type/code only.
-        Write-PocketInstallEvent @{stage=$Stage;call=$Call;startedAt=$started;state='failed';hresult=$hresult;exceptionType=$exception.GetType().FullName}
+        Write-PocketInstallEvent @{stage=$Stage;call=$Call;startedAt=$started;state='failed';hresult=$hresult;osCode=$osCode;exceptionType=$exception.GetType().FullName}
+        if($null -ne $osCode){$failure.Exception.Data['PocketOSCode']=$osCode}
         if (-not $failure.Exception.Data.Contains('PocketStage')) {
             $failure.Exception.Data['PocketStage']=$Stage
             $failure.Exception.Data['PocketCall']=$Call

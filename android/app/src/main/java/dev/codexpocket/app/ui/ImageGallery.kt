@@ -152,7 +152,7 @@ private fun rememberGalleryBitmap(path: String, maxSide: Int): ImageLoad {
     val key = "$maxSide:$identity"
     val retry = galleryRetries[identity] ?: 0
     val connection = LocalImageConnection.current
-    val load by produceState<ImageLoad>(bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading, key, source, toolSource, retry, connection) {
+    val load by produceState<ImageLoad>(bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading, key, media, source, toolSource, retry, connection) {
         value = bitmapCache.get(key)?.let { ImageLoad.Ready(it) } ?: ImageLoad.Loading
         if (value is ImageLoad.Ready) return@produceState
         suspend fun unavailable(status: ToolMediaStatus): ImageLoad {
@@ -215,7 +215,7 @@ private fun GalleryRetry(file: MentionedFile) {
         val identity = "${source?.ownerKey}:${media?.cacheKey ?: file.path}"
         if (galleryRetries.size > 512) galleryRetries.clear()
         galleryRetries[identity] = (galleryRetries[identity] ?: 0) + 1
-    } }) { Text("重试图片") }
+    } }, Modifier.heightIn(min=48.dp).testTag("image-retry:${media?.mediaId ?: file.path}")) { Text("重试图片") }
 }
 
 /**
@@ -348,9 +348,12 @@ private fun SingleImage(file: MentionedFile, onOpen: () -> Unit) {
     val scale = pressScale(interaction)
     val ratio = (load as? ImageLoad.Ready)?.bitmap?.let { (it.width.toFloat() / it.height).coerceIn(.5f, 2.2f) } ?: 1.33f
     val width = if (ratio >= 1f) 240.dp else (240 * ratio).dp.coerceAtLeast(140.dp)
-    Box(Modifier.width(width).aspectRatio(ratio).graphicsLayer { scaleX = scale; scaleY = scale }.clip(RoundedCornerShape(16.dp))
-        .clickable(interactionSource = interaction, indication = null, role = Role.Image, onClick = onOpen)
-        .semantics { contentDescription = file.name }) { ImageFill(load, file) }
+    Column(Modifier.width(width)) {
+        Box(Modifier.fillMaxWidth().aspectRatio(ratio).graphicsLayer { scaleX = scale; scaleY = scale }.clip(RoundedCornerShape(16.dp))
+            .clickable(interactionSource = interaction, indication = null, role = Role.Image, onClick = onOpen)
+            .semantics { contentDescription = file.name }) { ImageFill(load, file) }
+        if(load is ImageLoad.MediaUnavailable && load.status !in setOf(ToolMediaStatus.Unsupported,ToolMediaStatus.OwnerChanged)) GalleryRetry(file)
+    }
 }
 
 @Composable

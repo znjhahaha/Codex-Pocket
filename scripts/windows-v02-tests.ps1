@@ -34,6 +34,8 @@ function Get-PocketTaskXml { return $script:fakeTask }
 function Set-PocketTaskXml([AllowNull()]$Xml) { $script:fakeTask=$Xml; $script:registrations++ }
 function Start-PocketTask { $script:starts++ }
 function Assert-PocketWindowsPrerequisites { }
+function Enter-PocketInstallLifecycle { return @{processesStopped=0} }
+function Complete-PocketInstallLifecycle { return @{processesStarted=0;runtimeVerification='verified'} }
 function Get-PocketDesktopPackage { return [pscustomobject]@{InstallLocation=(Join-Path $testRoot 'native');PackageFamilyName='fixture'} }
 
 Test 'canonical LocalAppData ignores a virtualized process environment' {
@@ -80,7 +82,7 @@ Put (Join-Path $testRoot 'native\app\resources\codex.exe') 'never execute'
 foreach($name in Get-PocketWindowsFiles) {
     if($name -in @('cloudflared.exe','cloudflared-LICENSE.txt')){$path=Join-Path $root ('.local\tools\'+$name)}
     elseif($name -in @('pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe')){$path=Join-Path $root ('desktop\target\release\'+$name)}
-    elseif($name -like '*.exe'){$path=Join-Path $root ('target\release\'+$name)}
+    elseif($name -like '*.exe' -or $name -like '*.dll'){$path=Join-Path $root ('target\release\'+$name)}
     elseif($name -like '*.md'){$path=Join-Path $root ('docs\'+$name)}
     else{$path=Join-Path $root ('scripts\'+$name)}
     Put $path ('fixture '+$name)

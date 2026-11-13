@@ -382,7 +382,9 @@ fn agent_record(a: &mut impl Adapter, state: &Path) -> Result<AgentRecord> {
 pub(super) fn no_agent_handoff(state: &Path) -> Result<bool> {
     let path = state.join("handoff/state.json");
     storage::unredirected(&path)?;
-    if !path.try_exists()? { return Ok(true); }
+    if !path.try_exists()? {
+        return Ok(true);
+    }
     let mut adapter = Windows;
     let record: AgentRecord = decode(&mut adapter, &path, 65536)?;
     record.validate()?;
@@ -1208,6 +1210,38 @@ fn ready(a: &mut impl Adapter, s: &UpgradeStatus, d: &Durable) -> Result<Checkpo
     image(a, &s.state_directory, &cp, &d.computer_id)?;
     Ok(cp)
 }
+fn cancel_recovery_inventory(a: &mut impl Adapter, s: &UpgradeStatus, d: &Durable) -> Result<()> {
+    let agent = (|| -> Result<()> {
+        // Verification may fail before a checkpoint exists. Cancel only this
+        // authenticated operation/run; cancellation retains unresolved writes.
+        let r = get_receipt(a, s, d, "upgrade/cancel", None)?;
+        ensure!(
+            r.phase == "cancelled"
+                && !r.safe_to_exit
+                && !r.shutdown_requested
+                && r.accepting_writes
+                && r.remote_enabled == d.prior_remote,
+            "Recovery upgrade/cancel did not restore admission"
+        );
+        let health = ensure_owner(a, s, d)?;
+        ensure!(
+            health["acceptingWrites"] == true && health["remoteEnabled"] == d.prior_remote,
+            "Recovery upgrade/cancel gate readback failed"
+        );
+        Ok(())
+    })();
+    // Attempt both cancellations even if the agent reply/readback is uncertain.
+    // Neither a restored gate nor maintenance acknowledgement proves handoff.
+    let maintenance = ack(a, s, d, Action::Cancel);
+    match (agent, maintenance) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e.context("Recovery upgrade/cancel unconfirmed")),
+        (Ok(()), Err(e)) => Err(e.context("Recovery maintenance cancel unconfirmed")),
+        (Err(e), Err(m)) => Err(e.context(format!(
+            "Recovery upgrade/cancel and maintenance cancel unconfirmed: {m:#}"
+        ))),
+    }
+}
 fn gone(a: &mut impl Adapter, p: &ProcessIdentity) -> Result<()> {
     let end = Instant::now() + Duration::from_secs(15);
     loop {
@@ -1660,31 +1694,47 @@ fn rollback(a: &mut impl Adapter, s: &UpgradeStatus) -> Result<Verification> {
             // proof of current safety. Take a fresh inventory under maintenance.
             d.verify_id = uuid::Uuid::new_v4().to_string();
             d.active_id = d.verify_id.clone();
-            save_stage(a, s, &mut d, "recovery_verifying")?;
-            let cp = ready(a, s, &d)?;
-            let current = image(a, &s.state_directory, &cp, &d.computer_id)?;
-            if let Some(previous) = previous {
-                successor(&previous, &current)?;
+            let verification = (|| -> Result<()> {
+                save_stage(a, s, &mut d, "recovery_verifying")?;
+                let cp = ready(a, s, &d)?;
+                let current = image(a, &s.state_directory, &cp, &d.computer_id)?;
+                if let Some(previous) = previous {
+                    successor(&previous, &current)?;
+                }
+                d.ready = Some(cp.clone());
+                a.save(s, &d)?;
+                let cancelled = get_receipt(a, s, &d, "upgrade/cancel", Some(&cp))?;
+                ensure!(
+                    cancelled.phase == "cancelled"
+                        && !cancelled.safe_to_exit
+                        && !cancelled.shutdown_requested
+                        && cancelled.accepting_writes
+                        && cancelled.remote_enabled == d.prior_remote,
+                    "Recovery inventory fence not cancelled"
+                );
+                let restored = ensure_owner(a, s, &d)?;
+                ensure!(
+                    restored["acceptingWrites"] == true
+                        && restored["remoteEnabled"] == d.prior_remote,
+                    "Old admission readback failed"
+                );
+                ensure!(
+                    a.rpc(&s.state_directory, "routes/read", json!({}))?["routePreferences"]
+                        == d.routes["routePreferences"],
+                    "Old routes readback changed"
+                );
+                Ok(())
+            })();
+            if let Err(e) = verification {
+                return match cancel_recovery_inventory(a, s, &d) {
+                    Ok(()) => Err(e.context(
+                        "Recovery verification failed; admission restored and maintenance cancelled",
+                    )),
+                    Err(cleanup) => Err(e.context(format!(
+                        "Recovery verification failed; cancellation unconfirmed: {cleanup:#}"
+                    ))),
+                };
             }
-            d.ready = Some(cp.clone());
-            a.save(s, &d)?;
-            let cancelled = get_receipt(a, s, &d, "upgrade/cancel", Some(&cp))?;
-            ensure!(
-                cancelled.phase == "cancelled"
-                    && cancelled.accepting_writes
-                    && cancelled.remote_enabled == d.prior_remote,
-                "Recovery inventory fence not cancelled"
-            );
-            let restored = ensure_owner(a, s, &d)?;
-            ensure!(
-                restored["acceptingWrites"] == true && restored["remoteEnabled"] == d.prior_remote,
-                "Old admission readback failed"
-            );
-            ensure!(
-                a.rpc(&s.state_directory, "routes/read", json!({}))?["routePreferences"]
-                    == d.routes["routePreferences"],
-                "Old routes readback changed"
-            );
             ack(a, s, &d, Action::Cancel)?;
             save_stage(a, s, &mut d, "rolled_back")?;
             return Ok(Verification {

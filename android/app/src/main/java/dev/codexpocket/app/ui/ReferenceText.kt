@@ -28,6 +28,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.input.*
@@ -137,20 +138,42 @@ internal fun ReferenceEditor(value: TextFieldValue, onValueChange: (TextFieldVal
 internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: Modifier = Modifier,
     maxLines: Int = Int.MAX_VALUE, color: Color = MaterialTheme.colorScheme.onSurface) {
     val valid = remember(text, spans) { validReferenceSpans(text, spans) }
+    val threads = remember(text, valid) {threadTextLinks(text, valid.map {it.start until it.end})}
+    val binding = LocalThreadLinkBinding.current
+    val pocket = binding?.repository?.state?.collectAsState()?.value
+    val clipboard = LocalClipboardManager.current
+    val handler = rememberMarkdownLinkHandler(null)
+    var selectedThread by remember {mutableStateOf<ThreadTextLink?>(null)}
+    fun threadTitle(link: ThreadTextLink): String = (pocket?.chats.orEmpty()+pocket?.agentChats.orEmpty()).firstOrNull {
+        it.key.nativeId == link.nativeId && it.key.computerId == binding?.origin?.computerId && it.key.configStoreId == binding?.origin?.configStoreId
+    }?.title?.takeIf {it.isNotBlank()} ?: link.label ?: "打开会话"
     var selected by remember { mutableStateOf<ReferenceSpan?>(null) }
     var anchor by remember { mutableStateOf<Rect?>(null) }
     val inputActive by rememberUpdatedState(LocalPocketInputActive.current)
     val openMetadata: (ReferenceSpan) -> Unit = { if (inputActive() && selected == null) selected = it }
+    val openThread: (ThreadTextLink) -> Unit = { if (inputActive() && selectedThread == null) selectedThread = it }
     LaunchedEffect(valid) { if (selected !in valid) selected = null }
+    LaunchedEffect(threads) {if(selectedThread !in threads) selectedThread=null}
     val annotated = buildAnnotatedString {
         var cursor = 0
-        valid.forEachIndexed { index, span ->
-            append(text.substring(cursor, span.start))
-            appendInlineContent("reference:$index", " ")
-            withLink(LinkAnnotation.Clickable("reference:$index", TextLinkStyles(SpanStyle(color = ReferenceBlue))) { openMetadata(span) }) {
-                append(span.displayName)
+        val decorations = (valid.mapIndexed {i, span -> Triple(span.start, span.end, "reference:$i")} +
+            threads.mapIndexed {i, link -> Triple(link.start, link.end, "thread:$i")}).sortedBy {it.first}
+        decorations.forEach { (start, end, tag) ->
+            append(text.substring(cursor, start))
+            if(tag.startsWith("thread:")) {
+                val link = threads[tag.substringAfter(':').toInt()]
+                appendInlineContent(tag," ")
+                withLink(LinkAnnotation.Clickable(tag,TextLinkStyles(SpanStyle(color=ReferenceBlue))) {openThread(link)}) {
+                    append(threadTitle(link))
+                }
             }
-            cursor = span.end
+            else {
+                appendInlineContent(tag," ")
+                withLink(LinkAnnotation.Clickable(tag,TextLinkStyles(SpanStyle(color=ReferenceBlue))) {openMetadata(valid[tag.substringAfter(':').toInt()])}) {
+                    append(valid[tag.substringAfter(':').toInt()].displayName)
+                }
+            }
+            cursor = end
         }
         append(text.substring(cursor))
     }
@@ -160,9 +183,28 @@ internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: M
             Icon(referenceIcon(span.reference.string("type")), "查看${span.displayName}", Modifier.fillMaxSize().padding(1.dp), tint = ReferenceBlue)
         }
     } }.toMap()
-    Text(annotated, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }, inlineContent = inline,
+    val density=LocalDensity.current
+    val screenHeight=with(density) {LocalConfiguration.current.screenHeightDp.dp.toPx()}
+    val threadInline = threads.mapIndexed {i, link ->
+        // Only the icon is a placeholder; title and following prose share one line layout.
+        "thread:$i" to InlineTextContent(Placeholder(1.5.em,1.125.em,PlaceholderVerticalAlign.TextCenter)) {
+            Box(Modifier.fillMaxSize().clickable {openThread(link)},contentAlignment=Alignment.CenterStart) {
+                Icon(PocketIcons.Link2,"会话链接",Modifier.fillMaxHeight().aspectRatio(1f),tint=ReferenceBlue)
+            }
+        }
+    }.toMap()
+    Text(annotated, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }, inlineContent = inline + threadInline,
         style = MaterialTheme.typography.bodyLarge, color = color, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
     selected?.let { ReferenceMetadata(it, anchor) { selected = null } }
+    selectedThread?.let {link ->
+        PocketAnchoredMenu("会话链接", {selectedThread = null}, anchor, widthDp = 288f, below=anchor?.top?.let {it < screenHeight * .45f} ?: true) {
+            Column(Modifier.padding(12.dp).testTag("thread-reference-menu")) {
+                Text(threadTitle(link), style = MaterialTheme.typography.titleSmall,maxLines=2,overflow=TextOverflow.Ellipsis)
+                PocketMenuItem("打开会话",PocketIcons.Link2,{selectedThread=null;handler?.invoke(link.url)},Modifier.testTag("thread-reference-open"),enabled=binding?.origin!=null)
+                PocketMenuItem("复制链接",PocketIcons.ContentCopy,{clipboard.setText(AnnotatedString(link.url));selectedThread=null},Modifier.testTag("thread-reference-copy"))
+            }
+        }
+    }
 }
 
 /** Transcript integration: supply the item's raw native content, never a parsed legacy text identity. */

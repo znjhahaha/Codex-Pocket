@@ -5,6 +5,13 @@ import type {InstallationStatus} from './domain';
 
 const render=(optional?:unknown)=>renderToStaticMarkup(<InstallationPanel status={{consistent:true,optionalIntegrations:optional} as InstallationStatus} onRefresh={()=>{}} onDiagnostics={()=>{}}/>);
 describe('installed optional integration presentation',()=>{
+ it('allows an explicit pending repair from native integrity evidence without claiming protocol support',()=>{
+  const html=renderToStaticMarkup(<InstallationPanel status={{consistent:true,installedGeneration:'a'.repeat(64),optionalIntegrations:{recordState:'available',repairSupported:false,repairCheckAvailable:true,recoveryState:'clear',steps:[
+   {step:'shortcut_0',state:'completed'}, {step:'shortcut_1',state:'pending'}, {step:'shortcut_2',state:'completed'}, {step:'startup',state:'pending'}]}}} onRefresh={()=>{}} onDiagnostics={()=>{}}/>);
+  expect((html.match(/disabled=""/g)||[]).length).toBe(2);
+  expect(html).toContain('修复能力待核验');expect(html).toContain('点击重试时将核验安装器能力');
+  expect(html).not.toContain('修复能力已核验');
+ });
  it('shows recorded pending failure separately from completed steps and restart',()=>{
   const html=render({recordState:'available',installationState:'installed_incomplete',repairSupported:false,recoveryState:'clear',steps:[
    {step:'shortcut_0',state:'completed'}, {step:'shortcut_1',state:'pending',stage:'shortcut_verify',code:'shortcut_integration_failed',call:'IPersistFile.Load/GetPath/GetArguments/GetIconLocation',hresult:'0x80004005'},

@@ -1,5 +1,6 @@
 ﻿#requires -Version 5.1
-<# Dry-run by default. Does not start or stop the desktop, tray, helper or CLI. #>
+<# Dry-run by default. Apply stops the verified Pocket process group, installs,
+   restarts and authenticates the new helper. Native user work is never replayed. #>
 [CmdletBinding()]
 param(
     [switch]$CheckWebViewOnly,
@@ -315,16 +316,665 @@ function Get-PocketInstallResult($Plan,$Record) {
     Update-PocketInstallState $Record
     $Plan.state=$Record.installationState
     $Plan.coreInstalled=$true
-    $Plan.runtimeVerification='pending'
-    $Plan.exitCode=if($Plan.state -eq 'installed_incomplete'){2}else{0}
+    $Plan.runtimeVerification=Get-PocketProperty $Plan 'runtimeVerification' 'pending'
+    $Plan.exitCode=if($Plan.runtimeVerification -ne 'verified'){1}elseif($Plan.state -eq 'installed_incomplete'){2}else{0}
     $Plan.pendingIntegration=@()
     for($i=0;$i -lt 3;$i++) { if($Record.integration.shortcuts[$i].state -ne 'completed') { $Plan.pendingIntegration+=@{step=('shortcut_'+$i);details=$Record.integration.shortcuts[$i]} } }
     if ($Record.integration.startup.state -ne 'completed') { $Plan.pendingIntegration+=@{step='startup';details=$Record.integration.startup} }
     return $Plan
 }
+function Complete-PocketWindowsInstall($Plan,$Record,$Lifecycle) {
+    $result=Get-PocketInstallResult $Plan $Record
+    if ($null -ne $Lifecycle) {
+        $verified=Invoke-PocketInstallStep 'runtime_verify' 'Complete-PocketInstallLifecycle' {
+            Complete-PocketInstallLifecycle $Lifecycle $Plan.installRoot $Plan.stateDirectory $Record.generation
+        }
+        $result.processesStarted+=$verified.processesStarted
+        $result.runtimeVerification=$verified.runtimeVerification
+        $result.discoveryWarnings=@(Get-PocketProperty $verified 'discoveryWarnings' @())
+        $result.exitCode=if($verified.runtimeVerification -ne 'verified'){1}elseif($result.state -eq 'installed_incomplete'){2}else{0}
+    }
+    return $result
+}
 function Get-PocketRecordBackup($Record,[string]$Path) {
     $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record | ConvertTo-Json -Depth 30))
     return @{path=$Path;bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
+}
+
+# Process identities use the same Windows creation FILETIME, executable path and
+# current-user ownership as runtime maintenance. Termination revalidates through
+# ONE handle, so a PID reused between discovery and exit is never terminated.
+function Initialize-PocketInstallProcessApi {
+    if ('PocketInstallProcess' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+public sealed class PocketInstallIdentity {
+    public int pid; public ulong createdAt; public string executable;
+}
+public static class PocketInstallProcess {
+    [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint rights,bool inherit,int pid);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint ms);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessTimes(IntPtr h,out long created,out long exit,out long kernel,out long user);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr h,int flags,StringBuilder path,ref int count);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr h,uint code);
+    [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr h,uint access,out IntPtr token);
+    [DllImport("shell32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CommandLineToArgvW(string line,out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
+    [DllImport("iphlpapi.dll")] static extern uint GetExtendedTcpTable(IntPtr table,ref uint size,bool ordered,int family,int tableClass,uint reserved);
+    static PocketInstallIdentity Read(IntPtr h,int pid) {
+        uint presence=WaitForSingleObject(h,0);
+        if(presence==0) return null;
+        if(presence!=258) throw new Win32Exception();
+        IntPtr token;
+        if(!OpenProcessToken(h,8,out token)) throw new Win32Exception();
+        try {
+            using(var owner=new WindowsIdentity(token))
+            using(var current=WindowsIdentity.GetCurrent()) {
+                if(!owner.User.Equals(current.User)) throw new InvalidOperationException("Pocket process owner changed");
+            }
+        } finally {CloseHandle(token);}
+        long created,exit,kernel,user;
+        if(!GetProcessTimes(h,out created,out exit,out kernel,out user)) throw new Win32Exception();
+        var path=new StringBuilder(32768);int size=path.Capacity;
+        if(!QueryFullProcessImageName(h,0,path,ref size)) throw new Win32Exception();
+        if(WaitForSingleObject(h,0)!=258) throw new InvalidOperationException("Pocket process changed during capture");
+        return new PocketInstallIdentity {pid=pid,createdAt=(ulong)created,executable=path.ToString()};
+    }
+    public static PocketInstallIdentity Capture(int pid) {
+        if(pid<=0) throw new InvalidOperationException("Invalid Pocket PID");
+        IntPtr h=OpenProcess(0x1000|0x100000,false,pid);
+        if(h==IntPtr.Zero) {if(Marshal.GetLastWin32Error()==87) return null;throw new Win32Exception();}
+        try {return Read(h,pid);} finally {CloseHandle(h);}
+    }
+    public static void Stop(int pid,ulong created,string executable) {
+        IntPtr h=OpenProcess(1|0x1000|0x100000,false,pid);
+        if(h==IntPtr.Zero) {if(Marshal.GetLastWin32Error()==87) return;throw new Win32Exception();}
+        try {
+            var actual=Read(h,pid);
+            if(actual==null) return;
+            if(actual.createdAt!=created || !String.Equals(actual.executable,executable,StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Pocket process identity changed; refusing termination");
+            if(!TerminateProcess(h,0) || WaitForSingleObject(h,15000)!=0) throw new Win32Exception();
+        } finally {CloseHandle(h);}
+    }
+    public static string[] Arguments(string line) {
+        int count;IntPtr raw=CommandLineToArgvW(line,out count);
+        if(raw==IntPtr.Zero) throw new Win32Exception();
+        try {var result=new string[count];for(int i=0;i<count;i++) result[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(raw,i*IntPtr.Size));return result;}
+        finally {LocalFree(raw);}
+    }
+    public static int LoopbackListenerOwner(int port) {
+        if(port<1 || port>65535) throw new InvalidOperationException("Invalid control port");
+        uint size=0;uint error=GetExtendedTcpTable(IntPtr.Zero,ref size,false,2,3,0);
+        if(error!=122 && error!=0) throw new Win32Exception((int)error);
+        IntPtr table=Marshal.AllocHGlobal((int)size);
+        try {
+            error=GetExtendedTcpTable(table,ref size,false,2,3,0);
+            if(error!=0) throw new Win32Exception((int)error);
+            int count=Marshal.ReadInt32(table);int found=0;
+            if(count<0 || 4L+24L*count>size) throw new InvalidOperationException("Invalid control owner table");
+            for(int i=0;i<count;i++) {
+                IntPtr row=IntPtr.Add(table,4+24*i);
+                uint address=(uint)Marshal.ReadInt32(row,4);
+                uint raw=(uint)Marshal.ReadInt32(row,8);
+                int localPort=(int)(((raw & 255)<<8)|((raw>>8)&255));
+                if(Marshal.ReadInt32(row)==2 && address==0x0100007f && localPort==port) {
+                    int owner=Marshal.ReadInt32(row,20);
+                    if(found!=0 && found!=owner) throw new InvalidOperationException("Ambiguous control listener owner");
+                    found=owner;
+                }
+            }
+            if(found==0) throw new InvalidOperationException("Control listener owner unavailable");
+            return found;
+        } finally {Marshal.FreeHGlobal(table);}
+    }
+}
+'@
+}
+function Get-PocketInstallProcessIdentity([int]$ProcessId) {
+    Initialize-PocketInstallProcessApi
+    return [PocketInstallProcess]::Capture($ProcessId)
+}
+function Stop-PocketInstallProcess($Identity) {
+    Initialize-PocketInstallProcessApi
+    if ((Get-PocketFileHash $Identity.executable) -ne $Identity.sha256) { throw 'Pocket process image changed; refusing termination.' }
+    [PocketInstallProcess]::Stop($Identity.pid,$Identity.createdAt,$Identity.executable)
+}
+function Get-PocketInstallProcesses { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
+function Get-PocketInstallControlOwner([string]$StateDirectory) {
+    $endpoint=Read-PocketRepairJson (Join-Path $StateDirectory 'control.json') 4096
+    if($endpoint.protocol -ne 1){throw 'Invalid legacy control endpoint.'}
+    Initialize-PocketInstallProcessApi
+    return [PocketInstallProcess]::LoopbackListenerOwner([int]$endpoint.port)
+}
+function Get-PocketAuthenticatedInstallerAgent($Health,$Agents,[string]$StateDirectory) {
+    $runtime=Get-PocketProperty $Health 'helperRuntime' $null
+    if($null -ne $runtime) {
+        $matches=@($Agents | Where-Object {$_.pid -eq $runtime.pid -and $_.generation -eq $runtime.generation})
+    } else {
+        # Stock 0.6.3 predates runtime stamps. Associate its authenticated socket
+        # with the kernel's exact listener owner, then recheck creation identity.
+        $owner=Get-PocketInstallControlOwner $StateDirectory
+        $matches=@($Agents|Where-Object {$_.pid -eq $owner})
+    }
+    if($matches.Count -ne 1){throw 'Authenticated helper identity does not match the process group.'}
+    $identity=$matches[0];$actual=Get-PocketInstallProcessIdentity $identity.pid
+    if($null -eq $actual -or $actual.createdAt -ne $identity.createdAt -or $actual.executable -ne $identity.executable){throw 'Authenticated helper creation identity changed.'}
+    if($null -ne $runtime) {
+        $claimed=Get-PocketProperty $runtime 'processIdentity' $null
+        if($null -ne $claimed -and ($claimed.pid -ne $identity.pid -or $claimed.createdAt -ne $identity.createdAt)){throw 'Authenticated helper creation identity changed.'}
+    }
+    return $identity
+}
+function Get-PocketInstallArguments([string]$CommandLine) {
+    if (-not $CommandLine) { throw 'Pocket command line unavailable.' }
+    Initialize-PocketInstallProcessApi
+    return ,([PocketInstallProcess]::Arguments($CommandLine))
+}
+function Get-PocketInstallShadowLauncherPath([string]$InstallRoot) {
+    # Only the current user's registered official Codex package is eligible.
+    # A physical cached executable is different from accepting a redirected
+    # state directory: its owner and exact installed bytes are checked below.
+    $local=Get-PocketLocalAppData
+    if ($InstallRoot -ne (Join-Path $local 'CodexPocket')) { return $null }
+    $package=Get-PocketDesktopPackage
+    if ($package.PackageFamilyName -cne 'OpenAI.Codex_2p2nqsd0c76g0') { return $null }
+    return Join-Path $local 'Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\CodexPocket\pocket-launcher.exe'
+}
+function Get-PocketInstallShadowLauncher([string]$InstallRoot,$Record) {
+    $path=Get-PocketInstallShadowLauncherPath $InstallRoot
+    if (-not $path -or -not [IO.File]::Exists($path)) { return $null }
+    Assert-PocketUnredirectedPath $path
+    if ($null -eq $Record -or $Record.installRoot -ne $InstallRoot -or $Record.bridge -ne (Join-Path $InstallRoot 'pocket-launcher.exe')) { throw 'MSIX launcher shadow identity is unverified.' }
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ((Get-Acl -LiteralPath $path).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid) { throw 'MSIX launcher shadow owner is unverified.' }
+    $hash=Get-PocketFileHash $path
+    if ($hash -cne $Record.launcherHash) { throw 'MSIX launcher shadow integrity differs from the installed launcher.' }
+    return @{path=$path;sha256=$hash;state='captured'}
+}
+function Archive-PocketInstallShadowLauncher($Lifecycle,[string]$LifecyclePath) {
+    $alias=Get-PocketProperty $Lifecycle 'shadowLauncher' $null
+    if ($null -eq $alias) { return }
+    $expected=Get-PocketInstallShadowLauncherPath $Lifecycle.installRoot
+    if (-not $expected -or $alias.path -ne $expected -or $alias.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'MSIX launcher shadow archive identity changed.' }
+    Assert-PocketUnredirectedPath $alias.path
+    foreach($row in @(Get-PocketInstallProcesses)) {
+        if ($row.ExecutablePath -notin @($alias.path,(Join-Path $Lifecycle.installRoot 'pocket-launcher.exe'))) { continue }
+        $owner=Get-PocketInstallProcessIdentity ([int]$row.ProcessId)
+        if ($null -ne $owner -and $owner.executable -eq $alias.path) { throw 'MSIX launcher shadow is still running.' }
+    }
+    $directory=Join-Path $Lifecycle.installRoot 'recovery'
+    $archive=Join-Path $directory ('msix-launcher-'+$alias.sha256+'.exe')
+    Assert-PocketUnredirectedPath $archive
+    if ((Get-PocketProperty $alias 'archive' $archive) -ne $archive) { throw 'MSIX launcher shadow archive path changed.' }
+    $sourceHash=Get-PocketFileHash $alias.path
+    $archiveHash=Get-PocketFileHash $archive
+    if (($null -ne $sourceHash -and $sourceHash -cne $alias.sha256) -or ($null -ne $archiveHash -and $archiveHash -cne $alias.sha256)) { throw 'MSIX launcher shadow or archive changed.' }
+    if ($null -eq $sourceHash -and $null -eq $archiveHash) { throw 'MSIX launcher shadow recovery evidence is missing.' }
+    Set-PocketProperty $alias 'archive' $archive
+    Set-PocketProperty $alias 'state' 'archive_pending'
+    Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+    [void][IO.Directory]::CreateDirectory($directory)
+    if ($null -eq $archiveHash) {[IO.File]::Copy($alias.path,$archive,$false)}
+    # A previous attempt may have copied successfully and failed to flush.
+    # Revalidate durability on every attempt before removing the source.
+    Sync-PocketRepairFile $archive
+    if ((Get-PocketFileHash $archive) -cne $alias.sha256) { throw 'MSIX launcher shadow archive integrity failed.' }
+    # Keep the old bytes, then remove only the verified executable overlay.
+    # All cached state/history stays intact. Windows can now resolve the
+    # canonical launcher after the new generation is published.
+    if ($null -ne $sourceHash) {
+        if ((Get-PocketFileHash $alias.path) -cne $alias.sha256) { throw 'MSIX launcher shadow changed during archival.' }
+        [IO.File]::Delete($alias.path)
+    }
+    $alias.state='archived';Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+}
+function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
+    $prefix=(Join-Path $InstallRoot 'bin')+'\'
+    $rows=@(Get-PocketInstallProcesses)
+    $group=@();$verified=@{}
+    $shadowPath=Get-PocketInstallShadowLauncherPath $InstallRoot
+    foreach($row in $rows) {
+        $path=[string]$row.ExecutablePath
+        if ($path -eq (Join-Path $InstallRoot 'pocket-launcher.exe') -or ($shadowPath -and $path -eq $shadowPath)) {
+            $record=Read-PocketRepairJson (Join-Path $InstallRoot 'desktop-install.json')
+            if ($record.installRoot -ne $InstallRoot -or $record.stateDirectory -ne $StateDirectory -or $record.bridge -ne (Join-Path $InstallRoot 'pocket-launcher.exe') -or (Get-PocketFileHash $record.bridge) -ne $record.launcherHash) { throw 'Stable launcher ownership unverified.' }
+            $identity=Get-PocketInstallProcessIdentity ([int]$row.ProcessId)
+            if ($null -ne $identity) {
+                if ($identity.executable -ne $record.bridge) {
+                    if (-not $shadowPath -or $identity.executable -ne $shadowPath) { throw 'Stable launcher identity changed.' }
+                    $alias=Get-PocketInstallShadowLauncher $InstallRoot $record
+                    if ($null -eq $alias) { throw 'MSIX launcher shadow identity changed.' }
+                }
+                $group+=@{pid=$identity.pid;createdAt=$identity.createdAt;executable=$identity.executable;sha256=$record.launcherHash;generation=$record.generation;name='pocket-launcher.exe';parentPid=[int]$row.ParentProcessId}
+            }
+            continue
+        }
+        if (-not $path -or -not $path.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) { continue }
+        $relative=$path.Substring($prefix.Length)
+        if ($relative -notmatch '^([a-f0-9]{64})\\(pocket-(supervisor|agent|desktop|bridge|runtime-host|upgrade)\.exe|cloudflared\.exe)$') { continue }
+        $generation=$Matches[1];$name=[IO.Path]::GetFileName($path)
+        $bin=Join-Path $InstallRoot ('bin\'+$generation)
+        if (-not $verified.ContainsKey($generation)) {
+            $inventory=Test-PocketWindowsDirectory $bin
+            if ((Get-PocketFileHash (Join-Path $bin 'windows-manifest.json')) -ne $generation) { throw 'Running Pocket generation inventory changed.' }
+            $verified[$generation]=$inventory
+        }
+        $entry=@($verified[$generation].files | Where-Object {$_.path -eq $name})
+        if ($entry.Count -ne 1 -or (Get-PocketFileHash $path) -ne $entry[0].sha256) { throw 'Running Pocket executable failed inventory verification.' }
+        $identity=Get-PocketInstallProcessIdentity ([int]$row.ProcessId)
+        if ($null -eq $identity) { continue }
+        if ($identity.executable -ne $path) { throw 'Pocket process image changed during inventory.' }
+        $args=Get-PocketInstallArguments $row.CommandLine
+        if ($name -in @('pocket-supervisor.exe','pocket-agent.exe','pocket-runtime-host.exe','pocket-upgrade.exe')) {
+            $indices=@(for($i=0;$i -lt $args.Count;$i++){if($args[$i] -eq '--state'){$i}})
+            if ($indices.Count -ne 1 -or $indices[0]+1 -ge $args.Count) { throw 'Pocket process state directory differs from this installation.' }
+            $processState=Get-PocketDirectoryPath $args[$indices[0]+1]
+            $stateMatches=$processState -eq $StateDirectory
+            if ($name -eq 'pocket-runtime-host.exe') { $stateMatches=$stateMatches -or $processState.StartsWith($StateDirectory+'\',[StringComparison]::OrdinalIgnoreCase) }
+            if (-not $stateMatches) { throw 'Pocket process state directory differs from this installation.' }
+        }
+        $nativeBinary=$null
+        if($name -in @('pocket-bridge.exe','pocket-runtime-host.exe')) {
+            $option=if($name -eq 'pocket-bridge.exe'){'--original'}else{'--binary'}
+            $index=@(for($i=0;$i -lt $args.Count-1;$i++){if($args[$i] -eq $option){$i}})
+            if($index.Count -eq 1){$nativeBinary=Get-PocketFullPath $args[$index[0]+1];Assert-PocketUnredirectedPath $nativeBinary}
+        }
+        $group+=@{pid=$identity.pid;createdAt=$identity.createdAt;executable=$identity.executable;sha256=$entry[0].sha256;generation=$generation;name=$name;parentPid=[int]$row.ParentProcessId;nativeBinary=$nativeBinary;hostState=$(if($name -eq 'pocket-runtime-host.exe'){$processState}else{$null})}
+    }
+    # cloudflared is owned only through a verified Pocket parent. Never select a
+    # system/global tunnel by name. External native Codex work is not in this set.
+    foreach($item in @($group | Where-Object {$_.name -eq 'cloudflared.exe'})) {
+        $parents=@($group | Where-Object {$_.pid -eq $item.parentPid -and $_.name -in @('pocket-supervisor.exe','pocket-agent.exe','pocket-runtime-host.exe') -and $_.createdAt -lt $item.createdAt})
+        if ($parents.Count -ne 1) { $group=@($group | Where-Object {$_.pid -ne $item.pid}) }
+    }
+    $package=Get-PocketDesktopPackage
+    $desktopPaths=@((Join-Path $package.InstallLocation 'app\Codex.exe'),(Join-Path $package.InstallLocation 'app\ChatGPT.exe'))
+    foreach($seed in @($group | Where-Object {$_.name -in @('pocket-bridge.exe','pocket-launcher.exe')})) {
+        $parent=$seed.parentPid;$childCreated=$seed.createdAt;$seen=@{}
+        for($depth=0;$depth -lt 12 -and $parent -gt 0 -and -not $seen.ContainsKey($parent);$depth++) {
+            $seen[$parent]=$true;$ancestors=@($rows | Where-Object {$_.ProcessId -eq $parent})
+            if($ancestors.Count -ne 1){break};$row=$ancestors[0]
+            try {$ancestor=Get-PocketInstallProcessIdentity $parent}
+            catch {
+                # A task-launched supervisor has a SYSTEM service ancestor.
+                # It is outside this installation's current-user process tree.
+                # Failure to identify a potential Codex desktop is still fatal.
+                if ($row.ExecutablePath -in $desktopPaths -or $row.Name -in @('Codex.exe','ChatGPT.exe')) { throw }
+                break
+            }
+            if($null -eq $ancestor -or $ancestor.createdAt -ge $childCreated){break}
+            if($ancestor.executable -in $desktopPaths) {
+                if(@($group | Where-Object {$_.pid -eq $parent}).Count -eq 0) {
+                    Assert-PocketUnredirectedPath $ancestor.executable
+                    $group+=@{pid=$parent;createdAt=$ancestor.createdAt;executable=$ancestor.executable;sha256=(Get-PocketFileHash $ancestor.executable);generation=$null;name='associated-desktop';parentPid=[int]$row.ParentProcessId}
+                }
+                break
+            }
+            $childCreated=$ancestor.createdAt;$parent=[int]$row.ParentProcessId
+        }
+    }
+    foreach($parent in @($group | Where-Object {$_.name -in @('pocket-bridge.exe','pocket-runtime-host.exe')})) {
+        foreach($row in @($rows | Where-Object {$_.ParentProcessId -eq $parent.pid})) {
+            if(@($group | Where-Object {$_.pid -eq $row.ProcessId}).Count -gt 0){continue}
+            $expected=Get-PocketProperty $parent 'nativeBinary' $null
+            if(-not $expected){$expected=Join-Path $package.InstallLocation 'app\resources\codex.exe'}
+            if($row.ExecutablePath -ne $expected){continue}
+            $native=Get-PocketInstallProcessIdentity ([int]$row.ProcessId)
+            if($null -eq $native){continue}
+            if($native.executable -ne $expected -or $native.createdAt -le $parent.createdAt){throw 'Associated native process identity unverified.'}
+            Assert-PocketUnredirectedPath $expected
+            $group+=@{pid=$native.pid;createdAt=$native.createdAt;executable=$native.executable;sha256=(Get-PocketFileHash $expected);generation=$null;name='associated-native';parentPid=$parent.pid}
+        }
+    }
+    # Killing an ancestor of this installer can cut off installation mid-write.
+    # Setup is a separate process; a CLI invoked from Codex must be detached first.
+    $selfRows=@($rows|Where-Object {$_.ProcessId -eq $PID})
+    if($selfRows.Count -eq 1) {
+        $parent=[int]$selfRows[0].ParentProcessId;$seen=@{}
+        while($parent -gt 0 -and -not $seen.ContainsKey($parent)) {
+            if(@($group|Where-Object {$_.pid -eq $parent}).Count -gt 0){throw 'detached_installer_required: updater is running under a process it must restart.'}
+            $seen[$parent]=$true;$parents=@($rows|Where-Object {$_.ProcessId -eq $parent})
+            if($parents.Count -ne 1){break};$parent=[int]$parents[0].ParentProcessId
+        }
+    }
+    return ,$group
+}
+function Assert-PocketInstallLocksFree([string]$InstallRoot,[string]$StateDirectory,$Group=@()) {
+    $locks=@();$locked=@()
+    try {
+        $paths=@((Join-Path $InstallRoot 'control\supervisor.lock'),(Join-Path $StateDirectory 'desktop\supervisor.lock'),(Join-Path $StateDirectory 'agent.lock'),(Join-Path $InstallRoot 'control\upgrade.lock'),(Join-Path $StateDirectory 'desktop\upgrade.lock'),(Join-Path $StateDirectory 'desktop\maintenance.lock'))
+        foreach($item in @($Group|Where-Object {$_.name -eq 'pocket-runtime-host.exe'})) {
+            $directory=Get-PocketProperty $item 'hostState' $null
+            if($directory){$paths+=@((Join-Path $directory 'host.lock'),(Join-Path $directory 'ensure.lock'))}
+        }
+        foreach($path in $paths) {
+            Assert-PocketUnredirectedPath $path
+            if (-not [IO.File]::Exists($path)) { continue }
+            $file=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)
+            $locks+=@($file)
+            try {$file.Lock(0,[long]::MaxValue);$locked+=@($file)} catch {throw 'Pocket owner lock is still held; refusing installation.'}
+        }
+    } finally {foreach($file in $locked){$file.Unlock(0,[long]::MaxValue)};foreach($file in $locks){$file.Dispose()}}
+}
+function Invoke-PocketInstallControl([string]$StateDirectory,[string]$Method,$Params=@{}) {
+    # Only authenticated status and exact cancellation. No CLI fallback, model
+    # requests, command replay, native thread/turn methods or handoff release.
+    if ($Method -notin @('status','routes/read','upgrade/cancel')) { throw 'Unsupported installer control method.' }
+    $path=Join-Path $StateDirectory 'control.json'
+    Assert-PocketUnredirectedPath $path
+    $endpoint=Read-PocketRepairJson $path 4096
+    $acl=Get-Acl -LiteralPath $path
+    $descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0)
+    if($null -eq $descriptor.DiscretionaryAcl){throw 'Local control endpoint has an unprotected null DACL.'}
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($acl.Owner -ne $sid -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid) { throw 'Local control endpoint owner unverified.' }
+    foreach($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($sid,'S-1-5-18')) { throw 'Local control endpoint grants another principal access.' }
+    }
+    if ($endpoint.protocol -ne 1 -or $endpoint.port -lt 1 -or $endpoint.port -gt 65535 -or $endpoint.token -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid local control endpoint.' }
+    $client=[Net.Sockets.TcpClient]::new()
+    try {
+        $pending=$client.BeginConnect('127.0.0.1',[int]$endpoint.port,$null,$null)
+        try {if(-not $pending.AsyncWaitHandle.WaitOne(1000)){throw 'Local control connection timed out.'};$client.EndConnect($pending)} finally {$pending.AsyncWaitHandle.Close()}
+        $stream=$client.GetStream();$stream.ReadTimeout=5000;$stream.WriteTimeout=5000
+        $bytes=[Text.Encoding]::UTF8.GetBytes((@{token=$endpoint.token;method=$Method;params=$Params} | ConvertTo-Json -Depth 12 -Compress))
+        $header=[BitConverter]::GetBytes([uint32]$bytes.Length);[Array]::Reverse($header)
+        $stream.Write($header,0,4);$stream.Write($bytes,0,$bytes.Length);$stream.Flush()
+        $size=[byte[]]::new(4);$offset=0
+        while($offset -lt 4){$n=$stream.Read($size,$offset,4-$offset);if($n -eq 0){throw 'Local control disconnected.'};$offset+=$n}
+        [Array]::Reverse($size);$length=[BitConverter]::ToUInt32($size,0)
+        if($length -eq 0 -or $length -gt 1MB){throw 'Invalid local control frame.'}
+        $body=[byte[]]::new($length);$offset=0
+        while($offset -lt $length){$n=$stream.Read($body,$offset,$length-$offset);if($n -eq 0){throw 'Local control disconnected.'};$offset+=$n}
+        $reply=[Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json
+        if (@($reply.PSObject.Properties).Count -ne 1 -or -not $reply.PSObject.Properties['result']) { throw 'Authenticated local control request failed (details omitted).' }
+        return $reply.result
+    } finally {$client.Dispose()}
+}
+function Cancel-PocketInstallerHandoff([string]$StateDirectory,$Health,$Group,$Lifecycle,[string]$LifecyclePath) {
+    $Lifecycle.cancellations=@()
+    $path=Join-Path $StateDirectory 'handoff\state.json'
+    if ([IO.File]::Exists($path)) {
+        $handoff=Read-PocketRepairJson $path
+        foreach($op in $handoff.operations.PSObject.Properties) {
+            $receipt=$op.Value.receipt
+            if ($receipt.generation -ne $handoff.generation -or $receipt.phase -eq 'cancelled') { continue }
+            if ($receipt.phase -in @('released','release_pending')) {
+                # A release cannot be cancelled. Require exact recorded owner
+                # exit proof; never infer it from a missing/overwritten heartbeat.
+                throw 'handoff_release_exit_unresolved: released operation requires verified owner exit recovery.'
+            }
+            if ($receipt.phase -notin @('draining','ready','failed')) { throw 'Invalid retained handoff phase.' }
+            $caps=Get-PocketProperty $Health 'handoffCapabilities' $null
+            if ($null -eq $caps -or $caps.generation -ne $handoff.generation -or $caps.supported -ne $true -or $op.Name -ne $receipt.id) { throw 'Handoff cancellation run or operation unverified.' }
+            $Lifecycle.phase='cancelling';$Lifecycle.cancelIntent=@{id=$receipt.id;fromGeneration=$receipt.generation}
+            Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+            $reply=Invoke-PocketInstallControl $StateDirectory 'upgrade/cancel' @{id=$receipt.id;fromGeneration=$receipt.generation;checkpoint=$receipt.checkpoint}
+            if ($reply.protocol -ne 1 -or $reply.id -ne $receipt.id -or $reply.generation -ne $receipt.generation -or $reply.phase -ne 'cancelled' -or $reply.acceptingWrites -ne $true) { throw 'Authenticated handoff cancellation not confirmed.' }
+            $persisted=Read-PocketRepairJson $path
+            if ($persisted.generation -ne $receipt.generation -or $persisted.operations.($receipt.id).receipt.phase -ne 'cancelled') { throw 'Durable handoff cancellation not confirmed.' }
+            $Lifecycle.cancellations+=@(@{id=$reply.id;generation=$reply.generation;phase='cancelled';unconfirmedWrites=$reply.unconfirmedWrites})
+            Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+        }
+    }
+    if ($null -ne $Health) {
+        $after=Invoke-PocketInstallControl $StateDirectory 'status'
+        $beforeAgent=Get-PocketAuthenticatedInstallerAgent $Health @($Group|Where-Object {$_.name -eq 'pocket-agent.exe'}) $StateDirectory
+        $afterAgent=Get-PocketAuthenticatedInstallerAgent $after @($Group|Where-Object {$_.name -eq 'pocket-agent.exe'}) $StateDirectory
+        if ($beforeAgent.pid -ne $afterAgent.pid -or (Get-PocketProperty $after 'acceptingWrites' $true) -ne $true) { throw 'Helper identity or write gate changed after cancellation.' }
+    }
+}
+function Archive-PocketInstallerRecovery($Lifecycle,[string]$LifecyclePath) {
+    # This explicitly supersedes the old operation with a user-authorized FULL
+    # process restart. It never marks that upgrade succeeded or invents a final
+    # checkpoint/native-task-preservation result. Cancelled receipts stay in place.
+    $Lifecycle.supersession=@{reason='user_authorized_full_restart';nativeTasksPreserved=$false;ownersExited=$true;locksReleased=$true;archives=@()}
+    $recovery=Join-Path $Lifecycle.stateDirectory ('desktop\recovery\installer-'+$Lifecycle.operationId)
+    Assert-PocketUnredirectedPath $recovery
+    $created=$false
+    foreach($name in @('upgrade.json','upgrade-local.json','maintenance.json','maintenance-request.json')) {
+        $source=Join-Path $Lifecycle.stateDirectory ('desktop\'+$name)
+        Assert-PocketUnredirectedPath $source
+        if (-not [IO.File]::Exists($source)) { continue }
+        $value=Read-PocketRepairJson $source
+        if ($name -eq 'upgrade.json' -and ($value.installRoot -ne $Lifecycle.installRoot -or $value.stateDirectory -ne $Lifecycle.stateDirectory)) { throw 'Upgrade supersession belongs to another installation.' }
+        Assert-PocketJournalOwnersExited $value
+        if (-not $created) {
+            [void][IO.Directory]::CreateDirectory($recovery)
+            $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+            $acl=[Security.AccessControl.DirectorySecurity]::new();$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+            Set-Acl -LiteralPath $recovery -AclObject $acl
+            $created=$true
+        }
+        $hash=Get-PocketFileHash $source;$archive=Join-Path $recovery ($name+'.'+$hash+'.json')
+        $evidence=@{source=$source;archive=$archive;sha256=$hash;originalPhase=(Get-PocketProperty $value 'phase' $null);state='archive_pending'}
+        $Lifecycle.supersession.archives+=@($evidence)
+        Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+        [IO.File]::Copy($source,$archive,$false);Sync-PocketRepairFile $archive
+        if ((Get-PocketFileHash $archive) -ne $hash -or (Get-PocketFileHash $source) -ne $hash) { throw 'Recovery journal changed during supersession.' }
+        $evidence.state='archived';Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+        # Evidence is durable before removal from the ACTIVE journal location.
+        # A crash here retains both copies; retry must recover the recorded intent.
+        [IO.File]::Delete($source)
+        $evidence.state='superseded';Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+    }
+    Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
+}
+function Assert-PocketJournalOwnersExited($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return }
+    $processId=Get-PocketProperty $Value 'pid' $null
+    $created=Get-PocketProperty $Value 'createdAt' $null
+    $exe=Get-PocketProperty $Value 'executable' $null
+    if ($null -ne $processId -and $null -ne $created -and $null -ne $exe) {
+        $actual=Get-PocketInstallProcessIdentity $processId
+        if ($null -ne $actual -and $actual.createdAt -eq $created -and $actual.executable -eq $exe) { throw 'Journal owner exit unverified; supersession refused.' }
+        return
+    }
+    if ($Value -is [Collections.IDictionary]) {foreach($key in $Value.Keys){Assert-PocketJournalOwnersExited $Value[$key]}}
+    elseif ($Value -is [Collections.IEnumerable]) {foreach($item in $Value){Assert-PocketJournalOwnersExited $item}}
+    else {foreach($property in $Value.PSObject.Properties){Assert-PocketJournalOwnersExited $property.Value}}
+}
+function Assert-PocketLifecycleArchives($Prior) {
+    $supersession=Get-PocketProperty $Prior 'supersession' $null
+    foreach($entry in @(Get-PocketProperty $supersession 'archives' @())) {
+        $prefix=Join-Path $Prior.stateDirectory ('desktop\recovery\installer-'+$Prior.operationId+'\')
+        if ($entry.sha256 -cnotmatch '^[a-f0-9]{64}$' -or -not $entry.archive.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -or
+            $entry.source -notin @('upgrade.json','upgrade-local.json','maintenance.json','maintenance-request.json'|ForEach-Object{Join-Path $Prior.stateDirectory ('desktop\'+$_)})) { throw 'Interrupted lifecycle archive is outside the recorded scope.' }
+        Assert-PocketUnredirectedPath $entry.archive;Assert-PocketUnredirectedPath $entry.source
+        $archiveHash=Get-PocketFileHash $entry.archive;$sourceHash=Get-PocketFileHash $entry.source
+        if ($null -ne $archiveHash -and $archiveHash -ne $entry.sha256) { throw 'Interrupted lifecycle archive integrity failed.' }
+        if ($null -ne $sourceHash -and $sourceHash -ne $entry.sha256) { throw 'Active recovery journal changed since interrupted supersession.' }
+        if ($null -eq $archiveHash -and $null -eq $sourceHash) { throw 'Interrupted lifecycle lost its recovery evidence.' }
+    }
+}
+function Enter-PocketInstallLifecycle([string]$InstallRoot,[string]$StateDirectory,$Saved) {
+    $group=Get-PocketInstallGroup $InstallRoot $StateDirectory
+    $agents=@($group | Where-Object {$_.name -eq 'pocket-agent.exe'})
+    $health=$null
+    if ($agents.Count -gt 0) {
+        $health=Invoke-PocketInstallControl $StateDirectory 'status'
+        $config=Read-PocketRepairJson (Join-Path $StateDirectory 'config.json')
+        if ($health.protocol -ne 1 -or $health.computerId -ne $config.computerId) { throw 'Authenticated helper identity does not match the process group.' }
+        Get-PocketAuthenticatedInstallerAgent $health $agents $StateDirectory | Out-Null
+    }
+    $lifecycle=@{schema=1;operationId=[guid]::NewGuid().ToString();installRoot=$InstallRoot;stateDirectory=$StateDirectory;phase='captured';mode='full_process_restart';nativeTasksPreserved=$false;processes=$group;processesStopped=0;processesStarted=0;restartDesktop=(@($group|Where-Object {$_.name -in @('associated-desktop','pocket-bridge.exe')}).Count -gt 0);restartUi=(@($group|Where-Object {$_.name -eq 'pocket-desktop.exe'}).Count -gt 0)}
+    $lifecycle.shadowLauncher=Get-PocketInstallShadowLauncher $InstallRoot $Saved
+    $path=Join-Path $InstallRoot 'installer-lifecycle.json'
+    Assert-PocketUnredirectedPath $path
+    if ([IO.File]::Exists($path)) {
+        $prior=Read-PocketRepairJson $path
+        if ($prior.schema -ne 1 -or $prior.installRoot -ne $InstallRoot -or $prior.stateDirectory -ne $StateDirectory -or $prior.operationId -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$') { throw 'Invalid retained installer lifecycle.' }
+        if ($prior.phase -notin @('captured','cancelling','stopping','stopped','starting','verifying','verification_failed','install_failed','verified')) { throw 'Invalid retained lifecycle phase.' }
+        Assert-PocketLifecycleArchives $prior
+        $priorAlias=Get-PocketProperty $prior 'shadowLauncher' $null
+        if ($null -ne $priorAlias) {
+            $expectedAlias=Get-PocketInstallShadowLauncherPath $InstallRoot
+            if (-not $expectedAlias -or $priorAlias.path -ne $expectedAlias -or $priorAlias.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Retained MSIX launcher shadow identity changed.' }
+            $aliasArchive=Get-PocketProperty $priorAlias 'archive' $null
+            if ($null -ne $aliasArchive) {
+                if ($aliasArchive -ne (Join-Path $InstallRoot ('recovery\msix-launcher-'+$priorAlias.sha256+'.exe'))) { throw 'Retained MSIX launcher shadow archive path changed.' }
+                Assert-PocketUnredirectedPath $aliasArchive
+                $archiveHash=Get-PocketFileHash $aliasArchive
+                if ($null -ne $archiveHash -and $archiveHash -cne $priorAlias.sha256) { throw 'Retained MSIX launcher shadow archive integrity failed.' }
+                if ($null -eq $archiveHash -and -not [IO.File]::Exists($priorAlias.path)) { throw 'Retained MSIX launcher shadow evidence is missing.' }
+                if ($null -eq $lifecycle.shadowLauncher -and $priorAlias.state -eq 'archive_pending') { $lifecycle.shadowLauncher=$priorAlias }
+            }
+        }
+        foreach($identity in @(Get-PocketProperty $prior 'processes' @())) {
+            if ($identity.name -notin @('associated-desktop','associated-native','pocket-launcher.exe','pocket-upgrade.exe','pocket-supervisor.exe','pocket-agent.exe','pocket-desktop.exe','pocket-runtime-host.exe','pocket-bridge.exe','cloudflared.exe') -or $identity.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid captured lifecycle process identity.' }
+            $actual=Get-PocketInstallProcessIdentity $identity.pid
+            if ($null -eq $actual -or $actual.createdAt -ne $identity.createdAt -or $actual.executable -ne $identity.executable) { continue } # exact predecessor exited/PID reused
+            Assert-PocketUnredirectedPath $identity.executable
+            if ((Get-PocketFileHash $identity.executable) -ne $identity.sha256) { throw 'Captured predecessor executable changed.' }
+            if (@($group|Where-Object {$_.pid -eq $identity.pid}).Count -eq 0) { $group+=@($identity) } # proven orphan from interrupted stop
+        }
+        $lifecycle.processes=$group
+        $lifecycle.restartDesktop=$lifecycle.restartDesktop -or (Get-PocketProperty $prior 'restartDesktop' $false)
+        $lifecycle.restartUi=@($group|Where-Object {$_.name -eq 'pocket-desktop.exe'}).Count -gt 0
+        if ($prior.phase -ne 'verified') {
+            # Retry must restore an already-stopped UI, including journals from
+            # older installers that recorded identities without a restartUi flag.
+            $lifecycle.restartUi=$lifecycle.restartUi -or (Get-PocketProperty $prior 'restartUi' $false) -or
+                (@((Get-PocketProperty $prior 'processes' @())|Where-Object {$_.name -eq 'pocket-desktop.exe'}).Count -gt 0)
+        }
+        $archive=$path+'.'+$prior.operationId+'.'+(Get-PocketFileHash $path)+'.json'
+        Assert-PocketUnredirectedPath $archive
+        $hash=Get-PocketFileHash $path
+        if ([IO.File]::Exists($archive)) {if((Get-PocketFileHash $archive) -ne $hash){throw 'Lifecycle archive integrity failed.'}}
+        else {[IO.File]::Copy($path,$archive,$false);Sync-PocketRepairFile $archive}
+        $lifecycle.recoveredFrom=@{operationId=$prior.operationId;phase=$prior.phase;sha256=$hash;archive=$archive}
+    }
+    Write-PocketRepairDurableJson $path $lifecycle
+    Cancel-PocketInstallerHandoff $StateDirectory $health $group $lifecycle $path
+    $lifecycle.phase='stopping';Write-PocketRepairDurableJson $path $lifecycle
+    # This restart may abort related native tasks. Durable unknown outcomes are
+    # retained and never replayed. Only captured identities are terminated.
+    foreach($name in @('associated-desktop','pocket-launcher.exe','pocket-upgrade.exe','pocket-supervisor.exe','pocket-desktop.exe','pocket-agent.exe','pocket-runtime-host.exe','pocket-bridge.exe','associated-native','cloudflared.exe')) {
+        foreach($identity in @($group | Where-Object {$_.name -eq $name})) {
+            Stop-PocketInstallProcess $identity
+            $lifecycle.processesStopped++
+            Write-PocketRepairDurableJson $path $lifecycle
+        }
+    }
+    if ((Get-PocketInstallGroup $InstallRoot $StateDirectory).Count -ne 0) { throw 'Pocket process group respawned; refusing installation.' }
+    foreach($identity in $group) {
+        $actual=Get-PocketInstallProcessIdentity $identity.pid
+        if ($null -ne $actual -and $actual.createdAt -eq $identity.createdAt -and $actual.executable -eq $identity.executable) { throw 'Captured old process is still alive.' }
+    }
+    Assert-PocketInstallLocksFree $InstallRoot $StateDirectory $group
+    Archive-PocketInstallShadowLauncher $lifecycle $path
+    Archive-PocketInstallerRecovery $lifecycle $path
+    $lifecycle.phase='stopped';Write-PocketRepairDurableJson $path $lifecycle
+    return $lifecycle
+}
+function Start-PocketInstalledSupervisor([string]$InstallRoot) {
+    $info=[Diagnostics.ProcessStartInfo]::new()
+    $info.FileName=Join-Path $InstallRoot 'pocket-launcher.exe';$info.Arguments='--pocket-supervise'
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$InstallRoot
+    $child=[Diagnostics.Process]::Start($info)
+    $child.Dispose()
+}
+function Start-PocketInstalledDesktop([string]$InstallRoot) {
+    $info=[Diagnostics.ProcessStartInfo]::new()
+    $info.FileName=Join-Path $InstallRoot 'pocket-launcher.exe';$info.Arguments='--pocket-desktop'
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$InstallRoot
+    $child=[Diagnostics.Process]::Start($info);$child.Dispose()
+}
+function Start-PocketInstalledUi([string]$InstallRoot) {
+    # Setup's finish page uses the same mode; the UI single-instance handler
+    # focuses this restored instance if the user opens it again there.
+    $info=[Diagnostics.ProcessStartInfo]::new()
+    $info.FileName=Join-Path $InstallRoot 'pocket-launcher.exe';$info.Arguments='--pocket-ui'
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$InstallRoot
+    $child=[Diagnostics.Process]::Start($info);$child.Dispose()
+}
+function Test-PocketInstalledRuntime([string]$InstallRoot,[string]$StateDirectory,[string]$Generation,[bool]$RequireDesktop=$false,[bool]$RequireUi=$false,$Diagnostics=$null) {
+    $group=Get-PocketInstallGroup $InstallRoot $StateDirectory
+    $supervisors=@($group | Where-Object {$_.name -eq 'pocket-supervisor.exe'})
+    $agents=@($group | Where-Object {$_.name -eq 'pocket-agent.exe'})
+    if ($supervisors.Count -ne 1 -or $agents.Count -ne 1 -or @($group | Where-Object {$null -ne $_.generation -and $_.generation -ne $Generation}).Count -ne 0) { throw 'Installed process generation not verified.' }
+    if ($RequireUi -and @($group|Where-Object {$_.name -eq 'pocket-desktop.exe' -and $_.generation -eq $Generation}).Count -ne 1) { throw 'Pocket UI restart not verified.' }
+    $supervisor=$supervisors[0];$agent=$agents[0]
+    if ($agent.parentPid -ne $supervisor.pid -or $agent.createdAt -le $supervisor.createdAt) { throw 'Installed helper parent identity unverified.' }
+    $status=Read-PocketRepairJson (Join-Path $StateDirectory 'desktop\supervisor.json')
+    if ($status.pid -ne $supervisor.pid -or $status.childPid -ne $agent.pid -or $status.runtime.processCreatedAt -ne $supervisor.createdAt -or $status.runtime.generation -ne $Generation -or $status.runtime.executableSha256 -ne $supervisor.sha256) { throw 'Supervisor heartbeat identity unverified.' }
+    $health=Invoke-PocketInstallControl $StateDirectory 'status'
+    $config=Read-PocketRepairJson (Join-Path $StateDirectory 'config.json')
+    if ($health.protocol -ne 1 -or $health.computerId -ne $config.computerId -or $health.remoteControlProtocol -ne 1 -or $health.acceptingWrites -ne $true -or $health.helperRuntime.pid -ne $agent.pid -or $health.helperRuntime.generation -ne $Generation -or $health.helperRuntime.processIdentity.createdAt -ne $agent.createdAt -or $health.helperRuntime.executableSha256 -ne $agent.sha256) { throw 'Authenticated new helper identity or admission unverified.' }
+    # Discovery errors aggregate optional roots and stale descriptors. Keep their
+    # diagnostic codes while proving the required bridge independently below.
+    $warnings=@(foreach($warning in @(Get-PocketProperty $health 'discoveryErrors' @())) {
+        $source=[string](Get-PocketProperty $warning 'source' 'unknown');$code=[string](Get-PocketProperty $warning 'code' 'unknown')
+        @{source=$(if($source -cmatch '^[a-z0-9_-]{1,64}$'){$source}else{'unknown'});code=$(if($code -cmatch '^[a-z0-9_-]{1,64}$'){$code}else{'unknown'})}
+    })
+    if ($null -ne $Diagnostics) { Set-PocketProperty $Diagnostics 'discoveryWarnings' $warnings }
+    $routes=Invoke-PocketInstallControl $StateDirectory 'routes/read'
+    if ($null -eq $routes.routePreferences) { throw 'Authenticated routes read failed.' }
+    # A healthy broker can still have failed to restore its saved assistant.
+    # Preserve unknown work, but do not report complete restart without attachment.
+    $assistantError=Get-PocketProperty $health 'assistantRestoreError' $null
+    $assistantProfile=Join-Path $StateDirectory 'assistant\profile.json'
+    Assert-PocketUnredirectedPath $assistantProfile
+    if ([IO.File]::Exists($assistantProfile)) {
+        if ($null -ne $assistantError) { throw 'Assistant restoration not verified.' }
+        $assistantRuntimes=@((Get-PocketProperty $health 'runtimes' @()) | Where-Object {
+            (Get-PocketProperty $_ 'online' $false) -eq $true -and (Get-PocketProperty (Get-PocketProperty $_ 'role' $null) 'kind' '') -eq 'managedHost'
+        })
+        if ($assistantRuntimes.Count -eq 0) { throw 'Assistant restoration not verified.' }
+    }
+    if ($RequireDesktop) {
+        $bridges=@($group|Where-Object {$_.name -eq 'pocket-bridge.exe'})
+        if ($bridges.Count -eq 0 -or @($group|Where-Object {$_.name -eq 'associated-desktop'}).Count -eq 0 -or @($group|Where-Object {$_.name -eq 'associated-native'}).Count -eq 0) { throw 'Associated desktop/bridge/native restart not verified.' }
+        $inventory=Read-PocketRepairJson (Join-Path $InstallRoot ('bin\'+$Generation+'\windows-manifest.json'))
+        $discovered=$false;$directory=Join-Path $InstallRoot 'runtimes';Assert-PocketUnredirectedPath $directory
+        if([IO.Directory]::Exists($directory)) {
+            foreach($file in Get-ChildItem -LiteralPath $directory -Filter '*.json' -File) {
+                $descriptor=Read-PocketRepairJson $file.FullName 16384
+                if (@($bridges|Where-Object {$_.pid -eq $descriptor.pid}).Count -eq 0) { continue }
+                $runtime=@($health.runtimes|Where-Object {$_.id -eq $descriptor.runtimeId -and $_.source -eq 'desktop' -and $_.online -eq $true -and $_.bridgeVersion -eq $inventory.version})
+                if($runtime.Count -gt 0){$discovered=$true}
+            }
+        }
+        if(-not $discovered){throw 'Authenticated new bridge discovery not verified.'}
+    }
+    return $true
+}
+function Complete-PocketInstallLifecycle($Lifecycle,[string]$InstallRoot,[string]$StateDirectory,[string]$Generation) {
+    $path=Join-Path $InstallRoot 'installer-lifecycle.json'
+    $Lifecycle.phase='starting';$Lifecycle.targetGeneration=$Generation;Write-PocketRepairDurableJson $path $Lifecycle
+    Start-PocketInstalledSupervisor $InstallRoot
+    if ($Lifecycle.restartDesktop) {Start-PocketInstalledDesktop $InstallRoot;$Lifecycle.processesStarted++}
+    $restartUi=[bool](Get-PocketProperty $Lifecycle 'restartUi' $false)
+    if ($restartUi) {Start-PocketInstalledUi $InstallRoot;$Lifecycle.processesStarted++}
+    $Lifecycle.processesStarted++;$Lifecycle.phase='verifying';Write-PocketRepairDurableJson $path $Lifecycle
+    $deadline=[DateTime]::UtcNow.AddSeconds(45)
+    do {
+        try {
+            if (Test-PocketInstalledRuntime $InstallRoot $StateDirectory $Generation $Lifecycle.restartDesktop $restartUi $Lifecycle) {
+                $Lifecycle.phase='verified';Write-PocketRepairDurableJson $path $Lifecycle
+                return @{processesStarted=$Lifecycle.processesStarted;runtimeVerification='verified';discoveryWarnings=@(Get-PocketProperty $Lifecycle 'discoveryWarnings' @())}
+            }
+        } catch {
+            $last=$_.Exception;while($null -ne $last.InnerException){$last=$last.InnerException}
+            $Lifecycle.lastVerificationFailure=@{hresult=('0x'+$last.HResult.ToString('X8'));osCode=$(if($last -is [ComponentModel.Win32Exception]){$last.NativeErrorCode}else{$null});exceptionType=$last.GetType().FullName}
+            if ([DateTime]::UtcNow -ge $deadline) {
+            $Lifecycle.phase='verification_failed';Write-PocketRepairDurableJson $path $Lifecycle
+            $error=[InvalidOperationException]::new('runtime_verification_failed: new Pocket identities/control/routes not verified; retained lifecycle contains the OS failure code.')
+            $error.Data['PocketStage']='runtime_verify';$error.Data['PocketCall']='Test-PocketInstalledRuntime'
+            $error.Data['PocketHResult']=$Lifecycle.lastVerificationFailure.hresult;$error.Data['PocketOSCode']=$Lifecycle.lastVerificationFailure.osCode
+            throw $error
+        } }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $Lifecycle.phase='verification_failed';Write-PocketRepairDurableJson $path $Lifecycle
+    throw 'runtime_verification_failed: readiness timed out; lifecycle retained.'
 }
 function Invoke-PocketInstallTransaction($Before,$After,[string]$JournalPath,[string]$Manifest,[string[]]$Links,[string]$Launcher,[switch]$TaskManaged,[switch]$Optional,
     [string]$RepairStep,[string]$OperationId,[string]$ExpectedGeneration) {
@@ -707,7 +1357,7 @@ function Invoke-PocketWindowsInstall {
     $journalPath=Join-Path $installRoot 'installation-pending.json'
     $links=@((Join-Path $Context.Programs 'Codex Pocket.lnk'),(Join-Path $Context.Programs 'Codex Pocket Desktop.lnk'),(Join-Path $Context.Startup 'Codex Pocket.lnk'))
     foreach($path in @($manifestPath,$journalPath,$launcher)+$links) { Assert-PocketPlainPath $path }
-    $mutex=$null; $owns=$false
+    $mutex=$null; $owns=$false; $lifecycle=$null
     try {
         if ($Apply) {
             $mutex=[Threading.Mutex]::new($false,('Local\CodexPocketInstall_'+(Get-PocketBytesHash ([Text.Encoding]::UTF8.GetBytes($installRoot.ToLowerInvariant())))))
@@ -794,6 +1444,12 @@ function Invoke-PocketWindowsInstall {
         $plan=@{action=$(if($Uninstall){'uninstall'}elseif($Rollback){'rollback'}else{'install'});applied=[bool]$Apply;installRoot=$installRoot;stateDirectory=$(if($saved){$saved.stateDirectory}else{$StateDirectory});processesStarted=0;processesStopped=0;shortcuts=$links;scheduledTask=(Get-PocketTaskName)}
         if (-not $Apply) { return $plan }
         [void][IO.Directory]::CreateDirectory($installRoot)
+        if (-not ($Uninstall -or $Rollback)) {
+            $lifecycle=Invoke-PocketInstallStep 'runtime_stop' 'Enter-PocketInstallLifecycle' {
+                Enter-PocketInstallLifecycle $installRoot $StateDirectory $saved
+            }
+            $plan.processesStopped=$lifecycle.processesStopped
+        }
         if ($Rollback) {
             $after=Read-PocketRollbackSnapshot $saved.rollback $installRoot
             Assert-PocketSnapshot $after $manifestPath $links
@@ -806,7 +1462,7 @@ function Invoke-PocketWindowsInstall {
             if ($fresh) {
                 $freshStage=$StateDirectory+'.staging-'+[guid]::NewGuid().ToString('N')
                 Invoke-PocketInstallStep 'identity_initialize' 'pocket-agent init' { Initialize-PocketPrivateState (Join-Path $SourceDirectory 'pocket-agent.exe') $freshStage } | Out-Null
-                $plan.processesStarted=1
+                $plan.processesStarted++
                 Assert-PocketInitializedState $freshStage
                 Move-PocketStagedDirectory $freshStage $StateDirectory
             } elseif ($migrate) { Copy-PocketState $ExistingStateDirectory $StateDirectory }
@@ -904,13 +1560,13 @@ function Invoke-PocketWindowsInstall {
                 $outcome=Invoke-PocketInstallTransaction $snapshot $target $journalPath $manifestPath $links $launcher -Optional
                 if (-not $outcome.succeeded) { throw $outcome.failure }
             } catch {
-                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -eq 'installation_publish') { throw }
+                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -in @('installation_publish','runtime_stop','runtime_verify')) { throw }
                 # Reload the committed record; installedHash must describe actual
                 # published bytes, never a failed COM or publication intention.
                 $candidate=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 $candidate.integration.shortcuts[$i]=Get-PocketOptionalFailure $_ 'shortcut' 'shortcut_integration_failed' 'New-PocketShortcutBytes'
                 Write-PocketInstallEvent ($candidate.integration.shortcuts[$i]+@{recovery='retry_shortcut';slot=$i})
-                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Get-PocketInstallResult $plan $candidate }
+                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Complete-PocketWindowsInstall $plan $candidate $lifecycle }
                 Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
             }
         }
@@ -920,7 +1576,7 @@ function Invoke-PocketWindowsInstall {
                     $failure=Get-PocketProperty $before 'taskFailure' (New-PocketPendingIntegration 'startup_read')
                     $candidate.integration.startup=$failure
                     Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
-                    return Get-PocketInstallResult $plan $candidate
+                    return Complete-PocketWindowsInstall $plan $candidate $lifecycle
                 }
                 Invoke-PocketInstallStep 'startup_ownership' 'Assert-PocketTaskOwned' { Assert-PocketTaskOwned $before.task $launcher } | Out-Null
                 $rollbackSnapshot=Get-PocketProperty $candidate 'rollback' $null
@@ -948,15 +1604,15 @@ function Invoke-PocketWindowsInstall {
                 $outcome=Invoke-PocketInstallTransaction $snapshot $target $journalPath $manifestPath $links $launcher -TaskManaged -Optional
                 if (-not $outcome.succeeded) { throw $outcome.failure }
             } catch {
-                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -eq 'installation_publish') { throw }
+                if ($_.Exception.Data['PocketCoreFailure'] -or $_.Exception.Data['PocketStage'] -in @('installation_publish','runtime_stop','runtime_verify')) { throw }
                 $candidate=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 $candidate.integration.startup=Get-PocketOptionalFailure $_ 'startup_register' 'startup_integration_failed' 'Set-PocketTaskXml'
                 Write-PocketInstallEvent ($candidate.integration.startup+@{recovery='retry_startup'})
-                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Get-PocketInstallResult $plan $candidate }
+                if ([IO.File]::Exists($journalPath)) { $plan.recoveryPending=$true; return Complete-PocketWindowsInstall $plan $candidate $lifecycle }
                 Save-PocketIntegrationRecord $candidate $manifestPath $links $launcher $journalPath
             }
         }
-        return Get-PocketInstallResult $plan $candidate
+        return Complete-PocketWindowsInstall $plan $candidate $lifecycle
     } finally { if($owns){$mutex.ReleaseMutex()}; if($mutex){$mutex.Dispose()} }
 }
 if ($MyInvocation.InvocationName -ne '.') {
@@ -973,20 +1629,27 @@ if ($MyInvocation.InvocationName -ne '.') {
     try {
         if ($Apply) { $logPath=Start-PocketInstallDiagnostics }
         $result=Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -Initialize:$Initialize -UiStartup $UiStartup
+        if ($Apply -and -not ($Uninstall -or $Rollback) -and (Get-PocketProperty $result 'runtimeVerification' 'pending') -ne 'verified') {
+            throw 'runtime_recovery_required: installation retained but background was not verified.'
+        }
         $state=Get-PocketProperty $result 'state' $(if($Apply){'completed'}else{'planned'})
-        Write-PocketInstallEvent @{stage='complete';call='install';state=$state;runtimeVerification='pending'}
+        Write-PocketInstallEvent @{stage='complete';call='install';state=$state;runtimeVerification=(Get-PocketProperty $result 'runtimeVerification' 'pending')}
         $result
+        foreach($warning in @(Get-PocketProperty $result 'discoveryWarnings' @())) {
+            Write-Output ('后台发现警告：'+$warning.source+' / '+$warning.code+'；必需组件已独立核验。')
+        }
         if ($state -eq 'installed_incomplete') {
-            Write-Output ('核心文件已安装并验证，可选集成待补全。重新运行本安装包仅重试未完成步骤。后台生效待核验。诊断：'+$logPath)
+            Write-Output ('核心文件与后台已验证，可选集成待补全。重新运行本安装包重试未完成步骤。诊断：'+$logPath)
             foreach($pending in $result.pendingIntegration) { Write-Output ('待补全：'+$pending.step+'；阶段：'+$pending.details.stage+'；代码：'+$pending.details.code+'；调用：'+$pending.details.call+'；错误：'+$pending.details.hresult) }
             exit 2
         }
-        if ($logPath) { Write-Output ('安装操作已完成，后台生效待核验。诊断：'+$logPath) }
+        if ($logPath) { Write-Output ('安装操作已完成。后台核验：'+(Get-PocketProperty $result 'runtimeVerification' 'pending')+'。诊断：'+$logPath) }
     } catch {
         $failure=$_; $stage=$_.Exception.Data['PocketStage'];$call=$_.Exception.Data['PocketCall'];$hr=$_.Exception.Data['PocketHResult']
         if (-not $stage) { $stage='preflight_or_state';$call='Invoke-PocketWindowsInstall';$hr='0x'+$_.Exception.HResult.ToString('X8') }
-        Write-PocketInstallEvent @{stage=$stage;call=$call;state='failed';hresult=$hr;recovery='inspect_journal_then_retry'}
-        Write-Output ('安装未完成。阶段：'+$stage+'；调用：'+$call+'；错误：'+$hr+'；诊断：'+$logPath)
+        $osCode=$_.Exception.Data['PocketOSCode']
+        Write-PocketInstallEvent @{stage=$stage;call=$call;state='failed';hresult=$hr;osCode=$osCode;recovery='inspect_journal_then_retry'}
+        Write-Output ('安装未完成。阶段：'+$stage+'；调用：'+$call+'；错误：'+$hr+'；系统代码：'+$osCode+'；诊断：'+$logPath)
         exit 1
     }
 }

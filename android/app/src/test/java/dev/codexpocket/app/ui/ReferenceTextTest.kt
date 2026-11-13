@@ -42,6 +42,23 @@ class ReferenceTextTest {
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") { PocketBackdrop { block() } } } }
         compose.waitForIdle()
     }
+    @Test fun sentMarkdownConversationReferenceHasLabelIconAndCopiesCanonicalLink() {
+        val id="01a1ca02-c5db-74a0-a1d5-cf3ef5eb0473"
+        lateinit var readClipboard: () -> String?
+        content {
+            val clipboard=LocalClipboardManager.current
+            readClipboard={clipboard.getText()?.text}
+            SentReferenceText("查看 [原任务](codex://threads/$id)",buildJsonObject {},Modifier.testTag("sent-thread-reference"))
+        }
+        compose.onNodeWithTag("sent-thread-reference").assertTextContains("原任务",substring=true)
+        compose.onNodeWithTag("sent-thread-reference").assertTextContains("查看",substring=true)
+        compose.onNodeWithContentDescription("会话链接",useUnmergedTree=true).performClick()
+        compose.onNodeWithTag("thread-reference-open").assertIsNotEnabled()
+        compose.onNodeWithTag("thread-reference-copy").performClick()
+        compose.runOnIdle {
+            assertEquals("codex://threads/$id",readClipboard())
+        }
+    }
     @Test fun visualOffsetsRoundTripEveryUtf16PositionWithoutChangingComposingText() {
         val first = insertVerifiedReference("中文🙂 /r @a", "中文🙂 /r @a", 5, 7, skill)!!
         val app = JsonObject(skill + ("type" to JsonPrimitive("mention")))

@@ -5,26 +5,76 @@ import java.time.*
 
 data class AssistantAction(val method: String, val params: JsonObject)
 data class AssistantRuntimeChoice(val id: String, val label: String, val available: Boolean = true)
-data class AssistantWorkspaceChoice(val runtimeId: String, val threadId: String, val label: String, val canWrite: Boolean = false)
+data class AssistantWorkspaceChoice(val runtimeId: String, val threadId: String, val label: String, val canWrite: Boolean = false, val parentThreadId: String? = null, val isSubagent: Boolean = false)
 enum class AssistantTaskStatus { Queued, Running, WaitingUser, Paused, Done, Failed, Unknown }
 enum class AssistantOperationPhase { Unknown, Running, Waiting, Paused, Completed, Failed }
 enum class AssistantQuestionKind { Input, Approval, Unknown }
 data class AssistantNotifications(val completed: Boolean = true, val failed: Boolean = true, val waitingUser: Boolean = true)
 data class AssistantSettings(val personality: String = "", val tone: String = "", val model: String? = null, val timezone: String = "UTC", val notifications: AssistantNotifications = AssistantNotifications())
-data class AssistantTask(val id: String, val prompt: String, val status: AssistantTaskStatus, val activeRunId: String?, val reconciliationRequired: Boolean, val detail: String?)
+data class AssistantTask(val id: String, val prompt: String, val status: AssistantTaskStatus, val activeRunId: String?, val reconciliationRequired: Boolean, val detail: String?, val assignment: AssistantAssignment? = null)
 data class AssistantQuestion(val requestId: String, val kind: AssistantQuestionKind, val text: String)
 data class AssistantOperation(val id: String, val role: String, val taskId: String?, val phase: AssistantOperationPhase, val suspended: Boolean, val threadId: String?, val question: AssistantQuestion?, val result: String?)
-data class AssistantEvent(val sequence: Long, val id: String, val operationId: String?, val kind: String, val detail: String, val atMs: Long?)
+data class AssistantEvent(val sequence: Long, val id: String, val operationId: String?, val kind: String, val detail: String, val atMs: Long?, val taskId: String? = null, val memberId: String? = null, val groupId: String? = null, val threadId: String? = null, val memberAttributionProvided: Boolean = memberId != null)
 data class AssistantMemory(val id: String, val text: String)
 data class AssistantSchedule(val id: String, val prompt: String, val kind: JsonObject, val timezone: String, val nextMs: Long?, val missed: Boolean, val error: String?)
-data class AssistantChatMessage(val id: String, val role: String, val text: String, val atMs: Long? = null, val operationId: String? = null)
+data class AssistantAssignment(val taskId: String, val memberId: String? = null, val groupId: String? = null,
+    val dependencies: List<String> = emptyList(), val completionCriteria: String = "", val continueFromTask: String? = null) {
+    companion object {
+        fun from(o: JsonObject, taskId: String) = AssistantAssignment(taskId, o.assistantText("member_id"), o.assistantText("group_id"),
+            o.assistantStrings("dependencies"), o.assistantText("completion_criteria").orEmpty(), o.assistantText("continue_from_task"))
+    }
+}
+data class AssistantMember(val id: String, val name: String, val duty: String, val mainThreadId: String?, val directory: String,
+    val threadId: String?, val active: Boolean)
+data class AssistantGroup(val id: String, val title: String, val taskIds: List<String>, val requiresSummary: Boolean, val sealed: Boolean, val status: String)
+data class AssistantDelivery(val id: String, val message: String, val memberId: String?, val taskId: String?, val status: String, val deliveredTaskId: String?, val atMs: Long? = null) {
+    val label get() = when(status) {"queued" -> "待送达"; "sent" -> "已送达"; "sending" -> "正在送达"; "paused" -> "暂停送达"; else -> "待确认送达"}
+}
+data class AssistantQuestionHistory(val id: String, val operationId: String?, val requestId: String?, val atMs: Long?, val item: TimelineItem)
+data class AssistantChatMessage(val id: String, val role: String, val text: String, val atMs: Long? = null, val operationId: String? = null,
+    val memberId: String? = null, val taskId: String? = null, val groupId: String? = null, val sourceThreadId: String? = null,
+    val authorName: String? = null, val eventId: String? = null) {
+    companion object {
+        fun from(o: JsonObject): AssistantChatMessage? {
+            val id = o.assistantText("id") ?: return null
+            val role = o.assistantText("role")?.takeIf {it in setOf("User", "Assistant")} ?: return null
+            val text = o.assistantText("text") ?: return null
+            return AssistantChatMessage(id, role, text, o.assistantLong("at_ms") ?: o.assistantLong("atMs"),
+                o.assistantText("operationId") ?: o.assistantText("operation_id"), o.assistantText("memberId") ?: o.assistantText("member_id"), o.assistantText("taskId") ?: o.assistantText("task_id"),
+                o.assistantText("groupId") ?: o.assistantText("group_id"), o.assistantText("sourceThreadId") ?: o.assistantText("source_thread_id"), o.assistantText("authorName"), o.assistantText("eventId"))
+        }
+    }
+}
 data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String? = null, val coordinatorThreadId: String? = null, val paused: Boolean? = null,
     val settings: AssistantSettings? = null, val tasks: List<AssistantTask> = emptyList(), val operations: List<AssistantOperation> = emptyList(),
-    val events: List<AssistantEvent> = emptyList(), val memories: List<AssistantMemory> = emptyList(), val schedules: List<AssistantSchedule> = emptyList()) {
+    val events: List<AssistantEvent> = emptyList(), val memories: List<AssistantMemory> = emptyList(), val schedules: List<AssistantSchedule> = emptyList(),
+    val members: List<AssistantMember> = emptyList(), val groups: List<AssistantGroup> = emptyList(), val assignments: List<AssistantAssignment> = emptyList(),
+    val deliveries: List<AssistantDelivery> = emptyList(), val questionHistory: List<AssistantQuestionHistory> = emptyList(), val ready: Boolean? = null, val preparationStatus: String? = null, val errorCode: String? = null) {
+    val prepReady get() = preparationStatus in setOf(null,"ready") && errorCode.isNullOrBlank()
+    val prepared get() = enabled==true && ready==true && prepReady
+    val preparationIssue: String? get() = when {
+        errorCode=="assistant_missing_cli" || preparationStatus=="missing_cli" -> "电脑端尚未找到 Codex CLI，请安装或定位 CLI 后重试"
+        errorCode=="assistant_missing_config" || preparationStatus in setOf("config","missing_config") -> "电脑端 Codex 配置尚未就绪，请修复配置后重试"
+        errorCode=="assistant_needs_login" || preparationStatus=="needs_login" -> "请在电脑端登录 Codex 后重试"
+        errorCode=="assistant_restore_failed" -> "助理恢复未完成，请重试准备"
+        errorCode=="assistant_preparing" || preparationStatus=="preparing" -> "助理正在准备，草稿会保留"
+        !errorCode.isNullOrBlank() || preparationStatus=="recoverable_error" -> "助理准备遇到问题，请检查电脑端后重试"
+        !prepReady -> "助理准备状态尚未确认，请重试"
+        ready==false -> "助理正在准备，可保留草稿并重试"
+        else -> null
+    }
+    val preparationRetryLabel get() = when(preparationStatus) {
+        "needs_login" -> "登录后重试"; "missing_cli" -> "安装后重试"; "config", "missing_config" -> "修复后重试"; else -> "重试准备"
+    }
+    fun operationMemberId(operationId: String?, taskId: String?): String? {
+        val evidence=events.lastOrNull {it.operationId==operationId && it.memberAttributionProvided}
+        return if(evidence!=null) evidence.memberId else assignmentFor(taskId.orEmpty())?.memberId
+    }
+    fun assignmentFor(taskId: String) = assignments.firstOrNull {it.taskId == taskId} ?: tasks.firstOrNull {it.id == taskId}?.assignment
     val after: Long get() = events.maxOfOrNull { it.sequence } ?: 0
     val coordinatorReplies: List<AssistantChatMessage> get() {
         val summaries = events.filter { it.kind == "summary" && it.detail.isNotBlank() }.map {
-            AssistantChatMessage("event:${it.id}", "Assistant", it.detail, it.atMs, it.operationId)
+            AssistantChatMessage("event:${it.id}", "Assistant", it.detail, it.atMs, it.operationId, it.memberId, it.taskId, it.groupId, it.threadId, members.firstOrNull {m -> m.id == it.memberId}?.name, it.id)
         }
         val results = operations.filter { it.role == "Coordinator" && it.phase == AssistantOperationPhase.Completed && !it.result.isNullOrBlank() }.mapNotNull { op ->
             if (summaries.any { it.operationId == op.id && it.text == op.result }) null
@@ -34,6 +84,19 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
     }
     companion object {
         fun from(o: JsonObject): AssistantSnapshot = AssistantSnapshot(
+            questionHistory = o.assistantObjects("questionHistory").mapNotNull {h -> h.assistantText("id")?.let {id ->
+                val item = h["item"] as? JsonObject ?: return@mapNotNull null
+                val native = NativeQuestionHistory.cacheSafe(TimelineItem.from(h.assistantText("operationId") ?: id, JsonObject(item + ("id" to JsonPrimitive(id))),true))
+                if(NativeQuestionHistory.from(native) == null) null else AssistantQuestionHistory(id,h.assistantText("operationId"),h.assistantText("requestId"),h.assistantLong("atMs"),native)
+            }},
+            members = o.assistantObjects("members").mapNotNull {m -> m.assistantText("id")?.let {id -> AssistantMember(id,
+                m.assistantText("name") ?: "成员", m.assistantText("duty").orEmpty(), m.assistantText("main_thread_id"), m.assistantText("directory").orEmpty(), m.assistantText("thread_id"), m.assistantBoolean("active") == true)}},
+            groups = o.assistantObjects("groups").mapNotNull {g -> g.assistantText("id")?.let {id -> AssistantGroup(id, g.assistantText("title").orEmpty(),
+                g.assistantStrings("task_ids"), g.assistantBoolean("requires_summary") == true, g.assistantBoolean("sealed") == true, g.assistantText("status").orEmpty())}},
+            assignments = o.assistantObjects("assignments").mapNotNull {a -> a.assistantText("task_id")?.let {AssistantAssignment.from(a, it)}},
+            deliveries = o.assistantObjects("deliveries").mapNotNull {d -> d.assistantText("id")?.let {id -> AssistantDelivery(id, d.assistantText("message").orEmpty(),
+                d.assistantText("member_id"), d.assistantText("task_id"), d.assistantText("status").orEmpty(), d.assistantText("delivered_task_id"),d.assistantLong("at_ms"))}},
+            errorCode = o.assistantText("error"), ready = o.assistantBoolean("ready"), preparationStatus = o.assistantText("preparationStatus") ?: (o["preparation"] as? JsonObject)?.assistantText("status"),
             enabled = o.assistantBoolean("enabled"), runtimeId = o.assistantText("runtimeId"), coordinatorThreadId = o.assistantText("coordinatorThreadId"), paused = o.assistantBoolean("paused"),
             settings = (o["settings"] as? JsonObject)?.let { s ->
                 val n = s["notifications"] as? JsonObject
@@ -44,7 +107,7 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
                 AssistantTask(id, t.assistantText("prompt").orEmpty(), when (t.assistantText("status")) {
                     "queued" -> AssistantTaskStatus.Queued; "running" -> AssistantTaskStatus.Running; "waiting_user" -> AssistantTaskStatus.WaitingUser
                     "paused" -> AssistantTaskStatus.Paused; "done" -> AssistantTaskStatus.Done; "failed" -> AssistantTaskStatus.Failed; else -> AssistantTaskStatus.Unknown
-                }, t.assistantText("active_run_id"), t.assistantBoolean("reconciliation_required") ?: true, t.assistantText("detail"))
+                }, t.assistantText("active_run_id"), t.assistantBoolean("reconciliation_required") ?: true, t.assistantText("detail"), (t["assignment"] as? JsonObject)?.let {AssistantAssignment.from(it, id)})
             } },
             operations = o.assistantObjects("operations").mapNotNull { op -> op.assistantText("id")?.let { id ->
                 AssistantOperation(id, op.assistantText("role").orEmpty(), op.assistantText("task_id"), AssistantOperationPhase.entries.firstOrNull { it.name == op.assistantText("phase") } ?: AssistantOperationPhase.Unknown,
@@ -55,7 +118,7 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
             } },
             events = o.assistantObjects("events").mapNotNull { e -> e.assistantText("id")?.let { id ->
                 val sequence = e.assistantLong("sequence")?.takeIf { it >= 0 } ?: return@mapNotNull null
-                AssistantEvent(sequence,id,e.assistantText("operation_id"),e.assistantText("kind").orEmpty(),e.assistantText("detail").orEmpty(),e.assistantLong("at_ms"))
+                AssistantEvent(sequence,id,e.assistantText("operation_id"),e.assistantText("kind").orEmpty(),e.assistantText("detail").orEmpty(),e.assistantLong("at_ms"), e.assistantText("task_id"), e.assistantText("member_id"), e.assistantText("group_id"), e.assistantText("thread_id"), e.containsKey("member_id"))
             } },
             memories = o.assistantObjects("memories").mapNotNull { m -> m.assistantText("id")?.let { AssistantMemory(it,m.assistantText("text").orEmpty()) } },
             schedules = o.assistantObjects("schedules").mapNotNull { schedule -> schedule.assistantText("id")?.let { id ->
@@ -67,14 +130,18 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
     }
 }
 data class AssistantUiState(val snapshot: AssistantSnapshot? = null, val messages: List<AssistantChatMessage> = emptyList(), val loading: Boolean = false, val error: String? = null,
-    val pendingActions: Set<String> = emptySet(), val sendAcknowledgement: Long = 0)
+    val pendingActions: Set<String> = emptySet(), val sendAcknowledgement: Long = 0, val nextBefore: Long? = null, val historyPaged: Boolean = false)
 data class AssistantScheduleDraft(val prompt: String = "", val kind: String = "Once", val date: String = "", val time: String = "09:00", val weekday: Int = 0, val intervalMinutes: String = "60", val timezone: String = "UTC", val writes: Boolean = false)
 object AssistantActions {
     private fun payload(method: String, runtime: String, fields: JsonObjectBuilder.() -> Unit = {}): AssistantAction {
         bounded(runtime,256,"请选择运行入口")
         return AssistantAction(method,buildJsonObject {put("runtimeId",runtime);fields()})
     }
-    fun read(after: Long): AssistantAction { require(after >= 0); return AssistantAction("assistant/read",buildJsonObject {put("after",after)}) }
+    fun read(after: Long, before: Long? = null, limit: Int? = 50, taskId: String? = null): AssistantAction {
+        require(after >= 0 && (before == null || before >= 0) && (limit == null || limit in 1..100))
+        return AssistantAction("assistant/read",buildJsonObject {put("after",after);before?.let {put("before",it)};limit?.let {put("limit",it)};taskId?.let {bounded(it,256,"缺少任务标识");put("taskId",it)}})
+    }
+    fun prepare() = AssistantAction("assistant/prepare", buildJsonObject {})
     fun enable(runtime: String) = payload("assistant/enable",runtime)
     fun pause(runtime: String) = payload("assistant/pause",runtime)
     fun resume(runtime: String) = payload("assistant/resume",runtime)
@@ -82,10 +149,14 @@ object AssistantActions {
         bounded(id,256,"缺少任务标识")
         return payload(if(resume) "assistant/task/resume" else "assistant/task/pause",runtime) {put("taskId",id)}
     }
-    fun send(runtime: String, message: String, workspace: AssistantWorkspaceChoice?): AssistantAction {
+    fun send(runtime: String, message: String, workspace: AssistantWorkspaceChoice?, memberId: String? = null, taskId: String? = null): AssistantAction {
         bounded(message,65536,"请输入消息，最多 64KiB")
         workspace?.let { require(it.runtimeId == runtime && it.threadId.isNotBlank()) {"项目不属于当前运行入口"} }
-        return payload("assistant/send",runtime) {put("message",message);workspace?.let {put("threadId",it.threadId)}}
+        memberId?.let {bounded(it,256,"缺少成员标识")}; taskId?.let {bounded(it,256,"缺少任务标识")}
+        return AssistantAction("assistant/send",buildJsonObject {
+            if(runtime.isNotBlank()) put("runtimeId",runtime)
+            put("message",message);workspace?.let {put("threadId",it.threadId)};memberId?.let {put("memberId",it)};taskId?.let {put("taskId",it)}
+        })
     }
     fun respond(runtime: String, operation: String, request: String, answer: String): AssistantAction {
         bounded(answer,65536,"请输入回答，最多 64KiB")
@@ -173,3 +244,5 @@ private fun JsonObject.assistantText(key: String) = (this[key] as? JsonPrimitive
 private fun JsonObject.assistantBoolean(key: String) = (this[key] as? JsonPrimitive)?.takeUnless {it.isString}?.booleanOrNull
 private fun JsonObject.assistantLong(key: String) = (this[key] as? JsonPrimitive)?.takeUnless {it.isString}?.longOrNull
 private fun JsonObject.assistantObjects(key: String) = (this[key] as? JsonArray)?.mapNotNull {it as? JsonObject}.orEmpty()
+
+private fun JsonObject.assistantStrings(key: String) = (this[key] as? JsonArray)?.mapNotNull {(it as? JsonPrimitive)?.takeIf {v -> v.isString}?.content}.orEmpty()

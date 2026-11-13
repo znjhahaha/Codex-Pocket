@@ -1,4 +1,6 @@
 //! Authenticated application request routing, native ownership and replay.
+#[path = "history_questions.rs"]
+mod history_questions;
 #[cfg(test)]
 #[path = "broker/history_compat_tests.rs"]
 mod history_compat_tests;
@@ -595,6 +597,9 @@ struct MediaHistoryMetadata {
     store: String,
     path: PathBuf,
     turns: BTreeSet<String>,
+    image_roots: Vec<PathBuf>,
+    // Only canonical IDs on the preceding pages of this exact cursor traversal.
+    question_pages: BTreeMap<(String, String), BTreeSet<String>>,
     used: u64,
 }
 struct MediaHistoryProof {
@@ -618,6 +623,8 @@ impl MediaHistoryCache {
         turn: &str,
         home: &std::path::Path,
         store: &str,
+        extra_image_roots: &[PathBuf],
+        request_cursor: Option<&str>,
     ) -> Result<Value> {
         let now = storage::now();
         self.metadata.retain(|(r, c, _), entry| {
@@ -645,6 +652,11 @@ impl MediaHistoryCache {
             if let Some(path) = native.pointer("/thread/path").and_then(Value::as_str) {
                 match media_history_path(home, store, std::path::Path::new(path)) {
                     Ok(path) => {
+                        let mut roots = extra_image_roots.to_vec();
+                        if let Some(cwd) = native.pointer("/thread/cwd").and_then(Value::as_str) { roots.push(PathBuf::from(cwd)); }
+                        let image_roots: Vec<_> = roots.into_iter().filter_map(|root| {
+                            crate::workspace::Workspace::new(vec![root]).ok().map(|workspace| workspace.roots()[0].clone())
+                        }).take(32).collect();
                         let changed = self
                             .metadata
                             .get(&key)
@@ -659,9 +671,12 @@ impl MediaHistoryCache {
                                 store: store.into(),
                                 path,
                                 turns: BTreeSet::new(),
+                                image_roots: image_roots.clone(),
+                                question_pages: BTreeMap::new(),
                                 used: now,
                             })
                             .used = now;
+                        self.metadata.get_mut(&key).unwrap().image_roots = image_roots;
                     }
                     Err(_) => {
                         self.metadata.remove(&key);
@@ -700,7 +715,7 @@ impl MediaHistoryCache {
             while metadata.turns.len() > 4096 {
                 metadata.turns.pop_first();
             }
-            let skeleton = json!({"id":thread,"path":metadata.path,"turns":turns});
+            let skeleton = json!({"id":thread,"path":metadata.path,"turns":turns,"imageRoots":metadata.image_roots});
             let signature = auth::hash(&skeleton.to_string());
             let proof_key = (key.clone(), signature);
             if let Some(proof) = self.proofs.get_mut(&proof_key) {
@@ -709,7 +724,7 @@ impl MediaHistoryCache {
             }
             let proof =
                 crate::media::NativeHistory::from_native_thread(&skeleton, runtime, connection)
-                    .ok()?;
+                    .ok()?.with_image_roots(metadata.image_roots.clone());
             while self.proofs.len() >= 256 {
                 let oldest = self
                     .proofs
@@ -727,9 +742,42 @@ impl MediaHistoryCache {
             );
             Some(proof)
         })();
+        let mut supplemented = native.clone();
+        if matches!(method, "thread/read" | "thread/turns/list" | "thread/items/list") {
+            if let Some(metadata) = self.metadata.get_mut(&key) {
+                let mut canonical = BTreeMap::new();
+                let mut complete_traversal = true;
+                if method == "thread/items/list" {
+                    if let Some(cursor) = request_cursor {
+                        if let Some(seen) = metadata.question_pages.get(&(turn.to_owned(), cursor.to_owned())) {
+                            canonical.insert(turn.to_owned(), seen.clone());
+                        } else {
+                            // A cache miss means preceding native pages are unknown,
+                            // not that they contained no canonical question cards.
+                            complete_traversal = false;
+                        }
+                    }
+                }
+                let path = (proof.is_some() && complete_traversal).then_some(metadata.path.as_path());
+                history_questions::project(&mut supplemented,path,thread,method,turn,&metadata.turns,&mut canonical);
+                if method == "thread/items/list" {
+                    if let Some(cursor) = native["nextCursor"].as_str().filter(|cursor| cursor.len() <= 8192) {
+                        if !complete_traversal {
+                            metadata.question_pages.remove(&(turn.to_owned(),cursor.to_owned()));
+                        } else if let Some(seen) = canonical.remove(turn) {
+                            while metadata.question_pages.len() >= 128 { metadata.question_pages.pop_first(); }
+                            metadata.question_pages.insert((turn.to_owned(),cursor.to_owned()),seen);
+                        }
+                    }
+                }
+            } else {
+                history_questions::project(&mut supplemented,None,thread,method,turn,&BTreeSet::new(),&mut BTreeMap::new());
+            }
+        }
+        history_questions::sanitize_history(&mut supplemented);
         let mut projected = match proof {
-            Some(proof) => media.project_with_history(native, runtime, connection, thread, &proof),
-            None => media.project(native, runtime, connection, thread),
+            Some(proof) => media.project_with_history(&supplemented, runtime, connection, thread, &proof),
+            None => media.project(&supplemented, runtime, connection, thread),
         };
         media_connection_refs(&mut projected, runtime, connection, 0);
         Ok(projected)
@@ -857,6 +905,9 @@ fn media_history_turns(
                             return json!({"type":"other"});
                         }
                         let mut projected = json!({"type":kind});
+                        if kind == "localImage" {
+                            if let Some(path) = part.get("path").and_then(Value::as_str).filter(|path| path.len() <= 4096) { projected["path"] = json!(path); }
+                        }
                         for field in ["fileId", "url", "imageUrl", "image_url", "data"] {
                             if let Some(value) = part.get(field) {
                                 projected[field] = if value.is_null() {
@@ -1050,6 +1101,7 @@ impl Broker {
         connection: &str,
         thread: &str,
         turn: &str,
+        request_cursor: Option<&str>,
     ) -> Result<Value> {
         let (home, store) = {
             let state = self.state.lock().await;
@@ -1062,6 +1114,9 @@ impl Broker {
         };
         let media = self.media.clone();
         let histories = self.media_histories.clone();
+        let request_cursor = request_cursor.map(str::to_owned);
+        let mut extra_roots = image_roots(&self.state_dir);
+        extra_roots.push(home.join("generated_images"));
         let (method, runtime, connection, thread, turn) = (
             method.to_owned(),
             runtime.to_owned(),
@@ -1083,6 +1138,8 @@ impl Broker {
                     &turn,
                     &home,
                     &store,
+                    &extra_roots,
+                    request_cursor.as_deref(),
                 )
         })
         .await
@@ -4202,18 +4259,21 @@ impl Broker {
             bound["threadId"] = p["params"]["threadId"].clone();
             bound["turnId"] = p["params"]["turnId"].clone();
         }
+        // Receipt reconciliation consumes native evidence only; supplemental cards are display history.
+        let question_evidence = if matches!(method,"thread/turns/list"|"thread/items/list") {
+            let turns = if method == "thread/items/list" {
+                json!([{"id":p["params"]["turnId"],"items":bound["data"]}])
+            } else { bound["data"].clone() };
+            Some(json!({"thread":{"id":p["params"]["threadId"],"turns":turns}}))
+        } else { None };
         let mut projected = self.project_native_media(bound, method, runtime, &connection_id,
             p["params"]["threadId"].as_str().unwrap_or(""),
-            p["params"]["turnId"].as_str().unwrap_or("")).await?;
+            p["params"]["turnId"].as_str().unwrap_or(""), p["params"]["cursor"].as_str()).await?;
         self.check_generation(runtime, &connection_id).await?;
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
-        if matches!(method,"thread/turns/list"|"thread/items/list") {
-            let turns=if method=="thread/items/list" {
-                json!([{"id":p["params"]["turnId"],"items":projected["data"]}])
-            } else {projected["data"].clone()};
-            let evidence=json!({"thread":{"id":p["params"]["threadId"],"turns":turns}});
+        if let Some(evidence) = question_evidence {
             let mut state=self.state.lock().await;
             if state.runtimes.get(runtime).is_some_and(|r|r.connection_id==connection_id) {
                 self.observe_question_results(&mut state,runtime,&evidence);
@@ -4359,7 +4419,7 @@ impl Broker {
                     .get(selected)
                     .map(|r| r.source.as_str())
                     .unwrap_or("cli");
-                let mut row = json!({"id":thread_id,"runtimeId":selected,"ownerRuntimeId":owner.as_ref().ok().map(|o|o.runtime_id.as_str()),"nativeSource":thread["source"],"preferredMode":access.default_mode,"configStoreId":store,"source":source,"name":thread["name"],"preview":thread["preview"],"cwd":thread["cwd"],"updatedAt":thread["updatedAt"],"status":thread["status"],"conflict":matches!(owner,Err(ResolveError::AmbiguousOwners|ResolveError::UncertainOwner))});
+                let mut row = json!({"id":thread_id,"runtimeId":selected,"ownerRuntimeId":owner.as_ref().ok().map(|o|o.runtime_id.as_str()),"nativeSource":thread["source"],"preferredMode":access.default_mode,"configStoreId":store,"source":source,"name":thread["name"],"preview":thread["preview"],"cwd":thread["cwd"],"updatedAt":thread["updatedAt"],"status":thread["status"],"conflict":matches!(owner,Err(ResolveError::AmbiguousOwners|ResolveError::UncertainOwner)),"ownershipReason":session_access::ownership_reason(&owner)});
                 row.as_object_mut().unwrap().extend(
                     crate::permissions::thread_metadata(thread)
                         .as_object()
@@ -6643,6 +6703,110 @@ mod media_recovery_tests {
     fn read_params(image: &Value, item: &str, offset: u64) -> Value {
         json!({"runtimeId":"r","threadId":"t","turnId":"u","itemId":item,
             "mediaId":image["mediaId"],"offset":offset,"maxBytes":8})
+    }
+    fn question_records(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(path).unwrap();
+        for record in [
+            json!({"type":"session_meta","payload":{"id":"t"}}),
+            json!({"type":"turn_context","payload":{"turn_id":"u"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","id":"fc","call_id":"call-q","name":"functions.request_user_input","arguments":json!({"questions":[{"id":"q","header":"Choice","question":"Which?","options":[]}]}).to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":"u"}}}),
+            json!({"type":"retained_context","payload":{"type":"verified_answer","call_id":"call-q","turn_id":"u","questions":[{"question":"native formatted prompt","answer":"chosen"}]}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call-q","output":json!({"answers":{"q":{"answers":["chosen"]}}}).to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":"u"}}}),
+        ] {
+            serde_json::to_writer(&mut file, &record).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn all_history_shapes_redact_canonical_secret_answers_without_rollout_proof() {
+        let (dir, b) = fixture().await;
+        let secret = json!({"type":"dynamicToolCall","id":"secret-call","tool":"functions.request_user_input",
+            "arguments":{"questions":[{"id":"q","question":"Password?","isSecret":true}]},
+            "contentItems":[{"type":"inputText","text":"{\"answers\":{\"q\":{\"answers\":[\"SECRET-HISTORY-SENTINEL\"]}}}"}],
+            "toolOutputBlocks":[{"type":"text","text":"SECRET-HISTORY-SENTINEL"}]});
+        let store = storage::config_store(dir.path()).unwrap();
+        for method in ["thread/read", "thread/resume", "thread/fork", "thread/turns/list", "thread/items/list"] {
+            let turn = json!({"id":"u","items":[secret.clone()]});
+            let history = match method {
+                "thread/turns/list" => json!({"data":[turn]}),
+                "thread/items/list" => json!({"data":[secret.clone()]}),
+                _ => json!({"thread":{"id":if method == "thread/fork" {"forked"} else {"t"},"turns":[turn]}}),
+            };
+            let public = MediaHistoryCache::default().project(&b.media, &history, method, "r", "c", "t", "u", dir.path(), &store, &[], None).unwrap();
+            assert!(!public.to_string().contains("SECRET-HISTORY-SENTINEL"), "secret exposed via {method}");
+        }
+    }
+    #[tokio::test]
+    async fn supplemental_questions_full_and_paged_history_are_completed_and_deduplicated() {
+        let (dir, b) = fixture().await;
+        let mut native = peer(&b, "r", "cli").await;
+        let path = dir.path().join("sessions/questions.jsonl");
+        question_records(&path);
+        let full = reply(&b, &mut native, "thread/read", json!({"threadId":"t","includeTurns":true}),
+            json!({"thread":{"id":"t","path":path,"turns":[{"id":"u","items":[]}]}})).await.unwrap();
+        let card = &full["thread"]["turns"][0]["items"][0];
+        assert_eq!(card["type"], "dynamicToolCall");
+        assert_eq!(card["status"], "completed");
+        assert_eq!(serde_json::from_str::<Value>(card["contentItems"][0]["text"].as_str().unwrap()).unwrap()["answers"]["q"]["answers"][0], "chosen");
+        let page = reply(&b, &mut native, "thread/turns/list", json!({"threadId":"t","limit":1}),
+            json!({"data":[{"id":"u","items":[]}],"nextCursor":"next"})).await.unwrap();
+        assert_eq!(page["data"][0]["items"][0]["id"], card["id"]);
+        assert_eq!(page["nextCursor"], "next");
+        let items = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","limit":1}),
+            json!({"data":[],"nextCursor":null})).await.unwrap();
+        assert_eq!(items["data"][0]["id"], card["id"]);
+        let canonical = json!({"type":"dynamicToolCall","id":"canonical-native-id","callId":"call-q","tool":"functions.request_user_input","arguments":card["arguments"],"status":"completed","success":true,"contentItems":card["contentItems"]});
+        let duplicate = reply(&b, &mut native, "thread/turns/list", json!({"threadId":"t","limit":1}),
+            json!({"data":[{"id":"u","items":[canonical]}]})).await.unwrap();
+        assert_eq!(duplicate["data"][0]["items"].as_array().unwrap().len(), 1);
+        // Independent snapshots must not inherit canonical IDs from an earlier response.
+        let restored = reply(&b, &mut native, "thread/read", json!({"threadId":"t","includeTurns":true}),
+            json!({"thread":{"id":"t","path":path,"turns":[{"id":"u","items":[]}]}})).await.unwrap();
+        assert_eq!(restored["thread"]["turns"][0]["items"][0]["id"], card["id"]);
+        let first = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","limit":1}),
+            json!({"data":[canonical],"nextCursor":"second"})).await.unwrap();
+        assert_eq!(first["data"].as_array().unwrap().len(), 1);
+        let last = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","cursor":"second","limit":1}),
+            json!({"data":[],"nextCursor":null})).await.unwrap();
+        assert!(last["data"].as_array().unwrap().is_empty());
+        let refreshed = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","limit":1}),
+            json!({"data":[],"nextCursor":null})).await.unwrap();
+        assert_eq!(refreshed["data"][0]["id"], card["id"]);
+        // A continuation whose cache was evicted must not fabricate evidence
+        // that earlier pages lacked the canonical item, including later pages.
+        b.media_histories.lock().unwrap().metadata.values_mut().for_each(|entry| entry.question_pages.clear());
+        let unproven = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","cursor":"evicted","limit":1}),
+            json!({"data":[],"nextCursor":"after-eviction"})).await.unwrap();
+        assert!(unproven["data"].as_array().unwrap().is_empty());
+        let unproven_last = reply(&b, &mut native, "thread/items/list", json!({"threadId":"t","turnId":"u","cursor":"after-eviction","limit":1}),
+            json!({"data":[],"nextCursor":null})).await.unwrap();
+        assert!(unproven_last["data"].as_array().unwrap().is_empty());
+        assert!(b.state.lock().await.pending.is_empty());
+        native.assert_idle().await;
+    }
+    #[tokio::test]
+    async fn native_local_images_with_different_raw_ids_survive_reconnect_and_source_removal() {
+        let (dir, b) = fixture().await;
+        let mut native = peer(&b, "r", "cli").await;
+        let image_path = dir.path().join("native-paste.png");
+        fs::write(&image_path, b"\x89PNG\r\n\x1a\nx").unwrap();
+        let path = dir.path().join("sessions/native.jsonl");
+        write_history(&path, "t"); // Raw item is `i`; source-native item is intentionally different.
+        let source = json!({"thread":{"id":"t","path":path,"cwd":dir.path(),"turns":[{"id":"u","items":[{"type":"userMessage","id":"native-i","content":[{"type":"localImage","path":image_path}]}]}]}});
+        let full = reply(&b, &mut native, "thread/read", json!({"threadId":"t","includeTurns":true}), source.clone()).await.unwrap();
+        let first = &full["thread"]["turns"][0]["items"][0]["content"][0];
+        assert_eq!(b.request("phone", "thread/media/read", read_params(first,"native-i",0)).await.unwrap()["status"], "ready");
+        assert!(!full.to_string().contains("native-paste.png"));
+        fs::remove_file(&image_path).unwrap();
+        native.offline();
+        let mut current = peer(&b, "r", "cli").await;
+        let renewed = reply(&b, &mut current, "thread/read", json!({"threadId":"t","includeTurns":true}), source).await.unwrap();
+        let image = &renewed["thread"]["turns"][0]["items"][0]["content"][0];
+        assert_ne!(first["mediaId"], image["mediaId"]);
+        assert_eq!(b.request("phone", "thread/media/read", read_params(image,"native-i",0)).await.unwrap()["status"], "ready");
+        assert!(b.request("phone", "thread/media/read", read_params(first,"native-i",0)).await.is_err());
+        current.assert_idle().await;
     }
     #[tokio::test]
     async fn v06_media_metadata_and_pages_register_lazy_owner_bound_refs_without_history_fetch() {

@@ -52,7 +52,7 @@ class AssistantChatNavigationTest {
     private val runtimes = listOf(AssistantRuntimeChoice("r", "我的电脑"))
     private val workspaces = listOf(AssistantWorkspaceChoice("r", "authorized-thread", "已有项目", true))
     private val snapshot = AssistantSnapshot(
-        enabled = true, runtimeId = "r", coordinatorThreadId = "coordinator", paused = false,
+        enabled = true, ready=true, runtimeId = "r", coordinatorThreadId = "coordinator", paused = false,
         settings = AssistantSettings("认真协助", "简洁", null, "UTC"),
         tasks = listOf(AssistantTask("task", "整理项目待办", AssistantTaskStatus.Running, "execution", false, "真实任务详情")),
         operations = listOf(AssistantOperation("execution", "Execution", "task", AssistantOperationPhase.Running, false, "native-task", null, null)),
@@ -237,15 +237,15 @@ class AssistantChatNavigationTest {
         compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-task:task").assertIsDisplayed().assertHasClickAction()
         compose.onNodeWithTag("assistant-task-pause:task").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-task-thread:task").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-native-thread:native-task").assertDoesNotExist()
         compose.onNodeWithText("真实任务详情").assertDoesNotExist()
         compose.expandAssistantTask("task")
         compose.onNodeWithText("真实任务详情").assertIsDisplayed()
         compose.onNodeWithTag("assistant-task-pause:task").assertIsDisplayed().assertIsEnabled()
-        compose.onNodeWithTag("assistant-task-thread:task").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-native-thread:native-task").assertIsDisplayed()
         assertTrue(actions.isEmpty())
         assertTrue(opens.isEmpty())
-        compose.onNodeWithTag("assistant-task-thread:task").performClick()
+        compose.onNodeWithTag("assistant-native-thread:native-task").performClick()
         assertEquals(listOf("r" to "native-task"), opens)
         assertTrue(actions.isEmpty())
         compose.onNodeWithTag("assistant-task-pause:task").performClick()

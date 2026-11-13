@@ -12,6 +12,7 @@ struct Fake {
     batch: Vec<Value>,
     online: bool,
     unsupported_method: Option<String>,
+    reject_steer_before_dispatch: bool,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -26,11 +27,21 @@ impl Default for Fake {
             batch: vec![],
             online: true,
             unsupported_method: None,
+            reject_steer_before_dispatch: false,
         }
     }
 }
 impl RuntimeIo for Fake {
+    fn supports(&self, method: &str, _: &Value) -> bool {
+        method == "turn/steer" && self.unsupported_method.as_deref() != Some(method)
+    }
     fn request(&mut self, id: Value, method: &str, params: Value) -> Result<Value> {
+        if method == "turn/steer" && self.reject_steer_before_dispatch {
+            return Err(RuntimeUnsupported {
+                method: method.into(),
+            }
+            .into());
+        }
         if self.unsupported_method.as_deref() == Some(method) {
             return Err(RuntimeUnsupported {
                 method: method.into(),
@@ -63,6 +74,7 @@ impl RuntimeIo for Fake {
                     .push(turn.clone());
                 json!({"turn":turn})
             }
+            "turn/steer" => json!({"turnId":params["expectedTurnId"]}),
             "thread/turns/list" => {
                 json!({"data":self.turns.get(params["threadId"].as_str().unwrap()).cloned().unwrap_or_default(),"nextCursor":null})
             }
@@ -201,6 +213,266 @@ impl Fixture {
 }
 
 #[test]
+fn collaboration_native_append_reconciles_lost_receipt_without_replay() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    f.executor.runtime.lose_method = Some("turn/steer".into());
+    assert!(
+        f.executor
+            .append("follow-up", &mapping, "Also cover retries")
+            .is_err()
+    );
+    assert_eq!(
+        f.executor
+            .append("follow-up", &mapping, "Also cover retries")
+            .unwrap(),
+        AppendOutcome::Delivered
+    );
+    assert_eq!(
+        f.executor
+            .runtime
+            .calls
+            .iter()
+            .filter(|(_, method, _)| method == "turn/steer")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collaboration_native_append_requires_capability_and_current_turn() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    f.executor.runtime.unsupported_method = Some("turn/steer".into());
+    assert_eq!(
+        f.executor
+            .append("follow-up", &mapping, "Also cover retries")
+            .unwrap(),
+        AppendOutcome::Unsupported
+    );
+    assert!(
+        !f.executor
+            .runtime
+            .calls
+            .iter()
+            .any(|(_, method, _)| method == "turn/steer")
+    );
+    f.executor.runtime.unsupported_method = None;
+    let mut stale = mapping.clone();
+    stale.turn_id = "unrelated-turn".into();
+    assert!(f.executor.append("stale", &stale, "Do not send").is_err());
+    assert!(
+        !f.executor
+            .runtime
+            .calls
+            .iter()
+            .any(|(_, method, _)| method == "turn/steer")
+    );
+}
+
+#[test]
+fn collaboration_append_rejection_receipt_is_final_without_resend() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    f.executor.runtime.lose_method = Some("turn/steer".into());
+    let _ = f.executor.append("follow", &mapping, "Correction");
+    let id = rpc_id("follow", "append");
+    f.executor.runtime.receipts.insert(
+        native_key(&id).unwrap(),
+        RuntimeReceipt {
+            generation: "host-1".into(),
+            state: "completed".into(),
+            response: Some(
+                json!({"id":id,"error":{"code":-32602,"message":"Expected turn already stopped"}}),
+            ),
+        },
+    );
+    let outcome = f
+        .executor
+        .append_status("follow", &mapping, "Correction")
+        .unwrap();
+    assert_eq!(format!("{outcome:?}"), "Rejected");
+    assert_eq!(
+        format!(
+            "{:?}",
+            f.executor.append("follow", &mapping, "Correction").unwrap()
+        ),
+        "Rejected"
+    );
+    assert_eq!(
+        f.executor
+            .runtime
+            .calls
+            .iter()
+            .filter(|(_, m, _)| m == "turn/steer")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collaboration_append_predispatch_rejection_survives_restart() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    f.executor.runtime.reject_steer_before_dispatch = true;
+    let outcome = f.executor.append("follow", &mapping, "Correction").unwrap();
+    assert_eq!(format!("{outcome:?}"), "Rejected");
+    let runtime = f.executor.runtime.clone();
+    let policy = f.executor.policy.clone();
+    drop(f.executor);
+    let mut executor =
+        HostExecutor::open(&f.root.path().join("adapter.db"), runtime, policy).unwrap();
+    assert_eq!(
+        format!(
+            "{:?}",
+            executor
+                .append_status("follow", &mapping, "Correction")
+                .unwrap()
+        ),
+        "Rejected"
+    );
+    assert!(
+        !executor
+            .runtime
+            .calls
+            .iter()
+            .any(|(_, m, _)| m == "turn/steer")
+    );
+}
+
+#[test]
+fn collaboration_append_receipt_identity_and_uncertainty_remain_fenced() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    f.executor.runtime.lose_method = Some("turn/steer".into());
+    let _ = f.executor.append("follow", &mapping, "Correction");
+    let id = rpc_id("follow", "append");
+    let key = native_key(&id).unwrap();
+    for receipt in [
+        RuntimeReceipt {
+            generation: "wrong".into(),
+            state: "completed".into(),
+            response: Some(json!({"id":id,"error":{}})),
+        },
+        RuntimeReceipt {
+            generation: "host-1".into(),
+            state: "completed".into(),
+            response: Some(json!({"id":"wrong","error":{}})),
+        },
+        RuntimeReceipt {
+            generation: "host-1".into(),
+            state: "submitted".into(),
+            response: Some(json!({"id":id,"error":{}})),
+        },
+    ] {
+        f.executor.runtime.receipts.insert(key.clone(), receipt);
+        assert!(
+            f.executor
+                .append_status("follow", &mapping, "Correction")
+                .is_err()
+        );
+    }
+    f.executor.runtime.receipts.remove(&key);
+    assert_eq!(
+        f.executor
+            .append_status("follow", &mapping, "Correction")
+            .unwrap(),
+        AppendOutcome::Uncertain
+    );
+    assert_eq!(
+        f.executor.append("follow", &mapping, "Correction").unwrap(),
+        AppendOutcome::Uncertain
+    );
+    assert_eq!(
+        f.executor
+            .runtime
+            .calls
+            .iter()
+            .filter(|(_, m, _)| m == "turn/steer")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn collaboration_legacy_resume_preserves_installed_tool_revision() {
+    let mut f = Fixture::new();
+    let mapping = f.start("legacy", Role::Execution);
+    f.executor
+        .state
+        .threads
+        .get_mut(&mapping.thread_id)
+        .unwrap()
+        .tool_revision = 0;
+    f.executor
+        .runtime
+        .turns
+        .get_mut(&mapping.thread_id)
+        .unwrap()[0]["status"] = json!("interrupted");
+    let mut request = f.req("resume-legacy", Role::Execution);
+    request.thread_id = Some(mapping.thread_id.clone());
+    f.executor.resume(request).unwrap();
+    assert_eq!(
+        f.executor.state.threads[&mapping.thread_id].tool_revision,
+        0
+    );
+    assert_eq!(
+        f.executor.state.operations["resume-legacy"].tool_revision,
+        0
+    );
+    let resume = f
+        .executor
+        .runtime
+        .calls
+        .iter()
+        .find(|(_, m, _)| m == "thread/resume")
+        .unwrap();
+    assert!(resume.2.get("dynamicTools").is_none());
+    assert!(
+        !f.executor
+            .can_resume(
+                &mapping.thread_id,
+                Role::Execution,
+                Some(f.root.path()),
+                true
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn collaboration_member_reuse_rechecks_native_stop_and_write_policy() {
+    let mut f = Fixture::new();
+    let mapping = f.start("task", Role::Execution);
+    let root = f.root.path().to_owned();
+    assert!(
+        !f.executor
+            .can_resume(&mapping.thread_id, Role::Execution, Some(&root), true)
+            .unwrap()
+    );
+    f.executor
+        .runtime
+        .turns
+        .get_mut(&mapping.thread_id)
+        .unwrap()[0]["status"] = json!("completed");
+    assert!(
+        f.executor
+            .can_resume(&mapping.thread_id, Role::Execution, Some(&root), true)
+            .unwrap()
+    );
+    assert!(
+        !f.executor
+            .can_resume(&mapping.thread_id, Role::Execution, Some(&root), false)
+            .unwrap()
+    );
+    assert!(
+        !f.executor
+            .can_resume(&mapping.thread_id, Role::Coordinator, Some(&root), true)
+            .unwrap()
+    );
+}
+
+#[test]
 fn execution_sandbox_only_grants_canonical_authorized_root() {
     let mut f = Fixture::new();
     let m = f.start("task", Role::Execution);
@@ -219,17 +491,20 @@ fn execution_sandbox_only_grants_canonical_authorized_root() {
     assert_eq!(turn.2["sandboxPolicy"]["excludeTmpdirEnvVar"], true);
     assert_eq!(turn.2["approvalsReviewer"], "user");
     assert_eq!(turn.2["approvalPolicy"], "on-request");
-    assert!(
-        !f.executor
+    assert_eq!(
+        f.executor
             .runtime
             .calls
             .iter()
             .find(|(_, method, _)| method == "thread/start")
             .unwrap()
-            .2
-            .as_object()
+            .2["dynamicTools"]
+            .as_array()
             .unwrap()
-            .contains_key("dynamicTools")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["assistant_read_main"]
     );
     assert!(matches!(
         f.status("task", Some(m)),
@@ -1231,7 +1506,13 @@ fn coordinator_uses_native_thread_and_turn_protocol_with_read_only_tools() {
         .find(|(_, m, _)| m == "thread/start")
         .unwrap();
     assert_eq!(thread.2["sandbox"], "read-only");
-    assert_eq!(thread.2["dynamicTools"].as_array().unwrap().len(), 6);
+    assert!(
+        thread.2["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "assistant_create_member")
+    );
     let turn = executor
         .runtime
         .calls

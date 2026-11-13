@@ -17,6 +17,8 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -28,84 +30,83 @@ import java.time.format.DateTimeFormatter
 
 @Composable
 fun AssistantScreen(state: AssistantUiState, models: List<NativeModel>, runtimes: List<AssistantRuntimeChoice>, workspaces: List<AssistantWorkspaceChoice>,
-    onAction: (AssistantAction) -> Unit, onOpenThread: (String, String) -> Unit, onBack: () -> Unit, modifier: Modifier = Modifier, nowMs: Long = System.currentTimeMillis()) {
-    val snapshot = state.snapshot
-    val runtime = snapshot?.runtimeId.orEmpty()
-    val canAct = snapshot?.enabled == true && runtimes.any {it.id==runtime && it.available} && !state.loading && state.error == null
-    var tab by rememberSaveable { mutableStateOf("Chat") }
-    var localError by rememberSaveable(runtime) { mutableStateOf<String?>(null) }
-    val holder = rememberSaveableStateHolder()
+    onAction: (AssistantAction) -> Unit, onOpenThread: (String, String) -> Unit, onBack: () -> Unit, modifier: Modifier = Modifier, nowMs: Long = System.currentTimeMillis(), connected: Boolean = true) {
+    val snapshot=state.snapshot
+    val runtime=snapshot?.runtimeId.orEmpty()
+    val canAct=snapshot?.enabled==true && snapshot.prepReady && connected && !state.loading && state.error==null && !state.busy("assistant/prepare")
+    var tab by rememberSaveable {mutableStateOf("Chat")}
+    var localError by rememberSaveable(runtime) {mutableStateOf<String?>(null)}
+    val holder=rememberSaveableStateHolder()
+    var more by remember {mutableStateOf(false)}
     fun act(make: () -> AssistantAction) {
-        val result = runCatching(make)
-        result.onSuccess {localError=null;onAction(it)}.onFailure {localError=it.message ?: "请检查填写内容"}
+        runCatching(make).onSuccess {localError=null;onAction(it)}.onFailure {localError=it.message ?: "请检查填写内容"}
     }
-    val c = MaterialTheme.colorScheme
-    val palette = assistantPalette()
-    var more by remember { mutableStateOf(false) }
-    val navigate: (String) -> Unit = { more=false;tab=it }
-    BackHandler(tab != "Chat") { tab="Chat" }
-    MaterialTheme(colorScheme=c.copy(primary=palette.accent,onPrimary=palette.onAccent,secondary=palette.accent,
-        primaryContainer=palette.outgoing,onPrimaryContainer=palette.onOutgoing,surface=palette.surface,background=palette.background)) {
-    ProvideMarkdownRendering {
-        Column(modifier.fillMaxSize().background(palette.background).systemBarsPadding().imePadding().testTag("assistant-screen")) {
-            Row(Modifier.fillMaxWidth().heightIn(min=64.dp).padding(horizontal=8.dp,vertical=4.dp),verticalAlignment=Alignment.CenterVertically) {
-                IconButton({if(tab=="Chat") onBack() else tab="Chat"},Modifier.testTag("assistant-back")) {
-                    Icon(AssistantIcons.Back,if(tab=="Chat") "返回原页面" else "返回助理对话")
-                }
-                if(tab=="Chat") { AssistantAvatar(size=32.dp); Spacer(Modifier.width(10.dp)) }
-                Column(Modifier.weight(1f).padding(vertical=4.dp)) {
-                    Text(when(tab) {"Memory"->"记忆";"Schedules"->"定时事项";"Settings"->"助理设置";"Tasks"->"全部任务";else->"口袋助理"},style=MaterialTheme.typography.titleMedium)
-                    if(tab=="Chat") Text(if(runtime.isNotBlank() && runtimes.none {it.id==runtime && it.available}) "电脑离线 · 可先写草稿" else assistantStatus(state),style=MaterialTheme.typography.labelSmall,color=palette.muted)
-                }
-                Box {
-                    IconButton({more=true},Modifier.testTag("assistant-more")) {Icon(AssistantIcons.More,"更多助理功能")}
-                    DropdownMenu(more,{more=false}) {
-                        assistantDestinations.forEach { (id,label,icon) ->
-                            DropdownMenuItem(text={Text(label)},leadingIcon={Icon(icon,null)},onClick={navigate(id)},modifier=Modifier.testTag("assistant-tab:$id"))
+    val navigate: (String)->Unit={more=false;tab=it}
+    BackHandler(tab!="Chat") {tab="Chat"}
+    val chrome: @Composable ()->Unit = {
+        Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal=12.dp,vertical=8.dp).testTag("assistant-top-chrome")) {
+            CompositionLocalProvider(LocalPocketClearGlass provides true) {
+                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                    PocketGlassSurface(onClick={if(tab=="Chat") onBack() else tab="Chat"},shape=androidx.compose.foundation.shape.CircleShape,
+                        modifier=Modifier.size(48.dp).testTag("assistant-back").semantics {contentDescription=if(tab=="Chat") "返回原页面" else "返回助理对话"}) {
+                        Box(Modifier.size(48.dp),contentAlignment=Alignment.Center) {Icon(AssistantIcons.Back,null)}
+                    }
+                    // The title is a reading surface: clear icon optics let scrolling transcript
+                    // glyphs compete with it. Keep the real backdrop with the editor's diffusion.
+                    CompositionLocalProvider(LocalPocketClearGlass provides false) {
+                    PocketGlassSurface(Modifier.weight(1f).testTag("assistant-header-glass"),shape=PocketOval,dense=true) {
+                        Row(Modifier.fillMaxWidth().heightIn(min=56.dp).padding(horizontal=14.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                            if(tab=="Chat") AssistantAvatar(size=30.dp)
+                            Column(Modifier.weight(1f)) {
+                                Text(when(tab) {"Memory"->"记忆";"Schedules"->"定时事项";"Settings"->"助理设置";"Tasks"->"全部任务";else->"口袋助理"},style=MaterialTheme.typography.titleMedium,maxLines=1,overflow=TextOverflow.Ellipsis)
+                                if(tab=="Chat") Text(if(connected) assistantStatus(state) else "电脑离线 · 可先写草稿",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
+                            }
                         }
-                        HorizontalDivider()
-                        snapshot?.coordinatorThreadId?.let { thread ->
-                            DropdownMenuItem(text={Text("打开原对话")},leadingIcon={Icon(PocketIcons.Link2,null)},onClick={more=false;onOpenThread(runtime,thread)},enabled=runtime.isNotBlank(),modifier=Modifier.testTag("assistant-original-thread"))
+                    }
+                    }
+                    Box {
+                        PocketGlassSurface(onClick={more=true},shape=androidx.compose.foundation.shape.CircleShape,
+                            modifier=Modifier.size(48.dp).testTag("assistant-more").semantics {contentDescription="更多助理功能"}) {
+                            Box(Modifier.size(48.dp),contentAlignment=Alignment.Center) {Icon(AssistantIcons.More,null)}
                         }
-                        DropdownMenuItem(text={Text("刷新状态")},leadingIcon={Icon(PocketIcons.RefreshCw,null)},onClick={more=false;act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading && !state.busy("assistant/read"),modifier=Modifier.testTag("assistant-refresh"))
+                        DropdownMenu(more,{more=false}) {
+                            assistantDestinations.forEach {(id,label,icon)->DropdownMenuItem(text={Text(label)},leadingIcon={Icon(icon,null)},onClick={navigate(id)},modifier=Modifier.testTag("assistant-tab:$id"))}
+                            HorizontalDivider()
+                            snapshot?.coordinatorThreadId?.let {thread->DropdownMenuItem(text={Text("打开原对话")},leadingIcon={Icon(PocketIcons.Link2,null)},onClick={more=false;onOpenThread(runtime,thread)},enabled=runtime.isNotBlank(),modifier=Modifier.testTag("assistant-original-thread"))}
+                            DropdownMenuItem(text={Text("刷新状态")},leadingIcon={Icon(PocketIcons.RefreshCw,null)},onClick={more=false;act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading && !state.busy("assistant/read"),modifier=Modifier.testTag("assistant-refresh"))
+                        }
                     }
                 }
             }
-            HorizontalDivider(color=palette.border)
-            if(state.loading) LinearProgressIndicator(Modifier.fillMaxWidth(),color=palette.accent)
-            (state.error ?: localError)?.let { error ->
-                Row(Modifier.fillMaxWidth().background(c.errorContainer).padding(start=16.dp,end=4.dp),verticalAlignment=Alignment.CenterVertically) {
-                    Text(error,Modifier.weight(1f).padding(vertical=8.dp).testTag("assistant-error"),color=c.onErrorContainer,style=MaterialTheme.typography.bodySmall)
-                    TextButton({act {AssistantActions.read(snapshot?.after ?: 0)}},enabled=!state.loading) {Text("重试",color=c.onErrorContainer)}
-                }
-            }
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                holder.SaveableStateProvider("$runtime:$tab") {
-                    when(tab) {
-                        "Chat" -> if(snapshot?.enabled != true) {
-                            LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(16.dp)) {
-                                item {AssistantCard {
-                                    AssistantAvatar(size=48.dp)
-                                    Text(if(snapshot?.enabled==false) "你好，我是口袋助理" else "正在和电脑取得联系",style=MaterialTheme.typography.titleMedium)
-                                    Text(if(snapshot?.enabled==false) "连上电脑后，直接发消息给我。任务进度和结果都会回到这里。" else "读取状态后，就可以继续上次的对话。",style=MaterialTheme.typography.bodyMedium,color=c.onSurfaceVariant)
-                                    PocketButton(if(snapshot?.enabled==false) "前往启用设置" else "读取状态",{
-                                        if(snapshot?.enabled==false) tab="Settings" else act {AssistantActions.read(0)}
-                                    },Modifier.fillMaxWidth().testTag("assistant-configure"),enabled=!state.loading)
-                                }}
-                            }
-                        } else AssistantChat(state,workspaces,canAct,{make -> act(make)},onOpenThread,navigate)
-                        "Tasks" -> LazyColumn(Modifier.fillMaxSize().testTag("assistant-tasks-list"),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-                            if(snapshot?.tasks.isNullOrEmpty()) item {Text("还没有任务，发条消息开始吧。",color=palette.muted)}
-                            items(snapshot?.tasks.orEmpty().distinctBy {it.id},key={it.id}) {task -> AssistantTaskCard(task,state,canAct,{make -> act(make)},onOpenThread)}
-                        }
-                        "Memory" -> AssistantMemories(state,canAct) {make -> act(make)}
-                        "Schedules" -> AssistantSchedules(state,workspaces,canAct,nowMs) {make -> act(make)}
-                        "Settings" -> AssistantSettingsPage(state,models,runtimes,canAct) {make -> act(make)}
+            if(state.loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top=6.dp))
+            (state.error ?: localError ?: snapshot?.preparationIssue)?.let {error->
+                PocketGlassSurface(Modifier.fillMaxWidth().padding(top=6.dp),shape=RoundedCornerShape(20.dp),dense=true) {
+                    Row(Modifier.padding(start=14.dp,end=6.dp),verticalAlignment=Alignment.CenterVertically) {
+                        Text(error,Modifier.weight(1f).padding(vertical=8.dp).testTag("assistant-error"),color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)
+                        PocketTextButton({act {AssistantActions.prepare()}},enabled=connected && !state.loading && !state.busy("assistant/prepare")) {Text(snapshot?.preparationRetryLabel ?: "重试准备")}
                     }
                 }
             }
         }
     }
+    ProvideMarkdownRendering {
+        Box(modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).testTag("assistant-screen")) {
+            holder.SaveableStateProvider(tab) {
+                if(tab=="Chat") AssistantChat(state.copy(snapshot=snapshot ?: AssistantSnapshot()),workspaces,canAct,{make->act(make)},onOpenThread,navigate,chrome)
+                else Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+                    chrome()
+                    Box(Modifier.weight(1f)) {when(tab) {
+                        "Tasks"->LazyColumn(Modifier.fillMaxSize().testTag("assistant-tasks-list"),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+                            if(snapshot?.tasks.isNullOrEmpty()) item {Text("还没有任务，发条消息开始吧。",color=MaterialTheme.colorScheme.onSurfaceVariant)}
+                            items(snapshot?.tasks.orEmpty().distinctBy {it.id},key={it.id}) {task->AssistantTaskCard(task,state,canAct,{make->act(make)},onOpenThread,workspaces)}
+                        }
+                        "Memory"->AssistantMemories(state,canAct) {make->act(make)}
+                        "Schedules"->AssistantSchedules(state,workspaces,canAct,nowMs) {make->act(make)}
+                        "Settings"->AssistantSettingsPage(state,models,runtimes,canAct) {make->act(make)}
+                    }}
+                }
+            }
+        }
     }
 }
 
@@ -117,18 +118,18 @@ private val assistantDestinations get() = listOf(
 internal fun AssistantUiState.busy(method: String, id: String? = null) = method in pendingActions || (id!=null && "$method:$id" in pendingActions)
 private fun assistantStatus(state: AssistantUiState): String = when {
     state.loading -> "正在读取状态"; state.error != null -> "暂时无法确认状态"; state.snapshot?.enabled==null -> "状态尚未读取"
-    state.snapshot.enabled==false -> "尚未启用"; state.snapshot.runtimeId.isNullOrBlank() -> "运行入口尚未提供"; state.snapshot.paused==true -> "助理已暂停"
+    state.snapshot.enabled==false -> "尚未启用"; state.busy("assistant/prepare") || state.snapshot.ready==false -> "正在准备助理"; state.snapshot.paused==true -> "助理已暂停"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Waiting && !it.suspended} -> "等待你确认"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Unknown && !it.suspended} -> "正在核对运行状态"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Running && !it.suspended} -> "正在处理"
-    state.snapshot.tasks.any {it.status==AssistantTaskStatus.Queued} -> "有任务在排队"; else -> "在线"
+    state.snapshot.tasks.any {it.status==AssistantTaskStatus.Queued} -> "有任务在排队"; else -> "自动安排任务"
 }
 internal fun taskLabel(status: AssistantTaskStatus) = when(status) {
     AssistantTaskStatus.Queued -> "排队中"; AssistantTaskStatus.Running -> "运行中"; AssistantTaskStatus.WaitingUser -> "等你确认"; AssistantTaskStatus.Paused -> "已暂停"
     AssistantTaskStatus.Done -> "已完成"; AssistantTaskStatus.Failed -> "执行失败"; AssistantTaskStatus.Unknown -> "状态待确认"
 }
 @Composable internal fun AssistantCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    Surface(modifier.fillMaxWidth(),shape=RoundedCornerShape(16.dp),color=assistantPalette().surface) {
+    PocketGlassSurface(modifier.fillMaxWidth(),shape=RoundedCornerShape(24.dp),dense=true) {
         Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp),content=content)
     }
 }
@@ -150,33 +151,42 @@ internal fun taskLabel(status: AssistantTaskStatus) = when(status) {
     }
 }
 
-@Composable internal fun AssistantTaskCard(task: AssistantTask, state: AssistantUiState, canAct: Boolean, act: (() -> AssistantAction)->Unit, open:(String,String)->Unit) {
-    val runtime=state.snapshot?.runtimeId.orEmpty()
-    val operation=state.snapshot?.operations?.firstOrNull {it.id==task.activeRunId}
+@Composable internal fun AssistantTaskCard(task: AssistantTask, state: AssistantUiState, canAct: Boolean, act: (() -> AssistantAction)->Unit, open:(String,String)->Unit,
+    workspaces: List<AssistantWorkspaceChoice> = emptyList()) {
     var expanded by rememberSaveable(task.id) {mutableStateOf(false)}
+    val holder = rememberSaveableStateHolder()
     AssistantCard {
-        Column(Modifier.fillMaxWidth().clickable(onClickLabel=if(expanded) "收起任务详情" else "展开任务详情") {expanded=!expanded}.testTag("assistant-task:${task.id}"),verticalArrangement=Arrangement.spacedBy(6.dp)) {
+        PocketGlassSurface(onClick={expanded=!expanded},modifier=Modifier.fillMaxWidth().testTag("assistant-task:${task.id}").semantics {contentDescription=if(expanded) "收起任务详情" else "展开任务详情"},shape=RoundedCornerShape(16.dp),dense=true) {
+        Column(Modifier.fillMaxWidth().heightIn(min=48.dp).padding(8.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
             Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
                 Icon(AssistantIcons.Tasks,null,Modifier.size(18.dp),tint=assistantPalette().accent)
                 Text(taskLabel(task.status),Modifier.weight(1f).padding(start=8.dp),style=MaterialTheme.typography.labelMedium,color=if(task.status==AssistantTaskStatus.Failed) MaterialTheme.colorScheme.error else assistantPalette().accent)
                 Text(if(expanded) "收起" else "详情",style=MaterialTheme.typography.labelSmall,color=assistantPalette().muted)
             }
-            Text(task.prompt,style=MaterialTheme.typography.bodyLarge,maxLines=if(expanded) Int.MAX_VALUE else 2,overflow=TextOverflow.Ellipsis)
-        }
-        if(expanded) {
-        task.detail?.takeIf {it.isNotBlank()}?.let {Text(it,style=MaterialTheme.typography.bodyMedium)}
-        if(task.reconciliationRequired) Text("运行状态待电脑核对",style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
-        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-            if(task.status in setOf(AssistantTaskStatus.Queued,AssistantTaskStatus.Running,AssistantTaskStatus.WaitingUser)) PocketButton("暂停",{act {AssistantActions.task(runtime,task.id,false)}},Modifier.weight(1f).testTag("assistant-task-pause:${task.id}"),enabled=canAct && !state.busy("assistant/task/pause",task.id),secondary=true)
-            if(task.status in setOf(AssistantTaskStatus.Paused,AssistantTaskStatus.WaitingUser) && !task.reconciliationRequired && task.activeRunId==null) PocketButton("继续",{act {AssistantActions.task(runtime,task.id,true)}},Modifier.weight(1f).testTag("assistant-task-resume:${task.id}"),enabled=canAct && !state.busy("assistant/task/resume",task.id),secondary=true)
-            operation?.threadId?.let {thread -> PocketButton("原对话",{open(runtime,thread)},Modifier.weight(1f).testTag("assistant-task-thread:${task.id}"),enabled=runtime.isNotBlank(),secondary=true)}
+            Text(task.prompt,style=MaterialTheme.typography.bodyLarge,maxLines=2,overflow=TextOverflow.Ellipsis)
         }
         }
+        AssistantExpansion(expanded) {holder.SaveableStateProvider(task.id) {
+            AssistantTaskDetails(task,state,canAct,act,open,workspaces)
+        }}
     }
 }
 @Composable internal fun AssistantHumanQuestion(op: AssistantOperation, runtime:String, state:AssistantUiState, canAct:Boolean, act:(()->AssistantAction)->Unit) {
     val q=op.question ?: return
     var answer by rememberSaveable(op.id,q.requestId) {mutableStateOf("")}
+    if(op.phase in setOf(AssistantOperationPhase.Completed,AssistantOperationPhase.Failed)) {
+        val arguments = runCatching {when(val value=pocketJson.parseToJsonElement(q.text)) {
+            is JsonObject -> value; is JsonArray -> buildJsonObject {put("questions",value)}; else -> null
+        }}.getOrNull()
+        if(q.kind == AssistantQuestionKind.Input && arguments != null) {
+            val item = TimelineItem.from(op.id, buildJsonObject {
+                put("id",q.requestId);put("type","dynamicToolCall");put("tool","request_user_input");put("status","completed");put("arguments",arguments)
+                op.result?.let {result -> put("contentItems",buildJsonArray {add(buildJsonObject {put("type","text");put("text",result)})})}
+            })
+            NativeQuestionHistory.from(item)?.let {HistoricalQuestionRow(it,"assistant:${op.id}")}
+        } else Text(if(op.phase == AssistantOperationPhase.Completed) "已确认" else "确认已结束", style=MaterialTheme.typography.labelMedium)
+        return
+    }
     val allowed=canAct && op.phase==AssistantOperationPhase.Waiting && !op.suspended && !state.busy("assistant/respond",op.id)
     AssistantCard(Modifier.testTag("assistant-question:${op.id}")) {
         AssistantBadge(if(q.kind==AssistantQuestionKind.Approval) "需要你的审批" else "需要你的回答")
@@ -272,7 +282,16 @@ internal fun taskLabel(status: AssistantTaskStatus) = when(status) {
     var waiting by rememberSaveable {mutableStateOf(s?.notifications?.waitingUser ?: true)}
     var dirty by rememberSaveable {mutableStateOf(false)}
     val draft=AssistantSettings(personality,tone,model,zone,AssistantNotifications(completed,failed,waiting))
-    LaunchedEffect(s) {if(s!=null && (!dirty || s==draft)) {personality=s.personality;tone=s.tone;model=s.model;zone=s.timezone;completed=s.notifications.completed;failed=s.notifications.failed;waiting=s.notifications.waitingUser;dirty=false}}
+    var initializedSettings by rememberSaveable {mutableStateOf(s!=null)}
+    LaunchedEffect(s) {
+        if(s!=null && !initializedSettings) {
+            // Preparation can supply defaults after a model was explicitly chosen. Preserve that choice.
+            if(personality.isEmpty()) personality=s.personality
+            if(tone.isEmpty()) tone=s.tone
+            initializedSettings=true
+        }
+        if(s!=null && (!dirty || s==draft)) {personality=s.personality;tone=s.tone;model=s.model;zone=s.timezone;completed=s.notifications.completed;failed=s.notifications.failed;waiting=s.notifications.waitingUser;dirty=false}
+    }
     val savedAction=runCatching {AssistantActions.settings(current,draft,models)}
     LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
         item {AssistantCard {

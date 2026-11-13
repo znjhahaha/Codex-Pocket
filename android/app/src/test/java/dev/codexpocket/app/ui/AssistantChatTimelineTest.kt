@@ -6,6 +6,25 @@ import org.junit.Test
 
 /** Pure timeline projection tests: no Compose, Android runtime, clock, or transport. */
 class AssistantChatTimelineTest {
+    @Test fun groupSynthesisKeepsMemberResultInDetailsButPreservesFailureAndWaitingCards() {
+        val task=AssistantTask("group-task","综合核查",AssistantTaskStatus.Failed,"execution",false,"来源核查失败",AssistantAssignment("group-task","member","group"))
+        val execution=AssistantOperation("execution","Execution","group-task",AssistantOperationPhase.Failed,false,"native",null,"成员失败详情")
+        val question=execution.copy(id="waiting",phase=AssistantOperationPhase.Waiting,question=AssistantQuestion("q",AssistantQuestionKind.Approval,"允许读取？"),result=null)
+        val state=AssistantUiState(AssistantSnapshot(tasks=listOf(task),operations=listOf(execution,question),
+            groups=listOf(AssistantGroup("group","综合任务",listOf("group-task"),true,true,"incomplete"))))
+        val timeline=assistantTimeline(state)
+        assertTrue(timeline.none {it is AssistantTimeline.Result})
+        assertEquals(AssistantTaskStatus.Failed,timeline.filterIsInstance<AssistantTimeline.Group>().single().tasks.single().status)
+        assertEquals("waiting",timeline.filterIsInstance<AssistantTimeline.Question>().single().operation.id)
+    }
+    @Test fun relatedTaskGroupProducesOneSummaryWithoutDuplicateTaskRows() {
+        val first=task("first","one");val second=task("second","two");val ungrouped=task("other",null)
+        val snapshot=AssistantSnapshot(tasks=listOf(first,second,ungrouped),groups=listOf(AssistantGroup("g","调整助理界面",listOf("first","second"),true,true,"running")))
+        val timeline=assistantTimeline(AssistantUiState(snapshot))
+        assertEquals(listOf("group:g","task:other"),timeline.map {it.key})
+        assertEquals(listOf("first","second"),timeline.filterIsInstance<AssistantTimeline.Group>().single().tasks.map {it.id})
+    }
+
     private fun task(id: String, operationId: String?) = AssistantTask(
         id, "任务 $id", AssistantTaskStatus.Running, operationId, false, null)
 

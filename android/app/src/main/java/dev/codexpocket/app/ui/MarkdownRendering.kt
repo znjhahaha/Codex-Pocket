@@ -199,6 +199,17 @@ internal fun ProvideMarkdownRendering(threadLinks: ThreadLinkBinding? = LocalThr
 private class MarkdownView(context: Context) : TextView(context) {
     var onLink: ((String) -> Unit)? = null
     var codeBackground: Int = 0
+    // Selection can request an internal scroll before Compose finishes measuring the prose.
+    // Once all lines fit, vertical scrolling belongs to the surrounding transcript.
+    override fun scrollTo(x: Int, y: Int) {
+        val measured = layout
+        val visibleHeight = height - totalPaddingTop - totalPaddingBottom
+        super.scrollTo(x, if (measured != null && visibleHeight > 0 && measured.height <= visibleHeight) 0 else y)
+    }
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        scrollTo(scrollX, scrollY)
+    }
     override fun onDraw(canvas: android.graphics.Canvas) {
         val spans = text as? Spanned
         val measured = layout

@@ -31,6 +31,7 @@ struct Target {
     slot: usize,
     image_index: usize,
     image_count: usize,
+    local_path: Option<PathBuf>,
 }
 
 /// A short-lived proof from a native thread/read response, scoped to its connection generation.
@@ -40,6 +41,7 @@ struct Target {
 pub struct NativeHistory {
     path: PathBuf,
     targets: Arc<Vec<Target>>,
+    image_roots: Arc<Vec<PathBuf>>,
     scan_bytes: u64,
     record_limit: usize,
     selected_bytes: usize,
@@ -143,6 +145,9 @@ impl NativeHistory {
                             slot,
                             image_index,
                             image_count,
+                            local_path: (part["type"] == "localImage")
+                                .then(|| part["path"].as_str().map(PathBuf::from))
+                                .flatten(),
                         });
                     }
                     image_index += 1;
@@ -152,6 +157,7 @@ impl NativeHistory {
         Ok(Self {
             path,
             targets: Arc::new(targets),
+            image_roots: Arc::new(Vec::new()),
             scan_bytes: MAX_SCAN_BYTES,
             record_limit: MAX_RECORDS,
             selected_bytes: MAX_SELECTED_BYTES,
@@ -164,6 +170,68 @@ impl NativeHistory {
         self.targets
             .iter()
             .any(|t| t.owner == *owner && t.slot == content_part)
+    }
+    /// Roots must come from native workspace metadata and the computer's existing image policy.
+    pub fn with_image_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.image_roots = Arc::new(roots);
+        self
+    }
+    pub(super) fn local_source(&self, owner: &MediaOwner, slot: usize) -> Option<&Path> {
+        self.targets
+            .iter()
+            .find(|target| target.owner == *owner && target.slot == slot)
+            .and_then(|target| target.local_path.as_deref())
+    }
+    pub(super) fn authorizes_local_snapshot(
+        &self,
+        owner: &MediaOwner,
+        slot: usize,
+        canonical: &Path,
+    ) -> bool {
+        self.local_source(owner, slot).is_some()
+            && self
+                .image_roots
+                .iter()
+                .any(|root| canonical.starts_with(root) && canonical != root)
+    }
+    pub(super) fn local_image(&self, owner: &MediaOwner, slot: usize) -> Result<(File, PathBuf)> {
+        let path = self
+            .local_source(owner, slot)
+            .ok_or_else(|| anyhow::anyhow!("Native local image unavailable"))?;
+        let read = (|| -> Result<(File, PathBuf)> {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+            {
+                bail!("Invalid image path");
+            }
+            let file = open_history(path)?;
+            let canonical = dunce::canonicalize(path)?;
+            crate::storage::verify_physical_file(&canonical, &file)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let actual = file.metadata()?;
+                let expected = fs::metadata(&canonical)?;
+                if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+                    bail!("Image path changed");
+                }
+            }
+            if !self
+                .image_roots
+                .iter()
+                .any(|root| canonical.starts_with(root) && canonical != *root)
+            {
+                bail!("Image is outside authorized roots");
+            }
+            let size = file.metadata()?.len();
+            if size == 0 || size > super::implementation::MAX_MEDIA_BYTES {
+                bail!("Invalid image size");
+            }
+            Ok((file, canonical))
+        })();
+        read.map_err(|_| anyhow::anyhow!("Native local image unavailable or invalid"))
     }
     pub(super) fn same_proof(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cache, &other.cache)
@@ -187,7 +255,8 @@ impl NativeHistory {
             let current = index.file.metadata()?;
             if current.len() < index.complete_end
                 || prefix_digest(&index.file, index.complete_end)? != index.prefix_sha256
-                || (!index.records.contains_key(&target.owner.item_id) && current.len() > index.complete_end)
+                || (!index.records.contains_key(&target.owner.item_id)
+                    && current.len() > index.complete_end)
             {
                 *shared = None;
             }
@@ -317,6 +386,12 @@ impl NativeHistory {
                     || record["payload"]["type"] != "message"
                     || record["payload"]["role"] != "user"
                     || active_turn != target.owner.turn_id
+                    || record["payload"]
+                        .get("turn_id")
+                        .is_some_and(|id| id != &json!(target.owner.turn_id))
+                    || record["payload"]
+                        .pointer("/internal_chat_message_metadata_passthrough/turn_id")
+                        .is_some_and(|id| id != &json!(target.owner.turn_id))
                 {
                     bail!("History user identity mismatch");
                 }
@@ -372,7 +447,8 @@ fn prefix_digest(file: &File, length: u64) -> Result<[u8; 32]> {
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..count])?;
-        digest.update(&buffer[..count]); remaining -= count as u64;
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(digest.finalize().into())
@@ -441,6 +517,101 @@ fn open_history(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Select only bounded question evidence; large message/image/command bodies are skipped.
+/// The caller has already proven this path through native thread/read and the config store.
+pub(crate) fn question_records(path: &Path, thread: &str) -> Result<Vec<Value>> {
+    let scan = (|| -> Result<Vec<Value>> {
+        let file = open_history(path)?;
+        let length = file.metadata()?.len();
+        if length == 0 || length > MAX_SCAN_BYTES {
+            bail!("History scan limit");
+        }
+        let end = complete_prefix_end(&file, length)?;
+        let digest = prefix_digest(&file, end)?;
+        let budget = Rc::new(Cell::new(usize::MAX));
+        let mut reader = BoundedReader {
+            inner: BufReader::new(file),
+            position: 0,
+            end,
+            budget: budget.clone(),
+        };
+        let mut calls = HashSet::new();
+        let mut selected = Vec::new();
+        let mut count = 0;
+        let mut selected_bytes = 0;
+        while reader.skip_whitespace()? {
+            if count >= MAX_RECORDS || selected.len() >= 8192 {
+                bail!("History record limit");
+            }
+            let start = reader.position;
+            let skeleton = parse(&mut reader, &budget, Node::Record)?;
+            let record_end = reader.position;
+            let payload = &skeleton["payload"];
+            if count == 0 {
+                if skeleton["type"] != "session_meta"
+                    || payload["id"] != thread
+                    || payload
+                        .get("session_id")
+                        .is_some_and(|id| !id.is_null() && id != thread)
+                {
+                    bail!("History ownership mismatch");
+                }
+            } else if skeleton["type"] == "session_meta" {
+                bail!("Ambiguous history session");
+            }
+            let question = skeleton["type"] == "response_item"
+                && payload["type"] == "function_call"
+                && payload["name"].as_str().is_some_and(|name| {
+                    matches!(name, "request_user_input" | "functions.request_user_input")
+                });
+            if question {
+                let id = payload["call_id"]
+                    .as_str()
+                    .filter(|id| valid_id(id))
+                    .ok_or_else(|| anyhow::anyhow!("Invalid call identity"))?;
+                if calls.len() >= 256 {
+                    bail!("Question history limit");
+                }
+                calls.insert(id.to_owned());
+            }
+            let answer = payload["call_id"]
+                .as_str()
+                .is_some_and(|id| calls.contains(id))
+                && ((skeleton["type"] == "response_item"
+                    && payload["type"] == "function_call_output")
+                    || (skeleton["type"] == "retained_context"
+                        && payload["type"] == "verified_answer"));
+            if question || answer {
+                if selected.len() >= 1024 {
+                    bail!("Question evidence limit");
+                }
+                reader.seek_to(start, record_end)?;
+                selected_bytes += (record_end - start) as usize;
+                if selected_bytes > 16 * 1024 * 1024 {
+                    bail!("Question evidence byte limit");
+                }
+                selected.push(parse(&mut reader, &budget, Node::QuestionRecord)?);
+                reader.seek_to(record_end, end)?;
+            } else if skeleton["type"] == "turn_context"
+                || skeleton["type"] == "event_msg"
+                    && matches!(
+                        payload["type"].as_str(),
+                        Some("task_started" | "task_complete")
+                    )
+            {
+                selected.push(skeleton);
+            }
+            count += 1;
+        }
+        if prefix_digest(reader.inner.get_ref(), end)? != digest {
+            bail!("History changed during projection");
+        }
+        Ok(selected)
+    })();
+    // Parser errors can contain values; never forward them to logs or phone responses.
+    scan.map_err(|_| anyhow::anyhow!("Native question history unavailable or invalid"))
+}
+
 struct BoundedReader {
     inner: BufReader<File>,
     position: u64,
@@ -501,6 +672,9 @@ enum Node {
     RecordSelect(usize, usize),
     PayloadSelect(usize, usize),
     SelectContent(usize, usize),
+    QuestionRecord,
+    QuestionPayload,
+    Metadata,
 }
 struct Skeleton {
     node: Node,
@@ -606,6 +780,11 @@ impl<'de> Visitor<'de> for Skeleton {
                 (Node::RecordSelect(index, limit), "payload") => {
                     Some(Node::PayloadSelect(index, limit))
                 }
+                (Node::QuestionRecord, "payload") => Some(Node::QuestionPayload),
+                (
+                    Node::Payload | Node::QuestionPayload,
+                    "internal_chat_message_metadata_passthrough",
+                ) => Some(Node::Metadata),
                 (Node::PayloadContent, "content") => Some(Node::Content),
                 (Node::PayloadSelect(index, limit), "content") => {
                     Some(Node::SelectContent(index, limit))
@@ -613,13 +792,16 @@ impl<'de> Visitor<'de> for Skeleton {
                 _ => None,
             };
             let short = match self.node {
-                Node::Record | Node::RecordContent | Node::RecordSelect(..) | Node::Part => {
-                    key == "type"
-                }
-                Node::Payload => matches!(
+                Node::Record
+                | Node::RecordContent
+                | Node::RecordSelect(..)
+                | Node::QuestionRecord
+                | Node::Part => key == "type",
+                Node::Payload | Node::QuestionPayload => matches!(
                     key.as_str(),
-                    "id" | "session_id" | "type" | "role" | "turn_id"
+                    "id" | "session_id" | "type" | "role" | "turn_id" | "call_id" | "name"
                 ),
+                Node::Metadata => key == "turn_id",
                 _ => false,
             };
             if let Some(node) = child {
@@ -630,6 +812,19 @@ impl<'de> Visitor<'de> for Skeleton {
                         budget: self.budget.clone(),
                     })?,
                 );
+            } else if matches!(self.node, Node::QuestionPayload)
+                && matches!(
+                    key.as_str(),
+                    "arguments" | "output" | "questions" | "answers"
+                )
+            {
+                let old = self.budget.get();
+                let limit = old.min(128 * 1024);
+                self.budget.set(limit);
+                let selected = map.next_value::<Value>();
+                let used = limit - self.budget.get();
+                self.budget.set(old - used);
+                result.insert(key, selected?);
             } else if short {
                 result.insert(
                     key,
@@ -763,16 +958,40 @@ mod tests {
         }
     }
     #[test]
+    fn raw_fallback_rejects_explicit_turn_mismatch_and_different_message_id() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        for mismatch in [false, true] {
+            let mut data = records();
+            if mismatch {
+                data[3]["payload"]["internal_chat_message_metadata_passthrough"] =
+                    json!({"turn_id":"foreign-turn"});
+            } else {
+                data[3]["payload"]["id"] = json!("msg_user");
+            }
+            write(&path, &data);
+            let proof =
+                NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+            assert!(proof.recover(&owner(), 1).is_err());
+        }
+    }
+    #[test]
     fn append_only_active_history_reuses_verified_prefix_despite_incomplete_tail() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("native.jsonl");
         write(&path, &records());
-        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        let proof =
+            NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
         assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
         let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writer.write_all(b"{\"type\":\"event_msg\",\"payload\":").unwrap();
+        writer
+            .write_all(b"{\"type\":\"event_msg\",\"payload\":")
+            .unwrap();
         assert_eq!(proof.recover(&owner(), 3).unwrap(), second_image());
-        assert_eq!(proof.scan_builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            proof.scan_builds.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -780,10 +999,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("native.jsonl");
         write(&path, &records());
-        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":").unwrap();
-        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":")
+            .unwrap();
+        let proof =
+            NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
         assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
-        let mut changed = records(); changed[0]["payload"]["id"] = json!("foreign");
+        let mut changed = records();
+        changed[0]["payload"]["id"] = json!("foreign");
         write(&path, &changed);
         assert!(proof.recover(&owner(), 1).is_err());
     }
@@ -793,23 +1019,40 @@ mod tests {
         let path = root.path().join("native.jsonl");
         let data = records();
         write(&path, &data[..3]);
-        let proof = NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
+        let proof =
+            NativeHistory::from_native_thread(&native(&path), "runtime", "connection").unwrap();
         assert!(proof.recover(&owner(), 1).is_err());
         let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        serde_json::to_writer(&mut writer, &data[3]).unwrap(); writer.write_all(b"\n").unwrap();
+        serde_json::to_writer(&mut writer, &data[3]).unwrap();
+        writer.write_all(b"\n").unwrap();
         assert_eq!(proof.recover(&owner(), 1).unwrap(), image());
     }
     #[test]
     #[ignore = "Read-only local metadata probe; explicit fixture path required, no content printed"]
     fn supplied_native_image_history_probe() {
         let input = std::env::var("POCKET_MEDIA_PROBE").expect("Explicit probe metadata required");
-        let thread: Value = serde_json::from_slice(&crate::storage::read_physical(Path::new(&input), 1_048_576).unwrap()).unwrap();
+        let thread: Value = serde_json::from_slice(
+            &crate::storage::read_physical(Path::new(&input), 1_048_576).unwrap(),
+        )
+        .unwrap();
         let proof = NativeHistory::from_native_thread(&thread, "probe", "probe").unwrap();
         for target in proof.targets.iter() {
             let now = std::time::Instant::now();
             match proof.recover_target(target) {
-                Ok(part) => println!("media_probe success=true elapsedMs={} embedded={}", now.elapsed().as_millis(), part["image_url"].as_str().is_some_and(|s|s.starts_with("data:image/"))),
-                Err(e) => { println!("media_probe success=false elapsedMs={} error={e}", now.elapsed().as_millis()); panic!("Image recovery failed") }
+                Ok(part) => println!(
+                    "media_probe success=true elapsedMs={} embedded={}",
+                    now.elapsed().as_millis(),
+                    part["image_url"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("data:image/"))
+                ),
+                Err(e) => {
+                    println!(
+                        "media_probe success=false elapsedMs={} error={e}",
+                        now.elapsed().as_millis()
+                    );
+                    panic!("Image recovery failed")
+                }
             }
         }
     }

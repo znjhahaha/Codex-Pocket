@@ -14,6 +14,13 @@ pub(super) fn thread_params(
         v["allowProviderModelFallback"] = json!(false);
         if req.role == Role::Coordinator {
             v["dynamicTools"] = json!(dynamic_tools());
+        } else {
+            v["dynamicTools"] = json!(
+                collaboration_tools()
+                    .into_iter()
+                    .filter(|tool| tool["name"] == "assistant_read_main")
+                    .collect::<Vec<_>>()
+            );
         }
     }
     v
@@ -72,9 +79,85 @@ pub fn dynamic_tools() -> Vec<Value> {
             vec!["text"],
         ),
     ];
+    specs.into_iter().map(|(name,description,properties,required)|json!({"type":"function","name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).chain(collaboration_tools()).collect()
+}
+fn collaboration_tools() -> Vec<Value> {
+    let text = json!({"type":"string","minLength":1,"maxLength":65536});
+    let id = json!({"type":"string","minLength":1,"maxLength":256});
+    let specs = [
+        (
+            "assistant_create_member",
+            "Create a persistent member only for a distinct recurring responsibility in this conversation, or when explicitly requested. Reuse existing members. A one-off task needs no member.",
+            json!({"name":text,"duty":text,"directory":text}),
+            vec!["name", "duty", "directory"],
+        ),
+        (
+            "assistant_list_members",
+            "Read this conversation's members. Never poll to wait for results.",
+            json!({}),
+            vec![],
+        ),
+        (
+            "assistant_retire_member",
+            "Retire a member after its tasks have stopped. Keep its history.",
+            json!({"member_id":id}),
+            vec!["member_id"],
+        ),
+        (
+            "assistant_create_group",
+            "Group related delegated tasks. Set requires_summary only if their results need integration; otherwise results are shown directly.",
+            json!({"title":text,"requires_summary":{"type":"boolean"}}),
+            vec!["title", "requires_summary"],
+        ),
+        (
+            "assistant_seal_group",
+            "Finish adding tasks to this group and allow dispatch. Results wake you once when the sealed group settles.",
+            json!({"group_id":id}),
+            vec!["group_id"],
+        ),
+        (
+            "assistant_assign_task",
+            "Delegate a task with complete goal, scope, facts, constraints and completion criteria. Members retain their own conversation. Dependencies must refer to previously created tasks. Seal the group after assigning all tasks.",
+            json!({"prompt":text,"directory":text,"writes":{"type":"boolean"},"member_id":id,"group_id":id,"dependencies":{"type":"array","items":id,"maxItems":32},"completion_criteria":text}),
+            vec!["prompt", "directory", "writes", "completion_criteria"],
+        ),
+        (
+            "assistant_send_to_member",
+            "Forward a user's clarification or follow-up to its member; delivery is persisted and shown. Do not redo that member's work.",
+            json!({"member_id":id,"message":text}),
+            vec!["member_id", "message"],
+        ),
+        (
+            "assistant_reassign_task",
+            "Change a task's responsible member after a user adjustment. The previous execution is stopped and confirmed before the replacement starts.",
+            json!({"task_id":id,"member_id":id,"message":text}),
+            vec!["task_id", "member_id", "message"],
+        ),
+        (
+            "assistant_read_main",
+            "Read public conversation messages and member results. Use before for older pages. A truncated entry can be read in full using entry_id and offset; nextOffset continues the text. No hidden reasoning or secret approval payloads.",
+            json!({"before":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":20},"entry_id":id,"offset":{"type":"integer","minimum":0}}),
+            vec![],
+        ),
+    ];
     specs.into_iter().map(|(name,description,properties,required)|json!({"type":"function","name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
 }
 pub(super) fn decode_tool(name: &str, args: &Value) -> Result<ToolCall> {
+    if collaboration_tools()
+        .iter()
+        .any(|tool| tool["name"] == name)
+    {
+        let mut value = args.clone();
+        let object = value
+            .as_object_mut()
+            .context("Tool arguments must be object")?;
+        ensure!(!object.contains_key("action"), "Unexpected action override");
+        object.insert(
+            "action".into(),
+            json!(name.trim_start_matches("assistant_")),
+        );
+        return Ok(ToolCall::Collaboration(serde_json::from_value(value)?));
+    }
     let fields: &[&str] = match name {
         "assistant_list_sessions" => &["limit"],
         "assistant_progress" | "assistant_pause_task" => &["task_id"],
@@ -196,46 +279,57 @@ pub(super) fn human_response(p: &PendingRequest, answer: &HumanResponse) -> Resu
             Ok(json!({"permissions":permissions,"scope":"turn"}))
         }
         ("item/tool/requestUserInput", HumanResponse::Answer(text)) => {
-            bounded_text(text, 65536)?;
             let questions = p.params["questions"]
                 .as_array()
                 .context("Native questions missing")?;
-            ensure!(
-                !questions.is_empty() && questions.len() <= 32,
-                "Invalid native question count"
-            );
-            let ids = questions
-                .iter()
-                .map(|q| max_string(&q["id"], 256))
-                .collect::<Result<Vec<_>>>()?;
-            let mut answers = serde_json::Map::new();
-            if ids.len() == 1 {
-                answers.insert(ids[0].clone(), json!({"answers":[text]}));
-            } else {
-                let supplied: Value = serde_json::from_str(text).context(
-                    "Multiple questions require explicit JSON answers keyed by native question id",
-                )?;
-                let object = supplied.as_object().context("Answers must be object")?;
-                ensure!(
-                    object.len() == ids.len() && object.keys().all(|k| ids.contains(k)),
-                    "Answers do not match native questions"
-                );
-                for id in ids {
-                    let values = object[&id]
-                        .as_array()
-                        .context("Each answer must be string array")?;
-                    ensure!(
-                        !values.is_empty() && values.len() <= 32,
-                        "Invalid answer list"
-                    );
-                    for v in values {
-                        max_string(v, 65536)?;
-                    }
-                    answers.insert(id, json!({"answers":values}));
-                }
-            }
+            let answers = normalize_input_answers(questions, text)?;
             Ok(json!({"answers":answers}))
         }
         _ => anyhow::bail!("Human response kind does not match native question"),
     }
+}
+
+/// One encoding for native transport and redacted public history. Multi-question
+/// user input is a question-ID -> string-array object, not a native envelope.
+pub(crate) fn normalize_input_answers(questions: &[Value], text: &str) -> Result<Value> {
+    bounded_text(text, 65536)?;
+    ensure!(
+        !questions.is_empty() && questions.len() <= 32,
+        "Invalid native question count"
+    );
+    let ids = questions
+        .iter()
+        .map(|q| max_string(&q["id"], 256))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len() == ids.len(),
+        "Duplicate native question id"
+    );
+    let mut answers = serde_json::Map::new();
+    if ids.len() == 1 {
+        answers.insert(ids[0].clone(), json!({"answers":[text]}));
+    } else {
+        let supplied: Value = serde_json::from_str(text).context(
+            "Multiple questions require explicit JSON answers keyed by native question id",
+        )?;
+        let object = supplied.as_object().context("Answers must be object")?;
+        ensure!(
+            object.len() == ids.len() && object.keys().all(|k| ids.contains(k)),
+            "Answers do not match native questions"
+        );
+        for id in ids {
+            let values = object[&id]
+                .as_array()
+                .context("Each answer must be string array")?;
+            ensure!(
+                !values.is_empty() && values.len() <= 32,
+                "Invalid answer list"
+            );
+            for value in values {
+                max_string(value, 65536)?;
+            }
+            answers.insert(id, json!({"answers":values}));
+        }
+    }
+    Ok(Value::Object(answers))
 }

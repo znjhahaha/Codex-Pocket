@@ -9,7 +9,7 @@ export function OptionalIntegrationPanel({status,generation,busy,action}:{status
  if(!flight.current)flight.current=createRepairFlight(invoke,undefined,repairStore());
  const [working,setWorking]=useState(false),[result,setResult]=useState<RepairResult|null>(null),[error,setError]=useState<OperationError|null>(null);
  const available=status?.recordState==='available';
- const supported=available&&status.repairSupported===true&&!!generation&&/^[a-f0-9]{64}$/.test(generation);
+ const supported=available&&(status.repairSupported===true||status.repairCheckAvailable===true)&&!!generation&&/^[a-f0-9]{64}$/.test(generation);
  const pending=flight.current.current();
  const run=(step?:RepairStep)=>{
   if(busy||working||!supported)return;
@@ -30,7 +30,7 @@ export function OptionalIntegrationPanel({status,generation,busy,action}:{status
     <button className="button" disabled={!supported||busy||working||!!pending||detail?.state!=='pending'||status?.recoveryState!=='clear'} aria-describedby="installed-repair-availability" onClick={()=>run(step)}>重试{label}</button>
    </div>;
   })}</div>
-  <p id="installed-repair-availability">{supported?'仅重试所选步骤。修复完成仍需分别核验运行版本和实际登录。':'当前安装器尚不支持分项修复，或尚未通过修复能力核验。请保留诊断，使用完整安装包的重试流程补全可选集成。'}</p>
+  <p id="installed-repair-availability">{supported?(status?.repairSupported===true?'仅重试所选步骤。修复完成仍需分别核验运行版本和实际登录。':'安装脚本摘要已核对，修复能力待核验。点击重试时将核验安装器能力，仅重试所选步骤。修复完成仍需分别核验运行版本和实际登录。'):'当前安装器尚不支持分项修复，或尚未通过安装脚本摘要核验。请保留诊断，使用完整安装包的重试流程补全可选集成。'}</p>
   {result&&<p role={result.state==='completed'?'status':'alert'}>{result.state==='completed'?'所选集成已记录完成，运行生效仍待核验。':result.state==='failed'?'所选集成修复失败。':result.state==='busy'?'安装器正在处理另一项操作。':'本次操作结果尚未确认，请核对同一操作。'} · {result.code} · 操作 {result.operationId} · 阶段 {result.stage}{result.call&&` · 调用 ${result.call}`}{result.hresult&&` · HRESULT ${result.hresult}`}{result.exitCode!==null&&` · 退出码 ${result.exitCode}`}</p>}
   {error&&<p role="alert">{error.message} · {error.code} · 操作 {error.operationId}</p>}
   {pending&&<div><p role="status">待核对操作 {pending.operationId}。核对前不会创建新的修复操作。</p><button className="button" disabled={!supported||busy||working} onClick={()=>run()}>核对上次修复</button></div>}

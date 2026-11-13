@@ -97,15 +97,16 @@ impl<R: RuntimeIo> HostExecutor<R> {
                         call_id: Some(call_id.clone()),
                     };
                     self.insert_pending(pending)?;
-                    let decoded = if op.role != Role::Coordinator {
-                        Err(anyhow::anyhow!(
-                            "Only current coordinator may use assistant tools"
-                        ))
-                    } else if !p["namespace"].is_null() {
-                        Err(anyhow::anyhow!("Unknown dynamic tool namespace"))
-                    } else {
-                        protocol::decode_tool(p["tool"].as_str().unwrap_or(""), &p["arguments"])
-                    };
+                    let decoded =
+                        if op.role != Role::Coordinator && p["tool"] != "assistant_read_main" {
+                            Err(anyhow::anyhow!(
+                                "Only current coordinator may use assistant tools"
+                            ))
+                        } else if !p["namespace"].is_null() {
+                            Err(anyhow::anyhow!("Unknown dynamic tool namespace"))
+                        } else {
+                            protocol::decode_tool(p["tool"].as_str().unwrap_or(""), &p["arguments"])
+                        };
                     let (call, error) = match decoded {
                         Ok(c) => (Some(c), None),
                         Err(e) => (None, Some(e.to_string())),

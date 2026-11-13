@@ -55,6 +55,22 @@ pub struct AssistantStore {
     pub(super) assistant_id: String,
 }
 
+impl Task {
+    pub(super) fn reassigned_prompt(&self, message: &str) -> Result<String> {
+        bounded_text(message, 65536)?;
+        let prompt = format!("{}\n\nUser reassignment update:\n{message}", self.prompt);
+        let criteria = self
+            .assignment
+            .as_ref()
+            .map_or(0, |a| a.completion_criteria.len());
+        ensure!(
+            prompt.len() + criteria + 128 <= 65536,
+            "Reassigned task and completion criteria exceed native input limit; shorten the update"
+        );
+        Ok(prompt)
+    }
+}
+
 impl AssistantStore {
     /// The caller supplies a private, local database path; its parent must exist.
     /// Opening another handle does not fence workers. Recovery is explicit.
@@ -84,9 +100,25 @@ impl AssistantStore {
         &self.assistant_id
     }
 
+    pub(super) fn command_applied(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM assistant_commands WHERE assistant_id=?1 AND command_id=?2)",
+            params![self.assistant_id, id], |row| row.get(0))?)
+    }
+
     /// Atomically applies an explicit user command and persists its receipt.
     /// Reusing an ID with different content is an error, even after restart.
     pub fn apply(&mut self, command_id: &str, command: Command) -> Result<CommandReceipt> {
+        self.apply_with_effect(command_id, command, |_, _| Ok(()))
+    }
+
+    /// Commits a service-side state transition with a new command's receipt.
+    /// Replays return the original receipt without repeating the transition.
+    pub(super) fn apply_with_effect(
+        &mut self,
+        command_id: &str,
+        command: Command,
+        effect: impl FnOnce(&Connection, &CommandReceipt) -> Result<()>,
+    ) -> Result<CommandReceipt> {
         bounded_text(command_id, 256)?;
         // Persist a fingerprint, not an extra copy of explicit memory text.
         let payload = format!("{:x}", Sha256::digest(serde_json::to_vec(&command)?));
@@ -104,7 +136,25 @@ impl AssistantStore {
             );
             return Ok(serde_json::from_str(&receipt)?);
         }
+        let (command, assignment) = match command {
+            Command::CreateAssignedTask {
+                prompt,
+                directory,
+                writes,
+                assignment,
+            } => (
+                Command::CreateTask {
+                    prompt,
+                    directory,
+                    writes,
+                    not_before_ms: 0,
+                },
+                Some(assignment),
+            ),
+            command => (command, None),
+        };
         let result = match command {
+            Command::CreateAssignedTask { .. } => unreachable!(),
             Command::CreateTask {
                 prompt,
                 directory,
@@ -128,6 +178,7 @@ impl AssistantStore {
                     active_run_id: None,
                     reconciliation_required: false,
                     detail: None,
+                    assignment,
                 };
                 tx.execute(
                     "INSERT INTO assistant_tasks(id,assistant_id,status,directory_key,writes,not_before_ms,data)
@@ -158,6 +209,36 @@ impl AssistantStore {
                     "Task cannot resume"
                 );
                 task.status = TaskStatus::Queued;
+                save_task(&tx, &task)?;
+                CommandResult::Task(task)
+            }
+            Command::ReassignTask {
+                task_id,
+                member_id,
+                message,
+            } => {
+                bounded_text(&member_id, 256)?;
+                let mut task = read_task(&tx, &self.assistant_id, &task_id)?;
+                ensure!(!takeover(&tx, &self.assistant_id)?, "Assistant is paused");
+                ensure!(
+                    !matches!(task.status, TaskStatus::Done | TaskStatus::Failed),
+                    "Task is terminal; use a follow-up instead"
+                );
+                ensure!(
+                    task.active_run_id.is_none()
+                        && !task.reconciliation_required
+                        && matches!(task.status, TaskStatus::Paused | TaskStatus::Queued),
+                    "Confirm the previous execution stopped before reassignment"
+                );
+                task.prompt = task.reassigned_prompt(&message)?;
+                let assignment = task.assignment.get_or_insert_with(TaskAssignment::default);
+                assignment.member_id = Some(member_id);
+                // Reassignment changes ownership, not the task graph. Never
+                // inherit an anonymous predecessor's native conversation.
+                assignment.continue_from_task = None;
+                assignment.lineage_root = None;
+                task.status = TaskStatus::Queued;
+                task.detail = None;
                 save_task(&tx, &task)?;
                 CommandResult::Task(task)
             }
@@ -208,6 +289,7 @@ impl AssistantStore {
         };
         tx.execute("INSERT INTO assistant_commands(assistant_id,command_id,payload,receipt) VALUES(?1,?2,?3,?4)",
             params![self.assistant_id, command_id, payload, serde_json::to_string(&receipt)?])?;
+        effect(&tx, &receipt)?;
         tx.commit()?;
         Ok(receipt)
     }
@@ -238,6 +320,14 @@ impl AssistantStore {
     /// Claims one due task, skipping blocked writers. Unresolved executions still
     /// occupy capacity and directory reservations, regardless of visible status.
     pub fn claim_next(&mut self, now_ms: i64) -> Result<Option<RunLease>> {
+        self.claim_eligible(now_ms, |_| true)
+    }
+
+    pub fn claim_eligible(
+        &mut self,
+        now_ms: i64,
+        eligible: impl Fn(&Task) -> bool,
+    ) -> Result<Option<RunLease>> {
         ensure!(now_ms >= 0, "Invalid clock time");
         let tx = self
             .db
@@ -267,6 +357,28 @@ impl AssistantStore {
         let mut selected = None;
         for data in candidates {
             let mut task: Task = serde_json::from_str(&data)?;
+            if !eligible(&task) {
+                continue;
+            }
+            if let Some(assignment) = &task.assignment {
+                let tasks = read_tasks(&tx, &self.assistant_id, None)?;
+                if assignment.dependencies.iter().any(|id| {
+                    !tasks
+                        .iter()
+                        .any(|t| &t.id == id && t.status == TaskStatus::Done)
+                }) {
+                    continue;
+                }
+                if assignment.member_id.as_ref().is_some_and(|member| {
+                    tasks.iter().any(|t| {
+                        t.active_run_id.is_some()
+                            && t.assignment.as_ref().and_then(|a| a.member_id.as_ref())
+                                == Some(member)
+                    })
+                }) {
+                    continue;
+                }
+            }
             // Resolve aliases again at reservation time, including replaced junctions.
             let directory = dunce::canonicalize(&task.directory)?;
             ensure!(directory.is_dir(), "Task directory no longer exists");
@@ -307,6 +419,23 @@ impl AssistantStore {
             Reconciliation::Resolved(outcome),
             false,
         )
+    }
+
+    /// A prerequisite failed before this task dispatched. No native turn is invented.
+    pub fn fail_queued(&mut self, id: &str, detail: &str) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut task = read_task(&tx, &self.assistant_id, id)?;
+        ensure!(
+            task.status == TaskStatus::Queued && task.active_run_id.is_none(),
+            "Task already dispatched"
+        );
+        task.status = TaskStatus::Failed;
+        task.detail = Some(detail.into());
+        save_task(&tx, &task)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn reconcile(
         &mut self,
@@ -597,6 +726,55 @@ mod tests {
         assert_ne!(other.assistant_id(), id);
         assert!(other.tasks().unwrap().is_empty());
         assert!(other.memories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collaboration_store_reassign_requires_stop_and_retains_contract() {
+        let mut f = Fixture::new();
+        let task = f.create("task", true, 0);
+        let lease = f.store.claim_next(0).unwrap().unwrap();
+        let command = Command::ReassignTask {
+            task_id: task.id.clone(),
+            member_id: "member".into(),
+            message: "New approach".into(),
+        };
+        assert!(f.store.apply("replace", command.clone()).is_err());
+        f.store
+            .apply(
+                "pause",
+                Command::PauseTask {
+                    task_id: task.id.clone(),
+                },
+            )
+            .unwrap();
+        assert!(f.store.apply("replace", command.clone()).is_err());
+        f.store
+            .reconcile(&task.id, &lease.run_id, Reconciliation::Stopped)
+            .unwrap();
+        let receipt = f.store.apply("replace", command.clone()).unwrap();
+        let next = f.store.claim_next(1).unwrap().unwrap();
+        assert_eq!(next.task.id, task.id);
+        assert_ne!(next.run_id, lease.run_id);
+        assert_eq!(f.second().apply("replace", command).unwrap(), receipt);
+        assert_eq!(
+            f.store.task(&task.id).unwrap().active_run_id,
+            Some(next.run_id.clone())
+        );
+        f.store
+            .finish(&next, RunOutcome::Done("Done".into()))
+            .unwrap();
+        assert!(
+            f.store
+                .apply(
+                    "terminal",
+                    Command::ReassignTask {
+                        task_id: task.id,
+                        member_id: "member".into(),
+                        message: "Again".into()
+                    }
+                )
+                .is_err()
+        );
     }
 
     #[test]

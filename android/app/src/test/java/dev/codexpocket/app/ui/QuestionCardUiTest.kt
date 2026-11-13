@@ -63,6 +63,9 @@ class QuestionCardUiTest {
             "contentItems":[{"type":"inputText","text":"{\"answers\":{\"public\":{\"answers\":[\"Phone\"]},\"secret\":{\"answers\":[\"private-history-fixture\"]}}}"}]
         }""").jsonObject)
         content { HistoricalQuestionRow(NativeQuestionHistory.from(item)!!, item.key) }
+        compose.onNodeWithText("已询问 2 个问题").assertExists()
+        compose.onNodeWithText("Which client?").assertDoesNotExist()
+        compose.onNodeWithTag("question-history-toggle:${item.key}").performClick()
         compose.onNodeWithText("Which client?").assertExists()
         compose.onNodeWithTag("question-history-answer:public").assertTextEquals("回答：Phone")
         compose.onNodeWithTag("question-history-answer:secret").assertTextEquals("回答：敏感回答已隐藏")

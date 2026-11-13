@@ -389,6 +389,152 @@ impl MediaStore {
         image["contentPart"] = json!(content_part);
         image
     }
+    /// The agent supplies a regular file handle after proving native ownership and authorized roots.
+    /// This API never accepts a path from a phone request.
+    pub fn project_user_image_file(
+        &self,
+        owner: &MediaOwner,
+        content_part: usize,
+        mut source: File,
+    ) -> Value {
+        let import = (|| -> Result<(String, &'static str, u64)> {
+            if !owner.valid() {
+                bail!("Invalid media ownership");
+            }
+            let before = source.metadata()?;
+            if !before.is_file()
+                || linked(&before)
+                || before.len() == 0
+                || before.len() > self.max_image
+            {
+                bail!("Invalid source image");
+            }
+            source.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(before.len() as usize);
+            (&mut source)
+                .take(self.max_image + 1)
+                .read_to_end(&mut bytes)?;
+            let after = source.metadata()?;
+            if bytes.len() as u64 != before.len()
+                || after.len() != before.len()
+                || before.modified()? != after.modified()?
+            {
+                bail!("Image changed while reading");
+            }
+            let mime = sniff_mime(&bytes).context("Invalid image magic")?;
+            let size = bytes.len() as u64;
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Media store unavailable"))?;
+            for (id, entry) in entries.iter() {
+                if entry.owner == *owner
+                    && entry.slot == content_part
+                    && entry.size == size
+                    && entry.mime == mime
+                    && now().saturating_sub(entry.created) < TTL_SECONDS
+                    && matches_bytes(&self.root.join(format!("{id}.blob")), &bytes)?
+                {
+                    return Ok((id.clone(), mime, size));
+                }
+            }
+            self.prune(&mut entries, size);
+            regular_directory(&self.root)?;
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let temporary = self.root.join(format!("{id}.part"));
+            let blob = self.root.join(format!("{id}.blob"));
+            let entry = Entry {
+                owner: owner.clone(),
+                mime: mime.into(),
+                size,
+                created: now(),
+                slot: content_part,
+            };
+            let write = (|| -> Result<()> {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&temporary, &blob)?;
+                let mut metadata = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(self.root.join(format!("{id}.json")))?;
+                metadata.write_all(&serde_json::to_vec(&entry)?)?;
+                metadata.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = write {
+                let _ = fs::remove_file(&temporary);
+                remove_entry(&self.root, &id);
+                return Err(error);
+            }
+            entries.insert(id.clone(), entry);
+            Ok((id, mime, size))
+        })();
+        let mut image = match import {
+            Ok((id, mime, size)) => {
+                let mut block = image_status(owner, "ready", "", mime);
+                block["mediaId"] = json!(id);
+                block["byteLength"] = json!(size);
+                block
+            }
+            Err(_) => image_status(
+                owner,
+                "failed",
+                "Native local image unavailable or invalid",
+                "",
+            ),
+        };
+        image["contentPart"] = json!(content_part);
+        image
+    }
+    /// Rebind cached bytes only after the agent proves the same source-native image in a new generation.
+    pub fn renew_user_image(
+        &self,
+        previous: &MediaOwner,
+        owner: &MediaOwner,
+        slot: usize,
+        media_id: &str,
+    ) -> Value {
+        let renew = (|| -> Result<File> {
+            if previous.runtime_id != owner.runtime_id
+                || previous.thread_id != owner.thread_id
+                || previous.turn_id != owner.turn_id
+                || previous.item_id != owner.item_id
+                || !owner.valid()
+                || !opaque_id(media_id)
+            {
+                bail!("Image ownership changed");
+            }
+            let entry = self
+                .entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Media store unavailable"))?
+                .get(media_id)
+                .cloned()
+                .context("Cached image unavailable")?;
+            if entry.owner != *previous
+                || entry.slot != slot
+                || now().saturating_sub(entry.created) >= TTL_SECONDS
+            {
+                bail!("Cached image proof expired");
+            }
+            regular_directory(&self.root)?;
+            let file = regular_file(&self.root.join(format!("{media_id}.blob")))?;
+            if file.metadata()?.len() != entry.size {
+                bail!("Cached image changed");
+            }
+            Ok(file)
+        })();
+        match renew {
+            Ok(file) => self.project_user_image_file(owner, slot, file),
+            Err(_) => image_status(owner, "expired", "Cached native image unavailable", ""),
+        }
+    }
     fn walk(&self, value: &Value, owner: &MediaOwner, depth: usize, slot: usize) -> Value {
         if depth > 64 {
             return Value::Null;
@@ -779,6 +925,20 @@ fn matches_encoded(path: &Path, encoded: &str) -> Result<bool> {
     let mut tail = [0];
     Ok(file.read(&mut tail)? == 0)
 }
+fn matches_bytes(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let Ok(mut file) = regular_file(path) else {
+        return Ok(false);
+    };
+    let mut buffer = [0; 65536];
+    for expected in bytes.chunks(buffer.len()) {
+        if file.read_exact(&mut buffer[..expected.len()]).is_err()
+            || &buffer[..expected.len()] != expected
+        {
+            return Ok(false);
+        }
+    }
+    Ok(file.read(&mut buffer[..1])? == 0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1034,5 +1194,42 @@ mod tests {
         let parts = &projected["params"]["result"]["content"];
         assert_eq!(parts[0]["status"], "ready");
         assert_ne!(parts[0]["mediaId"], parts[1]["mediaId"]);
+    }
+    #[test]
+    fn native_file_import_checks_magic_bounds_slots_and_generation() {
+        let root = Fixture::new();
+        let path = root.0.join("native.png");
+        fs::write(&path, b"\x89PNG\r\n\x1a\nx").unwrap();
+        let store = MediaStore::with_limits(&root.0, 16, 8).unwrap();
+        let first = store.project_user_image_file(&owner(), 0, File::open(&path).unwrap());
+        assert_eq!(first["status"], "ready");
+        let same = store.project_user_image_file(&owner(), 0, File::open(&path).unwrap());
+        assert_eq!(same["mediaId"], first["mediaId"]);
+        let second = store.project_user_image_file(&owner(), 1, File::open(&path).unwrap());
+        assert_ne!(second["mediaId"], first["mediaId"]);
+        let mut new_owner = owner();
+        new_owner.connection_id = "new".into();
+        assert!(
+            store
+                .read(&new_owner, first["mediaId"].as_str().unwrap(), 0, 8)
+                .is_err()
+        );
+        fs::write(&path, b"\x89PNGbad").unwrap();
+        assert_eq!(
+            store.project_user_image_file(&owner(), 0, File::open(&path).unwrap())["status"],
+            "failed"
+        );
+        fs::write(&path, b"\x89PNG\r\n\x1a\nx").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(17)
+            .unwrap();
+        assert_eq!(
+            store.project_user_image_file(&owner(), 0, File::open(&path).unwrap())["status"],
+            "failed"
+        );
+        assert!(!first.to_string().contains("native.png"));
     }
 }

@@ -6,7 +6,7 @@ export type RepairStep = typeof REPAIR_STEPS[number]['step'];
 export interface OptionalIntegrationStep {step:RepairStep;state:'completed'|'pending'|'unverified';stage?:string;code?:string;call?:string|null;hresult?:string|null}
 export interface OptionalIntegrations {
  recordState:'available'|'unverified';reason?:string;installationState?:'installed'|'installed_incomplete'|'unknown';
- recoveryState:'clear'|'pending'|'unknown';repairSupported:boolean;steps:OptionalIntegrationStep[];
+ recoveryState:'clear'|'pending'|'unknown';repairSupported:boolean;repairCheckAvailable?:boolean;steps:OptionalIntegrationStep[];
 }
 export interface RepairOperation {step:RepairStep;expectedGeneration:string;operationId:string}
 export interface RepairResult extends RepairOperation {state:'completed'|'failed'|'recovery-needed'|'unknown'|'busy';code:string;stage:string;call?:string|null;hresult?:string|null;exitCode:number|null;recoveryState:string}
@@ -30,7 +30,7 @@ export function createRepairFlight(send:(command:string,args:Record<string,unkno
    return value as RepairResult;
   }catch(error){
    const code=(error as {code?:string}|null)?.code;
-   if(code&&['repair_unsupported','invalid_params','operation_busy','installation_changed','installation_invalid'].includes(code))save(null);
+   if(code&&(['repair_unsupported','invalid_params','operation_busy','installation_changed','installation_invalid'].includes(code)||(code==='repair_capability_unknown'&&!check)))save(null);
    throw error;
   }finally{pending=false}
  };

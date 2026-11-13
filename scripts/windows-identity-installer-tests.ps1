@@ -5,9 +5,11 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $AgentPath) { $AgentPath = Join-Path $PSScriptRoot '..\dist\delivery-final\windows\pocket-agent.exe' }
 . (Join-Path $PSScriptRoot 'windows-install.ps1')
+function Enter-PocketInstallLifecycle { return @{processesStopped=0} }
+function Complete-PocketInstallLifecycle { return @{processesStarted=0;runtimeVerification='verified'} }
 $AgentPath = [IO.Path]::GetFullPath($AgentPath)
 if (-not [IO.File]::Exists($AgentPath)) { throw 'The final Release helper is required; this test never builds it.' }
-$testRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('..\.local\windows-readiness-tests\identity-' + [guid]::NewGuid().ToString('N'))))
+$testRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('pocket-identity-' + [guid]::NewGuid().ToString('N'))))
 [void][IO.Directory]::CreateDirectory($testRoot)
 $script:passed = 0
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message } }

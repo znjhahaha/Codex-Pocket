@@ -6,7 +6,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
 import kotlinx.coroutines.delay
 
@@ -32,6 +34,34 @@ internal fun ObserveThreadHandoff(s: PocketState, repo: PocketRepository) {
     }
 }
 
+internal fun ownershipNoticeText(s: PocketState, legacyMessage: String): String? {
+    val chat = s.selected ?: return null
+    val check = s.ownershipChecks[chat.key]
+    val reason = s.ownershipReasonFor(chat)
+    if (check == OwnershipCheck.Checking) return "正在重新核验会话归属…"
+    if (check != null && !chat.conflict && s.ownershipVerifiedFor(chat)) return "会话归属已确认，可以继续发送。"
+    if (check == OwnershipCheck.Failed) return "归属核验失败，尚未确认发送权限。请检查电脑连接后重试；草稿已保留。"
+    val explanation = when (reason) {
+        OwnershipReason.Uncertain -> PocketFailure.OwnerUncertain.label
+        OwnershipReason.Multiple -> PocketFailure.MultipleOwners.label
+        null -> legacyMessage
+    }
+    if (check != null) return "核验完成，发送仍暂停。$explanation"
+    return explanation.takeIf { chat.conflict || reason != null }
+}
+
+@Composable
+internal fun ThreadOwnershipNotice(s: PocketState, repo: PocketRepository) {
+    val chat = s.selected ?: return
+    val message = ownershipNoticeText(s, stringResource(R.string.owner_conflict)) ?: return
+    val check = s.ownershipChecks[chat.key]
+    val recovered = check != null && check != OwnershipCheck.Checking && !chat.conflict && s.ownershipVerifiedFor(chat)
+    val canRecheck = s.online && s.supports(BrokerCapability.AccessRead) && check != OwnershipCheck.Checking &&
+        s.actionStatus["access:${chat.key.encoded}"]?.loading != true && s.accessFor()?.phase?.inProgress != true
+    Notice(message, action = if (recovered) "知道了" else if (canRecheck) "重新核验" else null,
+        onAction = { if (recovered) repo.dismissOwnershipCheck() else repo.recheckThreadOwnership() })
+}
+
 @Composable
 internal fun ThreadOwnership(s: PocketState, repo: PocketRepository) {
     val chat = s.selected ?: return
@@ -52,12 +82,14 @@ internal fun ThreadOwnership(s: PocketState, repo: PocketRepository) {
                 access?.phase?.inProgress != true && !s.sendBusy && !s.uncertainSend && !chat.isSubagent && !chat.archived, repo::setThreadSessionMode)
             if (access?.phase?.inProgress == true && s.supports(BrokerCapability.AccessCancel))
                 PocketTextButton({ repo.cancelThreadHandoff() }, enabled = s.online && status?.loading != true) { Text("取消交接") }
-            if (access?.reason != null) Text(PocketFailure.fromCode(access.reason)?.label ?: access.phase.label,
+            if (access?.reason != null && s.ownershipReasonFor() == null) Text(PocketFailure.fromCode(access.reason)?.label ?: access.phase.label,
                 style = MaterialTheme.typography.bodySmall)
+            ThreadOwnershipNotice(s, repo)
             if (status?.loading == true) PocketProgressStatus("正在确认会话归属")
             status?.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-            if (access == null || access.phase in setOf(AccessPhase.Blocked, AccessPhase.Failed, AccessPhase.Cancelled) || chat.key !in s.accessFresh)
-                PocketTextButton({ repo.refreshThreadAccess() }, enabled = s.online && s.supports(BrokerCapability.AccessRead) && status?.loading != true) { Text("刷新归属") }
+            if (ownershipNoticeText(s, stringResource(R.string.owner_conflict)) == null &&
+                (access == null || access.phase in setOf(AccessPhase.Blocked, AccessPhase.Failed, AccessPhase.Cancelled) || chat.key !in s.accessFresh))
+                PocketTextButton({ repo.recheckThreadOwnership() }, enabled = s.online && s.supports(BrokerCapability.AccessRead) && status?.loading != true) { Text("刷新归属") }
         }
     }
 }

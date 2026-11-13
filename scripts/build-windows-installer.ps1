@@ -34,12 +34,12 @@ Name "Codex Pocket"
 OutFile "__OUTPUT__"
 !include "MUI2.nsh"
 !include "x64.nsh"
-!define MUI_FINISHPAGE_TITLE "安装文件已就绪"
-!define MUI_FINISHPAGE_TEXT "安装文件已经验证，已有配对和配置会保留。$\r$\n$\r$\n打开 Pocket 查看后台是否已生效。若旧版本不支持安全交接，请先保存工作，再退出并重新登录 Windows；只重开 Codex 不一定会更新常驻后台。$\r$\n$\r$\n后台未启动时，Pocket 会显示自动重试进度，也可以手动重试。"
+!define MUI_FINISHPAGE_TITLE "安装流程已结束"
+!define MUI_FINISHPAGE_TEXT "成功安装会先退出属于本安装的 Pocket 后台，再安装、自动重启并核验新代次。已有配对、历史和未确认操作记录会保留。$\r$\n$\r$\n请以“显示详情”中的最终结果为准。可选集成待补全时，重新运行安装包重试；升级恢复被阻塞或后台未通过核验时，安装会报告失败并保留恢复证据。"
 !define MUI_FINISHPAGE_RUN
-!define MUI_FINISHPAGE_RUN_TEXT "打开 Pocket 检查后台状态"
+!define MUI_FINISHPAGE_RUN_TEXT "打开 Pocket"
 !define MUI_FINISHPAGE_RUN_FUNCTION OpenPocket
-!define MUI_WELCOMEPAGE_TEXT "将为当前 Windows 用户安装 Codex Pocket。$\r$\n$\r$\n安装前会检查 Codex 桌面、WebView2 与 Visual C++ x64 运行库，并验证现有配对和文件。$\r$\n$\r$\n已有配对和配置会保留。安装后从开始菜单打开唯一的 Codex Pocket 入口，在界面中打开 Codex。$\r$\n$\r$\n若发生错误，“显示详情”会给出阶段和持久诊断文件位置。"
+!define MUI_WELCOMEPAGE_TEXT "将为当前 Windows 用户安装 Codex Pocket。$\r$\n$\r$\n安装前会检查 Codex 桌面、WebView2 与 Visual C++ x64 运行库，并验证现有配对和文件。随后退出本安装的 Pocket 后台、桥接和关联进程。正在使用的 Codex 桌面也会关闭并在安装后重新打开，当前任务可能中断。请先保存工作，再点击“下一步”。未确认操作不会自动重放。$\r$\n$\r$\n安装后会自动重启后台并核验进程身份、新代次和本机认证接口。已有配对和配置会保留。$\r$\n$\r$\n若发生错误，“显示详情”会给出阶段和持久诊断文件位置。"
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckWebView
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
@@ -81,7 +81,7 @@ Section "Codex Pocket"
   SetOutPath "$PLUGINSDIR\payload"
   File /r "__PAYLOAD__\*"
   DetailPrint "正在为当前 Windows 用户安装并核验 Pocket…"
-  nsExec::ExecToStack '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\windows-install.ps1" -SourceDirectory "$PLUGINSDIR\payload" -Initialize -Apply'
+  nsExec::ExecToStack /TIMEOUT=180000 '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\windows-install.ps1" -SourceDirectory "$PLUGINSDIR\payload" -Initialize -Apply'
   Pop $0
   Pop $1
   StrCmp $0 "0" installed
@@ -91,12 +91,13 @@ Section "Codex Pocket"
   SetErrorLevel 1
   Abort
 installed:
-  DetailPrint "安装文件已完成。请从开始菜单打开 Codex Pocket，核验后台生效状态后配置连接。"
+  DetailPrint "$1"
+  DetailPrint "安装完成，后台已自动重启并通过新代次与本机认证核验。"
   Goto installation_done
 installed_incomplete:
   DetailPrint "$1"
   DetailPrint "核心文件已安装并验证，开始菜单或登录启动集成待补全。"
-  MessageBox MB_ICONINFORMATION "核心文件已安装并验证，可选集成尚未完成。$\r$\n$\r$\n请展开“显示详情”查看具体阶段与错误码。修复后重新运行本安装包，仅补全未完成步骤。后台生效仍需核验。"
+  MessageBox MB_ICONINFORMATION "核心文件与后台已核验，可选集成尚未完成。$\r$\n$\r$\n请展开“显示详情”查看具体阶段与错误码。修复后重新运行本安装包重试未完成步骤。若存在待恢复事务，必须先恢复其已知结果。"
   SetErrorLevel 2
 installation_done:
 SectionEnd

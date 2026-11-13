@@ -1,115 +1,141 @@
 use crate::managed_runtime::{Controller, Installation, Registry, SelectedProfile};
 use pocket_runtime_ipc::{Descriptor, HostClient};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
-fn native_fixture() -> &'static Path {
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY.get_or_init(|| {
-        let target =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/managed-runtime-fixtures");
-        std::fs::create_dir_all(&target).unwrap();
-        let binary = target.join("fake-native.exe");
-        let output = std::process::Command::new("rustc")
-            .arg("--edition=2024")
-            .arg(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/managed_runtime/tests/fake_native.rs"),
-            )
-            .arg("-o")
-            .arg(&binary)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        binary
-    })
+#[path = "fixture.rs"]
+mod fixture;
+use fixture::*;
+
+fn msix_restore_fixture(f:&Fixture)->(SelectedProfile,SelectedProfile,Controller) {
+    use crate::managed_runtime::discovery::MsixPackage;
+    let root=f.dir.path().join("WindowsApps");
+    let old=root.join("OpenAI.Codex_26.1103.7773.0_x64__2p2nqsd0c76g0/app/resources/codex.exe");
+    let name="OpenAI.Codex_26.1106.6628.0_x64__2p2nqsd0c76g0".to_string();
+    let package=MsixPackage{location:root.join(&name),full_name:name};
+    let new=package.location.join("app/resources/codex.exe");
+    for path in [&old,&new] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(native_fixture(),path).unwrap();
+    }
+    let mut registry=f.registry.clone();registry.msix_packages=Some(vec![package]);
+    let controller=Controller::new(Installation::new(&f.bin,f.generation.clone()).unwrap(),registry);
+    (SelectedProfile::new(f.profile.config_home(),old).unwrap(),SelectedProfile::new(f.profile.config_home(),new).unwrap(),controller)
 }
-struct Fixture {
-    dir: tempfile::TempDir,
-    profile: SelectedProfile,
-    controller: Controller,
-    registry: Registry,
-    bin: PathBuf,
-    generation: String,
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn msix_restore_dead_original_owners_keep_unknown_recovery_and_use_new_binary() {
+    let f=Fixture::new();let(old,new,controller)=msix_restore_fixture(&f);
+    let first=controller.ensure(&old).await.unwrap();
+    let descriptor=f.state().join("descriptor.json");
+    let d=pocket_runtime_ipc::load_descriptor(&descriptor,old.config_home()).unwrap();
+    let deferred=first.request(json!("unknown-msix"),"fixture/deferred",json!({}));
+    tokio::pin!(deferred);
+    tokio::select! {r=&mut deferred=>panic!("Fixture write unexpectedly completed: {r:?}"),_=tokio::time::sleep(Duration::from_millis(120))=>{}}
+    assert_eq!(first.receipt(json!("unknown-msix")).await.unwrap().state,"unknown");
+    let stop=old.config_home().join("fixture-stop");std::fs::write(&stop,b"stop only the fake native").unwrap();
+    ended(&d).await;std::fs::remove_file(&stop).unwrap();
+    std::fs::remove_file(old.native_binary()).unwrap();
+    let journal=f.state().join("recovery.json");
+    let uncertain=read_json(&journal)["commands"]["s:unknown-msix"].clone();assert!(uncertain.is_object());
+    let trace=old.config_home().join("fixture-methods");let before_methods=std::fs::read_to_string(&trace).unwrap();
+    let account=f.profile.config_home().join("fixture-account");std::fs::write(&account,b"preserve account").unwrap();
+    let next=controller.ensure(&new).await.unwrap();
+    assert_ne!(next.generation(),first.generation());
+    assert_eq!(next.receipt(json!("unknown-msix")).await.unwrap().state,"unknown");
+    assert!(next.request(json!("unknown-msix"),"fixture/info",json!({})).await.is_err());
+    assert!(next.health().await.unwrap().reconciliation_required);
+    next.request(json!("msix-read"),"thread/read",json!({"threadId":"fixture-thread","includeTurns":true})).await.unwrap();
+    let methods=std::fs::read_to_string(&trace).unwrap();let new_methods=&methods[before_methods.len()..];
+    assert!(!new_methods.contains("fixture/deferred"));assert!(!new_methods.contains("fixture/info"));
+    assert!(!new_methods.contains("turn/start"));assert!(!new_methods.contains("thread/start"));
+    assert!(next.health().await.unwrap().reconciliation_required);
+    assert_eq!(read_json(&journal)["commands"]["s:unknown-msix"],uncertain);
+    assert_eq!(read_json(&f.state().join("startup.json"))["nativeBinary"],json!(new.native_binary()));
+    assert_eq!(std::fs::read(&account).unwrap(),b"preserve account");
+    assert!(descriptor.exists());assert!(journal.exists());
+    assert!(next.shutdown_idle().await.is_err());
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        // Only fixture-private sentinel files: no process signals/kill commands.
-        for home in [self.dir.path().join("home"), self.dir.path().join("other")] {
-            if home.exists() {
-                let _ = std::fs::write(home.join("fixture-stop"), b"stop fake peer");
-            }
-        }
-        if let Ok(entries) = std::fs::read_dir(self.dir.path().join("registry")) {
-            for entry in entries.flatten() {
-                if let Ok(d) = pocket_runtime_ipc::load_descriptor(
-                    &entry.path().join("descriptor.json"),
-                    self.profile.config_home(),
-                ) {
-                    let until = std::time::Instant::now() + Duration::from_secs(2);
-                    while !d.host_process.as_ref().is_some_and(|p| p.terminated())
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-            }
-        }
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn msix_restore_live_original_owner_never_overwrites_records_or_starts_another_host() {
+    let f=Fixture::new();let(old,new,controller)=msix_restore_fixture(&f);
+    let first=controller.ensure(&f.profile).await.unwrap();
+    let descriptor=f.state().join("descriptor.json");let d=pocket_runtime_ipc::load_descriptor(&descriptor,old.config_home()).unwrap();
+    let startup=f.state().join("startup.json");let mut owner=read_json(&startup);
+    std::fs::remove_file(old.native_binary()).unwrap();owner["nativeBinary"]=json!(old.native_binary());
+    crate::storage::atomic_write(&startup,&serde_json::to_vec(&owner).unwrap()).unwrap();
+    let paths=[startup,descriptor,f.state().join("recovery.json")];
+    let before:Vec<_>=paths.iter().map(|p|std::fs::read(p).unwrap()).collect();
+    let error=controller.ensure(&new).await.err().unwrap();
+    assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),Some(&crate::managed_runtime::discovery::RestoreFailure::OwnershipUnconfirmed));
+    for (path,bytes) in paths.iter().zip(before) {assert_eq!(std::fs::read(path).unwrap(),bytes);}
+    assert_eq!(first.health().await.unwrap().native_pid,d.native_pid);
+    first.shutdown_idle().await.unwrap();ended(&d).await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn msix_restore_missing_native_creation_identity_never_discards_recovery() {
+    let f=Fixture::new();let(old,new,controller)=msix_restore_fixture(&f);
+    let first=controller.ensure(&old).await.unwrap();
+    let descriptor=f.state().join("descriptor.json");let d=pocket_runtime_ipc::load_descriptor(&descriptor,old.config_home()).unwrap();
+    first.shutdown_idle().await.unwrap();ended(&d).await;
+    std::fs::remove_file(old.native_binary()).unwrap();
+    let mut value=read_json(&descriptor);
+    for native in [None,Some(pocket_core::native_process::NativeProcess::capture(std::process::id()).unwrap())] {
+        value["nativeProcess"]=json!(native);
+        value["nativePid"]=json!(native.as_ref().map_or(d.native_pid,|p|p.pid));
+        crate::storage::atomic_write(&descriptor,&serde_json::to_vec(&value).unwrap()).unwrap();
+        let paths=[f.state().join("startup.json"),descriptor.clone(),f.state().join("recovery.json")];
+        let before:Vec<_>=paths.iter().map(|p|std::fs::read(p).unwrap()).collect();
+        let error=controller.ensure(&new).await.err().unwrap();
+        assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),Some(&crate::managed_runtime::discovery::RestoreFailure::OwnershipUnconfirmed));
+        for (path,bytes) in paths.iter().zip(before) {assert_eq!(std::fs::read(path).unwrap(),bytes);}
     }
 }
-impl Fixture {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        std::fs::create_dir(&home).unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let source = std::env::var_os("MANAGED_RUNTIME_TEST_HOST")
-            .expect("build isolated runtime host and set MANAGED_RUNTIME_TEST_HOST");
-        let bytes = std::fs::read(source).unwrap();
-        std::fs::write(bin.join("pocket-runtime-host.exe"), &bytes).unwrap();
-        let manifest = serde_json::to_vec(&json!({"schema":1,"product":"Codex Pocket","version":"0.6.3","files":[{"path":"pocket-runtime-host.exe","bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))}]})).unwrap();
-        std::fs::write(bin.join("windows-manifest.json"), &manifest).unwrap();
-        let generation = format!("{:x}", Sha256::digest(&manifest));
-        let installation = Installation::new(&bin, generation.clone()).unwrap();
-        let registry = Registry::new(dir.path().join("registry")).unwrap();
-        let profile = SelectedProfile::new(&home, native_fixture()).unwrap();
-        let controller = Controller::new(installation, registry.clone());
-        Self {
-            dir,
-            profile,
-            controller,
-            registry,
-            bin,
-            generation,
-        }
-    }
-    fn state(&self) -> PathBuf {
-        self.registry.profile_directory(&self.profile).unwrap()
-    }
-}
-async fn ended(d: &Descriptor) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !d.host_process.as_ref().unwrap().terminated()
-            || !d.native_process.as_ref().unwrap().terminated()
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_replay_excludes_rpc_replies_but_keeps_receipts_and_cursor() {
+    let f = Fixture::new();
+    let runtime = f.controller.ensure(&f.profile).await.unwrap();
+    runtime
+        .request(
+            json!("account"),
+            "account/read",
+            json!({"refreshToken":false}),
+        )
+        .await
+        .unwrap();
+    let reads = runtime.events(0).await.unwrap();
+    assert!(
+        reads.events.is_empty(),
+        "read replies must not enter the assistant event projection"
+    );
+    assert!(
+        reads.next_after > 0,
+        "filtered replies must still advance the replay cursor"
+    );
+    let receipt = runtime.receipt(json!("account")).await.unwrap();
+    assert_eq!(receipt.state, "completed");
+    assert_eq!(
+        receipt.response.unwrap()["result"]["requiresOpenaiAuth"],
+        true
+    );
+    runtime
+        .request(json!("event"), "fixture/finish", json!({}))
+        .await
+        .unwrap();
+    let events = runtime.events(reads.next_after).await.unwrap();
+    assert_eq!(events.events.len(), 1);
+    assert_eq!(events.events[0].event["method"], "turn/completed");
+    assert!(events.next_after > events.events[0].sequence);
+    let descriptor = pocket_runtime_ipc::load_descriptor(
+        &f.state().join("descriptor.json"),
+        f.profile.config_home(),
+    )
     .unwrap();
-}
-fn read_json(path: &Path) -> Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    runtime.shutdown_idle().await.unwrap();
+    ended(&descriptor).await;
 }
 
 #[test]
@@ -568,4 +594,67 @@ async fn manifest_tampering_and_uncertain_reservation_fail_closed() {
         .to_string();
     assert!(error.contains("uncertain"), "{error}");
     assert!(!state.join("descriptor.json").exists());
+}
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn fenced_attach_existing_preserves_spawned_ownership_and_live_generation() {
+    let f=Fixture::new();
+    let first=f.controller.ensure(&f.profile).await.unwrap();
+    let startup=f.state().join("startup.json");
+    let mut owner=read_json(&startup);owner["phase"]=json!("spawned");owner["descriptorGeneration"]=Value::Null;
+    crate::storage::atomic_write(&startup,&serde_json::to_vec_pretty(&owner).unwrap()).unwrap();
+    let bytes=std::fs::read(&startup).unwrap();
+    drop(first);
+    let attached=f.controller.attach_existing(&f.profile).await.unwrap();
+    assert_eq!(std::fs::read(&startup).unwrap(),bytes,"Attach-only must not repair spawned ownership behind the fence");
+    let descriptor=pocket_runtime_ipc::load_descriptor(&f.state().join("descriptor.json"),f.profile.config_home()).unwrap();
+    assert_eq!(attached.generation(),descriptor.generation);
+    assert_eq!(attached.health().await.unwrap().host_process,descriptor.host_process);
+    attached.shutdown_idle().await.unwrap();ended(&descriptor).await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn fenced_attach_existing_never_replaces_dead_host_or_discards_unknown_commands() {
+    let f=Fixture::new();let runtime=f.controller.ensure(&f.profile).await.unwrap();
+    let descriptor_path=f.state().join("descriptor.json");
+    let descriptor=pocket_runtime_ipc::load_descriptor(&descriptor_path,f.profile.config_home()).unwrap();
+    let pending=tokio::spawn(async move {runtime.request(json!("fenced-unknown"),"fixture/deferred",json!({})).await});
+    tokio::time::timeout(Duration::from_secs(5),async {
+        while !read_json(&f.state().join("recovery.json"))["commands"]["s:fenced-unknown"].is_object() {tokio::time::sleep(Duration::from_millis(10)).await;}
+    }).await.unwrap();
+    pending.abort();let _=pending.await;
+    std::fs::write(f.profile.config_home().join("fixture-stop"),b"stop isolated native").unwrap();ended(&descriptor).await;
+    let paths=[f.state().join("startup.json"),descriptor_path,f.state().join("recovery.json")];
+    let bytes:Vec<_>=paths.iter().map(|p|std::fs::read(p).unwrap()).collect();
+    let trace=f.profile.config_home().join("fixture-methods");let methods=std::fs::read(&trace).unwrap();
+    let error=f.controller.attach_existing(&f.profile).await.err().unwrap();
+    assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),Some(&crate::managed_runtime::discovery::RestoreFailure::ProfileMigrationFenced));
+    for (path,original) in paths.iter().zip(bytes) {assert_eq!(std::fs::read(path).unwrap(),original);}
+    assert_eq!(std::fs::read(&trace).unwrap(),methods);
+    assert_eq!(read_json(&f.state().join("recovery.json"))["commands"]["s:fenced-unknown"]["completed"],false);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn fenced_attach_existing_missing_registry_never_creates_reservation() {
+    let f=Fixture::new();
+    assert!(f.controller.attach_existing(&f.profile).await.is_err());
+    assert!(!f.state().exists());
+    assert!(!f.profile.config_home().join("fixture-methods").exists());
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn fenced_attach_existing_rejects_ownership_binary_migration_before_package_discovery() {
+    let f=Fixture::new();let (old,new,controller)=msix_restore_fixture(&f);
+    let runtime=controller.ensure(&old).await.unwrap();
+    let descriptor=pocket_runtime_ipc::load_descriptor(&f.state().join("descriptor.json"),old.config_home()).unwrap();
+    runtime.shutdown_idle().await.unwrap();ended(&descriptor).await;drop(runtime);
+    std::fs::remove_file(old.native_binary()).unwrap();
+    let mut registry=f.registry.clone();registry.msix_packages=Some(vec![]);
+    let controller=Controller::new(Installation::new(&f.bin,f.generation.clone()).unwrap(),registry);
+    let paths=[f.state().join("startup.json"),f.state().join("descriptor.json"),f.state().join("recovery.json")];
+    let bytes:Vec<_>=paths.iter().map(|p|std::fs::read(p).unwrap()).collect();
+    // Running package discovery would report PackageMissing from this empty
+    // inventory. A fenced attach must refuse retargeting before that query.
+    let error=controller.attach_existing(&new).await.err().unwrap();
+    assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),Some(&crate::managed_runtime::discovery::RestoreFailure::ProfileMigrationFenced));
+    for (path,original) in paths.iter().zip(bytes) {assert_eq!(std::fs::read(path).unwrap(),original);}
 }

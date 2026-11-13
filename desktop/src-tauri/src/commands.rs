@@ -14,7 +14,7 @@ pub struct Context {
 }
 #[derive(Default)]
 pub struct StartupCache {
-    enabled:Option<bool>,failure:Option<OperationError>,checked_at:Option<Instant>,in_flight:bool,revision:u64,
+    enabled:Option<bool>,failure:Option<OperationError>,checked_at:Option<Instant>,in_flight:bool,
 }
 impl Context {
     pub fn new(state:PathBuf,bin:PathBuf)->Self{Self{state,bin,operation:Arc::new(Mutex::new(())),startup_cache:Arc::new(Mutex::new(StartupCache::default())),action_failures:Arc::new(Mutex::new(Vec::new())),control_start_request:Arc::new(Mutex::new(None)),control_start_error:Arc::new(Mutex::new(None)),background_recovery:Arc::new(Mutex::new(Default::default()))}}
@@ -50,30 +50,37 @@ fn startup(c:&Context,action:&str)->anyhow::Result<Value>{
     cmd.args(["-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File"]).arg(script).args(["-Action",action]);
     Ok(serde_json::from_slice(&process::run_bounded(cmd,15)?)?)
 }
-fn startup_enabled(c:&Context)->Result<bool,OperationError>{
-    let owned=c.clone();
-    startup_cached(c,move||{
-        let result=startup(&owned,"Status").and_then(|value|value["enabled"].as_bool().ok_or_else(||anyhow::anyhow!("Invalid startup status")));
-        result.map_err(|e|{let mut error=fail("startup",e);error.code="login_task_status_failed".into();
-            error.message="登录任务状态暂时无法读取。手动连接可以继续；请在可选集成中核验登录任务。".into();error})
-    })
-}
-fn startup_cached(c:&Context,query:impl FnOnce()->Result<bool,OperationError>+Send+'static)->Result<bool,OperationError>{
-    let mut cache=c.startup_cache.lock().map_err(|_|OperationError::new("startup","login_task_status_failed",true))?;
-    if !cache.in_flight&&!cache.checked_at.is_some_and(|at|at.elapsed()<Duration::from_secs(60)){
-        cache.in_flight=true;let revision=cache.revision;let owned=c.clone();
-        std::thread::spawn(move||{
-            let result=query();
-            if let Ok(mut cache)=owned.startup_cache.lock(){
-                cache.in_flight=false;
-                if cache.revision==revision{cache.checked_at=Some(Instant::now());match result{Ok(value)=>{cache.enabled=Some(value);cache.failure=None},Err(error)=>{cache.enabled=None;cache.failure=Some(error)}}}
-            }
-        });
-    }
-    if let Some(error)=&cache.failure{Err(error.clone())}else{Ok(cache.enabled.unwrap_or(false))}
+// Dashboard, tray and diagnostic export only read evidence. Expiry removes a
+// claim of current state; it never schedules another PowerShell child.
+fn startup_enabled(c:&Context)->Result<Option<bool>,OperationError>{startup_cached(c)}
+fn startup_cached(c:&Context)->Result<Option<bool>,OperationError>{
+    let cache=c.startup_cache.lock().map_err(|_|OperationError::new("startup","login_task_status_failed",true))?;
+    if cache.in_flight||!cache.checked_at.is_some_and(|at|at.elapsed()<Duration::from_secs(60)){return Ok(None);}
+    if let Some(error)=&cache.failure{Err(error.clone())}else{Ok(cache.enabled)}
 }
 fn startup_cache_status(c:&Context)->&'static str{
-    match c.startup_cache.lock(){Ok(cache) if cache.in_flight=>"pending",Ok(cache) if cache.enabled.is_some()&&cache.failure.is_none()=>"known",_=>"unknown"}
+    match c.startup_cache.lock(){Ok(cache) if cache.in_flight=>"pending",
+        Ok(cache) if cache.checked_at.is_some_and(|at|at.elapsed()<Duration::from_secs(60))&&cache.enabled.is_some()&&cache.failure.is_none()=>"known",_=>"unknown"}
+}
+pub(crate) fn invalidate_startup(c:&Context){
+    if let Ok(mut cache)=c.startup_cache.lock(){cache.enabled=None;cache.failure=None;cache.checked_at=None;}
+}
+fn check_startup_with(c:&Context,query:impl FnOnce()->Result<bool,OperationError>)->Result<bool,OperationError>{
+    {
+        let mut cache=c.startup_cache.lock().map_err(|_|OperationError::new("startup","login_task_status_failed",true))?;
+        if cache.in_flight{return Err(OperationError::new("startup","operation_busy",true));}
+        cache.in_flight=true;cache.enabled=None;cache.failure=None;cache.checked_at=None;
+    }
+    let result=query();
+    let mut cache=c.startup_cache.lock().map_err(|_|OperationError::new("startup","login_task_status_failed",true))?;
+    cache.in_flight=false;cache.checked_at=Some(Instant::now());
+    match &result{Ok(value)=>cache.enabled=Some(*value),Err(error)=>cache.failure=Some(error.clone())}
+    result
+}
+fn startup_readback(value:&Value)->anyhow::Result<bool>{
+    let enabled=value["enabled"].as_bool().ok_or_else(||anyhow::anyhow!("Invalid startup status"))?;
+    let registered=value["registered"].as_bool().ok_or_else(||anyhow::anyhow!("Invalid startup registration"))?;
+    anyhow::ensure!(!enabled||registered,"Unregistered startup cannot be enabled");Ok(enabled)
 }
 fn connectivity_status(c:&Context)->Value {
     pocket_desktop_runtime::connectivity::ConnectivityManager::new(storage::control(&c.state).join("connectivity"),c.bin.clone()).map(|m|json!(m.status())).unwrap_or(Value::Null)
@@ -140,7 +147,7 @@ fn snapshot(c:&Context)->Value{
     let mut issues=Vec::<OperationError>::new();
     let consistent=match preflight(c){Ok(())=>true,Err(e)=>{issues.push(e);false}};
     let mut config=Value::Null;let mut status=Value::Null;let mut supervisor=json!(supervisor::Status::default());
-    let mut desired=storage::Desired::default();let mut paired=Vec::new();let mut startup_on=false;
+    let mut desired=storage::Desired::default();let mut paired=Vec::new();let mut startup_on=None;
     if consistent {
         match read_required_config(&c.state){Ok(v)=>config=v,Err(e)=>issues.push(e)}
         match optional_state::<storage::Desired>(&storage::control(&c.state).join("desired.json")){Ok(Some(v))=>desired=v,Ok(None)=>{},Err(e)=>issues.push(fail("desired_read",e))}
@@ -168,7 +175,9 @@ fn snapshot(c:&Context)->Value{
         Err(_)=>crate::installed_integrations::public_status(&Value::Null),
     };
     if consistent&&installation["optionalIntegrations"]["recordState"]=="available" {
-        installation["optionalIntegrations"]["repairSupported"]=json!(crate::installed_integrations::repair_supported(&c.bin,&installed_generation));
+        // Hash validation permits an explicit attempt; it is not proof that the
+        // installer protocol or Task Scheduler is available on this machine.
+        installation["optionalIntegrations"]["repairCheckAvailable"]=json!(crate::installed_integrations::repair_check_available(&c.bin,&installed_generation));
     }
     if consistent {
         match supervisor::upgrade::read_status(&c.state) {
@@ -193,7 +202,7 @@ fn snapshot(c:&Context)->Value{
     let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"state":if r["online"]==true{"在线"}else{"离线"},"version":r["version"],"bridgeVersion":r["bridgeVersion"],"helperVersion":r["helperVersion"],"bridgeUpdatePending":r["bridgeUpdatePending"]})).collect();
     let relay=config["relayUrl"].as_str().or(config["relay_url"].as_str()).unwrap_or("");
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
-    json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,"startupStatus":startup_cache_status(c),
+    json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,"startupStatus":if consistent{startup_cache_status(c)}else{"unknown"},
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
         "backgroundRecovery":c.background_recovery.lock().ok().map(|v|json!(*v)),
         "installation":installation,"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
@@ -343,12 +352,28 @@ pub async fn revoke_device(context:State<'_,Context>,id:String)->Result<(),Opera
     }).await.map_err(join_error)?
 }
 #[tauri::command]
+pub async fn check_startup(context:State<'_,Context>)->Result<bool,OperationError>{
+    let c=context.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        let _guard=c.operation.try_lock().map_err(|_|OperationError::new("startup","operation_busy",true))?;
+        preflight(&c)?;
+        check_startup_with(&c,||startup(&c,"Status").and_then(|v|startup_readback(&v)).map_err(|e|{
+            let mut error=fail("startup",e);error.code="login_task_status_failed".into();
+            error.message="登录任务状态暂时无法读取。手动连接可以继续；请在偏好设置中重试核验登录任务。".into();error
+        }))
+    }).await.map_err(join_error)?
+}
+#[tauri::command]
 pub async fn set_startup(context:State<'_,Context>,enabled:bool)->Result<(),OperationError>{
     let c=context.inner().clone();
     tauri::async_runtime::spawn_blocking(move||{
         let _guard=c.operation.try_lock().map_err(|_|OperationError::new("desktop","operation_busy",true))?;preflight(&c)?;
-        startup(&c,if enabled{"Enable"}else{"Disable"}).map_err(|e|fail("startup",e))?;
-        if let Ok(mut cache)=c.startup_cache.lock(){cache.revision+=1;cache.enabled=Some(enabled);cache.failure=None;cache.checked_at=Some(Instant::now());}Ok(())
+        check_startup_with(&c,||{
+            startup(&c,if enabled{"Enable"}else{"Disable"}).and_then(|v|{
+                let actual=startup_readback(&v)?;
+                anyhow::ensure!(actual==enabled,"Startup readback differs from requested state");Ok(actual)
+            }).map_err(|e|fail("startup",e))
+        })?;Ok(())
     }).await.map_err(join_error)?
 }
 #[tauri::command]
@@ -389,6 +414,31 @@ fn diagnostics(report:&Value,now:u64)->Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn automatic_startup_polling_never_dispatches_or_renews_expired_script_checks() {
+        let state=crate::test_support::tempdir();
+        let c=super::Context::new(state.path().into(),state.path().into());
+        for _ in 0..3 {
+            assert_eq!(super::startup_enabled(&c).unwrap(),None);
+            assert_eq!(super::startup_cache_status(&c),"unknown");
+            let mut cache=c.startup_cache.lock().unwrap();
+            assert!(!cache.in_flight,"A passive dashboard read must never dispatch a script");
+            cache.checked_at=Some(std::time::Instant::now()-std::time::Duration::from_secs(61));
+        }
+    }
+    #[test]
+    fn expired_startup_success_is_unknown_instead_of_claiming_disabled_or_current() {
+        let state=crate::test_support::tempdir();
+        let c=super::Context::new(state.path().into(),state.path().into());
+        {
+            let mut cache=c.startup_cache.lock().unwrap();
+            cache.enabled=Some(true);
+            cache.checked_at=Some(std::time::Instant::now()-std::time::Duration::from_secs(61));
+        }
+        assert_eq!(super::startup_cache_status(&c),"unknown");
+        assert_eq!(super::startup_enabled(&c).unwrap(),None);
+        assert!(!c.startup_cache.lock().unwrap().in_flight);
+    }
+    #[test]
     fn former_start_failure_clears_only_after_verified_helper_recovery(){
         let state=crate::test_support::tempdir();
         let context=super::Context::new(state.path().to_owned(),state.path().to_owned());
@@ -412,19 +462,36 @@ mod tests {
         let generic=control_start_failure(anyhow::anyhow!("Fixture generic start"));assert_eq!(generic.code,"control_start_failed");
     }
     #[test]
-    fn optional_startup_query_returns_immediately_is_single_flight_and_caches_failure(){
+    fn explicit_startup_query_is_single_flight_and_passive_reads_never_retry_failure(){
         use std::sync::{mpsc,atomic::{AtomicUsize,Ordering}};
         let state=crate::test_support::tempdir();let c=Context::new(state.path().into(),state.path().into());
-        let (release_tx,release_rx)=mpsc::channel();let calls=Arc::new(AtomicUsize::new(0));let worker_calls=calls.clone();
-        let start=Instant::now();
-        assert!(!startup_cached(&c,move||{worker_calls.fetch_add(1,Ordering::SeqCst);release_rx.recv_timeout(Duration::from_secs(1)).unwrap();Err(OperationError::new("startup","login_task_status_failed",true))}).unwrap());
-        assert!(start.elapsed()<Duration::from_millis(100));assert_eq!(startup_cache_status(&c),"pending");
-        startup_cached(&c,||panic!("Duplicate optional query")).unwrap();
+        let (release_tx,release_rx)=mpsc::channel();let (started_tx,started_rx)=mpsc::channel();
+        let calls=Arc::new(AtomicUsize::new(0));let worker_calls=calls.clone();let worker=c.clone();
+        let thread=std::thread::spawn(move||check_startup_with(&worker,||{
+            worker_calls.fetch_add(1,Ordering::SeqCst);started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();Err(OperationError::new("startup","login_task_status_failed",true))
+        }));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(startup_cache_status(&c),"pending");assert_eq!(startup_cached(&c).unwrap(),None);
+        assert_eq!(check_startup_with(&c,||panic!("Duplicate optional query")).unwrap_err().code,"operation_busy");
         release_tx.send(()).unwrap();
-        for _ in 0..100{if startup_cache_status(&c)!="pending"{break}std::thread::sleep(Duration::from_millis(2));}
+        assert_eq!(thread.join().unwrap().unwrap_err().code,"login_task_status_failed");
         assert_eq!(startup_cache_status(&c),"unknown");
-        assert_eq!(startup_cached(&c,||panic!("Failure must be cached")).unwrap_err().code,"login_task_status_failed");
+        for _ in 0..3{assert_eq!(startup_cached(&c).unwrap_err().code,"login_task_status_failed");}
         assert_eq!(calls.load(Ordering::SeqCst),1);
+        c.startup_cache.lock().unwrap().checked_at=Some(Instant::now()-Duration::from_secs(61));
+        for _ in 0..3{assert_eq!(startup_cached(&c).unwrap(),None);assert!(!c.startup_cache.lock().unwrap().in_flight);}
+        // Expired failure does not disable another explicit user request.
+        assert!(check_startup_with(&c,||{calls.fetch_add(1,Ordering::SeqCst);Ok(true)}).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst),2);assert_eq!(startup_cached(&c).unwrap(),Some(true));
+    }
+    #[test]
+    fn startup_readback_and_invalidation_never_turn_unknown_into_success(){
+        for value in [json!({}),json!({"enabled":false}),json!({"enabled":true,"registered":false}),json!({"enabled":"false","registered":true})]{assert!(startup_readback(&value).is_err());}
+        assert!(!startup_readback(&json!({"enabled":false,"registered":false})).unwrap());
+        let state=crate::test_support::tempdir();let c=Context::new(state.path().into(),state.path().into());
+        check_startup_with(&c,||Ok(true)).unwrap();assert_eq!(startup_cache_status(&c),"known");
+        invalidate_startup(&c);assert_eq!(startup_cached(&c).unwrap(),None);assert_eq!(startup_cache_status(&c),"unknown");
     }
     #[test]
     fn optional_task_scheduler_status_failure_does_not_block_manual_enable(){
@@ -639,7 +706,7 @@ pub async fn configure_routes(context:State<'_,Context>,preferences:Value)->Resu
  let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
   let result=(||{
   let _guard=c.operation.try_lock().map_err(|_|OperationError::new("route_lock","route_operation_busy",true))?;preflight(&c)?;
-  let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("route_prepare",e))?;
+  let dir=prepare_route_directory(&c.state)?;
   let _route_guard=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("route_lock",e))?;
   let file=dir.join(format!("route-request-{}-{}.json",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
   storage::atomic(&file,&preferences).map_err(|e|fail("route_request_write",e))?;
@@ -653,7 +720,7 @@ pub async fn configure_relay(context:State<'_,Context>,url:String)->Result<Value
  let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
   let result=(||{
   let _guard=c.operation.try_lock().map_err(|_|OperationError::new("route_lock","route_operation_busy",true))?;preflight(&c)?;
-  let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("route_prepare",e))?;
+  let dir=prepare_route_directory(&c.state)?;
   let _routes=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("route_lock",e))?;
   let config:Value=storage::read(&c.state.join("config.json")).map_err(|e|fail("route_prepare",e))?;
   let report=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).map_err(|e|fail("routes_read",e))?;
@@ -706,9 +773,40 @@ pub async fn session_preferences_update(context:State<'_,Context>,mode:String,kn
  }).await.map_err(join_error)?
 }
 
+fn prepare_route_directory(state:&Path)->Result<PathBuf,OperationError>{
+ let directory=storage::control(state);
+ storage::private_dir(&directory).map_err(|e|fail("route_prepare",e))?;
+ Ok(directory)
+}
+
+#[cfg(test)]
+mod route_prepare_tests {
+ use super::*;
+ #[cfg(windows)]
+ #[test]
+ fn preparation_failure_preserves_existing_state_and_does_not_dispatch_a_request(){
+  let state=crate::test_support::tempdir();
+  let occupied=storage::control(state.path());std::fs::write(&occupied,b"fixture existing file").unwrap();
+  let error=prepare_route_directory(state.path()).unwrap_err();
+  assert_eq!(error.stage,"route_prepare");assert!(!error.retryable);
+  assert!(error.message.contains("被文件占用"));
+  assert_eq!(std::fs::read(&occupied).unwrap(),b"fixture existing file");
+  assert_eq!(std::fs::read_dir(state.path()).unwrap().count(),1);
+ }
+ #[test]
+ fn preparation_creates_private_directory_and_supports_repeated_route_changes(){
+  let state=crate::test_support::tempdir();
+  let dir=prepare_route_directory(state.path()).unwrap();
+  let path=dir.join("route-request-fixture.json");
+  storage::atomic(&path,&json!({"policy":"lan"})).unwrap();
+  assert_eq!(prepare_route_directory(state.path()).unwrap(),dir);
+  let value:Value=storage::read(&path).unwrap();assert_eq!(value["policy"],"lan");
+ }
+}
+
 fn ensure_gateway(c:&Context,url:&str)->Result<(),OperationError>{
  let gateway=pocket_desktop_runtime::connectivity::gateway(url).map_err(|e|fail("route_prepare",e))?;
- let dir=storage::control(&c.state);storage::private_dir(&dir).map_err(|e|fail("route_prepare",e))?;
+ let dir=prepare_route_directory(&c.state)?;
  let _guard=storage::Lock::acquire(&dir.join("routes.lock")).map_err(|e|fail("route_lock",e))?;
  let report=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]).map_err(|e|fail("routes_read",e))?;
  let mut prefs=report["routePreferences"].clone();

@@ -60,6 +60,8 @@ function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$M
 }
 function Invoke-PocketDesktopBuild([string]$Root,[string]$Target) { $script:desktopBuilt=$true }
 function Assert-PocketWindowsPrerequisites { } # Host runtime availability is not a fixture prerequisite.
+function Enter-PocketInstallLifecycle { return @{processesStopped=0} }
+function Complete-PocketInstallLifecycle { return @{processesStarted=0;runtimeVerification='verified'} }
 
 
 Test 'shared path helpers reject extended and device namespaces before filesystem access' {

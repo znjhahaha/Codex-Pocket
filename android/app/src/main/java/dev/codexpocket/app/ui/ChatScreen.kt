@@ -281,7 +281,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth().padding(horizontal = 16.dp)) {
                 s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 if (!s.online) Notice(stringResource(R.string.offline_history), action = stringResource(R.string.reconnect), onAction = repo::reconnect)
-                if (chat.conflict) Notice(stringResource(R.string.owner_conflict))
+                ThreadOwnershipNotice(s, repo)
                 }
             }
             Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().testTag("chat-bottom-dock").onSizeChanged { composerHeight = it.height }) {

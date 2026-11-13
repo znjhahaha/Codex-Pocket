@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::sync::{Mutex, mpsc};
 
+#[path = "managed_runtime/discovery.rs"]
+pub mod discovery;
 #[path = "managed_runtime/installation.rs"]
 mod installation;
 #[path = "managed_runtime/registry.rs"]
@@ -14,8 +16,8 @@ pub use crate::native::host::Cursor;
 pub use installation::Installation;
 pub use registry::Registry;
 
-/// Constructed by main from a locally authorized, already selected runtime.
-/// No Deserialize implementation and no environment/default identity fallback.
+/// Local authority from an explicitly selected runtime or first-install discovery.
+/// Saved profiles are restored separately, without an environment identity fallback.
 #[derive(Clone, Debug)]
 pub struct SelectedProfile {
     home: PathBuf,
@@ -185,9 +187,22 @@ impl ManagedRuntime {
     pub async fn recovery(&self) -> Result<Value> {
         self.client().await?.recovery().await
     }
-    /// Native event replay; live delivery and activation are provided by attach().
+    /// Notifications/server requests, as in attach(). RPC replies remain receipts.
     pub async fn events(&self, after: u64) -> Result<Replay> {
-        self.client().await?.replay(self.generation(), after).await
+        let mut replay = self
+            .client()
+            .await?
+            .replay(self.generation(), after)
+            .await?;
+        replay.events.retain(|event| {
+            let value = &event.event;
+            !(value.get("method").is_none()
+                && value.get("id").is_some()
+                && (value.get("result").is_some() || value.get("error").is_some()))
+        });
+        // Keep Host sequence/next_after/has_more and pending snapshots unchanged:
+        // a setup/account read advances the cursor even when it has no events.
+        Ok(replay)
     }
     pub async fn shutdown_idle(&self) -> Result<()> {
         self.client().await?.shutdown_idle().await

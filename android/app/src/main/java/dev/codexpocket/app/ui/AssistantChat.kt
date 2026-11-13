@@ -22,6 +22,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onSizeChanged
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
@@ -32,7 +36,7 @@ import kotlinx.coroutines.launch
 /** A retained conversation; navigation never submits or discards its draft. */
 @Composable
 internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWorkspaceChoice>, canAct: Boolean,
-    act: (() -> AssistantAction) -> Unit, open: (String, String) -> Unit, navigate: (String) -> Unit) {
+    act: (() -> AssistantAction) -> Unit, open: (String, String) -> Unit, navigate: (String) -> Unit, header: @Composable () -> Unit = {}) {
     val snapshot=state.snapshot ?: return
     val runtime=snapshot.runtimeId.orEmpty()
     val palette=assistantPalette()
@@ -40,6 +44,9 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
     var sentDraft by rememberSaveable { mutableStateOf<String?>(null) }
     var sentAck by rememberSaveable { mutableLongStateOf(state.sendAcknowledgement) }
     var projectId by rememberSaveable { mutableStateOf<String?>(null) }
+    var targetMember by rememberSaveable {mutableStateOf<String?>(null)}
+    var targetTask by rememberSaveable {mutableStateOf<String?>(null)}
+    var targetPicker by rememberSaveable {mutableStateOf(false)}
     var toolsOpen by rememberSaveable { mutableStateOf(false) }
     var projectPicker by rememberSaveable { mutableStateOf(false) }
     val focus=LocalFocusManager.current
@@ -56,7 +63,8 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
     val project=projects.firstOrNull {it.threadId==projectId}
     val missingProject=projectId!=null && project==null
     val waiting=state.busy("assistant/send") || sentDraft!=null
-    val canSend=canAct && !missingProject && !waiting && message.isNotBlank() && '\u0000' !in message && message.toByteArray(Charsets.UTF_8).size<=65536
+    val missingTarget = (targetMember != null && snapshot.members.none {it.id == targetMember}) || (targetTask != null && snapshot.tasks.none {it.id == targetTask})
+    val canSend=canAct && snapshot.prepared && !missingTarget && !missingProject && !waiting && message.isNotBlank() && '\u0000' !in message && message.toByteArray(Charsets.UTF_8).size<=65536
     val timeline=remember(state.messages,snapshot) { assistantTimeline(state) }
     val list=rememberLazyListState()
     val scope=rememberCoroutineScope()
@@ -80,29 +88,30 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
         if(timeline.isNotEmpty()) {
             val previous=seenKeys.toSet()
             val hasNew=keys.any {it !in previous}
-            if(!positioned || (hasNew && followLatest) || state.sendAcknowledgement>scrollAck) {
+            if(!positioned || state.sendAcknowledgement>scrollAck) {
                 val working=snapshot.operations.any {it.phase==AssistantOperationPhase.Running && !it.suspended && it.role=="Coordinator"}
-                list.scrollToItem(timeline.lastIndex + if(working) 1 else 0)
+                list.scrollToItem(timeline.lastIndex + (if(working) 1 else 0) + (if(state.nextBefore != null) 1 else 0))
                 positioned=true
             } else if(hasNew) unread=true
             seenKeys=keys
         }
         scrollAck=state.sendAcknowledgement
     }
-    BackHandler(toolsOpen || projectPicker) {if(projectPicker) projectPicker=false else toolsOpen=false}
-    Column(Modifier.fillMaxSize()) {
+    BackHandler(toolsOpen || projectPicker || targetPicker) {if(targetPicker) targetPicker=false else if(projectPicker) projectPicker=false else toolsOpen=false}
+    val transcriptBackdrop=rememberLayerBackdrop()
+    // Restore chrome geometry together with the list. Zero padding on the first restored
+    // measure clamps a near-bottom saved offset before the chrome is measured again.
+    var headerHeight by rememberSaveable {mutableIntStateOf(0)}
+    var composerHeight by rememberSaveable {mutableIntStateOf(0)}
+    val topInset=with(LocalDensity.current) {headerHeight.toDp()}
+    val bottomInset=with(LocalDensity.current) {composerHeight.toDp()}
+    Box(Modifier.fillMaxSize()) {
         val waitingQuestions=timeline.filterIsInstance<AssistantTimeline.Question>().filter {it.operation.phase==AssistantOperationPhase.Waiting && !it.operation.suspended}
-        if(waitingQuestions.isNotEmpty()) Surface(color=palette.outgoing,modifier=Modifier.fillMaxWidth(),onClick={
-            scope.launch {list.scrollToItem(timeline.indexOf(waitingQuestions.first()).coerceAtLeast(0));followLatest=false}
-        }) {
-            Row(Modifier.heightIn(min=48.dp).padding(horizontal=16.dp,vertical=8.dp).testTag("assistant-attention"),verticalAlignment=Alignment.CenterVertically) {
-                Text("${waitingQuestions.size} 件事等你确认",Modifier.weight(1f),style=MaterialTheme.typography.labelLarge,color=palette.onOutgoing)
-                Text("查看",style=MaterialTheme.typography.labelMedium,color=palette.accent)
-            }
-        }
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyColumn(state=list,modifier=Modifier.fillMaxSize().testTag("assistant-chat-list"),
-                contentPadding=PaddingValues(horizontal=12.dp,vertical=20.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
+            LazyColumn(state=list,modifier=Modifier.fillMaxSize().testTag("assistant-chat-list").layerBackdrop(transcriptBackdrop),
+                contentPadding=PaddingValues(start=16.dp,end=16.dp,top=topInset+12.dp,bottom=bottomInset+20.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
+                state.nextBefore?.let {before -> item("older") {
+                    PocketTextButton({act {AssistantActions.read(snapshot.after,before=before,limit=50)}}, Modifier.fillMaxWidth().testTag("assistant-older"), enabled=!state.busy("assistant/read") && !state.loading) {Text("读取更早消息")}
+                }}
                 if(timeline.isEmpty()) item("greeting") {
                     Column(Modifier.fillMaxWidth().padding(top=36.dp,bottom=16.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(12.dp)) {
                         AssistantAvatar(size=56.dp)
@@ -119,14 +128,25 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
                     }
                     when(item) {
                         is AssistantTimeline.Message -> AssistantMessageBubble(item.message,runtime)
+                        is AssistantTimeline.Group -> AssistantGroupCard(item.group,item.tasks,state,canAct,act,open,workspaces)
                         is AssistantTimeline.Task -> AssistantIncoming {
-                            AssistantTaskCard(item.task,state,canAct,act,open)
+                            AssistantTaskCard(item.task,state,canAct,act,open,workspaces)
                         }
                         is AssistantTimeline.Question -> AssistantIncoming {
                             AssistantHumanQuestion(item.operation,runtime,state,canAct,act)
                         }
+                        is AssistantTimeline.Delivery -> Text("${item.delivery.label} · ${item.delivery.message}",
+                            Modifier.fillMaxWidth().testTag("assistant-delivery:${item.delivery.id}"),style=MaterialTheme.typography.labelMedium,maxLines=3,overflow=TextOverflow.Ellipsis)
+                        is AssistantTimeline.History -> {
+                            val op=snapshot.operations.firstOrNull {it.id==item.history.operationId}
+                            val memberId=snapshot.operationMemberId(item.history.operationId,op?.taskId)
+                            val source=op?.threadId ?: snapshot.events.lastOrNull {it.operationId==item.history.operationId && it.threadId!=null}?.threadId
+                            NativeQuestionHistory.from(item.history.item)?.let {history -> HistoricalQuestionRow(history,"assistant:${item.history.id}",
+                                snapshot.members.firstOrNull {it.id==memberId}?.name, if(source!=null && runtime.isNotBlank()) ({open(runtime,source)}) else null)}
+                        }
                         is AssistantTimeline.Result -> AssistantIncoming {
-                            AssistantCard(Modifier.testTag("assistant-result:${item.operation.id}")) {
+                            Column(Modifier.fillMaxWidth().testTag("assistant-result:${item.operation.id}"),verticalArrangement=Arrangement.spacedBy(8.dp)) {
+                                snapshot.operationMemberId(item.operation.id,item.operation.taskId)?.let {id -> snapshot.members.firstOrNull {it.id == id}}?.let {member -> Text(member.name,style=MaterialTheme.typography.labelMedium,color=palette.muted)}
                                 AssistantBadge(if(item.operation.phase==AssistantOperationPhase.Completed) "已完成" else "遇到问题",item.operation.phase==AssistantOperationPhase.Failed)
                                 MarkdownText(item.operation.result.orEmpty(),"assistant:$runtime:result:${item.operation.id}")
                                 item.operation.threadId?.let {thread ->
@@ -142,13 +162,34 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
                     AssistantIncoming {Text("正在处理…",Modifier.padding(12.dp).testTag("assistant-working"),style=MaterialTheme.typography.bodySmall,color=palette.muted)}
                 }
             }
-            if(list.canScrollForward) Surface(onClick={scope.launch {list.scrollToItem((list.layoutInfo.totalItemsCount-1).coerceAtLeast(0));followLatest=true;unread=false}},
-                modifier=Modifier.align(Alignment.BottomCenter).padding(12.dp).testTag("assistant-latest"),shape=RoundedCornerShape(24.dp),color=palette.surface,shadowElevation=2.dp) {
-                Text(if(unread) "有新消息 · 回到最新" else "回到最新",Modifier.padding(horizontal=18.dp,vertical=12.dp),style=MaterialTheme.typography.labelMedium,color=palette.accent)
+        CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
+            Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged {headerHeight=it.height}) {
+                header()
+                if(waitingQuestions.isNotEmpty()) CompositionLocalProvider(LocalPocketClearGlass provides true) {
+                    PocketGlassSurface(onClick={scope.launch {list.scrollToItem(timeline.indexOf(waitingQuestions.first()).coerceAtLeast(0)+if(state.nextBefore!=null) 1 else 0);followLatest=false}},
+                        modifier=Modifier.align(Alignment.CenterHorizontally).padding(horizontal=16.dp).testTag("assistant-attention"),shape=PocketOval) {
+                        Row(Modifier.heightIn(min=48.dp).padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically) {
+                            Text("${waitingQuestions.size} 件事等你确认",style=MaterialTheme.typography.labelLarge)
+                            Spacer(Modifier.width(12.dp));Text("查看",style=MaterialTheme.typography.labelMedium,color=palette.accent)
+                        }
+                    }
+                }
             }
-        }
-        HorizontalDivider(color=palette.border)
-        Column(Modifier.fillMaxWidth().background(palette.background)) {
+            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().onSizeChanged {composerHeight=it.height}.imePadding().navigationBarsPadding()
+                .padding(horizontal=16.dp,vertical=8.dp).testTag("assistant-bottom-dock")) {
+                if(list.canScrollForward) PocketGlassSurface(onClick={scope.launch {list.scrollToItem((list.layoutInfo.totalItemsCount-1).coerceAtLeast(0));followLatest=true;unread=false}},
+                    modifier=Modifier.align(Alignment.CenterHorizontally).padding(bottom=6.dp).testTag("assistant-latest"),shape=PocketOval,dense=true) {
+                    Text(if(unread) "有新消息 · 回到最新" else "回到最新",Modifier.padding(horizontal=18.dp,vertical=12.dp),style=MaterialTheme.typography.labelMedium,color=palette.accent)
+                }
+                PocketGlassSurface(Modifier.fillMaxWidth().testTag("assistant-composer-glass"),shape=RoundedCornerShape(28.dp),dense=true) {
+                Column(Modifier.fillMaxWidth()) {
+            if(!snapshot.prepared) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(snapshot.preparationIssue ?: "助理会自动准备，草稿会保留", Modifier.weight(1f).padding(12.dp), style=MaterialTheme.typography.bodySmall)
+                PocketTextButton({act {AssistantActions.prepare()}}, Modifier.testTag("assistant-prepare"), enabled=!state.busy("assistant/prepare")) {Text(snapshot.preparationRetryLabel)}
+            }
+            if(targetMember != null || targetTask != null) PocketTextButton({targetPicker=true}, Modifier.testTag("assistant-selected-target")) {
+                Text(if(missingTarget) "所选目标已不可用，请重新选择" else listOfNotNull(snapshot.members.firstOrNull {it.id == targetMember}?.name, snapshot.tasks.firstOrNull {it.id == targetTask}?.prompt).joinToString(" · "))
+            }
             if(waiting || missingProject || snapshot.paused==true) Text(
                 when {waiting->"正在发送，确认后清除草稿";missingProject->"所选项目已不可用，请重新选择";else->"助理已暂停，可发送消息或在设置中恢复"},
                 Modifier.padding(start=16.dp,end=16.dp,top=8.dp).testTag("assistant-send-status"),style=MaterialTheme.typography.labelSmall,color=if(missingProject) MaterialTheme.colorScheme.error else palette.muted)
@@ -164,22 +205,35 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
                     Icon(if(toolsOpen) AssistantIcons.Close else AssistantIcons.Plus,if(toolsOpen) "收起更多操作" else "更多操作")
                 }
                 BasicTextField(value=message,onValueChange={message=it},modifier=Modifier.weight(1f).heightIn(min=48.dp)
-                    .clip(RoundedCornerShape(12.dp)).background(palette.surface).onFocusChanged {if(it.isFocused) toolsOpen=false}
+                    .onFocusChanged {if(it.isFocused) toolsOpen=false}
                     .padding(horizontal=12.dp,vertical=10.dp).testTag("assistant-message-input").semantics {contentDescription="给助理发消息"},
                     maxLines=4,textStyle=MaterialTheme.typography.bodyLarge.copy(color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(palette.accent),
                     decorationBox={input -> Box {if(message.isEmpty()) Text("发消息…",style=MaterialTheme.typography.bodyLarge,color=palette.muted);input()}})
-                Button(onClick={val text=message;act {AssistantActions.send(runtime,text,project)};sentDraft=text;sentAck=state.sendAcknowledgement;toolsOpen=false;followLatest=true},
-                    modifier=Modifier.heightIn(min=48.dp).testTag("assistant-send"),enabled=canSend,shape=RoundedCornerShape(12.dp),
-                    contentPadding=PaddingValues(horizontal=14.dp,vertical=10.dp),colors=ButtonDefaults.buttonColors(containerColor=palette.accent,contentColor=palette.onAccent)) {Text("发送")}
+                PocketButton("发送",onClick={val text=message;act {AssistantActions.send(runtime,text,project,targetMember,targetTask)};sentDraft=text;sentAck=state.sendAcknowledgement;toolsOpen=false;followLatest=true},
+                    modifier=Modifier.heightIn(min=48.dp).testTag("assistant-send"),enabled=canSend)
             }
             if(toolsOpen) Row(Modifier.fillMaxWidth().padding(horizontal=8.dp,vertical=12.dp).testTag("assistant-tools-panel"),horizontalArrangement=Arrangement.spacedBy(4.dp)) {
                 AssistantTool("项目",AssistantIcons.Project,Modifier.weight(1f).testTag("assistant-workspace")) {projectPicker=true}
-                AssistantTool("任务",AssistantIcons.Tasks,Modifier.weight(1f)) {toolsOpen=false;navigate("Tasks")}
+                AssistantTool("发给",PocketIcons.Users,Modifier.weight(1f).testTag("assistant-target")) {targetPicker=true}
                 AssistantTool("记忆",AssistantIcons.Memory,Modifier.weight(1f)) {toolsOpen=false;navigate("Memory")}
                 AssistantTool("定时",AssistantIcons.Schedule,Modifier.weight(1f)) {toolsOpen=false;navigate("Schedules")}
             }
+                }
+                }
+            }
         }
     }
+    if(targetPicker) PocketDialog({targetPicker=false},title={Text("聊天目标")},text={
+        LazyColumn(Modifier.heightIn(max=320.dp)) {
+            item {PocketMenuItem("助理自动安排",AssistantIcons.Tasks,{targetMember=null;targetTask=null;targetPicker=false},Modifier.testTag("assistant-target:auto"),selected=targetMember==null && targetTask==null)}
+            itemsIndexed(snapshot.tasks.distinctBy {it.id},key={_,t -> "task:${t.id}"}) {_,task ->
+                PocketMenuItem(task.prompt,AssistantIcons.Tasks,{targetTask=task.id;targetMember=null;targetPicker=false},Modifier.testTag("assistant-target:task:${task.id}"),selected=targetTask==task.id)
+            }
+            itemsIndexed(snapshot.members.filter {it.active}.distinctBy {it.id},key={_,m -> "member:${m.id}"}) {_,member ->
+                PocketMenuItem(member.name,PocketIcons.Users,{targetMember=member.id;targetTask=null;targetPicker=false},Modifier.testTag("assistant-target:member:${member.id}"),selected=targetMember==member.id)
+            }
+        }
+    },confirmButton={TextButton({targetPicker=false}) {Text("完成")}})
     if(projectPicker) PocketDialog({projectPicker=false},title={Text("关联项目")},text={
         LazyColumn(Modifier.heightIn(max=320.dp)) {
             item {PocketMenuItem("不关联项目",AssistantIcons.Close,{projectId=null;projectPicker=false;toolsOpen=false},Modifier.testTag("assistant-workspace:none"),selected=projectId==null)}
@@ -200,25 +254,20 @@ internal fun AssistantChat(state: AssistantUiState, workspaces: List<AssistantWo
 }
 
 @Composable internal fun AssistantIncoming(content:@Composable ColumnScope.()->Unit) {
-    Row(Modifier.fillMaxWidth().widthIn(max=720.dp),horizontalArrangement=Arrangement.spacedBy(8.dp),verticalAlignment=Alignment.Top) {
-        AssistantAvatar(size=30.dp)
-        Column(Modifier.weight(1f).padding(end=20.dp),content=content)
-    }
+    Column(Modifier.fillMaxWidth().widthIn(max=720.dp),content=content)
 }
 
 @Composable private fun AssistantMessageBubble(message:AssistantChatMessage,runtime:String) {
     val palette=assistantPalette()
-    val outgoing=message.role=="User"
-    Row(Modifier.fillMaxWidth(),horizontalArrangement=if(outgoing) Arrangement.End else Arrangement.Start,verticalAlignment=Alignment.Top) {
-        if(!outgoing) {AssistantAvatar(size=30.dp);Spacer(Modifier.width(8.dp))}
-        BoxWithConstraints(Modifier.weight(1f).padding(start=if(outgoing) 40.dp else 0.dp,end=if(outgoing) 0.dp else 20.dp),contentAlignment=if(outgoing) Alignment.TopEnd else Alignment.TopStart) {
-            Surface(modifier=Modifier.widthIn(max=maxWidth.coerceAtMost(640.dp)).testTag("assistant-message:${message.id}"),
-                color=if(outgoing) palette.outgoing else palette.surface,shape=RoundedCornerShape(topStart=if(outgoing) 16.dp else 4.dp,topEnd=if(outgoing) 4.dp else 16.dp,bottomStart=16.dp,bottomEnd=16.dp)) {
-                Column(Modifier.padding(horizontal=14.dp,vertical=10.dp)) {
-                    if(outgoing) SelectionContainer {Text(message.text,style=MaterialTheme.typography.bodyLarge,color=palette.onOutgoing)}
-                    else MarkdownText(message.text,"assistant:$runtime:message:${message.id}")
-                }
-            }
+    if(message.role == "Assistant") {
+        Column(Modifier.fillMaxWidth().widthIn(max=720.dp).testTag("assistant-message:${message.id}"), verticalArrangement=Arrangement.spacedBy(6.dp)) {
+            message.authorName?.takeIf {it.isNotBlank()}?.let {Text(it,style=MaterialTheme.typography.labelMedium,color=palette.muted)}
+            MarkdownText(message.text,"assistant:$runtime:message:${message.id}")
+        }
+    } else Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End) {
+        Surface(Modifier.widthIn(max=640.dp).padding(start=32.dp).testTag("assistant-message:${message.id}"),
+            color=palette.outgoing,shape=RoundedCornerShape(16.dp)) {
+            SelectionContainer {ReferenceText(message.text,emptyList(),Modifier.padding(14.dp),color=palette.onOutgoing)}
         }
     }
 }

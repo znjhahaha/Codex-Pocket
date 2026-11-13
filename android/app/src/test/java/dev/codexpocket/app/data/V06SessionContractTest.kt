@@ -7,6 +7,26 @@ import kotlinx.serialization.json.*
 class V06SessionContractTest {
     private fun obj(raw: String) = pocketJson.parseToJsonElement(raw).jsonObject
 
+    @Test fun ownershipFailuresDistinguishUncertainFromMultipleOwners() {
+        val uncertain = PocketFailure.fromCode("owner_uncertain")
+        val multiple = PocketFailure.fromCode("multiple_owners")
+        assertNotNull(uncertain)
+        assertNotNull(multiple)
+        assertNotEquals(uncertain, multiple)
+        assertFalse(uncertain!!.label.contains("多个"))
+        assertTrue(multiple!!.label.contains("多个"))
+    }
+
+    @Test fun ownershipReasonsUseClosedCodesAndNeverGrantSendPermission() {
+        val uncertain = ThreadAccess.from(obj("""{"mode":"desktop","phase":"blocked","canSend":false,"ownershipReason":"owner_uncertain"}"""))
+        assertEquals(OwnershipReason.Uncertain, uncertain.ownershipReason)
+        assertFalse(uncertain.canSendFrom("desktop"))
+        assertEquals(OwnershipReason.Multiple, ThreadAccess.from(obj("""{"mode":"desktop","phase":"blocked","canSend":false,"reason":"multiple_owners"}""")).ownershipReason)
+        val legacy = ThreadAccess.from(obj("""{"mode":"desktop","phase":"blocked","canSend":false,"reason":"thread_owned_elsewhere","ownershipReason":"future_reason"}"""))
+        assertNull(legacy.ownershipReason)
+        assertFalse(legacy.canSendFrom("desktop"))
+    }
+
     @Test fun desktopDefaultNeverFallsBackToCli() {
         val cli = RuntimeInfo("cli", "cli", "v", "store", true, emptySet(), setOf("thread/start"))
         assertEquals(SessionMode.Desktop, SessionPreferences().defaultMode)

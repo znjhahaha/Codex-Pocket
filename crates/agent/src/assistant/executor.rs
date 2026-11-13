@@ -1,7 +1,7 @@
 use super::Settings;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeMapping {
@@ -97,10 +97,50 @@ pub struct ToolResponse {
     pub result: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendOutcome {
+    Unsupported,
+    /// Exact durable evidence proves rejection or no native dispatch.
+    Rejected,
+    Delivered,
+    Uncertain,
+}
+
 /// Implement on a serialized worker. An error from any mutating operation is
 /// ambiguous, not proof that the Host rejected or never accepted the request.
 /// `status` resolves persisted operation IDs after a lost native start receipt.
 pub trait Executor {
+    fn needs_tool_upgrade(&self, _thread: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Repeated calls only reconcile the stable append receipt; never resend an uncertain effect.
+    fn append(
+        &mut self,
+        _id: &str,
+        _mapping: &NativeMapping,
+        _message: &str,
+    ) -> Result<AppendOutcome> {
+        Ok(AppendOutcome::Unsupported)
+    }
+    /// Receipt-only reconciliation, safe while the product write gate is closed.
+    fn append_status(
+        &mut self,
+        _id: &str,
+        _mapping: &NativeMapping,
+        _message: &str,
+    ) -> Result<AppendOutcome> {
+        Ok(AppendOutcome::Unsupported)
+    }
+    /// Only positive native ownership, current policy, and a stopped prior turn allow reuse.
+    fn can_resume(
+        &mut self,
+        _thread: &str,
+        _role: Role,
+        _directory: Option<&Path>,
+        _writes: bool,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     fn start(&mut self, request: StartRequest) -> Result<NativeMapping>;
     fn resume(&mut self, request: StartRequest) -> Result<NativeMapping>;
     fn read(&mut self, request: ReadRequest) -> Result<Vec<SessionView>>;

@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 
 const MAX_OPERATIONS: usize = 128;
 
+// Presentation evidence only. The directory remains the write authority, and
+// legacy clients must keep treating both cases as conflict=true.
+pub(super) fn ownership_reason(owner: &std::result::Result<RuntimeId, ResolveError>) -> Option<&'static str> {
+    match owner {
+        Err(ResolveError::UncertainOwner) => Some("owner_uncertain"),
+        Err(ResolveError::AmbiguousOwners) => Some("multiple_owners"),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum AccessMode {
@@ -284,16 +294,15 @@ impl Broker {
             && !conflict
             && online
             && owner_source.as_deref() == Some(mode.source());
-        let reason = operation.and_then(|o| o.reason.as_deref()).or(if conflict {
-            Some("thread_owned_elsewhere")
-        } else if !online {
+        let ownership_reason = ownership_reason(&owner);
+        let reason = ownership_reason.or(operation.and_then(|o| o.reason.as_deref())).or(if !online {
             Some("runtime_offline")
         } else {
             None
         });
         Ok(
             json!({"threadId":thread,"runtimeId":owner_id.unwrap_or(runtime),"mode":mode,"ownerRuntimeId":owner_id,
-            "source":owner_source.unwrap_or(source),"phase":phase,"canSend":ready,"reason":reason,
+            "source":owner_source.unwrap_or(source),"phase":phase,"canSend":ready,"reason":reason,"ownershipReason":ownership_reason,
             "operationId":operation.map(|o|o.operation_id.as_str()),"canCancel":operation.is_some_and(AccessOperation::can_cancel)}),
         )
     }

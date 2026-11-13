@@ -32,8 +32,16 @@ data class SessionPreferences(val defaultMode: SessionMode = SessionMode.Desktop
     }
 }
 
+enum class OwnershipReason(val wire: String) {
+    Uncertain("owner_uncertain"), Multiple("multiple_owners");
+    companion object { fun from(value: String?) = entries.firstOrNull { it.wire == value } }
+}
+
+enum class OwnershipCheck { Checking, Recovered, Blocked, Failed }
+
 data class ThreadAccess(val mode: SessionMode, val ownerRuntimeId: String?, val source: String,
-    val phase: AccessPhase, val canSend: Boolean, val reason: String? = null, val operationId: String? = null) {
+    val phase: AccessPhase, val canSend: Boolean, val reason: String? = null, val operationId: String? = null,
+    val ownershipReason: OwnershipReason? = null) {
     fun canSendFrom(runtimeId: String) = phase == AccessPhase.Ready && canSend && ownerRuntimeId == runtimeId
     companion object {
         fun from(raw: JsonObject): ThreadAccess {
@@ -42,7 +50,8 @@ data class ThreadAccess(val mode: SessionMode, val ownerRuntimeId: String?, val 
                 ?: throw PocketOperationException(PocketFailure.InvalidSnapshot)
             return ThreadAccess(mode, raw.string("ownerRuntimeId").takeIf { it.isNotBlank() && it != "null" },
                 raw.string("source"), phase, raw.flag("canSend"), raw.string("reason").takeIf { it.isNotBlank() && it != "null" },
-                raw.string("operationId").takeIf { it.isNotBlank() && it != "null" })
+                raw.string("operationId").takeIf { it.isNotBlank() && it != "null" },
+                OwnershipReason.from(raw.string("ownershipReason")) ?: OwnershipReason.from(raw.string("reason")))
         }
     }
 }
@@ -51,6 +60,8 @@ data class ActionStatus(val loading: Boolean = false, val phase: String? = null,
 
 enum class PocketFailure(val label: String) {
     Ownership("会话归属已变化，请刷新归属后继续"), Handoff("会话正在交接，请等待完成"),
+    OwnerUncertain("尚未确认会话归属，发送已暂停。请在电脑上确认 Codex 已就绪，再重新核验"),
+    MultipleOwners("多个运行端声明拥有这段对话，发送已暂停。请在电脑上确认会话归属，再重新核验"),
     Runtime("所选运行环境尚未就绪，请稍后重试"), Unsupported("电脑助手尚未支持此功能，请更新后重试"),
     ModelSpeed("当前模型未提供 Fast 速度档位"), RuntimeSpeed("当前运行时未提供 serviceTier 能力"),
     StaleRevision("默认模式已在其他设备更新，请刷新后重试"), InvalidSnapshot("电脑返回的状态不完整，请刷新后重试"),
@@ -58,6 +69,8 @@ enum class PocketFailure(val label: String) {
     MediaUnsupported("暂不支持这张图片"), MediaFailed("图片读取失败，请重试");
     companion object {
         fun fromCode(code: String): PocketFailure? = when (code) {
+            "owner_uncertain" -> OwnerUncertain
+            "multiple_owners" -> MultipleOwners
             "thread_owned_elsewhere", "ownership_conflict", "owner_conflict", "owner_mismatch", "runtime_mismatch", "thread_owner_changed", "not_owner", "read_only", "conflict", "thread_owner_conflict", "thread_owned_by_other_runtime" -> Ownership
             "operation_in_progress", "handoff_pending", "handoff_in_progress", "waiting_idle", "waiting_release", "thread_busy", "thread_handoff_pending", "handoff_blocked" -> Handoff
             "request_timeout", "runtime_unavailable", "runtime_not_ready", "runtime_offline", "desktop_unavailable", "desktop_not_ready", "desktop_start_failed", "desktop_starting", "source_unavailable", "no_runtime", "runtime_not_found" -> Runtime
@@ -79,6 +92,13 @@ fun sessionRuntimes(runtimes: List<RuntimeInfo>, mode: SessionMode) = runtimes.f
 /** Source is historical provenance; only the broker's owner snapshot grants control. */
 fun PocketState.supports(capability: BrokerCapability) = capability.method in capabilities
 fun PocketState.accessFor(chat: ChatEntity? = selected) = chat?.let { threadAccess[it.key] }
+/** Reasons describe evidence, never grant permission. Legacy conflicts stay neutral. */
+fun PocketState.ownershipReasonFor(chat: ChatEntity? = selected): OwnershipReason? = chat?.let {
+    if (it.key in accessFresh) accessFor(it)?.ownershipReason else threadOwnershipReasons[it.key]
+}
+fun PocketState.ownershipVerifiedFor(chat: ChatEntity? = selected): Boolean = chat != null && online &&
+    supports(BrokerCapability.AccessRead) && chat.key in accessFresh && accessFor(chat)?.canSendFrom(chat.runtimeId) == true &&
+    runtimes.any { it.id == chat.runtimeId && it.online && it.configStoreId == chat.key.configStoreId && it.source == accessFor(chat)?.mode?.wire }
 fun PocketState.accessAllowsSending(chat: ChatEntity? = selected): Boolean = chat != null &&
     (!supports(BrokerCapability.AccessRead) || (chat.key in accessFresh && accessFor(chat)?.canSendFrom(chat.runtimeId) == true &&
         runtimes.firstOrNull { it.id == chat.runtimeId }?.source == accessFor(chat)?.mode?.wire))

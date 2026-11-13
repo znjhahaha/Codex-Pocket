@@ -15,8 +15,13 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct Registry {
     root: PathBuf,
+    #[cfg(test)]
+    pub(crate) msix_packages:Option<Vec<super::discovery::MsixPackage>>,
 }
 impl Registry {
+    pub(crate) fn existing(root:impl AsRef<Path>)->Result<Self> {
+        Ok(Self{root:physical(root.as_ref(),true)?,#[cfg(test)] msix_packages:None})
+    }
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         ensure!(
             root.as_ref().is_absolute(),
@@ -25,10 +30,19 @@ impl Registry {
         crate::storage::private_directory(root.as_ref())?;
         Ok(Self {
             root: physical(root.as_ref(), true)?,
+            #[cfg(test)]
+            msix_packages:None,
         })
     }
     pub fn profile_directory(&self, profile: &SelectedProfile) -> Result<PathBuf> {
         Ok(self.root.join(home_key(profile.config_home())?))
+    }
+    fn replacement_binary(&self,old:&Path)->Result<PathBuf>{
+        #[cfg(test)]
+        if let Some(packages)=&self.msix_packages {
+            return super::discovery::replacement_binary_with(old,||Ok(packages.clone()));
+        }
+        super::discovery::replacement_binary(old)
     }
 }
 fn home_key(home: &Path) -> Result<String> {
@@ -54,14 +68,13 @@ struct Ownership {
     descriptor_generation: Option<String>,
 }
 impl Ownership {
-    fn read(path: &Path, profile: &SelectedProfile) -> Result<Self> {
+    fn read(path: &Path, profile: &SelectedProfile,registry:&Registry,allow_migration:bool) -> Result<Self> {
         let record: Self = serde_json::from_slice(&pocket_runtime_ipc::support::read_private(path, 16384)?)
             .map_err(|_| anyhow::anyhow!("Invalid startup ownership; inspect startup.json and original processes, do not delete the descriptor"))?;
         ensure!(
             record.schema == 1
                 && record.home_key == home_key(profile.config_home())?
                 && physical(&record.config_home, true)? == profile.home
-                && physical(&record.native_binary, false)? == profile.binary
                 && uuid::Uuid::parse_str(&record.reservation).is_ok()
                 && record.installation_generation.len() == 64
                 && record
@@ -70,6 +83,15 @@ impl Ownership {
                     .all(|b| b.is_ascii_hexdigit()),
             "Startup ownership conflicts with selected local profile; inspect startup.json before repair"
         );
+        let binary=match std::fs::symlink_metadata(&record.native_binary) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
+                ensure!(allow_migration,super::discovery::RestoreFailure::ProfileMigrationFenced);
+                registry.replacement_binary(&record.native_binary)?
+            },
+            Err(e)=>return Err(e.into()),
+            Ok(_)=>physical(&record.native_binary,false)?,
+        };
+        ensure!(binary==profile.binary,"Startup native executable conflicts with the selected profile");
         match record.phase.as_str() {
             "reserved" => ensure!(
                 record.host_process.is_none() && record.descriptor_generation.is_none(),
@@ -115,9 +137,9 @@ impl Ownership {
     }
 }
 
-async fn acquire(path: &Path) -> Result<File> {
+async fn acquire(path: &Path,create:bool) -> Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
+    options.create(create).truncate(false).read(true).write(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -147,6 +169,16 @@ pub(super) async fn ensure(
     registry: &Registry,
     profile: &SelectedProfile,
 ) -> Result<ManagedRuntime> {
+    ensure_mode(installation,registry,profile,true).await
+}
+impl super::Controller {
+    /// Fenced successor bootstrap may reconnect to the original independent
+    /// Host, but may not reserve/spawn a replacement or migrate saved authority.
+    pub(crate) async fn attach_existing(&self,profile:&SelectedProfile)->Result<ManagedRuntime> {
+        ensure_mode(&self.installation,&self.registry,profile,false).await
+    }
+}
+async fn ensure_mode(installation:&Installation,registry:&Registry,profile:&SelectedProfile,allow_start:bool)->Result<ManagedRuntime> {
     // Revalidate physical paths every time, including after a controller restart.
     ensure!(
         physical(profile.config_home(), true)? == profile.home
@@ -156,7 +188,7 @@ pub(super) async fn ensure(
     let host_binary = installation.verify()?;
     physical(&registry.root, true)?;
     let directory = registry.profile_directory(profile)?;
-    crate::storage::private_directory(&directory)?;
+    if allow_start {crate::storage::private_directory(&directory)?;}
     physical(&directory, true)?;
     let lock_path = directory.join("ensure.lock");
     let ownership_path = directory.join("startup.json");
@@ -169,34 +201,39 @@ pub(super) async fn ensure(
         !artifacts || lock_path.try_exists()?,
         "ensure.lock ownership evidence missing; inspect this private profile registry before repair"
     );
-    let _lock = acquire(&lock_path).await?;
+    let _lock = acquire(&lock_path,allow_start).await?;
     let has_descriptor = descriptor_path.try_exists()?;
     let has_owner = ownership_path.try_exists()?;
     let previous = if has_owner {
-        Some(Ownership::read(&ownership_path, profile)?)
+        Some(Ownership::read(&ownership_path, profile,registry,allow_start).map_err(|e|if e.downcast_ref::<super::discovery::RestoreFailure>().is_some(){e}else{e.context(super::discovery::RestoreFailure::OwnershipUnconfirmed)})?)
     } else {
         None
     };
     if has_descriptor {
-        let mut owner = previous.context("Descriptor exists without startup ownership; replacement is unsafe, inspect original processes")?;
+        let mut owner = previous.context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         let descriptor =
-            pocket_runtime_ipc::load_descriptor(&descriptor_path, profile.config_home())?;
-        owner.matches(&descriptor)?;
-        if let Ok(client) = HostClient::attach(&descriptor).await {
+            pocket_runtime_ipc::load_descriptor(&descriptor_path, profile.config_home()).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+        owner.matches(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+        let migrating=matches!(std::fs::symlink_metadata(&owner.native_binary),Err(e) if e.kind()==std::io::ErrorKind::NotFound);
+        // An installed-package update cannot retarget a still-live Host/native.
+        // Hold ensure.lock throughout the death checks and durable reservation.
+        if migrating {
+            require_ended(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+        } else if let Ok(client) = HostClient::attach(&descriptor).await {
             if owner.phase == "spawned" {
                 owner.phase = "ready".into();
                 owner.descriptor_generation = Some(descriptor.generation.clone());
-                owner.save(&ownership_path)?;
+                if allow_start {owner.save(&ownership_path)?;}
             }
             return ManagedRuntime::open(descriptor_path, descriptor, client).await;
         }
-        require_ended(&descriptor)?;
+        require_ended(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         // Both original identities ended; leave their descriptor in place for
         // the Host's own second guard and cold journal recovery.
     } else {
         ensure!(
             previous.is_none(),
-            "Startup reservation has no descriptor; native ownership is uncertain. Inspect startup.json and original Host process; do not delete records to force a restart"
+            super::discovery::RestoreFailure::OwnershipUnconfirmed
         );
         ensure!(
             !directory.join("host.lock").try_exists()?
@@ -204,6 +241,7 @@ pub(super) async fn ensure(
             "Host state exists without descriptor/ownership; inspect original processes before repair"
         );
     }
+    ensure!(allow_start,super::discovery::RestoreFailure::ProfileMigrationFenced);
     // Check the Host's independent lifetime lock before reserving a replacement.
     let host_lock_path = directory.join("host.lock");
     let host_lock = OpenOptions::new()
@@ -215,7 +253,7 @@ pub(super) async fn ensure(
     crate::storage::verify_physical_file(&host_lock_path, &host_lock)?;
     host_lock
         .try_lock_exclusive()
-        .context("Host lock is live or inaccessible; replacement is unsafe")?;
+        .context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
     let mut owner = Ownership {
         schema: 1,
         home_key: home_key(profile.config_home())?,

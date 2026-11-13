@@ -48,6 +48,12 @@ fn main() {
         let value = line.unwrap();
         let id = field(&value, "id").to_owned();
         let method = field(&value, "method");
+        let mut trace = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&home).join("fixture-methods"))
+            .unwrap();
+        writeln!(trace, "{}", method.trim_matches('"')).unwrap();
         if method == "null" && id == "77" {
             answers += 1;
             emit("{\"method\":\"serverRequest/resolved\",\"params\":{\"requestId\":77}}".into());
@@ -62,12 +68,18 @@ fn main() {
             "\"initialize\"" => { initialized += 1; format!("{{\"codexHome\":{},\"userAgent\":\"fixture/1.0\",\"platformFamily\":\"windows\",\"platformOs\":\"windows\"}}", quote(&home)) }
             "\"initialized\"" => { ready = true; continue; }
             "\"fixture/info\"" => format!("{{\"home\":{},\"initialized\":{initialized},\"ready\":{ready},\"writes\":{writes},\"answers\":{answers}}}",quote(&home)),
+            "\"account/read\"" => {
+                assert_eq!(field(&value, "refreshToken"), "false", "preparation must not refresh or switch accounts");
+                std::fs::read_to_string(std::path::Path::new(&home).join("fixture-account.json"))
+                    .unwrap_or_else(|_| "{\"requiresOpenaiAuth\":true,\"account\":null}".into())
+            }
             "\"turn/start\"" => { assert!(ready); writes += 1; emit("{\"method\":\"turn/started\",\"params\":{\"threadId\":\"fixture-thread\",\"turn\":{\"id\":\"fixture-turn\"}}}".into()); "{\"turn\":{\"id\":\"fixture-turn\"},\"writes\":1}".into() }
             "\"fixture/finish\"" => { emit("{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"fixture-thread\",\"turn\":{\"id\":\"fixture-turn\",\"status\":\"completed\"}}}".into()); "{}".into() }
             "\"fixture/waitForHuman\"" => { waiting = Some(id); emit("{\"id\":77,\"method\":\"item/tool/requestUserInput\",\"params\":{\"threadId\":\"fixture-thread\",\"questions\":[]}}".into()); continue; }
             "\"fixture/deferred\"" => { writes += 1; deferred = Some(id); continue; }
             "\"fixture/release\"" => { if let Some(original) = deferred.take() { emit(format!("{{\"id\":{original},\"result\":{{\"released\":true}}}}")); } "{}".into() }
             "\"thread/read\"" => "{\"thread\":{\"id\":\"fixture-thread\",\"turns\":[{\"id\":\"fixture-turn\",\"status\":\"completed\"}]}}".into(),
+            "\"thread/loaded/list\"" => "{\"data\":[],\"nextCursor\":null}".into(),
             "\"fixture/exit\"" => break,
             _ => "{}".into(),
         };

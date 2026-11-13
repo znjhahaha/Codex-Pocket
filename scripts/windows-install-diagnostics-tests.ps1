@@ -47,3 +47,8 @@ $record=Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
 if($record.events[-1].code -ne 'shortcut_integration_failed' -or $record.events[-1].state -ne 'pending'){throw 'Partial success diagnostics were not persisted'}
 if(([IO.File]::ReadAllText($path)).Contains('fixture-secret')){throw 'Partial failure leaked raw error data'}
 Write-Output 'PASS exact task absence HRESULTs, optional pending codes, shortcut attribution and redaction'
+try {Invoke-PocketInstallStep 'runtime_stop' 'fixture_native_process' {throw [ComponentModel.Win32Exception]::new(5,'fixture-secret-native-code')}}
+catch {if($_.Exception.Data['PocketOSCode'] -ne 5){throw 'Lost the actionable Windows OS code'}}
+$record=Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+if($record.events[-1].osCode -ne 5 -or ([IO.File]::ReadAllText($path)).Contains('fixture-secret')){throw 'Native OS-code diagnostics missing or leaked raw text'}
+Write-Output 'PASS native Windows OS code is retained without raw error text'

@@ -110,6 +110,61 @@ class V054ToolMediaTest {
         compose.waitUntil(10_000) { compose.onAllNodesWithText("暂不支持这张图片").fetchSemanticsNodes().isNotEmpty() }
         compose.runOnIdle { assertEquals(0, paths) }
     }
+    @Test fun expiredReferenceRenewsFromHistoryAndNeverRetriesTheOldMediaIdentity() {
+        val bytes=Base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==",Base64.DEFAULT)
+        val old=media(bytes.size).copy(mediaId=java.util.UUID.randomUUID().toString().replace("-",""))
+        val renewed=old.copy(mediaId=java.util.UUID.randomUUID().toString().replace("-",""))
+        var refs by mutableStateOf(listOf(old))
+        val reads=java.util.concurrent.CopyOnWriteArrayList<String>()
+        val refreshes=java.util.concurrent.atomic.AtomicInteger()
+        val source=object:ToolMediaImageSource {
+            override suspend fun read(ref:ToolMediaRef,offset:Long,maxBytes:Int):ToolMediaChunk {
+                reads+=ref.mediaId
+                if(ref.mediaId==old.mediaId) throw ToolMediaLoadException(ToolMediaStatus.Expired)
+                return chunk(ref,offset,bytes,true)
+            }
+            override suspend fun refresh(ref:ToolMediaRef,manual:Boolean) {
+                assertEquals(old.mediaId,ref.mediaId);assertFalse(manual);refreshes.incrementAndGet()
+
+            }
+        }
+        content {CompositionLocalProvider(LocalToolMediaImages provides source,LocalImageConnection provides (1L to true)) {ToolMediaGrid(refs)}}
+        compose.waitUntil(10_000) {refreshes.get()==1}
+        compose.runOnIdle {refs=listOf(renewed)}
+        compose.waitForIdle()
+        try {compose.waitUntil(10_000) {reads.contains(renewed.mediaId)}} catch(failure:Exception) {
+            throw AssertionError("Renewed readable=${renewed.readable}; reads=$reads; refreshes=${refreshes.get()}; tree=${compose.onRoot().printToString()}",failure)
+        }
+        compose.waitForIdle()
+        assertEquals(listOf(old.mediaId,renewed.mediaId),reads)
+        assertEquals(1,refreshes.get())
+        compose.onNodeWithText("图片引用已失效，点击重试").assertDoesNotExist()
+    }
+
+    @Test fun manualRetryRereadsOnlyTheSelectedImageAfterFailure() {
+        val ref=media().copy(mediaId="c".repeat(32))
+        val reads=java.util.concurrent.atomic.AtomicInteger()
+        val manualRefreshes=java.util.concurrent.atomic.AtomicInteger()
+        val releaseFailure=kotlinx.coroutines.CompletableDeferred<Unit>()
+        val source=object:ToolMediaImageSource {
+            override suspend fun read(media:ToolMediaRef,offset:Long,maxBytes:Int):ToolMediaChunk {
+                if(reads.incrementAndGet()==1) releaseFailure.await()
+                throw ToolMediaLoadException(ToolMediaStatus.Failed)
+            }
+            override suspend fun refresh(media:ToolMediaRef,manual:Boolean) {assertEquals(ref,media);assertTrue(manual);manualRefreshes.incrementAndGet()}
+        }
+        content {CompositionLocalProvider(LocalToolMediaImages provides source) {ToolMediaGrid(listOf(ref))}}
+        compose.waitUntil(5_000) {reads.get()==1}
+        val retryTag="image-retry:${ref.mediaId}"
+        compose.onNodeWithTag(retryTag,useUnmergedTree=true).assertDoesNotExist()
+        releaseFailure.complete(Unit)
+        // An IO read starting is not the failure being delivered and rendered by Compose.
+        compose.waitUntil(5_000) {compose.onAllNodesWithTag(retryTag,useUnmergedTree=true).fetchSemanticsNodes().size==1}
+        compose.onNodeWithTag("image-retry:${ref.mediaId}",useUnmergedTree=true).performClick()
+        compose.waitUntil(5_000) {reads.get()==2}
+        assertEquals(1,manualRefreshes.get())
+    }
+
     @Test fun chipsOpenReadOnlyPreviewAndExposeCompletePathInDetails() {
         val file = MentionedFile("a-very-long-report-name-that-must-keep-its-extension.docx", "D:/work/full-folder/report.docx", image = false)
         var opened: String? = null

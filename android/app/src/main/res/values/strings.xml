@@ -54,7 +54,7 @@
     <string name="mode">工作模式</string>
     <string name="native_default">电脑端默认</string>
     <string name="offline_history">当前离线 · 正在显示本机记录，草稿已保留。</string>
-    <string name="owner_conflict">多个运行端正在使用这段对话，请先在电脑上确认后再发送。</string>
+    <string name="owner_conflict">会话归属尚未确认，发送已暂停。请在电脑上确认后重新核验。</string>
     <string name="unknown_action">上一次操作的结果尚未确认，不会自动重发。</string>
     <string name="check">查询状态</string>
     <string name="what_working">接下来做点什么？</string>

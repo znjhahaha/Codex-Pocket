@@ -37,7 +37,7 @@ class AssistantScrollBehaviorTest {
 
     private fun initialState(untimedTask: Boolean = false) = AssistantUiState(
         snapshot = AssistantSnapshot(
-            enabled = true, runtimeId = "r", paused = false, settings = AssistantSettings(timezone = "UTC"),
+            enabled = true, ready=true, runtimeId = "r", paused = false, settings = AssistantSettings(timezone = "UTC"),
             tasks = if (untimedTask) listOf(AssistantTask("untimed-tail", "Task without an event time", AssistantTaskStatus.Queued, null, false, null)) else emptyList(),
         ),
         messages = history,
@@ -125,6 +125,24 @@ class AssistantScrollBehaviorTest {
         compose.waitForIdle()
         assertReadingAnchor(anchor)
         compose.onNodeWithTag("assistant-latest").assertIsDisplayed().assertTextContains("有新消息", substring = true)
+        assertTrue(actions.isEmpty())
+    }
+
+    @Test fun returningFromSubpageKeepsNearBottomAnchorWithMultilineDraft() {
+        val state = initialState()
+        content { state }
+        compose.onNodeWithTag("assistant-message-input").performTextReplacement("Preserved draft\nSecond line")
+        compose.onNodeWithTag("assistant-chat-list").performScrollToIndex(history.lastIndex)
+        compose.waitForIdle()
+        val tag = "assistant-message:history-35"
+        val before = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot.top
+        compose.onNodeWithTag("assistant-more").performClick()
+        compose.onNodeWithTag("assistant-tab:Memory").performClick()
+        compose.onNodeWithContentDescription("返回助理对话").performClick()
+        compose.waitForIdle()
+        assertEquals("Near-bottom history must not be clamped by temporarily zero chrome padding",
+            before, compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot.top, 1f)
+        compose.onNodeWithTag("assistant-message-input").assertTextContains("Preserved draft\nSecond line")
         assertTrue(actions.isEmpty())
     }
 

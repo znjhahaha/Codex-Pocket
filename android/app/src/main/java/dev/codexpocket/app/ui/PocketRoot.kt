@@ -75,6 +75,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var runtimeFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var tab by rememberSaveable { mutableStateOf(HomeTab.Chats) }
     var settings by rememberSaveable { mutableStateOf(false) }
+    var assistantReturn by rememberSaveable {mutableStateOf(false)}
     var assistantOpen by rememberSaveable { mutableStateOf(false) }
     val assistantScope = rememberCoroutineScope()
     LaunchedEffect(assistantOpen, s.online, s.computerId) {
@@ -101,6 +102,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var previousSelection by remember { mutableStateOf(s.selected?.key) }
     LaunchedEffect(repo) {
         repo.threadLinkOpened.collect {
+            assistantReturn = assistantOpen || assistantReturn
             assistantOpen = false
             home = false
             settings = false
@@ -114,7 +116,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     }
     var createOrigin by remember { mutableStateOf<ThreadKey?>(null) }
     LaunchedEffect(home) { if (home) { repo.clearSourcePreview(); repo.closeAgentReader() } }
-    val backToParent: () -> Unit = { repo.clearSourcePreview(); repo.closeAgentReader(); home = true }
+    val backToParent: () -> Unit = { repo.clearSourcePreview(); repo.closeAgentReader(); if(assistantReturn) {assistantOpen=true;assistantReturn=false} else home=true }
     val openAgent: (String) -> Unit = { id -> repo.clearSourcePreview(); repo.openAgentReader(id); detail = null }
     val holder = rememberSaveableStateHolder()
     val homeHolder = rememberSaveableStateHolder()
@@ -169,14 +171,14 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 AssistantScreen(s.assistant, s.assistantModels,
                     s.runtimes.filter { it.role != "managedHost" || it.id == assistantRuntime }.map { AssistantRuntimeChoice(it.id, "${if (it.role == "managedHost") "助理 CLI" else it.source} · ${it.version}", it.online && s.online) },
-                    s.chats.filter { store==null || it.key.configStoreId==store }.map {
+                    (s.chats + s.agentChats).filter { store==null || it.key.configStoreId==store }.map {
                         AssistantWorkspaceChoice(assistantRuntime ?: it.runtimeId, it.key.nativeId, it.title,
-                            canWrite = s.online && !it.isSubagent)
+                            canWrite = s.online && !it.isSubagent, parentThreadId = it.parentThreadId, isSubagent = it.isSubagent)
                     }.distinctBy { it.threadId }, repo::assistantAction,
                     onOpenThread = { runtime, thread -> assistantScope.launch {
                         repo.openAssistantThread(runtime, thread).join()
-                        if (repo.state.value.selected?.key?.nativeId == thread) { assistantOpen=false;home=false }
-                    } }, onBack = {assistantOpen=false})
+                        if (repo.state.value.selected?.key?.nativeId == thread) { assistantReturn=true;assistantOpen=false;home=false }
+                    } }, onBack = {assistantOpen=false}, connected=s.online)
                 }
                 }
             }

@@ -2,6 +2,23 @@ import {describe,it,expect} from 'vitest';
 import {createRepairFlight,REPAIR_STEPS} from './installedRepair';
 
 describe('installed optional repair boundary',()=>{
+ it('keeps capability timeout unknown and permits a new explicit repair attempt',async()=>{
+  const error={code:'repair_capability_unknown',operationId:'fixture-id',retryable:true};let calls=0;
+  const flight=createRepairFlight(async()=>{calls++;throw error},()=> '12345678-1234-4234-8234-123456789abc');
+  for(let i=0;i<3;i++){
+   await expect(flight.run('startup','a'.repeat(64))).rejects.toBe(error);
+   expect(flight.current()).toBeNull();expect(flight.busy()).toBe(false);
+  }
+  expect(calls).toBe(3);
+ });
+ it('preserves a previous unknown mutation if capability times out during reconciliation',async()=>{
+  let calls=0;
+  const flight=createRepairFlight(async()=>{if(++calls===1)return {state:'unknown'};throw {code:'repair_capability_unknown'}},()=> '12345678-1234-4234-8234-123456789abc');
+  await flight.run('startup','a'.repeat(64));const pending=flight.current();
+  await expect(flight.check()).rejects.toMatchObject({code:'repair_capability_unknown'});
+  expect(flight.current()).toEqual(pending);
+  await expect(flight.run('shortcut_0','a'.repeat(64))).rejects.toMatchObject({code:'reconciliation_required'});
+ });
  it('exposes only four fixed installer steps',()=>expect(REPAIR_STEPS.map(s=>s.step)).toEqual(['shortcut_0','shortcut_1','shortcut_2','startup']));
  it('sends one closed request while a previous operation is pending',async()=>{
   let finish!:(value:unknown)=>void;

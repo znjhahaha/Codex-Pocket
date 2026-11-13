@@ -9,6 +9,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "service_collaboration.rs"]
+mod collaboration;
+pub use collaboration::*;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationPhase {
     Unknown,
@@ -54,6 +58,14 @@ pub struct AssistantEvent {
     pub notify: bool,
     pub wake_coordinator: bool,
     pub at_ms: i64,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,6 +81,8 @@ struct JournalEntry {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct State {
+    #[serde(default)]
+    collaboration: Collaboration,
     settings: Settings,
     coordinator_thread: Option<String>,
     coordinator_watermark: u64,
@@ -83,6 +97,7 @@ struct State {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolCall {
+    Collaboration(CollaborationTool),
     ListSessions {
         limit: usize,
     },
@@ -158,8 +173,17 @@ impl<E: Executor> AssistantService<E> {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default();
+        state.collaboration.migrate_delivery_sequences()?;
         if store.taken_over()? {
             state.paused = true;
+            for delivery in state.collaboration.deliveries.values_mut() {
+                if matches!(delivery.status.as_str(), "queued" | "sending" | "unknown") {
+                    delivery.cancelled = true;
+                    if delivery.status == "queued" {
+                        delivery.status = "paused".into();
+                    }
+                }
+            }
             state.inbox.clear();
             state.scheduled_commands.clear();
             state.coordinator_watermark = state.events.last().map_or(0, |e| e.sequence);
@@ -175,6 +199,13 @@ impl<E: Executor> AssistantService<E> {
             .filter(|t| t.active_run_id.is_some())
         {
             let id = task.active_run_id.clone().unwrap();
+            if let Some(assignment) = &task.assignment {
+                state
+                    .collaboration
+                    .operation_assignments
+                    .entry(id.clone())
+                    .or_insert_with(|| assignment.clone());
+            }
             let op = state.operations.entry(id.clone()).or_insert(Operation {
                 id,
                 role: Role::Execution,
@@ -294,15 +325,60 @@ impl<E: Executor> AssistantService<E> {
 
     /// Explicit user/phone command. Direct controls/memory cannot be model tools.
     pub fn apply(&mut self, id: &str, command: Command, now: i64) -> Result<CommandReceipt> {
+        self.apply_preserving_reassignment(id, command, now, None)
+    }
+
+    fn apply_preserving_reassignment(
+        &mut self,
+        id: &str,
+        command: Command,
+        now: i64,
+        preserve: Option<&str>,
+    ) -> Result<CommandReceipt> {
         clock(now)?;
         let hash = fingerprint(&command)?;
         if let Some(value) = self.replay(id, &hash)? {
             return Ok(serde_json::from_value(value)?);
         }
-        let receipt = self.store.apply(id, command.clone())?;
+        // The task pause and its delivery cancellation must survive together.
+        // Internal reassignment stops deliberately retain only their own update.
+        let pause_state = if let Command::PauseTask { task_id } = &command {
+            let mut state = self.state.clone();
+            state
+                .collaboration
+                .cancel_deliveries(Some(task_id), preserve);
+            for op in state
+                .operations
+                .values_mut()
+                .filter(|o| o.task_id.as_ref() == Some(task_id) && o.phase.live())
+            {
+                op.suspended = true;
+            }
+            Some(state)
+        } else {
+            None
+        };
+        let assistant_id = self.store.assistant_id.clone();
+        let receipt = self
+            .store
+            .apply_with_effect(id, command.clone(), |db, receipt| {
+                if let Some(mut state) = pause_state {
+                    // Replaying this pause after a crash must not cancel later work.
+                    state.journal.insert(
+                        id.into(),
+                        JournalEntry {
+                            fingerprint: hash.clone(),
+                            result: serde_json::to_value(receipt)?,
+                        },
+                    );
+                    save_state(db, &assistant_id, &state)?;
+                }
+                Ok(())
+            })?;
         if matches!(command, Command::TakeOver) {
             self.state.paused = true;
             self.state.inbox.clear();
+            self.cancel_deliveries(None, None);
             self.state.coordinator_watermark = self.state.events.last().map_or(0, |e| e.sequence);
             self.state.scheduled_commands.clear();
             // Pausing all previously queued/waiting work is intentional. Release
@@ -329,6 +405,7 @@ impl<E: Executor> AssistantService<E> {
         } else if matches!(command, Command::ReleaseTakeover) {
             self.state.paused = false;
         } else if let Command::PauseTask { task_id } = &command {
+            self.cancel_deliveries(Some(task_id), preserve);
             for op in self
                 .state
                 .operations
@@ -392,6 +469,16 @@ impl<E: Executor> AssistantService<E> {
             message: message.into(),
             directories,
         });
+        self.remember_entry(ConversationEntry {
+            id: format!("user:{id}"),
+            role: "User".into(),
+            text: message.into(),
+            at_ms: now,
+            member_id: None,
+            task_id: None,
+            group_id: None,
+            source_thread_id: None,
+        });
         self.record(id, hash, serde_json::Value::Null);
         self.event(
             format!("user:{id}"),
@@ -431,6 +518,7 @@ impl<E: Executor> AssistantService<E> {
             }
         }
         self.interrupt_suspended()?;
+        self.reconcile_deliveries()?;
         self.advance_schedules(now, opened_at)?;
         if self.state.paused || self.store.taken_over()? {
             return Ok(());
@@ -445,17 +533,19 @@ impl<E: Executor> AssistantService<E> {
         {
             return Ok(());
         }
+        self.advance_collaboration(now)?;
+        if self.uncertain_deliveries() {
+            return Ok(());
+        }
         for _ in 0..MAX_CONCURRENT_TASKS {
-            let Some(lease) = self.store.claim_next(now)? else {
+            let eligible = self.eligible_tasks()?;
+            let Some(lease) = self
+                .store
+                .claim_eligible(now, |task| eligible.contains(&task.id))?
+            else {
                 break;
             };
-            let thread = self
-                .state
-                .operations
-                .values()
-                .filter(|o| o.task_id.as_deref() == Some(&lease.task.id))
-                .filter_map(|o| o.mapping.as_ref().map(|m| m.thread_id.clone()))
-                .last();
+            // Save the lease identity before any fallible native inquiry.
             let op = Operation {
                 id: lease.run_id.clone(),
                 role: Role::Execution,
@@ -471,11 +561,36 @@ impl<E: Executor> AssistantService<E> {
                 prompt: None,
             };
             self.state.operations.insert(op.id.clone(), op.clone());
+            if let Some(assignment) = &lease.task.assignment {
+                self.state
+                    .collaboration
+                    .operation_assignments
+                    .insert(op.id.clone(), assignment.clone());
+            }
             self.save()?;
+            let prepared = (|| -> Result<_> {
+                Ok((
+                    self.execution_thread(&lease.task)?,
+                    self.task_prompt(&lease.task)?,
+                ))
+            })();
+            let (thread, prompt) = match prepared {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    // This newly claimed lease has made no native effect yet.
+                    self.observe(
+                        &op.id,
+                        ExecutionStatus::NotDispatched,
+                        &format!("preflight:{}", op.id),
+                        now,
+                    )?;
+                    continue;
+                }
+            };
             let req = self.request(
                 &op,
                 thread,
-                lease.task.prompt,
+                prompt,
                 Some(lease.task.directory),
                 lease.task.writes,
             )?;
@@ -510,7 +625,7 @@ impl<E: Executor> AssistantService<E> {
             self.state.settings.timezone,
             serde_json::to_string(&memories)?,
             if op.role == Role::Coordinator {
-                "Coordinate only entrusted work. Read-only. Use only the six assistant tools. Never approve native permissions or infer memories."
+                "Coordinate only entrusted work. Read-only. Use only registered assistant tools. Never approve native permissions or infer memories. Automatically delegate: ordinary one-off work needs no member; create a conversation-local member only for a distinct recurring responsibility, or at the user's explicit request. Reuse existing members. Give clear task scope, facts, constraints and completion criteria. Create task groups for related assignments and seal each group after dispatching; request synthesis only when results need integration. Member results are already shown to the user; do not repeat them. Never poll or wait for members. Route user corrections to the member or reassign a task, and keep native subagents separate from durable members."
             } else {
                 "Execute only the entrusted task using the project's existing authorization. Ask the human for approvals."
             }
@@ -577,28 +692,73 @@ impl<E: Executor> AssistantService<E> {
             .events
             .iter()
             .filter(|e| e.wake_coordinator && e.sequence > self.state.coordinator_watermark)
+            .take(16)
             .cloned()
             .collect();
         if wake.is_empty() && self.state.inbox.is_empty() {
             return Ok(());
         }
-        let inbox = std::mem::take(&mut self.state.inbox);
-        let roots = inbox.iter().flat_map(|i| i.directories.clone()).collect();
+        let upgrade = self
+            .state
+            .coordinator_thread
+            .as_deref()
+            .map(|thread| self.executor.needs_tool_upgrade(thread))
+            .transpose()?
+            .unwrap_or(false);
+        let inbox: Vec<_> = self
+            .state
+            .inbox
+            .drain(..self.state.inbox.len().min(8))
+            .collect();
+        let mut roots: Vec<_> = inbox.iter().flat_map(|i| i.directories.clone()).collect();
+        // Retain the conversation's explicitly granted scope for later member follow-ups.
+        for previous in self
+            .state
+            .operations
+            .values()
+            .filter(|op| op.role == Role::Coordinator)
+        {
+            for root in &previous.authorized_directories {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
         // Merge progress by managed operation; only external managed execution
         // events enter this prompt. Own output/tools never enqueue new messages.
         let mut merged = BTreeMap::new();
+        let event_budget = 8000usize / wake.len().max(1);
         for e in &wake {
             merged.insert(
                 e.operation_id.clone().unwrap_or(e.id.clone()),
-                format!("{}: {}", e.kind, e.detail),
+                format!(
+                    "{}: {}",
+                    e.kind,
+                    collaboration::clip_bytes(&e.detail, event_budget)
+                ),
             );
         }
+        let input_budget = 12000usize / inbox.len().max(1);
+        let handoffs=inbox.iter().map(|entry|serde_json::json!({"id":entry.id,"message":collaboration::clip_bytes(&entry.message,input_budget),"truncated":entry.message.len()>input_budget,"sourceEntryId":format!("user:{}",entry.id)})).collect::<Vec<_>>();
+        let members=self.members().into_iter().filter(|m|m.active).map(|m|serde_json::json!({"id":m.id,"name":m.name,"duty":collaboration::clip_bytes(&m.duty,256),"active":m.active,"directory":collaboration::clip_bytes(&m.directory.to_string_lossy(),512)})).collect::<Vec<_>>();
         let prompt = format!(
-            "User handoffs: {}\nManaged events: {}",
-            serde_json::to_string(&inbox)?,
-            serde_json::to_string(&merged)?
+            "User handoffs: {}\nRead any truncated handoff with assistant_read_main entry_id=sourceEntryId until nextOffset is null before acting.\nManaged events: {}\nConversation members: {}\nRecent public conversation: {}",
+            serde_json::to_string(&handoffs)?,
+            serde_json::to_string(&merged)?,
+            serde_json::to_string(&members)?,
+            serde_json::to_string(&self.conversation_page(None, 1)?)?
         );
         let id = uuid::Uuid::new_v4().to_string();
+        let mut coordinator_thread = self.state.coordinator_thread.clone();
+        if let Some(thread) = &coordinator_thread {
+            if upgrade {
+                self.state
+                    .collaboration
+                    .coordinator_successors
+                    .insert(id.clone(), thread.clone());
+                coordinator_thread = None;
+            }
+        }
         let op = Operation {
             id: id.clone(),
             role: Role::Coordinator,
@@ -613,16 +773,12 @@ impl<E: Executor> AssistantService<E> {
             authorized_directories: roots,
             prompt: Some(prompt.clone()),
         };
-        self.state.coordinator_watermark = self.state.events.last().map_or(0, |e| e.sequence);
+        if let Some(event) = wake.last() {
+            self.state.coordinator_watermark = event.sequence;
+        }
         self.state.operations.insert(id.clone(), op.clone());
         self.save()?;
-        let req = self.request(
-            &op,
-            self.state.coordinator_thread.clone(),
-            prompt,
-            None,
-            false,
-        )?;
+        let req = self.request(&op, coordinator_thread, prompt, None, false)?;
         self.dispatch(id, req, now)
     }
 
@@ -680,7 +836,9 @@ impl<E: Executor> AssistantService<E> {
                     );
                     if m.thread_id == other_mapping.thread_id {
                         ensure!(
-                            op.role == other.role && op.task_id == other.task_id,
+                            op.role == other.role
+                                && (op.role == Role::Coordinator
+                                    || self.same_member_operations(&op, other)),
                             "Native thread belongs to another task or coordinator"
                         );
                     }
@@ -688,7 +846,12 @@ impl<E: Executor> AssistantService<E> {
             }
             if op.role == Role::Coordinator {
                 if let Some(thread) = &self.state.coordinator_thread {
-                    ensure!(*thread == m.thread_id, "Coordinator thread changed");
+                    ensure!(
+                        *thread == m.thread_id
+                            || self.state.collaboration.coordinator_successors.get(id)
+                                == Some(thread),
+                        "Coordinator thread changed"
+                    );
                 }
             }
             op.mapping = Some(m.clone());
@@ -709,7 +872,7 @@ impl<E: Executor> AssistantService<E> {
             return Ok(());
         }
         let prior = self.state.operations.get(id).unwrap().clone();
-        let (kind, detail, wake, notify) = match status {
+        let (kind, detail, mut wake, notify) = match status {
             ExecutionStatus::Unknown => unreachable!(),
             ExecutionStatus::Running(_) => {
                 if op.input_tool_call.is_some() {
@@ -817,6 +980,17 @@ impl<E: Executor> AssistantService<E> {
         };
         if op.role == Role::Coordinator {
             if let Some(m) = &op.mapping {
+                if let Some(previous) = self.state.collaboration.coordinator_successors.get(id) {
+                    for member in self
+                        .state
+                        .collaboration
+                        .members
+                        .values_mut()
+                        .filter(|member| &member.main_thread_id == previous)
+                    {
+                        member.main_thread_id = m.thread_id.clone();
+                    }
+                }
                 self.state.coordinator_thread = Some(m.thread_id.clone());
             }
         }
@@ -824,6 +998,20 @@ impl<E: Executor> AssistantService<E> {
             || prior.question != op.question
             || prior.mapping != op.mapping
             || prior.result != op.result;
+        if self
+            .state
+            .collaboration
+            .operation_assignments
+            .contains_key(id)
+        {
+            // Questions are rendered directly; a grouped result wakes only at its barrier.
+            if kind == "waiting_user" || kind == "completed" || kind == "failed" {
+                wake = false;
+            }
+        }
+        if changed {
+            self.record_execution_result(&op, kind, &detail, now)?;
+        }
         self.state.operations.insert(id.into(), op);
         self.record(&source_id, source_hash, serde_json::Value::Null);
         if changed {
@@ -1013,7 +1201,14 @@ impl<E: Executor> AssistantService<E> {
             .state
             .operations
             .values()
-            .find(|o| o.role == Role::Coordinator && o.mapping.as_ref() == Some(&scope))
+            .find(|o| {
+                o.mapping.as_ref() == Some(&scope)
+                    && (o.role == Role::Coordinator
+                        || matches!(
+                            call,
+                            ToolCall::Collaboration(CollaborationTool::ReadMain { .. })
+                        ))
+            })
             .cloned()
             .context("Tool scope is not the current coordinator")?;
         ensure!(
@@ -1042,6 +1237,9 @@ impl<E: Executor> AssistantService<E> {
             "Coordinator is waiting or reconciling"
         );
         let result = match call {
+            ToolCall::Collaboration(call) => {
+                self.collaboration_tool(&op, &journal_id, call, now)?
+            }
             ToolCall::ListSessions { limit } => {
                 ensure!(limit > 0 && limit <= 100, "Session limit must be 1..100");
                 serde_json::to_value(
@@ -1105,20 +1303,11 @@ impl<E: Executor> AssistantService<E> {
                 )?)?
             }
             ToolCall::PauseTask { task_id } => {
-                let receipt = self.store.apply(
-                    &journal_id,
-                    Command::PauseTask {
-                        task_id: task_id.clone(),
-                    },
+                let receipt = self.apply(
+                    &format!("pause-tool:{}", fingerprint(&journal_id)?),
+                    Command::PauseTask { task_id },
+                    now,
                 )?;
-                for execution in self
-                    .state
-                    .operations
-                    .values_mut()
-                    .filter(|o| o.task_id.as_ref() == Some(&task_id) && o.phase.live())
-                {
-                    execution.suspended = true;
-                }
                 serde_json::to_value(receipt)?
             }
             ToolCall::RequestInput {
@@ -1419,6 +1608,12 @@ impl<E: Executor> AssistantService<E> {
             return;
         }
         let sequence = self.state.events.last().map_or(1, |e| e.sequence + 1);
+        let operation = operation_id
+            .as_ref()
+            .and_then(|id| self.state.operations.get(id));
+        let assignment = operation_id
+            .as_ref()
+            .and_then(|id| self.state.collaboration.operation_assignments.get(id));
         self.state.events.push(AssistantEvent {
             sequence,
             id,
@@ -1428,12 +1623,20 @@ impl<E: Executor> AssistantService<E> {
             notify,
             wake_coordinator: wake,
             at_ms: now,
+            task_id: operation.and_then(|op| op.task_id.clone()),
+            member_id: assignment.and_then(|a| a.member_id.clone()),
+            group_id: assignment.and_then(|a| a.group_id.clone()),
+            thread_id: operation.and_then(|op| op.mapping.as_ref().map(|m| m.thread_id.clone())),
         });
     }
     fn save(&self) -> Result<()> {
-        self.store.db.execute("INSERT INTO assistant_service_state(assistant_id,data) VALUES(?1,?2) ON CONFLICT(assistant_id) DO UPDATE SET data=excluded.data", params![self.store.assistant_id, serde_json::to_string(&self.state)?])?;
-        Ok(())
+        save_state(&self.store.db, &self.store.assistant_id, &self.state)
     }
+}
+
+fn save_state(db: &rusqlite::Connection, assistant_id: &str, state: &State) -> Result<()> {
+    db.execute("INSERT INTO assistant_service_state(assistant_id,data) VALUES(?1,?2) ON CONFLICT(assistant_id) DO UPDATE SET data=excluded.data", params![assistant_id, serde_json::to_string(state)?])?;
+    Ok(())
 }
 
 fn text(value: &str, max: usize) -> Result<()> {

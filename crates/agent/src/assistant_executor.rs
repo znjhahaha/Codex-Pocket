@@ -25,6 +25,7 @@ pub use permissions::{
     ProjectPermissionProof, ProjectPermissionReader, register_project_permission_reader,
 };
 pub use protocol::dynamic_tools;
+pub(crate) use protocol::normalize_input_answers;
 pub use shared::SharedHostExecutor;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +57,9 @@ pub struct RuntimeEvents {
     pub pending_requests: Vec<Value>,
 }
 pub trait RuntimeIo {
+    fn supports(&self, _method: &str, _parameters: &Value) -> bool {
+        false
+    }
     fn request(&mut self, stable_id: Value, method: &str, params: Value) -> Result<Value>;
     fn receipt(&mut self, stable_id: Value) -> Result<RuntimeReceipt>;
     fn answer(&mut self, native_id: Value, result: Value) -> Result<()>;
@@ -108,6 +112,8 @@ pub struct OperationRecord {
     pub thread_id: Option<String>,
     pub mapping: Option<NativeMapping>,
     pub rejected: bool,
+    #[serde(default)]
+    pub tool_revision: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ThreadOwner {
@@ -117,11 +123,15 @@ struct ThreadOwner {
     generation: String,
     #[serde(default)]
     current_operation: Option<String>,
+    #[serde(default)]
+    tool_revision: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Effect {
     fingerprint: String,
     accepted: bool,
+    #[serde(default)]
+    rejected: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Durable {
@@ -345,6 +355,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             Effect {
                 fingerprint: hash,
                 accepted: false,
+                rejected: false,
             },
         );
         self.save()?;
@@ -352,6 +363,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             Ok(value) => value,
             Err(error) => {
                 if error.downcast_ref::<RuntimeUnsupported>().is_some() {
+                    self.state.effects.get_mut(&key).unwrap().rejected = true;
                     for op in self.state.operations.values_mut().filter(|op| {
                         op.mapping.is_none() && (op.thread_rpc_id == id || op.turn_rpc_id == id)
                     }) {
@@ -374,6 +386,16 @@ impl<R: RuntimeIo> HostExecutor<R> {
         Ok(value)
     }
     fn completed_receipt(&mut self, id: &Value) -> Result<Option<Value>> {
+        let Some(response) = self.completed_envelope(id)? else {
+            return Ok(None);
+        };
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("Native rejected request: {error}");
+        }
+        Ok(response.get("result").cloned())
+    }
+
+    fn completed_envelope(&mut self, id: &Value) -> Result<Option<Value>> {
         let receipt = self.runtime.receipt(id.clone())?;
         ensure!(
             receipt.generation == self.state.generation,
@@ -403,10 +425,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 && (response.get("result").is_some() ^ response.get("error").is_some()),
             "Invalid receipt envelope"
         );
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("Native rejected request: {error}");
-        }
-        Ok(response.get("result").cloned())
+        Ok(Some(response))
     }
     fn dispatch(&mut self, req: StartRequest, resume: bool) -> Result<NativeMapping> {
         small(&req.operation_id)?;
@@ -492,6 +511,10 @@ impl<R: RuntimeIo> HostExecutor<R> {
         let model = self.select_model(req.settings.model.as_deref())?;
         let thread_rpc_id = rpc_id(&req.operation_id, "thread");
         let turn_rpc_id = rpc_id(&req.operation_id, "turn");
+        let tool_revision = req
+            .thread_id
+            .as_ref()
+            .map_or(1, |thread| self.state.threads[thread].tool_revision);
         let op = OperationRecord {
             operation_id: req.operation_id.clone(),
             generation: req.host_generation.clone(),
@@ -506,6 +529,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             thread_id: req.thread_id.clone(),
             mapping: None,
             rejected: false,
+            tool_revision,
         };
         self.state.operations.insert(req.operation_id.clone(), op);
         self.save()?;
@@ -573,6 +597,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 writes: req.writes,
                 generation: req.host_generation.clone(),
                 current_operation: None,
+                tool_revision,
             },
         );
         self.state
@@ -662,6 +687,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                         writes: op.writes,
                         generation: op.generation.clone(),
                         current_operation: None,
+                        tool_revision: op.tool_revision,
                     },
                 );
                 self.state.operations.insert(id.into(), op.clone());
@@ -758,6 +784,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             Effect {
                 fingerprint,
                 accepted: false,
+                rejected: false,
             },
         );
         self.save()?;
@@ -793,6 +820,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                     thread_id: None,
                     mapping: None,
                     rejected: true,
+                    tool_revision: 1,
                 },
             );
             self.save()?;
@@ -801,6 +829,147 @@ impl<R: RuntimeIo> HostExecutor<R> {
     }
 }
 impl<R: RuntimeIo> Executor for HostExecutor<R> {
+    fn needs_tool_upgrade(&self, thread: &str) -> Result<bool> {
+        Ok(self
+            .state
+            .threads
+            .get(thread)
+            .context("Unmanaged thread")?
+            .tool_revision
+            < 1)
+    }
+    fn append_status(
+        &mut self,
+        id: &str,
+        mapping: &NativeMapping,
+        message: &str,
+    ) -> Result<AppendOutcome> {
+        self.healthy(&mapping.host_generation, false)?;
+        let native_id = rpc_id(id, "append");
+        let Some(effect) = self.state.effects.get(&native_key(&native_id)?) else {
+            return Ok(AppendOutcome::Rejected);
+        };
+        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":[{"type":"text","text":message,"text_elements":[]}]});
+        ensure!(
+            effect.fingerprint == hash(&("turn/steer", &params))?,
+            "Append identity reused with different content"
+        );
+        if effect.rejected {
+            return Ok(AppendOutcome::Rejected);
+        }
+        let Some(envelope) = self.completed_envelope(&native_id)? else {
+            return Ok(AppendOutcome::Uncertain);
+        };
+        if envelope.get("error").is_some() {
+            return Ok(AppendOutcome::Rejected);
+        }
+        Ok(if envelope["result"]["turnId"] == mapping.turn_id {
+            AppendOutcome::Delivered
+        } else {
+            AppendOutcome::Uncertain
+        })
+    }
+    fn append(
+        &mut self,
+        id: &str,
+        mapping: &NativeMapping,
+        message: &str,
+    ) -> Result<AppendOutcome> {
+        bounded_text(id, 512)?;
+        bounded_text(message, 65536)?;
+        self.healthy(&mapping.host_generation, true)?;
+        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":[{"type":"text","text":message,"text_elements":[]}]});
+        let native_id = rpc_id(id, "append");
+        let key = native_key(&native_id)?;
+        if self.state.effects.contains_key(&key) {
+            return self.append_status(id, mapping, message);
+        }
+        if !self.runtime.supports("turn/steer", &params) {
+            return Ok(AppendOutcome::Unsupported);
+        }
+        let operation = self
+            .state
+            .operations
+            .values()
+            .find(|op| op.mapping.as_ref() == Some(mapping))
+            .cloned()
+            .context("Append target is not managed")?;
+        ensure!(
+            self.state
+                .threads
+                .get(&mapping.thread_id)
+                .and_then(|t| t.current_operation.as_ref())
+                == Some(&operation.operation_id),
+            "Append target is not the current turn"
+        );
+        ensure!(
+            operation.role == Role::Execution,
+            "Only execution tasks accept targeted input"
+        );
+        ensure!(
+            self.policy
+                .grants
+                .iter()
+                .any(|grant| within(&operation.directory, &grant.root)
+                    && (!operation.writes || grant.writable)
+                    && canonical(&grant.root).is_ok_and(|root| root == grant.root)),
+            "Append directory/write authorization changed"
+        );
+        let value = match self.effect(native_id, "turn/steer", params) {
+            Ok(value) => value,
+            Err(error) if error.downcast_ref::<RuntimeUnsupported>().is_some() => {
+                return Ok(AppendOutcome::Rejected);
+            }
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            value["turnId"] == mapping.turn_id,
+            "Append receipt targets another turn"
+        );
+        Ok(AppendOutcome::Delivered)
+    }
+    fn can_resume(
+        &mut self,
+        thread: &str,
+        role: Role,
+        directory: Option<&Path>,
+        writes: bool,
+    ) -> Result<bool> {
+        let Some(owner) = self.state.threads.get(thread).cloned() else {
+            return Ok(false);
+        };
+        let Some(directory) = directory else {
+            return Ok(false);
+        };
+        if owner.generation != self.state.generation
+            || owner.role != role
+            || owner.directory != canonical(directory)?
+            || owner.writes != writes
+            || owner.tool_revision < 1
+        {
+            return Ok(false);
+        }
+        if let Some(id) = owner.current_operation {
+            let Some(mapping) = self
+                .state
+                .operations
+                .get(&id)
+                .and_then(|o| o.mapping.clone())
+            else {
+                return Ok(false);
+            };
+            if !matches!(
+                self.read_exact_status(&id, &mapping)?,
+                ExecutionStatus::Completed(..)
+                    | ExecutionStatus::Failed(..)
+                    | ExecutionStatus::Interrupted(..)
+            ) {
+                return Ok(false);
+            }
+        }
+        self.require_idle_thread(thread)?;
+        Ok(true)
+    }
     fn start(&mut self, req: StartRequest) -> Result<NativeMapping> {
         self.attempt(req, false)
     }

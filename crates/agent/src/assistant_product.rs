@@ -95,6 +95,9 @@ fn checked_answer(id: &Value, generation: &str, receipt: RuntimeReceipt) -> Resu
     Ok(())
 }
 impl RuntimeIo for HostIo {
+    fn supports(&self, method: &str, parameters: &Value) -> bool {
+        self.capabilities.supports(method, parameters)
+    }
     fn project_permissions(
         &mut self,
         runtime: &str,
@@ -250,11 +253,16 @@ struct WorkerIo<R> {
     ledger: Arc<Mutex<Connection>>,
 }
 impl<R: RuntimeIo> RuntimeIo for WorkerIo<R> {
+    fn supports(&self, method: &str, parameters: &Value) -> bool {
+        self.inner.supports(method, parameters)
+    }
     fn request(&mut self, id: Value, method: &str, p: Value) -> Result<Value> {
         // New native work is checked again at the transport boundary. A fenced
         // operation is unavailable before dispatch, never an ambiguous retry.
-        if matches!(method, "thread/start" | "thread/resume" | "turn/start")
-            && self.handoff.as_ref().is_some_and(|h| !h.accepting_writes())
+        if matches!(
+            method,
+            "thread/start" | "thread/resume" | "turn/start" | "turn/steer"
+        ) && self.handoff.as_ref().is_some_and(|h| !h.accepting_writes())
         {
             return Err(RuntimeUnsupported {
                 method: format!("{method} (handoff fenced before dispatch)"),
@@ -450,7 +458,13 @@ impl Actor {
                         Ok(_) if is_read(&request.method)=>{
                             match value{Ok(mut v)=>{
                                 if request.method=="assistant/settings/read"{v=json!({"settings":v["settings"],"fresh":true,"updatedAtMs":v["updatedAtMs"],"snapshotSource":"worker_read"});}
-                                else if let Some(after)=request.parameters.get("after").and_then(Value::as_u64){v["events"]=json!(worker.service.events(after,256)?);}
+                                else {
+                                    if let Some(after)=request.parameters.get("after").and_then(Value::as_u64){v["events"]=json!(worker.service.events(after,256)?);}
+                                    if request.parameters.get("before").is_some() || request.parameters.get("limit").is_some() {
+                                        v["conversationPage"]=timeline_page(&worker.service,&worker.messages,request.parameters["before"].as_u64(),request.parameters["limit"].as_u64().unwrap_or(50) as usize)?;
+                                    }
+                                    if let Some(task)=request.parameters["taskId"].as_str(){v["taskDetail"]=worker.service.task_context(task)?;}
+                                }
                                 Ok(v)
                             },Err(e)=>Err(e)}
                         }
@@ -553,6 +567,7 @@ CREATE TABLE IF NOT EXISTS product_meta(key TEXT PRIMARY KEY,value INTEGER NOT N
 CREATE TABLE IF NOT EXISTS product_projects(thread_id TEXT NOT NULL,root TEXT NOT NULL,writable INTEGER NOT NULL,PRIMARY KEY(thread_id,root));
 CREATE TABLE IF NOT EXISTS product_answers(generation TEXT NOT NULL,native_id TEXT NOT NULL,PRIMARY KEY(generation,native_id));
 CREATE TABLE IF NOT EXISTS product_guards(token TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS product_question_history(id TEXT PRIMARY KEY,data TEXT NOT NULL);
 UPDATE product_projects SET writable=(SELECT max(p.writable) FROM product_projects p WHERE p.root=product_projects.root);
 DELETE FROM product_projects WHERE rowid NOT IN (SELECT max(rowid) FROM product_projects GROUP BY root);
 DELETE FROM product_timeline WHERE role='User' AND id IN (SELECT id FROM messages) AND ('user:'||id) IN (SELECT id FROM product_timeline);
@@ -677,13 +692,17 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 grants,
             },
         )?);
-        let service = AssistantService::open(
+        let mut service = AssistantService::open(
             &root.join("assistant.db"),
             &computer,
             &profile,
             &generation,
             executor.clone(),
         )?;
+        let legacy=messages.prepare("SELECT id,role,text,at_ms FROM (SELECT * FROM product_timeline ORDER BY sequence DESC LIMIT 200) ORDER BY sequence")?
+            .query_map([],|row|Ok(ConversationEntry{id:row.get(0)?,role:row.get(1)?,text:row.get(2)?,at_ms:row.get(3)?,member_id:None,task_id:None,group_id:None,source_thread_id:None}))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        service.import_legacy_conversation(legacy)?;
         let mut worker = Self {
             service,
             executor,
@@ -740,6 +759,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .operations()
             .iter()
             .any(|o| o.phase == OperationPhase::Unknown)
+            || self.service.uncertain_deliveries()
             || t.old_answers
             || !t.uncertain_answers.is_empty()
     }
@@ -787,10 +807,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             for event in &events {
                 if event.kind == "completed"
                     && event.operation_id.as_ref().is_some_and(|id| {
-                        self.service
-                            .operations()
-                            .iter()
-                            .any(|o| o.id == *id && o.role == Role::Coordinator)
+                        self.service.operations().iter().any(|o| {
+                            o.id == *id
+                                && (o.role == Role::Coordinator || self.service.direct_result(o))
+                        })
                     })
                 {
                     tx.execute("INSERT OR IGNORE INTO product_timeline(id,role,text,at_ms,operation_id,source_sequence) VALUES(?1,'Assistant',?2,?3,?4,?5)",params![format!("assistant:{}",event.id),event.detail,event.at_ms,event.operation_id,event.sequence])?;
@@ -882,6 +902,13 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 .filter(|s| s.next_ms.is_some_and(|at| at <= (self.clock)()))
                 .map(|s| s.spec.directory),
         );
+        pending.extend(
+            self.service
+                .deliveries()
+                .into_iter()
+                .filter(|d| matches!(d.status.as_str(), "queued" | "sending" | "unknown"))
+                .map(|d| d.directory),
+        );
         for project in &mut self.projects {
             if !pending
                 .iter()
@@ -940,12 +967,22 @@ impl<R: RuntimeIo + Clone> Worker<R> {
     fn apply(&mut self, r: &Request) -> Result<Value> {
         if is_read(&r.method) {
             ensure!(
-                r.parameters
-                    .as_object()
-                    .is_some_and(|p| p.keys().all(|k| k == "after"))
+                r.parameters.as_object().is_some_and(|p| p
+                    .keys()
+                    .all(|k| ["after", "before", "limit", "taskId"].contains(&k.as_str())))
+                    && ["after", "before"]
+                        .iter()
+                        .all(|k| r.parameters.get(k).is_none_or(|v| v.as_u64().is_some()))
                     && r.parameters
-                        .get("after")
-                        .is_none_or(|v| v.as_u64().is_some()),
+                        .get("limit")
+                        .is_none_or(|v| v.as_u64().is_some_and(|n| (1..=100).contains(&n)))
+                    && r.parameters
+                        .get("taskId")
+                        .is_none_or(|v| v.as_str().is_some_and(|id| !id.is_empty()
+                            && id.len() <= 256
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))),
                 "Invalid assistant read cursor"
             );
             return Ok(Value::Null);
@@ -985,8 +1022,23 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                         .to_owned();
                     self.authorize(&source, None, text(p, "threadId")?, root, true)?;
                 }
-                self.service
-                    .submit(&r.id, message, r.directory.iter().cloned().collect(), at)?;
+                if p["memberId"].is_string() || p["taskId"].is_string() {
+                    self.service.submit_targeted(
+                        &r.id,
+                        message,
+                        p["memberId"].as_str(),
+                        p["taskId"].as_str(),
+                        false,
+                        at,
+                    )?;
+                } else {
+                    self.service.submit(
+                        &r.id,
+                        message,
+                        r.directory.iter().cloned().collect(),
+                        at,
+                    )?;
+                }
                 let tx = self.messages.transaction()?;
                 tx.execute(
                     "INSERT OR IGNORE INTO messages(id,text,at_ms) VALUES(?1,?2,?3)",
@@ -1098,13 +1150,40 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     .map_err(|_| anyhow::anyhow!("Unknown timezone"))?;
                 self.service.update_settings(&r.id, settings, at)?;
             }
-            "assistant/respond" => self.service.respond(
-                &r.id,
-                text(p, "operationId")?,
-                text(p, "requestId")?,
-                serde_json::from_value(p["response"].clone())?,
-                at,
-            )?,
+            "assistant/respond" => {
+                let operation = text(p, "operationId")?;
+                let request = text(p, "requestId")?;
+                let response: HumanResponse = serde_json::from_value(p["response"].clone())?;
+                let pending = self
+                    .executor
+                    .pending_requests()?
+                    .into_iter()
+                    .find(|q| q.operation_id == operation && q.handle == request);
+                let op = self
+                    .service
+                    .operations()
+                    .into_iter()
+                    .find(|op| op.id == operation);
+                let history = safe_answer_history(
+                    operation,
+                    request,
+                    pending.as_ref(),
+                    op.as_ref(),
+                    &response,
+                    at,
+                );
+                self.service
+                    .respond(&r.id, operation, request, response, at)?;
+                if let Some(history) = history {
+                    self.messages.execute(
+                        "INSERT OR IGNORE INTO product_question_history(id,data) VALUES(?1,?2)",
+                        params![
+                            history["id"].as_str().unwrap(),
+                            serde_json::to_string(&history)?
+                        ],
+                    )?;
+                }
+            }
             "assistant/schedule/delete" => self
                 .service
                 .remove_schedule(&r.id, text(p, "scheduleId")?)?,
@@ -1245,6 +1324,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             Err(_) => self.error = Some("runtime_reconnecting"),
         }
         self.reconcile_only();
+        if self.service.reconcile_deliveries().is_err() {
+            self.error = Some("delivery_requires_reconciliation");
+        }
         if self.sync_timeline().is_err() {
             self.error = Some("timeline_unavailable");
         }
@@ -1440,6 +1522,116 @@ fn text<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
         .filter(|s| !s.is_empty() && s.len() <= 65536 && !s.contains('\0'))
         .context("Missing assistant field")
 }
+/// Only a public, positively acknowledged answer is retained by the product UI.
+/// Host recovery journals continue to store receipt identity, never answer payloads.
+fn safe_answer_history(
+    operation: &str,
+    request: &str,
+    pending: Option<&PendingRequest>,
+    op: Option<&Operation>,
+    response: &HumanResponse,
+    at: i64,
+) -> Option<Value> {
+    let HumanResponse::Answer(answer) = response else {
+        return None;
+    };
+    let (questions, answers) = if let Some(pending) =
+        pending.filter(|p| p.method == "item/tool/requestUserInput")
+    {
+        let questions = pending.params["questions"].as_array()?.clone();
+        let normalized = normalize_input_answers(&questions, answer).ok()?;
+        let mut answers = serde_json::Map::new();
+        for question in &questions {
+            let id = question["id"].as_str()?;
+            let secret = question["isSecret"].as_bool().unwrap_or(true);
+            let value = if secret {
+                json!({"answers":["敏感回答已隐藏"]})
+            } else {
+                normalized.get(id)?.clone()
+            };
+            answers.insert(id.into(), value);
+        }
+        (questions, Value::Object(answers))
+    } else if let Some(op) = op.filter(|op| op.input_tool_call.is_some()) {
+        let question = op.question.as_ref()?;
+        (
+            vec![
+                json!({"id":request,"header":"问题","question":question.text,"isOther":true,"isSecret":false,"options":null}),
+            ],
+            json!({request:{"answers":[answer]}}),
+        )
+    } else {
+        return None;
+    };
+    Some(
+        json!({"id":format!("answered:{operation}:{request}"),"operationId":operation,"requestId":request,"atMs":at,
+        "item":{"id":format!("answered:{operation}:{request}"),"type":"dynamicToolCall","tool":"request_user_input","arguments":{"questions":questions},"status":"completed","success":true,"contentItems":[{"type":"inputText","text":json!({"answers":answers}).to_string()}]}}),
+    )
+}
+fn attribute_messages<R: RuntimeIo>(
+    service: &AssistantService<SharedHostExecutor<R>>,
+    chat: &mut [Value],
+) -> Result<()> {
+    let operations = service.operations();
+    let members = service.members();
+    for message in chat {
+        let operation = message["operationId"]
+            .as_str()
+            .and_then(|id| operations.iter().find(|op| op.id == id));
+        let entry = message["id"]
+            .as_str()
+            .and_then(|id| service.conversation_entry(id));
+        let task = operation.and_then(|op| op.task_id.as_deref());
+        let assignment = operation.and_then(|op| service.operation_assignment(&op.id));
+        let member_id = assignment
+            .and_then(|a| a.member_id.as_deref())
+            .or_else(|| entry.and_then(|e| e.member_id.as_deref()));
+        message["memberId"] = json!(member_id);
+        message["authorName"] = json!(
+            member_id
+                .and_then(|id| members.iter().find(|m| m.id == id))
+                .map(|m| &m.name)
+        );
+        message["taskId"] = json!(task.or_else(|| entry.and_then(|e| e.task_id.as_deref())));
+        message["groupId"] = json!(
+            assignment
+                .and_then(|a| a.group_id.as_deref())
+                .or_else(|| entry.and_then(|e| e.group_id.as_deref()))
+        );
+        message["sourceThreadId"] = json!(
+            operation
+                .and_then(|op| op.mapping.as_ref())
+                .map(|m| &m.thread_id)
+        );
+    }
+    Ok(())
+}
+fn timeline_page<R: RuntimeIo>(
+    service: &AssistantService<SharedHostExecutor<R>>,
+    db: &Connection,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<Value> {
+    ensure!(
+        (1..=100).contains(&limit),
+        "Timeline page limit must be 1..100"
+    );
+    let before = before.unwrap_or(i64::MAX as u64).min(i64::MAX as u64) as i64;
+    let mut stmt=db.prepare("SELECT sequence,id,role,text,at_ms,operation_id,source_sequence FROM product_timeline WHERE sequence<?1 ORDER BY sequence DESC LIMIT ?2")?;
+    let mut chat=stmt.query_map(params![before,limit as i64],|r|Ok(json!({"sequence":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"atMs":r.get::<_,i64>(4)?,"operationId":r.get::<_,Option<String>>(5)?,"sourceEventSequence":r.get::<_,Option<u64>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    chat.reverse();
+    attribute_messages(service, &mut chat)?;
+    let cursor = chat.first().and_then(|v| v["sequence"].as_u64());
+    let more = cursor.is_some_and(|cursor| {
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM product_timeline WHERE sequence<?1)",
+            [cursor],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
+    Ok(json!({"messages":chat,"nextBefore":cursor.filter(|_|more)}))
+}
 fn snapshot_value<R: RuntimeIo>(
     service: &AssistantService<SharedHostExecutor<R>>,
     executor: &SharedHostExecutor<R>,
@@ -1448,7 +1640,7 @@ fn snapshot_value<R: RuntimeIo>(
     error: Option<&str>,
 ) -> Result<Value> {
     let operations = service.operations();
-    let chat = if messages
+    let mut chat = if messages
         .prepare("SELECT id FROM product_timeline LIMIT 1")
         .is_ok()
     {
@@ -1459,10 +1651,30 @@ fn snapshot_value<R: RuntimeIo>(
             .prepare("SELECT id,text,at_ms FROM messages ORDER BY at_ms,rowid LIMIT 200")?;
         stmt.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"role":"User","text":r.get::<_,String>(1)?,"atMs":r.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    let members = service.members();
+    let assignments = service.assignments()?;
+    attribute_messages(service, &mut chat)?;
+    let first = chat.iter().filter_map(|v| v["sequence"].as_u64()).min();
+    let next_before = first.filter(|sequence| {
+        messages
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM product_timeline WHERE sequence<?1)",
+                [sequence],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    });
     let pending=executor.pending_requests()?.into_iter().map(|p|json!({"operationId":p.operation_id,"requestId":p.handle,"method":p.method,"params":p.params})).collect::<Vec<_>>();
     let events = service.latest_events(256)?;
+    let question_history = messages
+        .prepare("SELECT data FROM product_question_history ORDER BY rowid DESC LIMIT 200")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|s| serde_json::from_str::<Value>(&s))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(
-        json!({"enabled":true,"ready":error.is_none(),"runtimeId":runtime,"coordinatorThreadId":service.coordinator_thread_id(),"assistantId":service.assistant_id(),"paused":service.is_paused(),"settings":service.settings(),"tasks":service.tasks()?,"operations":operations,"events":events,"eventCursor":events.last().map(|e|e.sequence),"memories":service.memories()?,"schedules":service.schedules(),"messages":chat,"pendingRequests":pending,"error":error}),
+        json!({"enabled":true,"ready":error.is_none(),"runtimeId":runtime,"coordinatorThreadId":service.coordinator_thread_id(),"assistantId":service.assistant_id(),"paused":service.is_paused(),"settings":service.settings(),"tasks":service.tasks()?,"members":members,"groups":service.groups()?,"assignments":assignments,"deliveries":service.deliveries(),"questionHistory":question_history,"operations":operations,"events":events,"eventCursor":events.last().map(|e|e.sequence),"memories":service.memories()?,"schedules":service.schedules(),"messages":chat,"nextBefore":next_before,"pendingRequests":pending,"error":error}),
     )
 }
 /// Timezone data is produced locally; clients supply a validated zone name only.

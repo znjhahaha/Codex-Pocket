@@ -152,6 +152,7 @@ impl Server {
                                 Ok(v)
                             }
                             Some("routes/read") => Ok(routes.read().await),
+                            Some("assistant/status") => Ok(broker.assistant_status().await),
                             Some(
                                 method @ ("session/preferences"
                                 | "session/preferences/read"

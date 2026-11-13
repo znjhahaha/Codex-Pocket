@@ -1,6 +1,416 @@
 use super::*;
 use std::sync::atomic::AtomicI64;
 
+#[test]
+fn collaboration_public_answer_history_redacts_secret_answers() {
+    let mapping = NativeMapping {
+        host_generation: "g".into(),
+        thread_id: "t".into(),
+        turn_id: "turn".into(),
+    };
+    let pending = PendingRequest {
+        operation_id: "op".into(),
+        mapping,
+        native_id: json!(1),
+        handle: "1".into(),
+        method: "item/tool/requestUserInput".into(),
+        call_id: None,
+        params: json!({"questions":[{"id":"public","question":"Format?","isSecret":false},{"id":"key","question":"Key?","isSecret":true}]}),
+    };
+    let answer =
+        HumanResponse::Answer(json!({"public":["PDF"],"key":["SECRET-SENTINEL"]}).to_string());
+    let history = safe_answer_history("op", "1", Some(&pending), None, &answer, 1).unwrap();
+    assert!(history.to_string().contains("PDF"));
+    assert!(!history.to_string().contains("SECRET-SENTINEL"));
+    assert_eq!(history["item"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn collaboration_member_result_is_attributed_and_persists_without_lead_rewrite() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("handoff").await;
+    let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    f.io.tool(
+        json!(801),
+        &lead,
+        "member",
+        "assistant_create_member",
+        json!({"name":"Backend","duty":"Own backend maintenance","directory":f.project.path()}),
+    );
+    let snapshot = f.read().await;
+    let member = snapshot["members"][0]["id"].clone();
+    f.io.tool(json!(802),&lead,"assign","assistant_assign_task",json!({"prompt":"Implement backend","directory":f.project.path(),"writes":true,"member_id":member,"completion_criteria":"Pass tests"}));
+    let snapshot = f.read().await;
+    let execution = Fixture::mapping(&Fixture::op(&snapshot, "Execution"));
+    f.io.complete(&lead, "Delegated the work");
+    f.io.complete(&execution, "Backend complete with tests");
+    let snapshot = f.read().await;
+    assert!(
+        snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["text"] == "Backend complete with tests"
+                && message["authorName"] == "Backend"
+                && message["memberId"] == member)
+    );
+    assert_eq!(f.io.count("turn/start"), 2);
+    f.stop().await;
+    f.start().await;
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["members"][0]["id"], member);
+    assert_eq!(
+        snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["text"] == "Backend complete with tests")
+            .count(),
+        1
+    );
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_legacy_coordinator_gets_new_tools_without_losing_chat_history() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("old-handoff").await;
+    let old = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    f.io.complete(&old, "Existing assistant history");
+    f.read().await;
+    f.stop().await;
+    let path = f.root.path().join("assistant/executor.db");
+    let db = Connection::open(path).unwrap();
+    let data: String = db
+        .query_row("SELECT data FROM assistant_executor_state", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut data: Value = serde_json::from_str(&data).unwrap();
+    for owner in data["threads"].as_object_mut().unwrap().values_mut() {
+        owner.as_object_mut().unwrap().remove("tool_revision");
+    }
+    db.execute(
+        "UPDATE assistant_executor_state SET data=?1",
+        [data.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    f.start().await;
+    assert_eq!(
+        f.io.count("turn/start"),
+        1,
+        "restoring must not generate a turn"
+    );
+    let snapshot = f.send("new-handoff").await;
+    let successor = Fixture::mapping(
+        snapshot["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["role"] == "Coordinator" && o["phase"] == "Running")
+            .unwrap(),
+    );
+    assert_ne!(old.thread_id, successor.thread_id);
+    assert!(
+        snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["text"] == "Existing assistant history")
+    );
+    let io = f.io.0.lock().unwrap();
+    let latest = io
+        .calls
+        .iter()
+        .rev()
+        .find(|(_, method, _)| method == "thread/start")
+        .unwrap();
+    assert!(
+        latest.2["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "assistant_create_member")
+    );
+    drop(io);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_timeline_pages_keep_stable_message_ids_without_overlap() {
+    let mut f = Fixture::new(false).await;
+    let db = Connection::open(f.root.path().join("assistant/messages.db")).unwrap();
+    for n in 0..235 {
+        db.execute(
+            "INSERT INTO product_timeline(id,role,text,at_ms) VALUES(?1,'User',?2,?3)",
+            params![format!("older-{n}"), format!("Message {n}"), n],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["messages"].as_array().unwrap().len(), 200);
+    let before = snapshot["nextBefore"].as_u64().unwrap();
+    let page = f
+        .call(
+            "assistant/read",
+            json!({"before":before,"limit":50}),
+            "older",
+            false,
+        )
+        .await
+        .unwrap();
+    let older = page["conversationPage"]["messages"].as_array().unwrap();
+    assert_eq!(older.len(), 35);
+    assert!(page["conversationPage"]["nextBefore"].is_null());
+    assert!(older.iter().all(|entry| {
+        !snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| entry["id"] == message["id"])
+    }));
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_actor_multiquestion_history_uses_accepted_answer_shape() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("handoff").await;
+    let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    let snapshot = f.create(&lead, 890, "Need public and secret input").await;
+    let execution = Fixture::mapping(&Fixture::op(&snapshot, "Execution"));
+    f.io.emit(
+        json!("multi-history"),
+        "item/tool/requestUserInput",
+        &execution,
+        json!({"itemId":"input","questions":[
+            {"id":"public","header":"Format","question":"Format?","isSecret":false},
+            {"id":"key","header":"Key","question":"Key?","isSecret":true}
+        ]}),
+    );
+    let snapshot = f.read().await;
+    let op = Fixture::op(&snapshot, "Execution");
+    let answer = json!({"public":["PDF"],"key":["SECRET-SENTINEL"]}).to_string();
+    let response = f.call("assistant/respond", json!({"operationId":op["id"],"requestId":op["question"]["request_id"],"response":{"Answer":answer}}), "answer", false).await.unwrap();
+    let history = &response["snapshot"]["questionHistory"];
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert!(history.to_string().contains("PDF"));
+    assert!(!history.to_string().contains("SECRET-SENTINEL"));
+    assert_eq!(
+        f.io.answers().last().unwrap().1,
+        json!({"answers":{"public":{"answers":["PDF"]},"key":{"answers":["SECRET-SENTINEL"]}}})
+    );
+    f.stop().await;
+    f.start().await;
+    assert_eq!(&f.read().await["questionHistory"], history);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_actor_read_accepts_task_detail_and_validates_all_fields() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("handoff").await;
+    let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    let snapshot = f.create(&lead, 891, "Task detail").await;
+    let task = snapshot["tasks"][0]["id"].clone();
+    let response = f
+        .call(
+            "assistant/read",
+            json!({"after":0,"before":0,"limit":1,"taskId":task}),
+            "detail",
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response["taskDetail"]["task"]["id"], task);
+    assert!(
+        response["conversationPage"]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for invalid in [
+        json!({"limit":0}),
+        json!({"limit":101}),
+        json!({"before":-1}),
+        json!({"after":null}),
+        json!({"taskId":"../task"}),
+        json!({"taskId":""}),
+        json!({"taskId":42}),
+        json!({"extra":0}),
+    ] {
+        assert!(
+            f.call("assistant/read", invalid, "invalid", false)
+                .await
+                .is_err()
+        );
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_actor_append_receipt_recovery_never_duplicates_effects() {
+    for rejected in [false, true] {
+        let mut f = Fixture::new(false).await;
+        let snapshot = f.send("handoff").await;
+        let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+        f.io.tool(json!(892), &lead, "assign", "assistant_assign_task",
+            json!({"prompt":"Original task","directory":f.project.path(),"writes":false,"completion_criteria":"Report evidence"}));
+        let snapshot = f.read().await;
+        let op = Fixture::op(&snapshot, "Execution");
+        let execution = Fixture::mapping(&op);
+        let task = op["task_id"].clone();
+        f.io.complete(&lead, "Delegated");
+        f.read().await;
+        {
+            let mut io = f.io.0.lock().unwrap();
+            io.supports_steer = true;
+            io.reject_steer = rejected;
+            io.lose_method = (!rejected).then(|| "turn/steer".into());
+        }
+        let response = f
+            .call(
+                "assistant/send",
+                json!({"message":"Correction","taskId":task}),
+                "follow",
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["snapshot"]["deliveries"][0]["status"], "unknown");
+        f.io.complete(&execution, "Original finished");
+        let snapshot = f.read().await;
+        assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["deliveries"][0]["status"], "unknown");
+        f.stop().await;
+        f.start().await;
+        assert_eq!(f.io.count("turn/steer"), 1);
+        f.io.0.lock().unwrap().hidden_receipts.clear();
+        let snapshot = f.read().await;
+        assert_eq!(snapshot["deliveries"][0]["status"], "sent");
+        assert_eq!(
+            snapshot["tasks"].as_array().unwrap().len(),
+            if rejected { 2 } else { 1 }
+        );
+        f.read().await;
+        assert_eq!(f.io.count("turn/steer"), 1);
+        assert_eq!(f.io.count("turn/start"), if rejected { 3 } else { 2 });
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn collaboration_actor_pause_prevents_fallback_after_rejected_append() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("handoff").await;
+    let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    let snapshot = f.create(&lead, 893, "Original").await;
+    let task = snapshot["tasks"][0]["id"].clone();
+    {
+        let mut io = f.io.0.lock().unwrap();
+        io.supports_steer = true;
+        io.reject_steer = true;
+    }
+    f.call(
+        "assistant/send",
+        json!({"message":"Correction","taskId":task}),
+        "follow",
+        false,
+    )
+    .await
+    .unwrap();
+    f.call(
+        "assistant/task/pause",
+        json!({"taskId":task}),
+        "pause",
+        false,
+    )
+    .await
+    .unwrap();
+    f.io.0.lock().unwrap().hidden_receipts.clear();
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["deliveries"][0]["status"], "paused");
+    assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(f.io.count("turn/steer"), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn collaboration_actor_reassignment_attributes_history_to_original_operation() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("handoff").await;
+    let lead = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    for (id, name) in [(894, "A"), (895, "B")] {
+        f.io.tool(
+            json!(id),
+            &lead,
+            name,
+            "assistant_create_member",
+            json!({"name":name,"duty":"Maintain work","directory":f.project.path()}),
+        );
+        f.read().await;
+    }
+    let snapshot = f.read().await;
+    let members = snapshot["members"].as_array().unwrap();
+    let a = members.iter().find(|m| m["name"] == "A").unwrap()["id"].clone();
+    let b = members.iter().find(|m| m["name"] == "B").unwrap()["id"].clone();
+    f.io.tool(json!(896), &lead, "assign", "assistant_assign_task",
+        json!({"prompt":"Task","directory":f.project.path(),"writes":false,"member_id":a,"completion_criteria":"Evidence"}));
+    let snapshot = f.read().await;
+    let original = Fixture::op(&snapshot, "Execution");
+    let task = original["task_id"].clone();
+    // A persisted historical row remains tied to its original run even though
+    // the logical task is subsequently assigned to a different member.
+    let db = Connection::open(f.root.path().join("assistant/messages.db")).unwrap();
+    db.execute("INSERT INTO product_timeline(id,role,text,at_ms,operation_id) VALUES('original-history','Assistant','Original progress',1000000,?1)", [original["id"].as_str().unwrap()]).unwrap();
+    drop(db);
+    f.io.tool(
+        json!(897),
+        &lead,
+        "reassign",
+        "assistant_reassign_task",
+        json!({"task_id":task,"member_id":b,"message":"Continue with B"}),
+    );
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["tasks"][0]["assignment"]["member_id"], b);
+    let history = snapshot["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "original-history")
+        .unwrap();
+    assert_eq!(history["memberId"], a);
+    assert_eq!(history["authorName"], "A");
+    let page = f
+        .call("assistant/read", json!({"limit":100}), "page", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        page["conversationPage"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "original-history")
+            .unwrap()["memberId"],
+        a
+    );
+    f.stop().await;
+    f.start().await;
+    assert_eq!(
+        f.read().await["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "original-history")
+            .unwrap()["memberId"],
+        a
+    );
+    f.stop().await;
+}
+
 #[derive(Default)]
 struct State {
     calls: Vec<(Value, String, Value)>,
@@ -20,6 +430,8 @@ struct State {
     offline: bool,
     fail_reads: bool,
     serial: u64,
+    supports_steer: bool,
+    reject_steer: bool,
 }
 #[derive(Clone, Default)]
 struct Fake(Arc<Mutex<State>>);
@@ -95,6 +507,9 @@ impl Fake {
     }
 }
 impl RuntimeIo for Fake {
+    fn supports(&self, method: &str, _: &Value) -> bool {
+        method == "turn/steer" && self.0.lock().unwrap().supports_steer
+    }
     fn project_permissions(
         &mut self,
         runtime: &str,
@@ -138,6 +553,20 @@ impl RuntimeIo for Fake {
             );
         }
         s.calls.push((id.clone(), method.into(), p.clone()));
+        if method == "turn/steer" && s.reject_steer {
+            s.receipts.insert(
+                key(&id),
+                RuntimeReceipt {
+                    generation: "host".into(),
+                    state: "completed".into(),
+                    response: Some(
+                        json!({"id":id,"error":{"code":-32602,"message":"Turn already stopped"}}),
+                    ),
+                },
+            );
+            s.hidden_receipts.insert(key(&id));
+            anyhow::bail!("Native rejected steer; receipt temporarily unavailable");
+        }
         s.serial += 1;
         let n = s.serial;
         let result = match method {
@@ -183,6 +612,7 @@ impl RuntimeIo for Fake {
                     .push(turn.clone());
                 json!({"turn":turn})
             }
+            "turn/steer" => json!({"turnId":p["expectedTurnId"]}),
             "turn/interrupt" => {
                 if s.ignore_interrupt {
                     anyhow::bail!("Interrupt outcome unknown; turn remains running");
@@ -445,7 +875,21 @@ async fn actual_actor_phone_to_native_tool_question_human_answer_result_and_rest
             .2
             .clone();
     assert_eq!(call["sandbox"], "read-only");
-    assert_eq!(call["dynamicTools"].as_array().unwrap().len(), 6);
+    let tool_names: Vec<_> = call["dynamicTools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    for required in [
+        "assistant_create_task",
+        "assistant_request_input",
+        "assistant_assign_task",
+        "assistant_create_member",
+        "assistant_seal_group",
+    ] {
+        assert!(tool_names.contains(&required));
+    }
     let s = f.create(&cm, 101, "写一份报告").await;
     let execution = Fixture::op(&s, "Execution");
     let em = Fixture::mapping(&execution);

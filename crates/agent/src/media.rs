@@ -9,7 +9,7 @@ pub use implementation::MediaOwner;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,13 +23,32 @@ struct RecoveryReference {
     created: u64,
     resolved: Mutex<Option<Value>>,
 }
+type LocalKey = (String, String, String, String, usize, PathBuf);
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LocalSnapshot {
+    canonical: PathBuf,
+    owner: MediaOwner,
+    media_id: String,
+    created: u64,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LocalBinding {
+    source: PathBuf,
+    slot: usize,
+    snapshot: LocalSnapshot,
+}
 #[derive(Clone)]
 pub struct MediaStore {
     store: Arc<implementation::MediaStore>,
     recoveries: Arc<Mutex<BTreeMap<String, Arc<RecoveryReference>>>>,
+    locals: Arc<Mutex<BTreeMap<LocalKey, LocalSnapshot>>>,
+    bindings_path: PathBuf,
 }
 impl MediaStore {
     pub fn new(state_dir: impl AsRef<Path>) -> Result<Self> {
+        let bindings_path=state_dir.as_ref().join("native-media-bindings.json");
+        // A damaged advisory cache cannot prevent the computer bridge from starting.
+        let locals=read_local_bindings(&bindings_path).unwrap_or_default();
         Ok(Self {
             store: Arc::new(implementation::MediaStore::with_limits(
                 state_dir,
@@ -37,6 +56,8 @@ impl MediaStore {
                 crate::workspace::IMAGE_CHUNK,
             )?),
             recoveries: Arc::new(Mutex::new(BTreeMap::new())),
+            locals: Arc::new(Mutex::new(locals)),
+            bindings_path,
         })
     }
     pub fn project(
@@ -90,6 +111,10 @@ impl MediaStore {
                         item_id: item.clone(),
                     };
                     if history.can_recover(&owner, slot) {
+                        if let Some(local) = self.local_reference(&owner, slot, history) {
+                            *part = local;
+                            continue;
+                        }
                         if let Some(reference) =
                             self.recovery_reference(&owner, slot, history, part)
                         {
@@ -113,6 +138,70 @@ impl MediaStore {
             }
             _ => {}
         }
+    }
+    fn local_reference(
+        &self,
+        owner: &MediaOwner,
+        slot: usize,
+        history: &NativeHistory,
+    ) -> Option<Value> {
+        let source = history.local_source(owner, slot)?;
+        let key = (
+            owner.runtime_id.clone(),
+            owner.thread_id.clone(),
+            owner.turn_id.clone(),
+            owner.item_id.clone(),
+            slot,
+            source.to_path_buf(),
+        );
+        let mut locals = self.locals.lock().ok()?;
+        let now = media_now();
+        locals.retain(|_, entry| now.saturating_sub(entry.created) < RECOVERY_TTL);
+        let (image, canonical, created) =
+            if let Ok((file, canonical)) = history.local_image(owner, slot) {
+                (
+                    self.store.project_user_image_file(owner, slot, file),
+                    canonical,
+                    now,
+                )
+            } else {
+                let snapshot = locals.get(&key)?;
+                if !history.authorizes_local_snapshot(owner, slot, &snapshot.canonical) {
+                    return None;
+                }
+                (
+                    self.store
+                        .renew_user_image(&snapshot.owner, owner, slot, &snapshot.media_id),
+                    snapshot.canonical.clone(),
+                    snapshot.created,
+                )
+            };
+        if image["status"] != "ready" {
+            return None;
+        }
+        if !locals.contains_key(&key) {
+            while locals.len() >= MAX_RECOVERY_REFS {
+                let oldest = locals
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.created)
+                    .map(|(key, _)| key.clone())?;
+                locals.remove(&oldest);
+            }
+        }
+        locals.insert(
+            key,
+            LocalSnapshot {
+                canonical,
+                owner: owner.clone(),
+                media_id: image["mediaId"].as_str()?.into(),
+                created,
+            },
+        );
+        let bindings:Vec<_>=locals.iter().map(|(key,snapshot)|LocalBinding{source:key.5.clone(),slot:key.4,snapshot:snapshot.clone()}).collect();
+        let data=serde_json::to_vec(&bindings).ok()?;
+        if data.len()>4*1024*1024 {return None;}
+        crate::storage::atomic_write(&self.bindings_path,&data).ok()?;
+        Some(image)
     }
     fn recovery_reference(
         &self,
@@ -197,7 +286,24 @@ impl MediaStore {
             .resolved
             .lock()
             .map_err(|_| anyhow::anyhow!("Media recovery unavailable"))?;
-        if resolution.as_ref().is_none_or(|r| r["status"] == "failed") {
+        if let Some(resolved) = resolution.as_ref().filter(|r| r["status"] == "ready") {
+            let result = self.store.read(
+                owner,
+                resolved["mediaId"].as_str().unwrap_or(""),
+                offset,
+                max_bytes,
+            )?;
+            if result["status"] == "ready" {
+                let mut result = result;
+                result["mediaId"] = json!(media_id);
+                return Ok(result);
+            }
+            *resolution = None;
+        }
+        if resolution
+            .as_ref()
+            .is_none_or(|r| matches!(r["status"].as_str(), Some("failed" | "expired")))
+        {
             *resolution = Some(match reference.history.recover(owner, reference.slot) {
                 Ok(part) => self.store.project_user_image(owner, reference.slot, &part),
                 Err(_) => {
@@ -220,6 +326,27 @@ impl MediaStore {
         Ok(result)
     }
 }
+
+fn read_local_bindings(path:&Path)->Result<BTreeMap<LocalKey,LocalSnapshot>> {
+    if !path.try_exists()? {return Ok(BTreeMap::new());}
+    let bytes=crate::storage::read_physical(path,4*1024*1024)?;
+    let bindings:Vec<LocalBinding>=serde_json::from_slice(&bytes)?;
+    if bindings.len()>MAX_RECOVERY_REFS {bail!("Too many native media bindings");}
+    let mut entries=BTreeMap::new();
+    for binding in bindings {
+        let snapshot=binding.snapshot;
+        if !binding.source.is_absolute() || !snapshot.canonical.is_absolute() || binding.slot>4096
+            || snapshot.media_id.len()!=32 || !snapshot.media_id.bytes().all(|b|b.is_ascii_hexdigit())
+            || snapshot.created>media_now() || media_now().saturating_sub(snapshot.created)>=RECOVERY_TTL {continue;}
+        let owner=&snapshot.owner;
+        if [&owner.runtime_id,&owner.connection_id,&owner.thread_id,&owner.turn_id,&owner.item_id].iter().any(|id|id.is_empty()||id.len()>4096||id.chars().any(char::is_control)){continue;}
+        // Persisted bindings never authorize a phone path: every use still checks native item,
+        // source path, current roots and the underlying cached blob's original owner.
+        let key=(owner.runtime_id.clone(),owner.thread_id.clone(),owner.turn_id.clone(),owner.item_id.clone(),binding.slot,binding.source);
+        entries.insert(key,snapshot);
+    }
+    Ok(entries)
+}
 fn media_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -232,6 +359,186 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{fs, io::Write};
+
+    #[test]
+    fn local_snapshots_require_current_roots_exact_path_item_and_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("paste.png");
+        fs::write(&path, b"\x89PNG\r\n\x1a\nx").unwrap();
+        let native = json!({"thread":{"id":"thread","path":root.path().join("unneeded.jsonl"),"turns":[{"id":"turn","items":[{"type":"userMessage","id":"native-user","content":[{"type":"localImage","path":path}]}]}]}});
+        let store = MediaStore::new(root.path()).unwrap();
+        let make_proof = |value: &Value, generation: &str, allowed: bool| {
+            NativeHistory::from_native_thread(&value["thread"], "runtime", generation)
+                .unwrap()
+                .with_image_roots(if allowed {
+                    vec![dunce::canonicalize(root.path()).unwrap()]
+                } else {
+                    vec![]
+                })
+        };
+        let denied = store.project_with_history(
+            &native,
+            "runtime",
+            "one",
+            "thread",
+            &make_proof(&native, "one", false),
+        );
+        assert_ne!(
+            denied["thread"]["turns"][0]["items"][0]["content"][0]["status"],
+            "ready"
+        );
+        let ready = store.project_with_history(
+            &native,
+            "runtime",
+            "one",
+            "thread",
+            &make_proof(&native, "one", true),
+        );
+        assert_eq!(
+            ready["thread"]["turns"][0]["items"][0]["content"][0]["status"],
+            "ready"
+        );
+        fs::remove_file(&path).unwrap();
+        for mode in 0..4 {
+            let mut changed = native.clone();
+            if mode == 1 {
+                changed["thread"]["turns"][0]["items"][0]["id"] = json!("other");
+            }
+            if mode == 2 {
+                changed["thread"]["turns"][0]["items"][0]["content"][0]["path"] =
+                    json!(root.path().join("other.png"));
+            }
+            if mode == 3 {
+                changed["thread"]["turns"][0]["items"][0]["content"] =
+                    json!([{"type":"text","text":"x"},{"type":"localImage","path":path}]);
+            }
+            let proof = make_proof(&changed, "two", mode != 0);
+            let projected =
+                store.project_with_history(&changed, "runtime", "two", "thread", &proof);
+            assert!(
+                projected["thread"]["turns"][0]["items"][0]["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|part| part["status"] != "ready")
+            );
+        }
+        let renewed = store.project_with_history(
+            &native,
+            "runtime",
+            "two",
+            "thread",
+            &make_proof(&native, "two", true),
+        );
+        assert_eq!(
+            renewed["thread"]["turns"][0]["items"][0]["content"][0]["status"],
+            "ready"
+        );
+    }
+    #[test]
+    #[ignore = "Explicit read-only native fixture probe; no text, paths, secrets or image bytes printed"]
+    fn real_rollout_seven_source_native_temp_images_are_cached_and_renewed() {
+        let path = Path::new(
+            "C:/Users/82206/.codex/sessions/2026/11/11/rollout-2026-11-11T17-49-02-01a1ca02-c5db-74a0-a1d5-cf3ef5eb0473.jsonl",
+        );
+        let bytes = crate::storage::read_physical(path, 512 * 1024 * 1024).unwrap();
+        let thread = "01a1ca02-c5db-74a0-a1d5-cf3ef5eb0473";
+        let mut turns: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let record: Value = serde_json::from_slice(line).unwrap();
+            let payload = &record["payload"];
+            if record["type"] != "event_msg"
+                || payload["type"] != "item_completed"
+                || payload["thread_id"] != thread
+                || payload["item"]["type"] != "UserMessage"
+            {
+                continue;
+            }
+            let content: Vec<_> = payload["item"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|part| part["type"] == "local_image")
+                .map(|part| json!({"type":"localImage","path":part["path"]}))
+                .collect();
+            if content.is_empty() {
+                continue;
+            }
+            turns
+                .entry(payload["turn_id"].as_str().unwrap().into())
+                .or_default()
+                .push(json!({"type":"userMessage","id":payload["item"]["id"],"content":content}));
+        }
+        let native = json!({"thread":{"id":thread,"path":path,"turns":turns.into_iter().map(|(id,items)|json!({"id":id,"items":items})).collect::<Vec<_>>()}});
+        let root = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(root.path()).unwrap();
+        let allowed = vec![dunce::canonicalize(std::env::temp_dir()).unwrap()];
+        for generation in ["first", "reconnected"] {
+            let proof = NativeHistory::from_native_thread(&native["thread"], "runtime", generation)
+                .unwrap()
+                .with_image_roots(allowed.clone());
+            let view = store.project_with_history(&native, "runtime", generation, thread, &proof);
+            let mut count = 0;
+            for turn in view["thread"]["turns"].as_array().unwrap() {
+                for item in turn["items"].as_array().unwrap() {
+                    let owner = MediaOwner {
+                        runtime_id: "runtime".into(),
+                        connection_id: generation.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn["id"].as_str().unwrap().into(),
+                        item_id: item["id"].as_str().unwrap().into(),
+                    };
+                    for part in item["content"].as_array().unwrap() {
+                        assert!(
+                            part["status"] == "ready",
+                            "Source-native fixture image unavailable"
+                        );
+                        let result = store
+                            .read(&owner, part["mediaId"].as_str().unwrap(), 0, 192 * 1024)
+                            .unwrap();
+                        assert!(
+                            result["status"] == "ready",
+                            "Cached fixture image unavailable"
+                        );
+                        assert!(part.get("path").is_none());
+                        count += 1;
+                    }
+                }
+            }
+            assert_eq!(count, 7);
+        }
+    }
+
+    #[test]
+    fn native_bindings_survive_reopen_after_temp_source_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        let images = tempfile::tempdir().unwrap();
+        let path = images.path().join("original.png");
+        fs::write(&path,b"\x89PNG\r\n\x1a\nx").unwrap();
+        let native = json!({"thread":{"id":"thread","path":state.path().join("native.jsonl"),"turns":[{"id":"turn","items":[{"type":"userMessage","id":"native-user","content":[{"type":"text","text":"omitted"},{"type":"localImage","path":path}]}]}]}});
+        let proof = |generation: &str, allowed: bool| NativeHistory::from_native_thread(&native["thread"],"runtime",generation).unwrap()
+            .with_image_roots(if allowed {vec![dunce::canonicalize(images.path()).unwrap()]} else {vec![]});
+        let first = {
+            let store = MediaStore::new(state.path()).unwrap();
+            let view = store.project_with_history(&native,"runtime","before","thread",&proof("before",true));
+            assert_eq!(view["thread"]["turns"][0]["items"][0]["content"][1]["status"],"ready");
+            view["thread"]["turns"][0]["items"][0]["content"][1]["mediaId"].as_str().unwrap().to_owned()
+        };
+        fs::remove_file(&path).unwrap(); // Only this test's disposable image is deleted.
+        let store = MediaStore::new(state.path()).unwrap();
+        let denied = store.project_with_history(&native,"runtime","after","thread",&proof("after",false));
+        assert_ne!(denied["thread"]["turns"][0]["items"][0]["content"][1]["status"],"ready");
+        let view = store.project_with_history(&native,"runtime","after","thread",&proof("after",true));
+        let image = &view["thread"]["turns"][0]["items"][0]["content"][1];
+        assert_eq!(image["status"],"ready");
+        assert_ne!(image["mediaId"],first);
+        let owner = MediaOwner {runtime_id:"runtime".into(),connection_id:"after".into(),thread_id:"thread".into(),turn_id:"turn".into(),item_id:"native-user".into()};
+        assert_eq!(store.read(&owner,image["mediaId"].as_str().unwrap(),0,9).unwrap()["data"],"iVBORw0KGgp4");
+        assert!(store.read(&owner,&first,0,9).is_err());
+    }
 
     #[test]
     fn recovered_user_images_are_ordered_opaque_and_readable_only_by_their_owner() {
@@ -288,7 +595,10 @@ mod tests {
         // A temporary inaccessible/incomplete history must not poison this
         // opaque reference for the rest of its 24-hour lifetime.
         fs::rename(&path, &moved).unwrap();
-        assert_eq!(store.read(&owner, first_id, 0, 8).unwrap()["status"], "failed");
+        assert_eq!(
+            store.read(&owner, first_id, 0, 8).unwrap()["status"],
+            "failed"
+        );
         let refreshed =
             store.project_with_history(&native, "runtime", "connection", "thread", &proof);
         let refreshed_image = &refreshed["thread"]["turns"][0]["items"][0]["content"][0];
@@ -323,6 +633,26 @@ mod tests {
             );
             assert_eq!(store.clone().read(&owner, id, 0, 8).unwrap()["mediaId"], id);
         }
+        // A pruned/missing underlying blob must not poison a still-valid recovery reference.
+        let resolved_id = store.recoveries.lock().unwrap()[first_id]
+            .resolved
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()["mediaId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fs::remove_file(
+            root.path()
+                .join("tool-media")
+                .join(format!("{resolved_id}.blob")),
+        )
+        .unwrap();
+        assert_eq!(
+            store.read(&owner, first_id, 0, 8).unwrap()["status"],
+            "ready"
+        );
         assert_eq!(
             proof.scan_builds.load(std::sync::atomic::Ordering::Relaxed),
             1
