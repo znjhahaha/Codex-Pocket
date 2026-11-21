@@ -45,9 +45,13 @@ impl Broker {
                 }
                 service.sources().await
             }
-            "usage/read" => {
+            "usage/read" | "usage/dashboard/read" | "usage/requests/read" => {
                 let query = prepare_read(p, crate::storage::now() as i64).map_err(|_| invalid())?;
-                service.read(query).await
+                match method {
+                    "usage/requests/read" => service.requests(query).await,
+                    "usage/dashboard/read" => service.dashboard(query).await,
+                    _ => service.read(query).await,
+                }
             }
             _ => {
                 return Err(classify(

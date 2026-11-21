@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-agent"
-version = "0.6.6"
+version = "0.7.1-rc.20261121.43"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1278,6 +1278,7 @@ dependencies = [
  "hex",
  "mdns-sd",
  "png",
+ "pocket-bridge",
  "pocket-core",
  "pocket-network",
  "pocket-p2p",
@@ -1304,23 +1305,28 @@ dependencies = [
 
 [[package]]
 name = "pocket-bridge"
-version = "0.6.6"
+version = "0.7.1-rc.20261121.43"
 dependencies = [
  "anyhow",
  "pocket-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "pocket-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "fs2",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -1368,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-runtime-ipc"
-version = "0.6.6"
+version = "0.7.1-rc.20261121.43"
 dependencies = [
  "anyhow",
  "pocket-core",

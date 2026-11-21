@@ -33,6 +33,7 @@ class TurnChangeSummaryTest {
         val value = timeline(edit("one"))
         assertTrue(turnChangeSummaries(value.copy(activeTurn = "turn")).isEmpty())
         assertTrue(turnChangeSummaries(value.copy(completedTurns = emptySet())).isEmpty())
+        assertTrue(turnChangeSummaries(value.copy(turns=mapOf("turn" to NativeTurnInfo("turn",status="inProgress")))).isEmpty())
     }
     @Test fun binaryCountsRemainUnknownAndNativeRenameUsesDestination() {
         val binary = edit("one", "image.png", "Binary files a/image.png and b/image.png differ")

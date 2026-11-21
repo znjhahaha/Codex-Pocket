@@ -9,6 +9,22 @@ use crate::managed_runtime::discovery::RestoreFailure;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Weak};
 
+#[path = "broker_assistant/project_read.rs"]
+mod project_read;
+
+#[path = "broker_assistant/command_receipts.rs"]
+mod command_receipts;
+
+#[cfg(test)]
+#[path = "broker_assistant/visibility_tests.rs"]
+mod visibility_tests;
+#[cfg(test)]
+#[path = "broker_assistant/project_source_tests.rs"]
+mod project_source_tests;
+#[cfg(all(test, windows))]
+#[path = "broker_assistant/project_read_tests.rs"]
+mod project_read_tests;
+
 struct BrokerPermissionReader(Weak<Broker>);
 impl ProjectPermissionReader for BrokerPermissionReader {
     fn read(&self, runtime: &str, thread: &str, cwd: &Path) -> Result<ProjectPermissionProof> {
@@ -38,7 +54,104 @@ struct Profile {
     native_binary: PathBuf,
     source_runtime_id: String,
 }
+
+#[derive(Default)]
+pub(super) struct CoordinatorVisibility {
+    store: Option<String>,
+    threads: BTreeSet<String>,
+    runtime_ids: BTreeSet<String>,
+}
+impl CoordinatorVisibility {
+    pub(super) fn metadata(&self, state: &State, store: Option<&str>) -> Value {
+        let Some(account) = self.store.as_deref().filter(|account| store.is_none_or(|s| s == *account)) else {
+            return json!({"schema":1,"authoritative":true,"bindings":[],"hiddenThreads":[]});
+        };
+        let mut runtimes = self.runtime_ids.clone();
+        runtimes.extend(state.runtimes.iter().filter(|(_,r)| r.store == account).map(|(id,_)|id.clone()));
+        let hidden = runtimes.iter().flat_map(|runtime| self.threads.iter().map(move |thread|
+            json!({"runtimeId":runtime,"configStoreId":account,"threadId":thread,"role":"assistant_coordinator"}))).collect::<Vec<_>>();
+        json!({"schema":1,"authoritative":true,"bindings":[{
+            "configStoreId":account,"runtimeIds":runtimes,"role":"Coordinator","threadIds":self.threads
+        }],"hiddenThreads":hidden})
+    }
+    pub(super) fn internal(&self, store: &str, thread: Option<&str>) -> bool {
+        self.store.as_deref() == Some(store) && thread.is_some_and(|t| self.threads.contains(t))
+    }
+    pub(super) fn event_thread<'a>(event: &'a Value) -> Option<&'a str> {
+        event["params"]["threadId"].as_str().or_else(|| event["params"]["thread"]["id"].as_str())
+    }
+    pub(super) fn event(&self, store: &str, event: &Value) -> bool {
+        self.internal(store, Self::event_thread(event))
+    }
+    pub(super) fn pending(&self, state: &State, pending: &Pending) -> bool {
+        state.runtimes.get(&pending.runtime).is_some_and(|r| self.event(&r.store, &pending.event))
+    }
+}
+
 impl Broker {
+    pub(super) fn coordinator_visibility(&self) -> Result<CoordinatorVisibility> {
+        let root = self.state_dir.join("assistant");
+        let path = root.join("profile.json");
+        if !path.try_exists()? {
+            anyhow::ensure!(!root.join("executor.db").try_exists()?, "Assistant thread identity has no profile");
+            return Ok(CoordinatorVisibility::default());
+        }
+        // Visibility must survive an unavailable Host/binary and disabled Actor.
+        // Resolve only the retained account store, never environment discovery.
+        let profile: Profile = serde_json::from_slice(&storage::read_physical(&path, 16384)?)?;
+        anyhow::ensure!(profile.schema == 1, "Invalid assistant identity profile");
+        let identity = crate::assistant_product::coordinator_identity(&root)?;
+        let mut runtime_ids = BTreeSet::from([profile.source_runtime_id.clone()]);
+        runtime_ids.extend(identity.runtime_id);
+        Ok(CoordinatorVisibility {
+            store: Some(storage::config_store(&profile.config_home)?),
+            threads: identity.threads,
+            runtime_ids,
+        })
+    }
+
+    pub(super) async fn reject_coordinator_access(&self, runtime: &str, thread: Option<&str>) -> Result<()> {
+        let Some(thread) = thread else { return Ok(()); };
+        let visibility = self.coordinator_visibility().map_err(|_| classify(
+            anyhow::anyhow!("Assistant thread identity unavailable; retry after reconciliation"), Code::Rejected,
+        ))?;
+        let state = self.state.lock().await;
+        if state.runtimes.get(runtime).is_some_and(|r| visibility.internal(&r.store, Some(thread))) {
+            return Err(classify(anyhow::anyhow!("Use the Assistant page to manage its internal coordinator"), Code::Rejected));
+        }
+        Ok(())
+    }
+
+    pub(super) fn public_runtime_values(&self, state: &State) -> Vec<Value> {
+        let visibility = self.coordinator_visibility();
+        let mut values = Self::runtime_values(state);
+        for value in &mut values {
+            let store = value["configStoreId"].as_str().unwrap_or_default().to_owned();
+            value["assistantInternalThreads"] = visibility.as_ref()
+                .map(|v|v.metadata(state,Some(&store)))
+                .unwrap_or_else(|_|json!({"schema":1,"authoritative":false,"bindings":[]}));
+            value["hiddenThreads"] = value["assistantInternalThreads"]["hiddenThreads"].as_array()
+                .map(|rows|json!(rows)).unwrap_or_else(||json!([]));
+            value["hiddenThreadsAuthoritative"] = value["assistantInternalThreads"]["authoritative"].clone();
+            if let Some(threads) = value["loadedThreadIds"].as_array_mut() {
+                threads.retain(|t| visibility.as_ref().is_ok_and(|v| !v.internal(&store, t.as_str())));
+            }
+        }
+        values
+    }
+
+    pub(super) fn ordinary_questions(&self, state: &State, device: &str, thread: Option<&str>) -> Result<Vec<Value>> {
+        let visibility = self.coordinator_visibility()?;
+        // Receipt stores remain authoritative after their runtime detaches.
+        let receipts = serde_json::to_value(&state.questions)?;
+        let internal: BTreeSet<_> = receipts["records"].as_array().into_iter().flatten()
+            .filter(|r| r["command"]["caller_id"] == device && visibility.internal(
+                r["store"].as_str().unwrap_or_default(), r["thread"].as_str()))
+            .filter_map(|r| r["command"]["command_id"].as_str()).collect();
+        Ok(state.questions.list(device, thread).into_iter()
+            .filter(|r| !r["commandId"].as_str().is_some_and(|id| internal.contains(id))).collect())
+    }
+
     #[cfg(all(test, windows))]
     pub(crate) async fn assistant_source_test_peer(
         &self,
@@ -63,6 +176,11 @@ impl Broker {
         } else {
             self.add_runtime(connected).await.unwrap();
         }
+        let (_, ()) = tokio::join!(self.refresh_loaded(), async {
+            let request = peer.recv().await;
+            assert_eq!(request["method"], "thread/loaded/list");
+            peer.reply(&request, json!({"data":["t","desktop-thread"],"nextCursor":null})).await;
+        });
         peer
     }
     pub(super) fn register_assistant_permission_reader(self: &Arc<Self>) -> Result<()> {
@@ -101,6 +219,8 @@ impl Broker {
         );
         let (rpc, generation, desktop, process, checkpoint, floor, mut caps) = {
             let mut state = self.state.lock().await;
+            let store = state.runtimes.get(runtime).context("Source runtime offline")?.store.clone();
+            self.require_assistant_project_owner(&state, runtime, thread, &store)?;
             let r = state
                 .runtimes
                 .get_mut(runtime)
@@ -210,6 +330,7 @@ impl Broker {
                     && r.native_process.as_ref() == Some(&process)
             })
             .ok_or(RpcFailure::Disconnected)?;
+        self.require_assistant_project_owner(&state, runtime, thread, &r.store)?;
         anyhow::ensure!(
             r.settings.permissions_proven_since(
                 thread,
@@ -224,7 +345,7 @@ impl Broker {
         let settings = crate::settings::canonical(&r.settings.read(thread)["settings"]);
         let bound_generation = format!("{generation}:{}:{}", process.pid, process.created_at);
         let revision = crate::auth::hash(
-            &json!([runtime, bound_generation, thread, expected, settings]).to_string(),
+            &json!([runtime, r.store, bound_generation, thread, expected, settings]).to_string(),
         );
         Ok(ProjectPermissionProof {
             runtime_id: runtime.into(),
@@ -234,6 +355,14 @@ impl Broker {
             revision,
             settings,
         })
+    }
+    fn require_assistant_project_owner(&self, state: &State, runtime: &str, thread: &str, store: &str) -> Result<()> {
+        let directory = self.directory(state)?;
+        let owner = directory.resolve_write(&ThreadKey {
+            computer_id:self.config.computer_id.clone(), config_store_id:store.into(), native_thread_id:thread.into(),
+        }).map_err(|e|anyhow::anyhow!("Selected project has no verified native owner; open it on the source runtime ({e:?})"))?;
+        anyhow::ensure!(owner.runtime_id == runtime, "Selected project owner changed; select its current owner runtime");
+        Ok(())
     }
     /// Watches durable service changes in memory. This never starts a model turn.
     pub async fn assistant_notifications(self: Arc<Self>) {
@@ -263,6 +392,7 @@ impl Broker {
                 value["ready"],
                 value["paused"],
                 value["error"]
+                ,value["runtimeEventCursor"]
             ])
             .to_string();
             if observed != key {
@@ -365,6 +495,7 @@ impl Broker {
         p: &Value,
         command: &str,
     ) -> Result<()> {
+        self.reject_coordinator_access(runtime, p["threadId"].as_str()).await?;
         if matches!(method, "thread/resume" | "thread/name/set") {
             return Ok(());
         }
@@ -466,6 +597,7 @@ impl Broker {
                 "preparationStatus":value["preparationStatus"], "error":value["error"],
                 "reconciliationRequired":value["reconciliationRequired"],
                 "paused":value["paused"], "runtimeId":value["runtimeId"]
+                ,"startupStages":value["startupStages"]
             }),
             Err(_) => json!({"ready":false,"error":"assistant_status_unavailable"}),
         }
@@ -516,15 +648,6 @@ impl Broker {
     }
 
     async fn ensure_assistant(&self, profile: Profile) -> Result<Actor> {
-        if let Some(actor) = self
-            .assistant
-            .lock()
-            .await
-            .as_ref()
-            .filter(|a| a.is_alive())
-        {
-            return Ok(actor.clone());
-        }
         let executable = std::env::current_exe()?;
         let bin = executable.parent().context("Missing installation")?;
         let generation = crate::installation::current()["generation"]
@@ -552,15 +675,32 @@ impl Broker {
         self.assistant_permission_handle
             .get_or_init(tokio::runtime::Handle::current);
         let mut current = self.assistant.lock().await;
-        if let Some(actor) = current.as_ref().filter(|actor| actor.is_alive()) {
-            return Ok(actor.clone());
-        }
-        *current = None;
         let selected = SelectedProfile::new(&profile.config_home, &profile.native_binary)?;
         let descriptor = registry
             .profile_directory(&selected)?
             .join("descriptor.json");
-        let runtime = Arc::new(if readonly {controller.attach_existing(&selected).await?}else{controller.ensure(&selected).await?});
+        let runtime = if let Some(actor)=current.as_ref().filter(|actor|actor.is_alive()).cloned() {
+            if readonly {return Ok(actor);}
+            // Park the single consumer at a request boundary. The controller
+            // owns retirement eligibility; a still-active Host remains intact.
+            let old=actor.park_for_runtime_transition().await?;
+            let checked=controller.ensure(&selected).await;
+            let runtime=match checked {
+                Ok(runtime)=>runtime,
+                Err(error)=>{actor.resume_after_runtime_check().await?;return Err(error);}
+            };
+            if runtime.generation()==old {
+                actor.resume_after_runtime_check().await?;return Ok(actor);
+            }
+            // Acknowledgement follows Worker drop, including the Service and
+            // Executor owner locks. Cloned Actor handles cannot keep it alive.
+            actor.stop_parked_worker().await?;
+            *current=None;
+            Arc::new(runtime)
+        } else {
+            *current=None;
+            Arc::new(if readonly {controller.attach_existing(&selected).await?}else{controller.ensure(&selected).await?})
+        };
         let cursor = self
             .handoff
             .get()
@@ -601,6 +741,12 @@ impl Broker {
         *self.assistant_error.lock().await = None;
         Ok(actor)
     }
+    pub(super) async fn assistant_artifact_read(&self, p:&Value)->Result<Value> {
+        anyhow::ensure!(p.as_object().is_some_and(|o|o.keys().all(|k|["artifactId","offset"].contains(&k.as_str()))) && p["artifactId"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=512) && p.get("offset").is_none_or(|v|v.as_u64().is_some()),"Invalid artifact read");
+        let actor=self.assistant.try_lock().ok().and_then(|a|a.clone()).context("Assistant unavailable")?;
+        actor.request("assistant/artifact/read",p.clone(),format!("artifact-read:{}",uuid::Uuid::new_v4()),None).await
+    }
+
     pub(super) async fn assistant_read(&self, p: &Value) -> Result<Value> {
         if p.as_object().is_none_or(|o| {
             o.keys()
@@ -635,9 +781,13 @@ impl Broker {
         };
         let mut error = *self.assistant_error.lock().await;
         if error.is_none() && result["runtimeId"].as_str().is_some() {
-            error = self.assistant_account_status(&result).await;
-            if error.is_none() && result["ready"] != true {
-                error = Some("assistant_runtime_unavailable");
+            error = if result.get("accountReady").is_some() {
+                match result["error"].as_str() { Some("assistant_needs_login")=>Some("assistant_needs_login"), Some("assistant_account_unavailable")=>Some("assistant_account_unavailable"), _=>None }
+            } else { self.assistant_account_status(&result).await };
+            if error.is_none() && result["ready"] != true && result["dispatchInFlight"] != true {
+                // A receipt reconciliation or a capability failure belongs to
+                // its own stage; do not relabel it as a failed Host startup.
+                if result["error"].is_null() { error = Some("assistant_runtime_unavailable"); }
             }
         }
         if let Some(error) = error.filter(|e| *e != "assistant_preparing") {
@@ -652,7 +802,7 @@ impl Broker {
             Some("assistant_missing_config") => "missing_config",
             Some("assistant_needs_login") => "needs_login",
             Some(_) => "recoverable_error",
-            None if result["ready"] == true => "ready",
+            None if result["ready"] == true || result["dispatchInFlight"] == true => "ready",
             None if result["runtimeId"].is_null() => "preparing",
             None => "recoverable_error",
         };
@@ -660,6 +810,19 @@ impl Broker {
         // setup and auth evidence, and never infers login from a config file.
         result["preparation"] = json!({"status":status,"recoveryAction":error.map(preparation_hint),"retryable":status != "ready"});
         result["preparationStatus"] = json!(status);
+        if !result["startupStages"].is_array() {
+            result["startupStages"] = json!([
+                {"id":"runtime","status":if status=="preparing" {"preparing"}else{"blocked"},"recoveryAction":error.map(preparation_hint)},
+                {"id":"account","status":"waiting","recoveryAction":null},
+                {"id":"capabilities","status":"waiting","recoveryAction":null},
+                {"id":"coordinator","status":"waiting","sessionCreated":false,"recoveryAction":null}
+            ]);
+        }
+        let state = self.state.lock().await;
+        let internal = self.coordinator_visibility().map(|v|v.metadata(&state,None))
+            .unwrap_or_else(|_|json!({"authoritative":false,"hiddenThreads":[]}));
+        result["hiddenThreads"] = internal["hiddenThreads"].clone();
+        result["hiddenThreadsAuthoritative"] = internal["authoritative"].clone();
         Ok(result)
     }
 
@@ -686,15 +849,20 @@ impl Broker {
     pub(super) fn validate_assistant(method: &str, p: &Value) -> Result<()> {
         let fields: &[&str] = match method {
             "assistant/prepare" => &[],
-            "assistant/enable" | "assistant/pause" | "assistant/resume" => &[],
-            "assistant/send" => &["message", "threadId", "memberId", "taskId"],
+            "assistant/enable" | "assistant/pause" => &[],
+            "assistant/resume" => &["operationId"],
+            "assistant/send" => &["message", "threadId", "sourceRuntimeId", "sourceConfigStoreId", "memberId", "taskId", "artifactId", "artifactVersion", "attachments"],
             "assistant/task/pause" | "assistant/task/resume" => &["taskId"],
+            "assistant/v2/task/retry" => &["taskId"],
+            "assistant/v2/task/seen" => &["taskId","throughSequence"],
+            "assistant/task/memory" => &["taskId", "enabled"],
             "assistant/settings/update" => &["settings"],
-            "assistant/memory/add" => &["text"],
+            "assistant/memory/add" => &["text", "scope"],
             "assistant/memory/update" => &["text", "memoryId"],
-            "assistant/memory/delete" => &["memoryId"],
-            "assistant/schedule/create" => &["threadId", "spec"],
-            "assistant/schedule/delete" => &["scheduleId"],
+            "assistant/memory/delete" | "assistant/memory/undo" => &["memoryId"],
+            "assistant/schedule/create" => &["threadId", "sourceRuntimeId", "sourceConfigStoreId", "spec"],
+            "assistant/schedule/update" => &["scheduleId", "spec", "missedPolicy"],
+            "assistant/schedule/delete" | "assistant/schedule/pause" | "assistant/schedule/resume" | "assistant/schedule/run" => &["scheduleId"],
             "assistant/respond" => &["operationId", "requestId", "response"],
             _ => {
                 return Err(classify(
@@ -707,6 +875,14 @@ impl Broker {
             o.keys()
                 .any(|k| !fields.contains(&k.as_str()) && k != "runtimeId" && k != "commandId")
         }) || (method == "assistant/prepare" && p.get("runtimeId").is_some())
+            || p.get("sourceRuntimeId").is_some_and(|source| {
+                !valid_scope_id(source)
+                    || !p["threadId"].as_str().is_some_and(|t| crate::settings::valid_thread(t) && t.len() <= 256)
+            })
+            || p.get("sourceConfigStoreId").is_some_and(|store| {
+                !valid_scope_id(store)
+                    || !p["threadId"].as_str().is_some_and(|t| crate::settings::valid_thread(t) && t.len() <= 256)
+            })
             || (method != "assistant/prepare"
                 && p["runtimeId"]
                     .as_str()
@@ -721,13 +897,14 @@ impl Broker {
                         }
                     })
                 }))
-            || p.to_string().len() > 131072
+            || p.to_string().len() > if method=="assistant/send" {2*1024*1024} else {131072}
         {
             return Err(classify(
                 anyhow::anyhow!("Invalid assistant action"),
                 Code::InvalidParams,
             ));
         }
+        if let Some(inputs)=p.get("attachments") {crate::assistant::inputs::validate_uploaded(inputs)?;}
         Ok(())
     }
     pub(super) async fn assistant_write(
@@ -809,12 +986,24 @@ impl Broker {
         }
         // Parent integration point: target-send/group validation belongs here,
         // before project proof and actor dispatch; prepare has no target scope.
+        if !self.device_exists(device).await {
+            return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
+        }
         let directory = if let Some(thread) = p.get("threadId") {
             let thread = thread
                 .as_str()
                 .filter(|s| crate::settings::valid_thread(s))
                 .context("Invalid project thread")?;
-            let (workspace, _, _, _) = self.workspace_proof(runtime_id, thread).await?;
+            let source = p["sourceRuntimeId"].as_str().unwrap_or(runtime_id);
+            {
+                let state = self.state.lock().await;
+                let current = state.runtimes.get(source).context("Project source runtime offline")?;
+                anyhow::ensure!(p["sourceConfigStoreId"].as_str().is_none_or(|store| store == current.store),
+                    "Selected project config store changed; select the current native project");
+                self.require_assistant_project_owner(&state, source, thread, &current.store)?;
+            }
+            self.reject_coordinator_access(source, Some(thread)).await?;
+            let (workspace, _, _, _) = self.workspace_proof(source, thread).await?;
             workspace.roots().first().cloned()
         } else {
             None
@@ -822,8 +1011,16 @@ impl Broker {
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
+        let mut parameters=p.clone();
+        if method=="assistant/send" {
+            if let Some(inputs)=p.get("attachments") {
+                let state=self.state.lock().await;
+                parameters["retainedAttachments"]=serde_json::to_value(crate::assistant::inputs::retain_uploaded(inputs,device,&state.attachments,
+                    &self.state_dir.join("assistant/input-images"))?)?;
+            }
+        }
         actor
-            .request(method, p.clone(), field(p, "commandId")?.into(), directory)
+            .request_from_device(method, parameters, field(p, "commandId")?.into(), directory, device.into())
             .await
             .map_err(|e| classify(e, Code::Unknown))
     }

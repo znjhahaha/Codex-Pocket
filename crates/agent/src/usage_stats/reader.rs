@@ -3,7 +3,7 @@ use super::{
     decimal::Decimal,
     *,
 };
-use rusqlite::{Connection, ErrorCode, OpenFlags, Row, params, types::ValueRef};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params, types::ValueRef};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -228,8 +228,8 @@ impl<'a> Progress<'a> {
     }
     fn new(conn: &'a Connection) -> Self {
         let mut budget = Box::new(Budget {
-            deadline: Instant::now() + Duration::from_secs(2),
-            remaining: 5000,
+            deadline: Instant::now() + Duration::from_secs(5),
+            remaining: 50000,
         });
         unsafe {
             rusqlite::ffi::sqlite3_progress_handler(
@@ -296,10 +296,10 @@ fn columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<
     }
     Ok(())
 }
-fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<(bool, bool), Failure> {
+fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<Schema, Failure> {
     let observed: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     *version = Some(observed);
-    if observed != 24 || !table(conn, "proxy_request_logs")? {
+    if !(24..=26).contains(&observed) || !table(conn, "proxy_request_logs")? {
         return Err(Failure::Schema);
     }
     columns(
@@ -323,9 +323,6 @@ fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<(bool, bool), 
             ("status_code", "INTEGER"),
             ("created_at", "INTEGER"),
             ("data_source", "TEXT"),
-            ("latency_ms", "INTEGER"),
-            ("first_token_ms", "INTEGER"),
-            ("is_streaming", "INTEGER"),
         ],
     )?;
     let (primary,count):(i64,i64)=conn.query_row("SELECT COALESCE(MAX(CASE WHEN name='request_id' THEN pk END),0),SUM(CASE WHEN pk>0 THEN 1 ELSE 0 END) FROM pragma_table_info('proxy_request_logs')",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -340,7 +337,31 @@ fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<(bool, bool), 
             &[("id", "TEXT"), ("app_type", "TEXT"), ("name", "TEXT")],
         )?;
     }
-    Ok((providers, table(conn, "usage_daily_rollups")?))
+    let mut optional = BTreeMap::new();
+    for (name, kind) in [
+        ("session_id", "TEXT"),
+        ("session_title", "TEXT"),
+        ("latency_ms", "INTEGER"),
+        ("first_token_ms", "INTEGER"),
+        ("is_streaming", "INTEGER"),
+    ] {
+        let ty: Option<String> = conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('proxy_request_logs') WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if ty.as_ref().is_some_and(|t| !t.eq_ignore_ascii_case(kind)) {
+            return Err(Failure::Schema);
+        }
+        optional.insert(name, ty.is_some());
+    }
+    Ok(Schema {
+        providers,
+        rollups: table(conn, "usage_daily_rollups")?,
+        optional,
+    })
 }
 fn identity(row: &Row<'_>, at: usize) -> Result<String, Failure> {
     match row.get_ref(at)? {
@@ -349,6 +370,188 @@ fn identity(row: &Row<'_>, at: usize) -> Result<String, Failure> {
             .map_err(|_| Failure::InvalidRow),
         _ => Err(Failure::InvalidRow),
     }
+}
+fn optional_text(row: &Row<'_>, at: usize, max: usize) -> Option<String> {
+    match row.get_ref(at).ok()? {
+        ValueRef::Text(v) if !v.is_empty() && v.len() <= max => std::str::from_utf8(v)
+            .ok()
+            .filter(|s| !s.contains('\0') && !s.trim().is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+struct Schema {
+    providers: bool,
+    rollups: bool,
+    optional: BTreeMap<&'static str, bool>,
+}
+impl Schema {
+    fn column(&self, name: &'static str) -> &'static str {
+        if self.optional.get(name) == Some(&true) {
+            name
+        } else {
+            "NULL"
+        }
+    }
+}
+fn projection(s: &Schema) -> String {
+    format!(
+        "provider_id,model,created_at,status_code,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_token_semantics,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,{},{},{},{},{},request_id",
+        s.column("latency_ms"),
+        s.column("first_token_ms"),
+        s.column("is_streaming"),
+        s.column("session_id"),
+        s.column("session_title")
+    )
+}
+fn predicate(s: &Schema) -> String {
+    format!(
+        "app_type=?1 AND COALESCE(data_source,'proxy')=?2 AND created_at>=?3 AND created_at<?4 AND (?5 IS NULL OR provider_id=?5) AND (?6 IS NULL OR model=?6) AND (?7='all' OR (?7='success' AND status_code>=200 AND status_code<300) OR (?7='error' AND (status_code<200 OR status_code>=300))) AND (?9 IS NULL OR {}=?9)",
+        s.column("session_id")
+    )
+}
+fn status(q: &UsageQuery) -> &'static str {
+    match q.filters.status {
+        StatusFilter::All => "all",
+        StatusFilter::Success => "success",
+        StatusFilter::Error => "error",
+    }
+}
+fn request_details(
+    conn: &Connection,
+    q: &UsageQuery,
+    s: &Schema,
+    names: &BTreeMap<String, Option<String>>,
+) -> Result<RequestDetailsPage, Failure> {
+    let sql = format!(
+        "SELECT {} FROM proxy_request_logs WHERE {} AND (?10 IS NULL OR created_at<?10 OR (created_at=?10 AND request_id<?11 COLLATE BINARY)) ORDER BY created_at DESC,request_id COLLATE BINARY DESC LIMIT ?8",
+        projection(s),
+        predicate(s)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![
+        q.filters.app_type,
+        q.filters.data_source.as_str(),
+        q.start_at,
+        q.end_at,
+        q.filters.provider_id,
+        q.filters.model,
+        status(q),
+        q.request_page.limit as i64 + 1,
+        q.filters.session_id,
+        q.request_page.cursor.as_ref().map(|c| c.created_at),
+        q.request_page.cursor.as_ref().map(|c| &c.request_id)
+    ])?;
+    let mut items = Vec::with_capacity(q.request_page.limit + 1);
+    while let Some(row) = rows.next()? {
+        let r = record(row, q)?;
+        let eligible = (200..300).contains(&r.status) && q.filters.data_source == DataSource::Proxy;
+        use super::performance::Observation::Sample;
+        let (ttft_ms, latency_ms, tokens_per_second) = if eligible {
+            (
+                match r.measurements.ttft {
+                    Sample(v) => Some(v),
+                    _ => None,
+                },
+                match r.measurements.duration {
+                    Sample(v) => Some(v),
+                    _ => None,
+                },
+                match r.measurements.speed {
+                    Sample((t, ms)) => Some(t as f64 * 1000.0 / ms as f64),
+                    _ => None,
+                },
+            )
+        } else {
+            (None, None, None)
+        };
+        let tokens = if r.token_anomaly {
+            None
+        } else {
+            r.tokens
+                .map(|[fresh_input, cache_read, cache_write, output]| {
+                    let total = fresh_input
+                        .checked_add(cache_read)
+                        .and_then(|t| t.checked_add(cache_write))
+                        .and_then(|t| t.checked_add(output))
+                        .ok_or(Failure::Overflow)?;
+                    Ok::<_, Failure>(TokenTotals {
+                        fresh_input,
+                        cache_read,
+                        cache_write,
+                        output,
+                        total,
+                        invalid_rows: 0,
+                    })
+                })
+                .transpose()?
+        };
+        let cost_usd = match &r.costs[4] {
+            Cost::Known(v) => Some(v.text()),
+            _ => None,
+        };
+        items.push(RequestDetail {
+            request_id: identity(row, 19)?,
+            created_at: r.at,
+            provider_name: names.get(&r.provider_id).cloned().flatten(),
+            provider_id: r.provider_id,
+            model: r.model,
+            session_id: r.session_id,
+            session_title: r.session_title,
+            status_code: r.status,
+            tokens,
+            cost_usd,
+            ttft_ms,
+            latency_ms,
+            tokens_per_second,
+        });
+    }
+    let has_more = items.len() > q.request_page.limit;
+    items.truncate(q.request_page.limit);
+    let next_cursor = if has_more {
+        items.last().map(|r| RequestCursor {
+            created_at: r.created_at,
+            request_id: r.request_id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(RequestDetailsPage {
+        items,
+        limit: q.request_page.limit,
+        has_more,
+        next_cursor,
+    })
+}
+
+/// Request pages do not aggregate or load history; LIMIT+1 is evaluated inside a readonly snapshot.
+pub(crate) fn requests(
+    path: &Path,
+    q: &UsageQuery,
+    version: &mut Option<i64>,
+) -> Result<RequestDetailsPage, Failure> {
+    let mut pins = Pins::new(path)?;
+    let conn = connect(path)?;
+    pins.verify(path)?;
+    let progress = Progress::new(&conn);
+    let tx = conn.unchecked_transaction()?;
+    let s = schema(&tx, version)?;
+    let mut page = request_details(&tx, q, &s, &BTreeMap::new())?;
+    if s.providers {
+        let mut stmt =
+            tx.prepare("SELECT name FROM providers WHERE id=?1 AND app_type=?2 LIMIT 2")?;
+        for item in &mut page.items {
+            let mut rows = stmt.query(params![item.provider_id, q.filters.app_type])?;
+            item.provider_name = rows.next()?.and_then(|r| optional_text(r, 0, 256));
+            if rows.next()?.is_some() {
+                return Err(Failure::Schema);
+            }
+        }
+    }
+    tx.commit()?;
+    pins.verify(path)?;
+    progress.check()?;
+    Ok(page)
 }
 fn integer(row: &Row<'_>, at: usize) -> Option<i64> {
     match row.get_ref(at).ok()? {
@@ -383,10 +586,16 @@ fn record(row: &Row<'_>, q: &UsageQuery) -> Result<Record, Failure> {
         }
         _ => (None, true),
     };
+    let session_id = optional_text(row, 17, 256);
+    let session_title = session_id
+        .as_ref()
+        .and_then(|_| optional_text(row, 18, 512));
     Ok(Record {
         at,
         provider_id,
         model,
+        session_id,
+        session_title,
         status,
         tokens,
         token_anomaly,
@@ -486,13 +695,13 @@ pub(crate) fn read(
     pins.verify(path)?;
     let _progress = Progress::new(&conn);
     let tx = conn.unchecked_transaction()?;
-    let (providers, rollups) = schema(&tx, version)?;
-    let mut stmt=tx.prepare("SELECT provider_id,model,created_at,status_code,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_token_semantics,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,is_streaming FROM proxy_request_logs WHERE app_type=?1 AND COALESCE(data_source,'proxy')=?2 AND created_at>=?3 AND created_at<?4 AND (?5 IS NULL OR provider_id=?5) AND (?6 IS NULL OR model=?6) AND (?7='all' OR (?7='success' AND status_code>=200 AND status_code<300) OR (?7='error' AND (status_code<200 OR status_code>=300))) LIMIT ?8")?;
-    let status = match q.filters.status {
-        StatusFilter::All => "all",
-        StatusFilter::Success => "success",
-        StatusFilter::Error => "error",
-    };
+    let schema = schema(&tx, version)?;
+    let sql = format!(
+        "SELECT {} FROM proxy_request_logs WHERE {} LIMIT ?8",
+        projection(&schema),
+        predicate(&schema)
+    );
+    let mut stmt = tx.prepare(&sql)?;
     let mut rows = stmt.query(params![
         q.filters.app_type,
         q.filters.data_source.as_str(),
@@ -500,8 +709,9 @@ pub(crate) fn read(
         q.end_at,
         q.filters.provider_id,
         q.filters.model,
-        status,
-        super::MAX_ROWS as i64 + 1
+        status(q),
+        super::MAX_ROWS as i64 + 1,
+        q.filters.session_id
     ])?;
     let mut aggregate = Aggregate::new(q);
     while let Some(row) = rows.next()? {
@@ -511,7 +721,7 @@ pub(crate) fn read(
     drop(rows);
     drop(stmt);
     let mut names = BTreeMap::new();
-    if providers {
+    if schema.providers {
         let mut stmt =
             tx.prepare("SELECT name FROM providers WHERE id=?1 AND app_type=?2 LIMIT 2")?;
         for id in aggregate.provider_ids() {
@@ -537,7 +747,8 @@ pub(crate) fn read(
     }
     let first = aggregate.first;
     let last = aggregate.last;
-    let data = aggregate.finish(q, names);
+    let recent = request_details(&tx, q, &schema, &names)?;
+    let data = aggregate.finish(q, names, recent);
     tx.commit()?;
     pins.verify(path)?;
     _progress.check()?;
@@ -545,7 +756,7 @@ pub(crate) fn read(
         data,
         first,
         last,
-        rollups,
+        rollups: schema.rollups,
     })
 }
 

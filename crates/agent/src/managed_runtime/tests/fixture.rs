@@ -13,7 +13,7 @@ pub(super) fn native_fixture() -> &'static Path {
     BINARY.get_or_init(|| {
         let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/managed-runtime-fixtures")
-            .join(std::process::id().to_string());
+            .join(format!("{}-{}",std::process::id(),uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&target).unwrap();
         let binary = target.join("fake-native.exe");
         let output = std::process::Command::new("rustc")

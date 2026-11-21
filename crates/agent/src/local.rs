@@ -113,6 +113,10 @@ impl Server {
                             bail!("Local authentication required");
                         }
                         let method=request["method"].as_str().unwrap_or_default();
+                        if method=="helper/health" && !request.get("params").is_some_and(|p|p.as_object().is_some_and(|o|o.is_empty())) {
+                            write(&mut stream,&failure("invalid_params","Helper health takes an empty object")).await?;
+                            return Ok::<(),anyhow::Error>(());
+                        }
                         if method.starts_with("upgrade/") {
                             let Some(handoff)=broker.handoff.get() else {
                                 write(&mut stream,&failure("unsupported","Safe handoff is unsupported")).await?;
@@ -134,8 +138,12 @@ impl Server {
                             }
                         }else{None};
                         let result = match request["method"].as_str() {
-                            Some("status") => {
+                            Some("status" | "helper/health") => {
                                 let mut v = broker.diagnostics().await;
+                                // Private owner identity/gates are not an idle proof.
+                                // Keep status admission scans intact; handoff receipts
+                                // independently fence and verify all native work.
+                                if method=="status" {v["lifecycle"] = broker.lifecycle_status().await;}
                                 let r = routes.read().await;
                                 for key in [
                                     "computerId",
@@ -153,6 +161,16 @@ impl Server {
                             }
                             Some("routes/read") => Ok(routes.read().await),
                             Some("assistant/status") => Ok(broker.assistant_status().await),
+                            Some("assistant/prepare") => {
+                                if request["params"].as_object().is_none_or(|p| p.len() != 1 || p.get("commandId").and_then(Value::as_str).is_none_or(|id| id.is_empty() || id.len() > 128)) {
+                                    Err(anyhow::anyhow!("Invalid assistant preparation request"))
+                                } else {
+                                    match broker.prepare_assistant().await {
+                                        Ok(()) => Ok(broker.assistant_status().await),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            },
                             Some(
                                 method @ ("session/preferences"
                                 | "session/preferences/read"

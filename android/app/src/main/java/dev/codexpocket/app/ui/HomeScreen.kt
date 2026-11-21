@@ -199,7 +199,7 @@ private fun ColumnScope.HomeProjectSessions(
                 val archiveMethod = if (chat.archived) "thread/unarchive" else "thread/archive"
                 ChatHomeRow(chat, statuses[chat.key.encoded].orEmpty(), chat.key.encoded in s.unreadKeys, s.online,
                     { onSelect(chat) }, { onPin(chat) }, { onArchive(chat) },
-                    archiveEnabled = s.online && s.supports(archiveMethod, runtimes[chat.runtimeId]), showDivider = index < group.chats.lastIndex,
+                    archiveEnabled = s.archiveUnavailableReason(chat) == null, showDivider = index < group.chats.lastIndex,
                     modifier = Modifier.animateItem(fadeInSpec = tween(pocketMotionMillis(150)), placementSpec = tween(pocketMotionMillis(180)), fadeOutSpec = tween(pocketMotionMillis(120))))
             }
         }
@@ -235,7 +235,9 @@ internal fun HomeScopeTab(text: String, selected: Boolean, onClick: () -> Unit, 
             .selectable(selected, interactionSource = interaction, indication = null, role = Role.Tab, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Text(text, Modifier.padding(horizontal = 2.dp, vertical = 12.dp), style = MaterialTheme.typography.labelLarge, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal, color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+        PocketTabLabel(text, selected, Modifier.padding(horizontal = 2.dp, vertical = 12.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
         Box(Modifier.align(Alignment.BottomCenter).width(26.dp).height(2.dp).graphicsLayer { alpha = indicator; scaleX = .6f + .4f * indicator }.background(MaterialTheme.colorScheme.onSurface, CircleShape))
     }
 }
@@ -383,6 +385,9 @@ internal fun ChatHomeRow(
             .testTag("home-chat-${chat.key.encoded}").padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.Center) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 HomeRowStatus(status, unread, chat.pinned)
+                if (chat.source == "cli") Icon(PocketIcons.CliOrigin, "CLI 会话",
+                    Modifier.size(14.dp).testTag("home-cli-${chat.key.encoded}"),
+                    tint = c.onSurfaceVariant.copy(alpha = .65f))
                 Text(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.bodyLarge, fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Medium)
                 if (relative.isNotBlank()) Text(relative, maxLines = 1, style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)

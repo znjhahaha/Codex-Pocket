@@ -104,6 +104,21 @@ impl NativeHistory {
                 if items_seen > MAX_RECORDS {
                     bail!("Native history item limit");
                 }
+                if item["type"] == "imageView" {
+                    let item_id = item["id"].as_str().filter(|s| valid_id(s))
+                        .ok_or_else(|| anyhow::anyhow!("Native image identity unavailable"))?;
+                    if !user_ids.insert(item_id) || targets.len() >= MAX_TARGETS {
+                        bail!("Ambiguous or excessive native image identity");
+                    }
+                    if let Some(path) = item["path"].as_str().filter(|p| p.len() <= 4096) {
+                        targets.push(Target {
+                            owner: MediaOwner { runtime_id: runtime.into(), connection_id: connection.into(),
+                                thread_id: id.into(), turn_id: turn_id.into(), item_id: item_id.into() },
+                            slot: 0, image_index: 0, image_count: 1, local_path: Some(PathBuf::from(path)),
+                        });
+                    }
+                    continue;
+                }
                 if item["type"] != "userMessage" {
                     continue;
                 }

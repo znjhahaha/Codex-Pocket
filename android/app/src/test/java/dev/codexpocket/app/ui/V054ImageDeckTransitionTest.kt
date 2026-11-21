@@ -71,7 +71,7 @@ class V054ImageDeckTransitionTest {
                 compose.mainClock.advanceTimeBy(16)
                 assertSameBounds(frame, bounds("image-transition-frame")); assertSameBounds(before, bounds("anchor-before")); assertSameBounds(after, bounds("anchor-after"))
             }
-            // Reverse before outgoing content disappears, then reverse after the incoming tree mounts.
+            // Reverse early and midway through expansion while the same cards remain mounted.
             compose.onNodeWithTag("image-deck-toggle").performClick()
             compose.mainClock.advanceTimeBy(240)
             compose.onNodeWithTag("image-deck").assertExists()

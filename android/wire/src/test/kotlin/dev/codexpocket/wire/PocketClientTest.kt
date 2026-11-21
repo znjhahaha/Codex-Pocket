@@ -12,6 +12,24 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PocketClientTest {
+    @Test fun projectReadsCrossEncryptedTransportWithoutMutationIdsButWritesStillRequireThem() = runBlocking {
+        Relay().use { relay -> PocketClient(relay).use { client ->
+            client.connect(relay.config)
+            for (method in listOf("project/list", "project/read")) {
+                client.request("codex/request", buildJsonObject {
+                    put("runtimeId", "runtime"); put("method", method)
+                    put("params", buildJsonObject { if (method == "project/read") put("projectId", "project") else put("limit", 100) })
+                })
+            }
+            assertEquals(2, relay.requests.size)
+            assertTrue(relay.requests.all { !it["params"]!!.jsonObject.containsKey("commandId") })
+            for (method in listOf("project/create", "fs/createDirectory", "thread/start")) {
+                val error=runCatching { client.request("codex/request", buildJsonObject { put("method", method) }) }.exceptionOrNull()
+                assertEquals("invalid_request", (error as WireException).code)
+            }
+            assertEquals(2, relay.requests.size)
+        } }
+    }
     @Test fun negotiatedReplyChunksReassembleInsidePinnedTlsAndPreserveNotifications() = runBlocking {
         Relay(replyText = "fixture 测试".repeat(12_000), chunk = 4096, chunkReplies = true).use { relay -> PocketClient(relay).use { client ->
             client.connect(relay.config)
@@ -195,6 +213,16 @@ class PocketClientTest {
                 assertEquals(1, relay.requests.size)
             }
         }
+    }
+
+    @Test fun historyFailureRetainsSafeReasonWithoutNativePayload() = runBlocking {
+        Relay(errorCode="native_history_unavailable").use {relay -> PocketClient(relay).use {client ->
+            client.connect(relay.config)
+            val error=runCatching {client.request("threads/history/read")}.exceptionOrNull()
+            assertTrue(error is WireException)
+            assertEquals("native_history_unavailable",(error as WireException).code)
+            assertFalse(error.toString().contains("SECRET_PAYLOAD"))
+        }}
     }
 
     @Test fun definiteMutationRejectionRemainsRejectedAndSanitized() = runBlocking {

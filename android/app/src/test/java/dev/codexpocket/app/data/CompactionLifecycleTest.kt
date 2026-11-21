@@ -7,6 +7,29 @@ import org.junit.Test
 
 /** Native event fixtures only: no compact request or model invocation. */
 class CompactionLifecycleTest {
+    @Test fun legacyNativeHistoryCompactedMarkerNeedsNoCompletionTimestamp() {
+        // Native ThreadHistoryBuilder.handle_context_compacted emits only type/id.
+        // This is a completed milestone even if a later tool fails in the same turn.
+        listOf("inProgress", "completed", "failed", "interrupted").forEach { status ->
+            listOf("", ",\"startedAtMs\":null,\"completedAtMs\":null").forEach { timing ->
+                val history = NativeReducer.snapshot(json("""{"turns":[{"id":"turn","status":"$status","items":[{"id":"compact","type":"contextCompaction"$timing}]}]}"""))
+                val item = compact(history)
+                assertTrue(item.complete)
+                assertFalse(item.liveStarted)
+                assertEquals("上下文已压缩", ConversationPresentation.compactionLabel(item, history))
+                val restored = ItemEntity.from(ThreadKey("computer", "store", "thread"),item,0).item()
+                assertTrue(restored.complete)
+            }
+        }
+    }
+
+    @Test fun legacyCompletionEventWithoutEarlierStartStillCreatesOneMilestone() {
+        val initial = NativeTimeline(activeTurn = "turn")
+        val first = event(initial, "thread/compacted", """{"threadId":"thread","turnId":"turn"}""")
+        val repeated = event(first, "thread/compacted", """{"threadId":"thread","turnId":"turn"}""")
+        assertEquals(1, repeated.items.size)
+        assertEquals("上下文已压缩", ConversationPresentation.compactionLabel(compact(repeated), repeated))
+    }
     private fun json(value: String) = pocketJson.parseToJsonElement(value).jsonObject
     private fun event(state: NativeTimeline, method: String, params: String) =
         NativeReducer.reduce(state, buildJsonObject { put("method", method); put("params", json(params)) })

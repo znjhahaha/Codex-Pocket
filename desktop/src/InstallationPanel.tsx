@@ -17,7 +17,7 @@ const upgradeReasons:Record<string,string>={
  startup_context_invalid:'启动交接记录未通过核验',
 };
 
-export function InstallationPanel({status,onRefresh,onDiagnostics,onUpgrade,busy,action,blockMutations,upgradeHistorical}:{status?:InstallationStatus;onRefresh:()=>void;onDiagnostics:()=>void;onUpgrade?:()=>void;busy?:boolean;blockMutations?:boolean;upgradeHistorical?:boolean;action?:(fn:()=>Promise<void>)=>Promise<void>}) {
+export function InstallationPanel({status,onRefresh,onDiagnostics,onUpgrade,busy,action,blockMutations,upgradeHistorical,showDiagnostics=true}:{status?:InstallationStatus;onRefresh:()=>void;onDiagnostics:()=>void;onUpgrade?:()=>void;busy?:boolean;showDiagnostics?:boolean;blockMutations?:boolean;upgradeHistorical?:boolean;action?:(fn:()=>Promise<void>)=>Promise<void>}) {
  const installed=status?.installedGeneration;
  const upgrade=status?.upgrade;
  const phase=upgrade&&Object.hasOwn(upgradePhases,upgrade.phase)?upgradePhases[upgrade.phase]:'状态待核验';
@@ -30,22 +30,22 @@ export function InstallationPanel({status,onRefresh,onDiagnostics,onUpgrade,busy
    <div><strong>{name}</strong><p>{runtime?.runningVerified?'运行版本':'报告版本'} {runtime?.version||'未知'} · 代次 <code title={runtime?.generation}>{runtime?.generation?.slice(0,12)||'未知'}</code>
     {runtime?.controlProtocol?` · 控制协议 ${runtime.controlProtocol}`:''}</p>
     <small>{runtime?.runningVerified?'已核对进程、创建时间、程序路径和摘要':'尚未取得有效的运行进程证据'}</small></div>
-   <span className={`status ${runtime?.state==='current'?'good':''}`}>{runtime?.state==='current'?'当前安装已生效':runtime?.state==='restart_required'?'等待重启生效':'尚未核验'}</span>
+   <span className={`status ${runtime?.state==='current'?'good':''}`}>{runtime?.state==='current'?'当前安装已生效':runtime?.state==='staged_dashboard'?'新版界面 · 后台待切换':runtime?.state==='restart_required'?'等待重启生效':'尚未核验'}</span>
   </div>)}</div>
   {status?.restartRequired&&<p role="status">有组件仍报告旧安装代次。请按上方各组件的核验结果处理；管理界面可从开始菜单重新打开 Pocket。</p>}
   {upgrade&&<>
    <p role="status">{upgradeHistorical?'上次后台更新记录：':'后台更新：'}{phase} · 操作 <code>{upgrade.operationId}</code>
     {upgrade.failure&&<>。原因：{reason||'原因尚未识别，请导出诊断'}{reason&&<>（<code>{upgrade.failure}</code>）</>}</>}
-    {upgrade.phase==='waiting_restart'&&!upgradeHistorical&&<>{!upgrade.failure&&'。等待重启的原因尚未核验'}。请先完成当前任务，再重新登录 Windows，点击“重新核验”。</>}
-    {upgradeHistorical&&'。此为历史交接记录，当前后台状态以下方实时核验为准。'}
+    {upgrade.phase==='waiting_restart'&&!upgradeHistorical&&<>{!upgrade.failure&&'。等待重启的原因尚未核验'}。请运行新版 Pocket 安装包，后台恢复后点击“重新核验”。</>}
+    {upgradeHistorical&&'。此为历史交接记录，当前后台状态以上方实时核验为准。'}
    </p>
-   <p role="status" aria-label="正在运行的 Codex bridge">后台交接只核验后台监督和电脑助手。
+   {!upgradeHistorical&&<p role="status" aria-label="正在运行的 Codex bridge">后台交接只核验后台监督和电脑助手。
     {upgrade.bridgeRestartRequired===true?'正在运行的 Codex bridge 仍等待重启生效。':'Codex bridge 的运行版本尚未核验。'}
     {upgrade.bridgeRestartRequired!==false&&'完成当前Codex任务后重新打开Codex，再核验 bridge 版本。'}
-   </p>
+   </p>}
   </>}
   {status?.restartRequired&&onUpgrade&&<button className="button" disabled={busy||(status.upgrade?.phase==='waiting_restart'&&status.upgrade.toGeneration===installed)} onClick={onUpgrade}>检查安全交接</button>}
   <OptionalIntegrationPanel status={status?.optionalIntegrations} generation={installed} busy={busy||blockMutations||status?.consistent!==true} action={action}/>
-  <button className="button" disabled={busy} onClick={onDiagnostics}>导出诊断</button>
+  {showDiagnostics&&<button className="button" disabled={busy} onClick={onDiagnostics}>导出诊断</button>}
  </section>;
 }

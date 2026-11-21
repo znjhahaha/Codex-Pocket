@@ -25,7 +25,7 @@ internal fun AssistantExpansion(expanded: Boolean, content: @Composable () -> Un
 @Composable
 internal fun AssistantTaskDetails(task: AssistantTask, state: AssistantUiState, canAct: Boolean,
     act: (() -> AssistantAction) -> Unit, open: (String, String) -> Unit,
-    workspaces: List<AssistantWorkspaceChoice>) {
+    workspaces: List<AssistantWorkspaceChoice>, navigate:(String)->Unit = {}, selectedSection:String? = null, onSectionSelected:(String)->Unit = {}) {
     val snapshot = state.snapshot ?: return
     val runtime = snapshot.runtimeId.orEmpty()
     val assignment = snapshot.assignmentFor(task.id)
@@ -33,8 +33,38 @@ internal fun AssistantTaskDetails(task: AssistantTask, state: AssistantUiState, 
     val memberIds = (listOfNotNull(assignment?.memberId) + snapshot.events.filter {it.taskId == task.id}.mapNotNull {it.memberId}).distinct()
     val members = snapshot.members.filter {it.id in memberIds}.distinctBy {it.id}
     val holder = rememberSaveableStateHolder()
+    var localSection by rememberSaveable(task.id) {mutableStateOf("Overview")}
+    val section=selectedSection ?: localSection
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(task.prompt,Modifier.testTag("assistant-task-full-prompt:${task.id}"),style=MaterialTheme.typography.bodyLarge)
+        Text(snapshot.taskStage(task),style=MaterialTheme.typography.bodyMedium)
+        operations.filter {it.question!=null && it.phase==AssistantOperationPhase.Waiting && !it.suspended}.forEach {op ->
+            key(op.id) {AssistantHumanQuestion(op,runtime,state,canAct,act)}
+        }
+        snapshot.recoveries.filter {request -> operations.any {it.id==request.operationId}}.forEach {request ->
+            AssistantRecoveryCard(request,runtime,state,canAct,act)
+        }
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+            listOf("Overview" to "概览","Process" to "过程","Artifacts" to "成果").forEach {(id,label) ->
+                FilterChip(selected=section==id,onClick={localSection=id;onSectionSelected(id)},label={Text(label)},modifier=Modifier.testTag("assistant-task-section:$id"))
+            }
+        }
+        if(section=="Artifacts") {
+            val artifacts=snapshot.taskArtifacts(task.id)
+            if(artifacts.isEmpty()) AssistantTaskOperationResults(operations,runtime,snapshot)
+            artifacts.forEach {artifact -> AssistantArtifactCard(artifact,snapshot,navigate,open)}
+            if(artifacts.isEmpty() && operations.none {!it.result.isNullOrBlank()}) Text("尚无成果，完成后会保留在此任务中。")
+        }
+        if(section=="Process") {
+            snapshot.events.filter {it.taskId==task.id || operations.any {op->op.id==it.operationId}}.sortedBy {it.sequence}.forEach {event ->
+                Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
+                    Text(event.atMs?.let {assistantTime(it,snapshot.settings?.timezone ?: "Asia/Shanghai")} ?: "时间未提供",style=MaterialTheme.typography.labelSmall)
+                    Text(event.detail.ifBlank {event.kind},style=MaterialTheme.typography.bodySmall)
+                }
+            }
+            snapshot.deliveries.filter {it.taskId==task.id}.forEach {Text("${it.label} · ${it.message}",style=MaterialTheme.typography.bodySmall)}
+        }
+        if(section=="Overview") {
         task.detail?.takeIf {it.isNotBlank()}?.let {Text(it, style = MaterialTheme.typography.bodyMedium)}
         assignment?.groupId?.let {id -> snapshot.groups.firstOrNull {it.id == id}}?.let {group ->
             Text("${group.title} · ${assistantGroupLabel(group.status)}", style = MaterialTheme.typography.labelMedium)
@@ -76,9 +106,20 @@ internal fun AssistantTaskDetails(task: AssistantTask, state: AssistantUiState, 
             AssistantTaskOperationResults(operations,runtime,snapshot)
             operations.mapNotNull {it.threadId}.distinct().forEach {thread -> NativeThreadBranch(thread, runtime, workspaces, open, emptySet())}
         }
-        operations.filter {it.phase == AssistantOperationPhase.Waiting && !it.suspended && it.question != null}.forEach {op ->
-            key(op.id) {Text("等待你确认 · 在助理对话中处理",style=MaterialTheme.typography.bodySmall)}
+        val memoryIds=operations.flatMap {snapshot.memoryUsage[it.id].orEmpty()}.distinct()
+        if(memoryIds.isNotEmpty()) {
+            Text("提供给执行的记忆",style=MaterialTheme.typography.labelLarge)
+            memoryIds.forEach {id->Text(snapshot.memories.firstOrNull {it.id==id}?.text ?: "已删除或撤销的记忆",style=MaterialTheme.typography.bodySmall)}
         }
+        val excluded=task.id in snapshot.memoryDisabledTasks
+        TextButton({act {AssistantActions.taskMemory(runtime,task.id,excluded)}},enabled=canAct && !state.busy("assistant/task/memory"),modifier=Modifier.testTag("assistant-task-memory:${task.id}")) {Text(if(excluded) "后续执行恢复使用记忆" else "后续执行不使用记忆")}
+        Text("从后续执行起生效，已运行的过程仍保留原记录。",style=MaterialTheme.typography.bodySmall)
+        snapshot.scheduleRuns.filter {it.taskId==task.id}.forEach {run ->
+            Text("定时来源 · ${snapshot.schedules.firstOrNull {it.id==run.scheduleId}?.prompt ?: run.scheduleId}",style=MaterialTheme.typography.bodySmall)
+        }
+        }
+        AssistantTaskFollowup(task,state,canAct,act)
+        if(task.status in setOf(AssistantTaskStatus.Done,AssistantTaskStatus.Failed)) TextButton({navigate("ScheduleFrom:${task.id}")},Modifier.testTag("assistant-task-schedule:${task.id}")) {Text("设为定时")}
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if(!task.reconciliationRequired && task.status in setOf(AssistantTaskStatus.Running, AssistantTaskStatus.Queued)) PocketButton("暂停任务", {act {AssistantActions.task(runtime,task.id,false)}},
                 Modifier.weight(1f).testTag("assistant-task-pause:${task.id}"), enabled = canAct && !task.reconciliationRequired && !state.busy("assistant/task/pause",task.id), secondary = true)

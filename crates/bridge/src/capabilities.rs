@@ -159,6 +159,10 @@ pub fn allowed_method(m: &str) -> bool {
             | "model/list"
             | "collaborationMode/list"
             | "thread/start"
+            | "project/list"
+            | "project/read"
+            | "project/create"
+            | "fs/createDirectory"
             | "thread/resume"
             | "thread/name/set"
             | "thread/archive"
@@ -174,6 +178,10 @@ pub fn advanced(m: &str) -> bool {
     matches!(
         m,
         "thread/queue/add"
+            | "project/list"
+            | "project/read"
+            | "project/create"
+            | "fs/createDirectory"
             | "thread/revert"
             | "thread/queue/update"
             | "thread/queue/delete"
@@ -220,7 +228,16 @@ pub async fn discover(binary: &std::path::Path) -> anyhow::Result<Capabilities> 
     .kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
-    let status = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.status()).await??;
+    let mut child = cmd.spawn()?;
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(15), child.wait()).await {
+        Ok(status) => status?,
+        Err(error) => {
+            // Reap before the installation admission guard can be released.
+            child.kill().await?;
+            child.wait().await?;
+            return Err(error.into());
+        }
+    };
     if !status.success() {
         bail!("Native schema export unavailable");
     }

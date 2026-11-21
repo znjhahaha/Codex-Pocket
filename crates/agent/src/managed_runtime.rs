@@ -41,12 +41,8 @@ impl SelectedProfile {
     pub fn new(config_home: impl AsRef<Path>, native_binary: impl AsRef<Path>) -> Result<Self> {
         let home = installation::physical(config_home.as_ref(), true)?;
         let binary = installation::physical(native_binary.as_ref(), false)?;
-        // Apply the existing native config-store discovery rules without connecting.
-        let discovered = codex_cli_adapter::Discovery::for_home(&home)?;
-        ensure!(
-            discovered.codex_home() == home,
-            "Selected home identity changed"
-        );
+        // Host starts native via stdio. The separate CLI daemon's socket must
+        // not constrain this physical configuration and executable identity.
         Ok(Self { home, binary })
     }
     pub fn config_home(&self) -> &Path {
@@ -79,19 +75,19 @@ pub struct ManagedRuntime {
     descriptor_path: PathBuf,
     descriptor: Descriptor,
     initial_health: Health,
-    control: Mutex<HostClient>,
-    answers: Mutex<HostClient>,
+    control: Mutex<()>,
+    answers: Mutex<()>,
 }
 impl ManagedRuntime {
     async fn open(path: PathBuf, descriptor: Descriptor, mut control: HostClient) -> Result<Self> {
         let initial_health = control.health().await?;
-        let answers = HostClient::attach(&descriptor).await?;
+        drop(control);
         Ok(Self {
             descriptor_path: path,
             descriptor,
             initial_health,
-            control: Mutex::new(control),
-            answers: Mutex::new(answers),
+            control: Mutex::new(()),
+            answers: Mutex::new(()),
         })
     }
     fn check_descriptor(&self) -> Result<()> {
@@ -156,7 +152,12 @@ impl ManagedRuntime {
             "Invalid native operation"
         );
         self.check_descriptor()?;
-        let mut client = self.control.lock().await;
+        let _lane = self.control.lock().await;
+        // Each authorized call owns its transport. Cancellation or a refusal
+        // must not strand the actor on a disconnected client; idle transports
+        // must not accumulate unrelated broadcast replies. Never retry this
+        // call, and still reconcile its original ID before any dispatch.
+        let mut client = self.client().await?;
         let previous = client.receipt(stable_operation_id.clone()).await?;
         if previous.state != "missing"
             && !(previous.state == "completed" && previous.response.is_some())
@@ -168,21 +169,34 @@ impl ManagedRuntime {
         // A retained completed request still goes through Host digest comparison,
         // so a caller cannot reuse its ID with different params. Host never rewrites it.
         // The Host atomically reserves the same ID before writing native stdin.
-        // If this socket is cancelled/disconnected, reconnect only for receipt reads.
+        // Cancellation closes this call's socket and leaves its receipt intact.
         client.request(stable_operation_id, method, params).await
     }
     /// Response contains exactly one of result/error, as in the existing IPC adapter.
     /// Its independent connection cannot be held behind a long native request.
     pub async fn answer(&self, native_request_id: Value, response: Value) -> Result<Receipt> {
         self.check_descriptor()?;
-        self.answers
-            .lock()
-            .await
+        let _lane = self.answers.lock().await;
+        self.client()
+            .await?
             .respond(native_request_id, response)
             .await
     }
     pub async fn receipt(&self, stable_operation_id: Value) -> Result<Receipt> {
         self.client().await?.receipt(stable_operation_id).await
+    }
+    /// Read only the original native answer namespace on a fresh authenticated socket.
+    pub async fn answer_receipt(&self, native_request_id: Value) -> Result<Receipt> {
+        self.client().await?.answer_receipt(native_request_id).await
+    }
+    /// Enumerate the original answer namespace, bound to a checked descriptor and snapshot.
+    /// An unsupported Host remains unavailable; command receipts are never substituted.
+    pub async fn answer_evidence(
+        &self,
+        offset: usize,
+        snapshot_digest: &str,
+    ) -> Result<pocket_runtime_ipc::client::AnswerEvidencePage> {
+        self.client().await?.answer_evidence(offset, snapshot_digest).await
     }
     pub async fn recovery(&self) -> Result<Value> {
         self.client().await?.recovery().await

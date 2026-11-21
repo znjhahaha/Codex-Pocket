@@ -169,16 +169,16 @@ pub(super) async fn ensure(
     registry: &Registry,
     profile: &SelectedProfile,
 ) -> Result<ManagedRuntime> {
-    ensure_mode(installation,registry,profile,true).await
+    ensure_mode(installation,registry,profile,true,true).await
 }
 impl super::Controller {
     /// Fenced successor bootstrap may reconnect to the original independent
     /// Host, but may not reserve/spawn a replacement or migrate saved authority.
     pub(crate) async fn attach_existing(&self,profile:&SelectedProfile)->Result<ManagedRuntime> {
-        ensure_mode(&self.installation,&self.registry,profile,false).await
+        ensure_mode(&self.installation,&self.registry,profile,false,false).await
     }
 }
-async fn ensure_mode(installation:&Installation,registry:&Registry,profile:&SelectedProfile,allow_start:bool)->Result<ManagedRuntime> {
+async fn ensure_mode(installation:&Installation,registry:&Registry,profile:&SelectedProfile,allow_start:bool,allow_legacy_upgrade:bool)->Result<ManagedRuntime> {
     // Revalidate physical paths every time, including after a controller restart.
     ensure!(
         physical(profile.config_home(), true)? == profile.home
@@ -215,17 +215,62 @@ async fn ensure_mode(installation:&Installation,registry:&Registry,profile:&Sele
             pocket_runtime_ipc::load_descriptor(&descriptor_path, profile.config_home()).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         owner.matches(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         let migrating=matches!(std::fs::symlink_metadata(&owner.native_binary),Err(e) if e.kind()==std::io::ErrorKind::NotFound);
-        // An installed-package update cannot retarget a still-live Host/native.
-        // Hold ensure.lock throughout the death checks and durable reservation.
-        if migrating {
-            require_ended(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
-        } else if let Ok(client) = HostClient::attach(&descriptor).await {
+        // Package files can disappear while their native process remains alive.
+        // Authenticate the original Host first; selecting the new package only
+        // changes a future launch and must not strand a live execution owner.
+        if let Ok(mut client) = HostClient::attach(&descriptor).await {
             if owner.phase == "spawned" {
                 owner.phase = "ready".into();
                 owner.descriptor_generation = Some(descriptor.generation.clone());
                 if allow_start {owner.save(&ownership_path)?;}
             }
-            return ManagedRuntime::open(descriptor_path, descriptor, client).await;
+            // A successor must not remain permanently attached to an idle old
+            // Host whose cold Unknown tombstones block its shutdown RPC. The
+            // installed helper owns the full authenticated retirement proof.
+            // Release our launcher lock so that helper can acquire it itself;
+            // afterwards re-enter through all ownership checks exactly once.
+            #[cfg(windows)]
+            if !migrating && allow_start && allow_legacy_upgrade && owner.installation_generation!=installation.generation() {
+                let health=client.health().await?;
+                if health.scoped_admission==0 && health.reconciliation_required && health.active_turns==0 && health.pending_requests==0 {
+                    drop(client);
+                    drop(_lock);
+                    let mut options=OpenOptions::new();
+                    use std::os::windows::fs::OpenOptionsExt;
+                    options.read(true).share_mode(1);
+                    let _guard=options.open(&host_binary)?;
+                    installation.verify()?;
+                    let mut command=tokio::process::Command::new(&host_binary);
+                    command.arg("--legacy-upgrade").arg("retire").arg("--state").arg(&directory)
+                        .arg("--descriptor").arg(&descriptor_path).arg("--config-home").arg(profile.config_home())
+                        .arg("--expected-generation").arg(&descriptor.generation)
+                        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                        .creation_flags(0x08000000).kill_on_drop(true);
+                    // A refusal preserves the live generation. A lost helper
+                    // response never proves exit; ensure_mode verifies both
+                    // original process identities before any replacement.
+                    let _=tokio::time::timeout(Duration::from_secs(25),command.status()).await;
+                    return Box::pin(ensure_mode(installation,registry,profile,allow_start,false)).await;
+                }
+            }
+            if migrating && allow_start {
+                let health = client.health().await?;
+                if health.scoped_admission > 0 && health.active_turns == 0 && health.pending_requests == 0 {
+                    // The old MSIX image can no longer supply schema discovery.
+                    // Ask its authenticated Host to close only if it is still
+                    // idle; the RPC rechecks admission atomically. Cold Unknown
+                    // receipts remain in the journal for the successor.
+                    client.shutdown_idle().await?;
+                    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while require_ended(&descriptor).is_err() && tokio::time::Instant::now() < until {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                } else {
+                    return ManagedRuntime::open(descriptor_path, descriptor, client).await;
+                }
+            } else {
+                return ManagedRuntime::open(descriptor_path, descriptor, client).await;
+            }
         }
         require_ended(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         // Both original identities ended; leave their descriptor in place for

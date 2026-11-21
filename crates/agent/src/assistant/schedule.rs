@@ -212,8 +212,14 @@ pub struct Schedule {
     pub next_ms: Option<i64>,
     pub missed: bool,
     #[serde(default)]
+    pub paused: bool,
+    #[serde(default = "default_missed_policy")]
+    pub missed_policy: String,
+    #[serde(default)]
     pub error: Option<String>,
 }
+
+fn default_missed_policy() -> String {"skip".into()}
 
 #[cfg(test)]
 mod tests {

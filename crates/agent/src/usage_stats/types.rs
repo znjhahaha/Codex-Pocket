@@ -30,6 +30,8 @@ pub struct Filters {
     pub data_source: DataSource,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub status: StatusFilter,
 }
 impl Default for Filters {
@@ -39,6 +41,7 @@ impl Default for Filters {
             data_source: DataSource::Proxy,
             provider_id: None,
             model: None,
+            session_id: None,
             status: StatusFilter::All,
         }
     }
@@ -69,6 +72,31 @@ pub struct UsageQuery {
     pub provider_page: Page,
     #[serde(default)]
     pub model_page: Page,
+    #[serde(default)]
+    pub session_page: Page,
+    #[serde(default)]
+    pub request_page: RequestPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCursor {
+    pub created_at: i64,
+    pub request_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestPage {
+    pub limit: usize,
+    pub cursor: Option<RequestCursor>,
+}
+impl Default for RequestPage {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            cursor: None,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +159,9 @@ pub struct TokenTotals {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostAmount {
     pub known_usd: String,
+    /// Dashboard amount is unavailable when no stored cost contributed to the subtotal.
+    #[serde(default)]
+    pub value_usd: Option<String>,
     pub known_rows: u64,
     pub missing_rows: u64,
     pub invalid_rows: u64,
@@ -140,6 +171,7 @@ impl Default for CostAmount {
     fn default() -> Self {
         Self {
             known_usd: "0".into(),
+            value_usd: None,
             known_rows: 0,
             missing_rows: 0,
             invalid_rows: 0,
@@ -235,4 +267,36 @@ pub struct UsageData {
     pub trend: Vec<TrendBucket>,
     pub provider_groups: GroupPage<ProviderGroup>,
     pub model_groups: GroupPage<ModelGroup>,
+    pub session_groups: GroupPage<SessionGroup>,
+    pub recent_requests: RequestDetailsPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGroup {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub totals: Totals,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestDetail {
+    pub request_id: String,
+    pub created_at: i64,
+    pub provider_id: String,
+    pub provider_name: Option<String>,
+    pub model: String,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
+    pub status_code: i64,
+    pub tokens: Option<TokenTotals>,
+    pub cost_usd: Option<String>,
+    pub ttft_ms: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestDetailsPage {
+    pub items: Vec<RequestDetail>,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<RequestCursor>,
 }

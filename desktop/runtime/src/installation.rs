@@ -8,6 +8,7 @@ use std::path::Path;
 #[serde(rename_all = "camelCase", default)]
 pub struct RuntimeStamp {
     pub version: String,
+    pub build_id: String,
     pub generation: Option<String>,
     pub pid: u32,
     pub started_at: u64,
@@ -24,7 +25,7 @@ impl RuntimeStamp {
             let generation=exe.as_deref().and_then(Path::parent).and_then(|p|generation(p).ok());
             let process_created_at=process_evidence(std::process::id()).map(|(created,_)|created);
             let executable_sha256=exe.as_deref().and_then(|p|digest_file(p).ok());
-            Self { version: env!("CARGO_PKG_VERSION").into(), generation, pid: std::process::id(),
+            Self { version: env!("CARGO_PKG_VERSION").into(), build_id:option_env!("POCKET_BUILD_ID").unwrap_or("development").into(), generation, pid: std::process::id(),
                 started_at: crate::storage::now(), control_protocol: 1, process_created_at, executable_sha256 }
         }).clone()
     }
@@ -80,7 +81,7 @@ unsafe fn same_user(handle:windows_sys::Win32::Foundation::HANDLE)->bool{
 fn process_evidence(_:u32)->Option<(u64,std::path::PathBuf)>{None}
 
 /// A stale status file, a reused PID, or a changed on-disk manifest is not a live process.
-fn verified_runtime(value:&Value,name:&str)->bool{
+pub(crate) fn verified_runtime(value:&Value,name:&str)->bool{
     let Some(pid)=value["pid"].as_u64().and_then(|n|u32::try_from(n).ok()) else{return false};
     let Some((created,path))=process_evidence(pid) else{return false};
     let claimed_created=value["processCreatedAt"].as_u64().or(value["processIdentity"]["createdAt"].as_u64());
@@ -121,7 +122,7 @@ pub fn report(installed: &str, installed_version: &str, ui: &RuntimeStamp,
     fn component(installed: &str, value: &Value, name:&str) -> Value {
         let running = value["generation"].as_str();
         let verified=verified_runtime(value,name);
-        json!({"version":value["version"],"generation":running,"pid":value["pid"],
+        json!({"version":value["version"],"buildId":value["buildId"],"generation":running,"pid":value["pid"],
             "controlProtocol":value["controlProtocol"],"runningVerified":verified,
             "state":match running {Some(g) if !g.is_empty()&&!installed.is_empty()&&g!=installed=>"restart_required",Some(g) if verified&&g==installed=>"current",_=>"unverified"}})
     }
@@ -171,5 +172,10 @@ mod tests {
         assert_eq!(first,process_evidence(std::process::id()).unwrap());
         assert!(first.1.is_file());
         assert!(process_evidence(0).is_none());
+    }
+    #[test]
+    fn runtime_identity_includes_the_build_id_without_requiring_a_version_change(){
+        let stamp=serde_json::to_value(RuntimeStamp::current()).unwrap();
+        assert_eq!(stamp["buildId"],option_env!("POCKET_BUILD_ID").unwrap_or("development"));
     }
 }

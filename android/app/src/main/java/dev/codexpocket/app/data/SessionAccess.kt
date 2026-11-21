@@ -63,12 +63,16 @@ enum class PocketFailure(val label: String) {
     OwnerUncertain("尚未确认会话归属，发送已暂停。请在电脑上确认 Codex 已就绪，再重新核验"),
     MultipleOwners("多个运行端声明拥有这段对话，发送已暂停。请在电脑上确认会话归属，再重新核验"),
     Runtime("所选运行环境尚未就绪，请稍后重试"), Unsupported("电脑助手尚未支持此功能，请更新后重试"),
+    DesktopIntegration("此桌面连接尚未完整接入，请在电脑空闲后重启 Codex"),
+    ProjectReadback("项目目录核验未通过，请刷新后重新选择目录"),
+    ProjectAssociation("会话已创建，但项目关联尚未确认，请在首页重新打开"),
     ModelSpeed("当前模型未提供 Fast 速度档位"), RuntimeSpeed("当前运行时未提供 serviceTier 能力"),
     StaleRevision("默认模式已在其他设备更新，请刷新后重试"), InvalidSnapshot("电脑返回的状态不完整，请刷新后重试"),
     MediaOwner("图片所属会话或连接已变化，请重新打开图片"), MediaExpired("图片已过期"),
     MediaUnsupported("暂不支持这张图片"), MediaFailed("图片读取失败，请重试");
     companion object {
         fun fromCode(code: String): PocketFailure? = when (code) {
+            "adapter_incomplete", "integration_required" -> DesktopIntegration
             "owner_uncertain" -> OwnerUncertain
             "multiple_owners" -> MultipleOwners
             "thread_owned_elsewhere", "ownership_conflict", "owner_conflict", "owner_mismatch", "runtime_mismatch", "thread_owner_changed", "not_owner", "read_only", "conflict", "thread_owner_conflict", "thread_owned_by_other_runtime" -> Ownership
@@ -87,10 +91,15 @@ enum class PocketFailure(val label: String) {
 }
 class PocketOperationException(val failure: PocketFailure) : Exception(failure.label)
 
-fun sessionRuntimes(runtimes: List<RuntimeInfo>, mode: SessionMode) = runtimes.filter { it.online && it.source == mode.wire }
+fun sessionRuntimes(runtimes: List<RuntimeInfo>, mode: SessionMode) = runtimes.filter { it.online && it.source == mode.wire && it.role != "managedHost" }
 
 /** Source is historical provenance; only the broker's owner snapshot grants control. */
 fun PocketState.supports(capability: BrokerCapability) = capability.method in capabilities
+fun PocketState.canPrepareRuntime(mode: SessionMode): Boolean = supports(BrokerCapability.EnsureRuntime) &&
+    (mode == SessionMode.Desktop || "runtime.ensure.cli" in capabilities)
+fun PocketState.creationRuntimes(mode: SessionMode) = sessionRuntimes(runtimes, mode).filter {
+    supports("thread/start", it) && (mode != SessionMode.Cli || it.readinessStage == null || it.readinessStage == "ready")
+}
 fun PocketState.accessFor(chat: ChatEntity? = selected) = chat?.let { threadAccess[it.key] }
 /** Reasons describe evidence, never grant permission. Legacy conflicts stay neutral. */
 fun PocketState.ownershipReasonFor(chat: ChatEntity? = selected): OwnershipReason? = chat?.let {

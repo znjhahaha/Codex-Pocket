@@ -87,7 +87,7 @@ test('unsupported legacy backend keeps the Windows login guidance and read-only 
   s.issues=[{stage:'helper_control',code:'control_rejected',message:'旧助手尚未支持本次请求',operationId:'fixture-read',exitCode:5,retryable:false}];});
  await refresh(page);
  await expect(panel(page)).toContainText('当前旧后台不支持安全交接');
- await expect(panel(page)).toContainText('退出并重新登录 Windows');
+ await expect(panel(page)).toContainText('运行新版 Pocket 安装包');
  await expect(panel(page).getByRole('button',{name:'重试启动后台',exact:true})).toHaveCount(0);
  await panel(page).getByRole('button',{name:'检查详情',exact:true}).click();
  await expect(page.getByRole('heading',{name:'连接诊断',exact:true})).toBeVisible();

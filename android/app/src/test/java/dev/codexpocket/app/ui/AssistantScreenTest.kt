@@ -87,6 +87,7 @@ class AssistantScreenTest {
         scroll("assistant-message:a").assertExists()
         screenshot("chat-overview")
         scroll("assistant-result:execution").assertIsDisplayed()
+        scroll("assistant-result-detail:execution").performClick()
         scroll("assistant-thread:execution").performClick()
         assertEquals(listOf("r" to "native-task"),opens)
         screenshot("chat-result")
@@ -105,7 +106,7 @@ class AssistantScreenTest {
         compose.onNodeWithTag("assistant-message-input").assertTextEquals("真实消息")
         compose.runOnIdle { state = state.copy(pendingActions=setOf("assistant/send")) }
         compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
-        compose.runOnIdle { state = state.copy(pendingActions=emptySet(),sendAcknowledgement=1) }
+        compose.runOnIdle { state = state.copy(pendingActions=emptySet()).acceptSend(actions.last()) }
         compose.onNodeWithTag("assistant-message-input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
     }
 
@@ -121,6 +122,36 @@ class AssistantScreenTest {
         scroll("assistant-deny:approval").performClick()
         assertEquals(false,actions.last().params.obj("response").obj("Approval").flag("approved"))
         screenshot("human-response")
+    }
+
+    @Test fun readFailurePreservesWaitingDraftAndBlocksSubmissionUntilFreshRead() {
+        val actions=mutableListOf<AssistantAction>()
+        val op=AssistantOperation("input","Coordinator",null,AssistantOperationPhase.Waiting,false,"c",AssistantQuestion("q",AssistantQuestionKind.Input,"请选择顺序"),null)
+        var state by mutableStateOf(AssistantUiState(snapshot().copy(operations=listOf(op),fresh=true)))
+        content({state},actions)
+        scroll("assistant-answer:input").assertIsEnabled().performTextInput("fixture answer")
+        compose.runOnIdle {state=state.copy(readError="刷新失败，显示上次读取结果",snapshot=state.snapshot!!.copy(fresh=false))}
+        scroll("assistant-answer:input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("fixture answer"))).assertIsNotEnabled()
+        scroll("assistant-respond:input").assertIsNotEnabled()
+        compose.onNodeWithTag("assistant-read-retry").performClick()
+        assertEquals(listOf("assistant/read"),actions.map {it.method})
+        scroll("assistant-respond:input").assertIsNotEnabled()
+        compose.runOnIdle {state=state.copy(readError=null,snapshot=state.snapshot!!.copy(fresh=true))}
+        scroll("assistant-answer:input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("fixture answer"))).assertIsEnabled()
+        scroll("assistant-respond:input").assertIsEnabled()
+        compose.onNodeWithText("等待你确认").assertExists()
+        scroll("assistant-respond:input").performClick()
+        assertEquals("assistant/respond",actions.last().method)
+        assertEquals("q",actions.last().params.string("requestId"))
+        assertEquals(JsonPrimitive("fixture answer"),actions.last().params.obj("response")["Answer"])
+    }
+
+    @Test fun dispatchCacheOffersReadRefreshWithoutPreparation() {
+        val actions=mutableListOf<AssistantAction>()
+        content({AssistantUiState(snapshot().copy(ready=false,fresh=false,dispatchInFlight=true),readError="显示上次读取结果")},actions)
+        compose.onNodeWithTag("assistant-prepare").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-read-retry").performClick()
+        assertEquals(listOf("assistant/read"),actions.map {it.method})
     }
 
     @Test fun settingsUsePassedModelDirectoryAndNotificationTimezoneDrafts() {
@@ -168,13 +199,15 @@ class AssistantScreenTest {
         compose.onNodeWithTag("assistant-schedule-add").performClick()
         compose.onNodeWithTag("assistant-schedule-prompt").performTextInput("新的定时事项")
         compose.onNodeWithTag("assistant-schedule-workspace").performClick()
-        compose.onNodeWithTag("assistant-schedule-workspace:authorized-thread").performClick()
-        compose.onNodeWithText("仅限电脑验证过的项目范围；原生审批仍需你逐次确认。").assertExists()
+        compose.onNodeWithTag("assistant-schedule-workspace:${AssistantWorkspaceChoice("r","authorized-thread","").selectionKey}").performClick()
+        compose.onNodeWithTag("assistant-project-permission-status").assertExists()
         compose.onNodeWithTag("assistant-schedule-save").performClick()
         assertEquals("assistant/schedule/create",actions.last().method)
+        assertEquals("authorized-thread",actions.last().params.string("threadId"))
         assertEquals("UTC",actions.last().params.obj("spec").obj("zone").string("name"))
         assertFalse(actions.last().params.obj("spec").containsKey("directory"))
-        compose.onNodeWithText("已错过 · 不补执行").assertExists()
+        compose.onNodeWithText("已错过 · 已记录").assertExists()
+        compose.onNodeWithText("错过后跳过").assertExists()
         scroll("assistant-schedule-delete:s").performClick()
         compose.onNodeWithTag("assistant-confirm-delete").performClick()
         assertEquals("assistant/schedule/delete",actions.last().method)
@@ -216,7 +249,9 @@ class AssistantScreenTest {
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot().copy(tasks=tasks,operations=listOf(op)))},actions)
         scroll("assistant-deny:paused-input").assertIsNotEnabled()
-        scroll("assistant-task:queued").assertHasClickAction()
+        compose.onNodeWithTag("assistant-shortcut:Tasks").performClick()
+        compose.onNodeWithTag("assistant-center:Tasks").assertIsSelected()
+        scroll("assistant-task-expand:queued").assertHasClickAction()
         compose.onNodeWithTag("assistant-task-pause:queued").assertDoesNotExist()
         compose.expandAssistantTask("queued")
         scroll("assistant-task-pause:queued").performClick()
@@ -226,10 +261,8 @@ class AssistantScreenTest {
         scroll("assistant-task-resume:paused").performClick()
         assertEquals("assistant/task/resume",actions.last().method)
         assertEquals("paused",actions.last().params.string("taskId"))
-        scroll("assistant-task:uncertain").assertExists()
         compose.expandAssistantTask("uncertain")
         compose.onNodeWithTag("assistant-task-resume:uncertain").assertDoesNotExist()
-        scroll("assistant-task:failed").assertExists()
         compose.expandAssistantTask("failed")
         compose.onNodeWithTag("assistant-task-resume:failed").assertDoesNotExist()
         assertEquals(2,actions.size)

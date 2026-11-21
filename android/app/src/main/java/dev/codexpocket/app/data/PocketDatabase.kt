@@ -55,6 +55,8 @@ data class ItemEntity(val chatKey: ThreadKey, val itemKey: String, val turnId: S
 data class CachedItemHeader(val chatKey: ThreadKey, val itemKey: String, val turnId: String, val itemId: String,
     val type: String, val status: String, val complete: Boolean, val ordinal: Long, val textLength: Int, val rawLength: Int)
 
+data class CachedItemPosition(val itemKey: String, val ordinal: Long)
+
 @Entity(tableName = "drafts")
 data class DraftEntity(@PrimaryKey val chatKey: ThreadKey, val text: String = "", val attachments: String = "[]", val scrollIndex: Int = 0, val scrollOffset: Int = 0, val expansions: String = "[]", val followEnd: Boolean = true,
     val scrollItemKey: String? = null, @ColumnInfo(defaultValue = "'[]'") val references: String = "[]")
@@ -80,6 +82,10 @@ interface PocketDao {
     @Upsert suspend fun putChat(chat: ChatEntity)
     @Upsert suspend fun putChats(chats: List<ChatEntity>)
     @Query("SELECT * FROM items WHERE chatKey = :key ORDER BY ordinal ASC") suspend fun items(key: ThreadKey): List<ItemEntity>
+    @Query("SELECT itemKey,ordinal FROM items WHERE chatKey = :key")
+    suspend fun itemPositions(key: ThreadKey): List<CachedItemPosition>
+    @Query("UPDATE items SET ordinal = :ordinal WHERE chatKey = :key AND itemKey = :item")
+    suspend fun moveItem(key: ThreadKey, item: String, ordinal: Long)
     @Query("SELECT chatKey,itemKey,turnId,itemId,type,status,complete,ordinal,length(text) AS textLength,length(raw) AS rawLength FROM items WHERE chatKey = :key ORDER BY ordinal ASC")
     suspend fun itemHeaders(key: ThreadKey): List<CachedItemHeader>
     @Query("SELECT substr(text,:start,:count) FROM items WHERE chatKey = :key AND itemKey = :item")
@@ -98,8 +104,10 @@ interface PocketDao {
     @Upsert suspend fun putSnapshot(snapshot: SnapshotEntity)
     @Query("DELETE FROM snapshots") suspend fun clearSnapshots()
     @Upsert suspend fun putCommand(command: CommandEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertAssistantCommand(command: CommandEntity): Long
     @Query("UPDATE commands SET status = :status WHERE id = :id AND status IN ('submitted','unknown','not_found')") suspend fun commandStatus(id: String, status: String)
     @Query("SELECT * FROM commands WHERE status IN ('submitted','unknown','not_found') ORDER BY createdAt DESC") fun uncertainCommands(): Flow<List<CommandEntity>>
+    @Query("SELECT * FROM commands WHERE method = 'assistant/send' AND status IN ('accepted','rejected') ORDER BY createdAt DESC LIMIT 256") fun assistantSendReceipts(): Flow<List<CommandEntity>>
     @Query("SELECT * FROM commands WHERE computerId = :computer AND status IN ('submitted','unknown','not_found')") suspend fun uncertain(computer: String): List<CommandEntity>
     @Query("UPDATE commands SET status = 'unknown' WHERE status = 'submitted'") suspend fun markInterruptedUnknown()
     @Query("DELETE FROM items") suspend fun clearHistory()

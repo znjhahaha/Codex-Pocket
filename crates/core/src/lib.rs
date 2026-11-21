@@ -3,3 +3,4 @@ pub mod directory;
 pub mod journal;
 pub mod ledger;
 pub mod native_process;
+pub mod admission;

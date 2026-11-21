@@ -18,7 +18,7 @@ pub const MAX_WINDOW_SECONDS: i64 = 32 * 86400;
 pub const MAX_BUCKET_SECONDS: i64 = 27 * 3600;
 pub const MAX_DAILY_BUCKETS: usize = 31;
 pub const MAX_BUCKETS: usize = 744;
-pub const MAX_ROWS: usize = 100_000;
+pub const MAX_ROWS: usize = 1_000_000;
 pub const MAX_GROUPS: usize = 10_000;
 fn valid(q: &UsageQuery) -> bool {
     let page = |p: Page| (1..=200).contains(&p.limit) && p.offset <= 10000;
@@ -51,8 +51,18 @@ fn valid(q: &UsageQuery) -> bool {
         && (q.filters.data_source != DataSource::CodexSession || q.filters.app_type == "codex")
         && filter(&q.filters.provider_id)
         && filter(&q.filters.model)
+        && filter(&q.filters.session_id)
         && page(q.provider_page)
         && page(q.model_page)
+        && page(q.session_page)
+        && (1..=200).contains(&q.request_page.limit)
+        && q.request_page.cursor.as_ref().is_none_or(|c| {
+            c.created_at >= q.start_at
+                && c.created_at < q.end_at
+                && !c.request_id.is_empty()
+                && c.request_id.len() <= 256
+                && !c.request_id.contains('\0')
+        })
 }
 fn error(code: &str, message: &str) -> UsageError {
     UsageError {
@@ -136,5 +146,30 @@ pub fn query(path: &Path, q: &UsageQuery) -> UsageResponse {
     }
     response
 }
+pub fn query_requests(path: &Path, q: &UsageQuery) -> serde_json::Value {
+    use serde_json::json;
+    let mut version = None;
+    let mut value = json!({"availability":"unavailable","source":SourceInfo { kind:"cc_switch".into(), table:"proxy_request_logs".into(), app_type:q.filters.app_type.chars().take(256).collect(), data_source:q.filters.data_source, schema_version:None },"errors":[],"data":null});
+    if !valid(q) {
+        value["availability"] = json!("rejected");
+        value["errors"] = json!([error("invalid_query", "Invalid usage request bounds.")]);
+        return value;
+    }
+    match reader::requests(path, q, &mut version) {
+        Ok(page) => {
+            value["availability"] = json!("ready");
+            value["data"] = json!({"requests":page});
+        }
+        Err(f) => {
+            let (availability, code, message) = f.details();
+            value["availability"] = json!(availability);
+            value["errors"] = json!([error(code, message)]);
+        }
+    }
+    value["source"]["schema_version"] = json!(version);
+    value
+}
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v070_tests;

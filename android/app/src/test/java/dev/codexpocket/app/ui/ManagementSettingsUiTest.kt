@@ -69,6 +69,9 @@ class ManagementSettingsUiTest {
         }
         compose.onNodeWithTag("settings-tab:Connection").assertIsSelected()
         compose.onNodeWithTag("Connection:24").performScrollTo().assertIsDisplayed()
+        val segments = compose.onNodeWithTag("settings-segments").fetchSemanticsNode().boundsInRoot
+        val viewport = compose.onNodeWithTag("settings-page:Connection").fetchSemanticsNode().boundsInRoot
+        assertTrue("Scrolling content must begin below the fixed segmented control", viewport.top >= segments.bottom)
         val before = compose.onNodeWithTag("Connection:24").fetchSemanticsNode().boundsInRoot.top
         compose.onNodeWithTag("settings-tab:Extensions").performClick()
         compose.onNodeWithTag("Extensions:0").assertIsDisplayed()

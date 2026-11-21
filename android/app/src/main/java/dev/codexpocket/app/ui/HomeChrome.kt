@@ -93,10 +93,10 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                 // One line: title, then the computer in gray with its connection dot. Less stacked text than before.
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 16.dp, end = 12.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" },
-                        Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    PocketDestinationTitle(when(tab) { HomeTab.Chats -> "Codex"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" },
+                        Modifier.semantics { heading() })
                     Box(Modifier.width(26.dp).height(18.dp), contentAlignment = Alignment.Center) {
-                        if (restoring) PocketLoader(Modifier.testTag("home-reconnecting").semantics { contentDescription = "正在恢复连接" }, dot = 4.dp)
+                        if (restoring) ActivityMotionIcon(ActivityMotion.Connection,true,Modifier.size(17.dp).testTag("home-reconnecting").semantics { contentDescription = "正在恢复连接" })
                         else Box(Modifier.size(6.dp).testTag("home-connectivity").background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
                     }
                     Text(s.computerName.ifBlank { stringResource(R.string.v03_home_computer) }, Modifier.weight(1f),
@@ -127,7 +127,7 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
     PocketGlassSurface(modifier = Modifier.weight(1f).testTag("home-navigation"), shape = PocketOval, dense = true) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(6.dp)) {
             val itemWidth = maxWidth / 3
-            val selectionX by animateDpAsState(itemWidth * tab.ordinal, tween(pocketMotionMillis(180), easing = FastOutSlowInEasing), label = "navigation-selection")
+            val selectionX by animateDpAsState(itemWidth * tab.ordinal, tween(pocketMotionMillis(320), easing = FastOutSlowInEasing), label = "navigation-selection")
             Box {
             Box(Modifier.matchParentSize()) {
                 Box(Modifier.offset(x = selectionX).width(itemWidth).fillMaxHeight().clip(PocketOval)
@@ -154,7 +154,7 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
                             if (item == HomeTab.Attention && attention > 0) Box(Modifier.align(Alignment.TopEnd).offset(x = 2.dp, y = (-1).dp).size(6.dp).background(MaterialTheme.colorScheme.secondary, CircleShape))
                         }
                         Spacer(Modifier.height(2.dp))
-                        Text(label, style = MaterialTheme.typography.labelMedium, color = tint)
+                        PocketTabLabel(label, selected, color = tint)
                     }
                 }
             }

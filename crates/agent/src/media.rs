@@ -93,6 +93,23 @@ impl MediaStore {
         if depth > 64 {
             return;
         }
+        if value["type"] == "imageView" {
+            let item = value["id"].as_str().unwrap_or("").to_owned();
+            if let Some(part) = value.get_mut("toolOutputBlocks").and_then(Value::as_array_mut).and_then(|p| p.first_mut()) {
+                if part["status"] != "ready" {
+                    let owner = MediaOwner { runtime_id: runtime.into(), connection_id: connection.into(),
+                        thread_id: part["threadId"].as_str().unwrap_or("").into(),
+                        turn_id: part["turnId"].as_str().unwrap_or("").into(), item_id: item };
+                    if let Some(local) = self.local_reference(&owner, 0, history) {
+                        *part = local;
+                    } else {
+                        part["status"] = json!("failed");
+                        part["message"] = json!("Viewed image unavailable or invalid");
+                    }
+                }
+            }
+            return;
+        }
         if value["type"] == "userMessage" {
             let item = value["id"].as_str().unwrap_or("").to_owned();
             if let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) {
@@ -359,6 +376,40 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::{fs, io::Write};
+
+    #[test]
+    fn viewed_image_uses_native_path_proof_and_survives_reconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("viewed.png");
+        let bytes = b"\x89PNG\r\n\x1a\nviewed-image";
+        fs::write(&path, bytes).unwrap();
+        let native = json!({"thread":{"id":"thread","path":root.path().join("rollout.jsonl"),
+            "turns":[{"id":"turn","items":[{"type":"imageView","id":"view","path":path}]}]}});
+        let store = MediaStore::new(root.path()).unwrap();
+        let proof = |connection: &str, allowed: bool| {
+            NativeHistory::from_native_thread(&native["thread"], "runtime", connection).unwrap()
+                .with_image_roots(if allowed { vec![dunce::canonicalize(root.path()).unwrap()] } else { vec![] })
+        };
+        let project = |connection: &str, allowed: bool| store.project_with_history(
+            &native, "runtime", connection, "thread", &proof(connection, allowed));
+        let denied = project("one", false);
+        assert_ne!(denied["thread"]["turns"][0]["items"][0]["toolOutputBlocks"][0]["status"], "ready");
+        let ready = project("one", true);
+        let block = &ready["thread"]["turns"][0]["items"][0]["toolOutputBlocks"][0];
+        assert_eq!(block["status"], "ready");
+        let owner = |connection: &str| MediaOwner { runtime_id:"runtime".into(),connection_id:connection.into(),thread_id:"thread".into(),turn_id:"turn".into(),item_id:"view".into() };
+        let read = store.read(&owner("one"), block["mediaId"].as_str().unwrap(), 0, 1024).unwrap();
+        assert_eq!(read["status"], "ready");
+        use base64::Engine;
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(read["data"].as_str().unwrap()).unwrap(), bytes);
+        assert!(store.read(&owner("other"), block["mediaId"].as_str().unwrap(), 0, 1024).is_err());
+        fs::remove_file(&path).unwrap();
+        let renewed = project("two", true);
+        let renewed = &renewed["thread"]["turns"][0]["items"][0]["toolOutputBlocks"][0];
+        assert_eq!(renewed["status"], "ready");
+        assert_eq!(store.read(&owner("two"),renewed["mediaId"].as_str().unwrap(),0,1024).unwrap()["status"],"ready");
+        assert_ne!(project("three",false)["thread"]["turns"][0]["items"][0]["toolOutputBlocks"][0]["status"],"ready");
+    }
 
     #[test]
     fn local_snapshots_require_current_roots_exact_path_item_and_slot() {

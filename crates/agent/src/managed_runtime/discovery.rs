@@ -65,8 +65,7 @@ pub(crate) fn restore_saved_profile_with(
 )->Result<SelectedProfile> {
     use anyhow::Context;
     // A missing executable must never cause account/config-home discovery.
-    let physical_home=installation::physical(home,true).context(RestoreFailure::ConfigHome)?;
-    codex_cli_adapter::Discovery::for_home(&physical_home).context(RestoreFailure::ConfigHome)?;
+    installation::physical(home,true).context(RestoreFailure::ConfigHome)?;
     match std::fs::symlink_metadata(binary) {
         Ok(_)=>SelectedProfile::new(home,binary).context(RestoreFailure::NativeInvalid),
         Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
@@ -145,7 +144,7 @@ pub(crate) fn replacement_binary_with(old:&Path,packages:impl FnOnce()->Result<V
 
 /// Same authority as Get-AppxPackage -Name OpenAI.Codex, queried directly for
 /// this user's registered package family. No shell, wrapper or CLI execution.
-fn registered_codex_packages()->Result<Vec<MsixPackage>> {
+pub(crate) fn registered_codex_packages()->Result<Vec<MsixPackage>> {
     #[cfg(windows)] {
         use std::{os::windows::ffi::{OsStrExt,OsStringExt},ptr};
         #[link(name="kernel32")]
@@ -182,12 +181,51 @@ fn registered_codex_packages()->Result<Vec<MsixPackage>> {
     #[cfg(not(windows))] {Ok(Vec::new())}
 }
 
-/// Use the adapter's native CODEX_HOME -> OS home/.codex precedence verbatim.
+/// Use native CODEX_HOME -> OS home/.codex precedence without CLI attachment.
 /// In particular, an invalid explicit home never falls back to another account.
 pub fn from_environment() -> Result<SelectedProfile> {
-    let home = codex_cli_adapter::Discovery::from_environment()
-        .map_err(|_| Unavailable::MissingConfig)?
-        .ok_or(Unavailable::MissingConfig)?;
+    let home = configuration_home(std::env::var_os("CODEX_HOME"), default_home)?;
+    for_home(&home)
+}
+
+/// Resolve an executable while retaining the explicitly selected account store.
+pub fn for_home(home: &Path) -> Result<SelectedProfile> {
+    let home=installation::physical(home,true)?;
+    let (explicit, roots) = discovery_paths(&home);
+    match select(&home, &explicit, &roots) {
+        Ok(profile) => Ok(profile),
+        Err(error) => {
+            // A Store installation need not be present in the background's PATH.
+            let mut packages = registered_codex_packages()?;
+            packages.sort_by_key(|p| package_identity(&p.full_name).map(|i| i.version));
+            for package in packages.into_iter().rev() {
+                let binary = package.location.join("app/resources/codex.exe");
+                if is_native(&binary) { return SelectedProfile::new(&home, binary); }
+            }
+            Err(error)
+        }
+    }
+}
+
+// The runtime selection order is unchanged. Inventory separately discovers a
+// CLI even when a desktop binary or legacy override wins runtime selection.
+pub(crate) fn cli_binary() -> Option<PathBuf> {
+    let (_, roots) = discovery_paths(Path::new(""));
+    find_binary(&[], &roots, |binary| {
+        !binary.components().any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+    })
+}
+
+/// Shared-daemon startup must resolve the ordinary CLI before desktop bridge overrides.
+/// Retain the requested profile even when the executable comes from npm/PATH.
+pub(crate) fn for_cli_home(home:&Path)->Result<SelectedProfile> {
+    match cli_binary() {
+        Some(binary)=>SelectedProfile::new(home,binary),
+        None=>for_home(home),
+    }
+}
+
+fn discovery_paths(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut explicit = Vec::new();
     if let Some(path) = std::env::var_os("CODEX_CLI_PATH").filter(|p| !p.is_empty()) {
         explicit.push(PathBuf::from(path));
@@ -197,7 +235,7 @@ pub fn from_environment() -> Result<SelectedProfile> {
             explicit.push(bin.join("pocket-original.json"));
         }
     }
-    explicit.push(home.codex_home().join("pocket-original.json"));
+    if home.is_absolute() { explicit.push(home.join("pocket-original.json")); }
     let mut roots = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
         roots.extend(std::env::split_paths(&path));
@@ -224,16 +262,68 @@ pub fn from_environment() -> Result<SelectedProfile> {
         roots.push(default.join(".npm-global/bin"));
         volta_roots(&default.join(".volta"), &mut roots);
     }
-    select(home.codex_home(), &explicit, &roots)
+    (explicit, roots)
+}
+
+fn configuration_home(
+    explicit: Option<std::ffi::OsString>,
+    fallback: impl FnOnce() -> Result<Option<PathBuf>>,
+) -> Result<PathBuf> {
+    let home = match explicit.filter(|home| !home.is_empty()) {
+        // Native parses CODEX_HOME as Unicode. Do not accept a physical path
+        // that native would ignore, and never fall back for an invalid value.
+        Some(home) => PathBuf::from(home.into_string().map_err(|_| Unavailable::MissingConfig)?),
+        None => fallback()?
+            .ok_or(Unavailable::MissingConfig)?
+            .join(".codex"),
+    };
+    installation::physical(&home, true).map_err(|_| Unavailable::MissingConfig.into())
 }
 
 fn default_home() -> Result<Option<PathBuf>> {
-    // No environment mutation or process probes; these are install locations only.
+    // Match dirs::home_dir used by the native adapter, including the Windows
+    // known-folder authority (USERPROFILE can be an unrelated process override).
     #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE");
+    {
+        use std::{ffi::c_void, os::windows::ffi::OsStringExt, ptr};
+        use windows_sys::core::GUID;
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SHGetKnownFolderPath(
+                id: *const GUID,
+                flags: u32,
+                token: *mut c_void,
+                path: *mut *mut u16,
+            ) -> i32;
+        }
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoTaskMemFree(memory: *const c_void);
+        }
+        const PROFILE: GUID = GUID::from_u128(0x5e6c858f_0e22_4760_9afe_ea3317b67173);
+        let mut path = ptr::null_mut();
+        let result = unsafe { SHGetKnownFolderPath(&PROFILE, 0, ptr::null_mut(), &mut path) };
+        let home = if result == 0 && !path.is_null() {
+            // The successful API result is an allocated NUL-terminated UTF-16 path.
+            let mut len = 0;
+            unsafe {
+                while *path.add(len) != 0 {
+                    len += 1;
+                }
+                Some(PathBuf::from(std::ffi::OsString::from_wide(
+                    std::slice::from_raw_parts(path, len),
+                )))
+            }
+        } else {
+            None
+        };
+        unsafe {
+            CoTaskMemFree(path.cast());
+        }
+        Ok(home)
+    }
     #[cfg(not(windows))]
-    let home = std::env::var_os("HOME");
-    Ok(home.filter(|p| !p.is_empty()).map(PathBuf::from))
+    Ok(std::env::home_dir())
 }
 
 fn volta_roots(volta: &Path, roots: &mut Vec<PathBuf>) {
@@ -254,10 +344,15 @@ fn volta_roots(volta: &Path, roots: &mut Vec<PathBuf>) {
 }
 
 fn select(home: &Path, explicit: &[PathBuf], roots: &[PathBuf]) -> Result<SelectedProfile> {
+    let binary = find_binary(explicit, roots, |_| true).ok_or(Unavailable::MissingCli)?;
+    SelectedProfile::new(home, binary)
+}
+
+fn find_binary(explicit: &[PathBuf], roots: &[PathBuf], accepts: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let mut seen = BTreeSet::new();
     for path in explicit {
-        if let Some(binary) = resolve(path, &mut seen) {
-            return SelectedProfile::new(home, binary);
+        if let Some(binary) = resolve(path, &mut seen).filter(|p| accepts(p)) {
+            return Some(binary);
         }
     }
     for root in roots.iter().filter(|p| p.is_absolute()) {
@@ -269,8 +364,8 @@ fn select(home: &Path, explicit: &[PathBuf], roots: &[PathBuf]) -> Result<Select
             "app/resources/codex.exe",
             "resources/codex.exe",
         ] {
-            if let Some(binary) = resolve(&root.join(name), &mut seen) {
-                return SelectedProfile::new(home, binary);
+            if let Some(binary) = resolve(&root.join(name), &mut seen).filter(|p| accepts(p)) {
+                return Some(binary);
             }
         }
         for package in [
@@ -278,12 +373,12 @@ fn select(home: &Path, explicit: &[PathBuf], roots: &[PathBuf]) -> Result<Select
             root.join("lib/node_modules/@openai/codex"),
             root.join("../lib/node_modules/@openai/codex"),
         ] {
-            if let Some(binary) = npm_native(&package, &mut seen) {
-                return SelectedProfile::new(home, binary);
+            if let Some(binary) = npm_native(&package, &mut seen).filter(|p| accepts(p)) {
+                return Some(binary);
             }
         }
     }
-    Err(Unavailable::MissingCli.into())
+    None
 }
 
 fn resolve(path: &Path, seen: &mut BTreeSet<PathBuf>) -> Option<PathBuf> {
@@ -387,11 +482,10 @@ fn npm_native(package: &Path, seen: &mut BTreeSet<PathBuf>) -> Option<PathBuf> {
         package.join("node_modules/@openai").join(optional),
         package.parent()?.join(optional),
     ] {
-        if let Some(binary) = resolve(
-            &root.join("vendor").join(target).join("codex").join(file),
-            seen,
-        ) {
-            return Some(binary);
+        for directory in ["bin", "codex"] {
+            if let Some(binary) = resolve(&root.join("vendor").join(target).join(directory).join(file), seen) {
+                return Some(binary);
+            }
         }
     }
     None

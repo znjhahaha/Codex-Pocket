@@ -273,6 +273,7 @@ async fn connect(
         }
     });
     Ok(Connected {
+        initial_status: None,
         role: NativeRole::ManagedHost {
             generation: descriptor.generation.clone(),
             reconciliation_required,
@@ -280,6 +281,8 @@ async fn connect(
         bridge_version: None,
         capabilities,
         rpc: Rpc {
+            #[cfg(windows)]
+            desktop_ipc: None,
             tx,
             response_tx: Some(response_tx),
             host_stop: Some(stop),
@@ -467,7 +470,9 @@ mod tests {
         async fn start_in(dir: tempfile::TempDir) -> Self {
             let home = dir.path().to_path_buf();
             let descriptor = dir.path().join("registry/host.json");
-            let bins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime-host/target/debug");
+            let bins = std::env::var_os("MANAGED_RUNTIME_TEST_HOST")
+                .and_then(|path| PathBuf::from(path).parent().map(Path::to_owned))
+                .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime-host/target/debug"));
             let host = bins.join("pocket-runtime-host.exe");
             let native = bins.join("pocket-host-fixture.exe");
             assert!(

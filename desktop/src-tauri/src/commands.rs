@@ -3,6 +3,10 @@ use serde_json::{json,Value};
 use std::{path::{Path,PathBuf},process::Command,sync::{Arc,Mutex},time::{Duration,Instant}};
 use tauri::State;
 
+#[cfg(all(test,windows))]
+#[path = "commands_live_probe.rs"]
+mod live_probe;
+
 #[derive(Clone)]
 pub struct Context {
     pub state:PathBuf,pub bin:PathBuf,pub operation:Arc<Mutex<()>>,
@@ -40,7 +44,7 @@ pub(crate) fn preflight(c:&Context)->Result<(),OperationError>{
     Ok(())
 }
 fn devices(c:&Context)->anyhow::Result<Vec<Value>>{
-    let result=process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"devices",&[])?;
+    let result=process::local_control(&c.state,"devices",json!({}))?;
     Ok(result["data"].as_array().unwrap_or(&vec![]).iter().map(|d|json!({"id":d["id"],"name":d["name"],"createdAt":d["createdAt"]})).collect())
 }
 fn startup(c:&Context,action:&str)->anyhow::Result<Value>{
@@ -144,6 +148,7 @@ fn optional_state<T:serde::de::DeserializeOwned>(path:&Path)->anyhow::Result<Opt
     match storage::read(path){Ok(value)=>Ok(Some(value)),Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(None),Err(error)=>Err(error)}
 }
 fn snapshot(c:&Context)->Value{
+    let current=current_context(c);let c=&current;
     let mut issues=Vec::<OperationError>::new();
     let consistent=match preflight(c){Ok(())=>true,Err(e)=>{issues.push(e);false}};
     let mut config=Value::Null;let mut status=Value::Null;let mut supervisor=json!(supervisor::Status::default());
@@ -153,14 +158,13 @@ fn snapshot(c:&Context)->Value{
         match optional_state::<storage::Desired>(&storage::control(&c.state).join("desired.json")){Ok(Some(v))=>desired=v,Ok(None)=>{},Err(e)=>issues.push(fail("desired_read",e))}
         match optional_state::<supervisor::Status>(&storage::control(&c.state).join("supervisor.json")){Ok(Some(v))=>supervisor=json!(v),Ok(None)=>{},Err(e)=>issues.push(fail("supervisor_read",e))}
         if config.is_object(){
-        match process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"status",&[]){Ok(v)=>status=v,Err(e)=>issues.push(fail("helper_control",e))}
+        match process::local_control(&c.state,"status",json!({})){Ok(v)=>status=v,Err(e)=>issues.push(fail("helper_control",e))}
         match devices(c){Ok(v)=>paired=v,Err(e)=>issues.push(fail("devices",e))}
         match startup_enabled(c){Ok(v)=>startup_on=v,Err(e)=>issues.push(e)}
         }
     }
-    let routes=if consistent&&config.is_object() {match process::agent(&c.bin.join("pocket-agent.exe"),&c.state,"routes/read",&[]) {
-        Ok(value)=>value,Err(error)=>{issues.push(fail("routes_read",error));Value::Null}
-    }}else{Value::Null};
+    let mut routes=if status.is_object(){json!({"routes":status["routes"],"routeStatus":status["routeStatus"],"routePreferences":status["routePreferences"],"policy":status["policy"]})}else{Value::Null};
+    if status.is_object(){if let Ok(catalog)=process::local_control(&c.state,"routes/read",json!({})){routes["routePreferences"]=catalog["routePreferences"].clone();}}
     let installed_generation=pocket_desktop_runtime::installation::generation(&c.bin).unwrap_or_default();
     let installed_version=storage::read::<Value>(&c.bin.join("windows-manifest.json")).ok().and_then(|v|v["version"].as_str().map(str::to_owned)).unwrap_or_default();
     let mut installation=pocket_desktop_runtime::installation::report(&installed_generation,&installed_version,
@@ -197,13 +201,32 @@ fn snapshot(c:&Context)->Value{
         status["usableRoutes"]=json!(readiness.ready_ids.len());
         if routes["routes"].is_array(){status["routes"]=routes["routes"].clone();}
     }
-    let available=desired.enabled&&supervisor["phase"]=="running"&&connection::fresh(supervisor["updatedAt"].as_u64().unwrap_or(0),storage::now())&&connection::fresh(status["updatedAt"].as_u64().unwrap_or(0),storage::now())&&!readiness.ready_ids.is_empty();
+    let authoritative=consistent&&status["protocol"]==1&&status["computerId"]==config["computerId"]&&installation["helper"]["runningVerified"]==true
+        &&installation["supervisor"]["runningVerified"]==true&&supervisor["childPid"]==status["helperRuntime"]["pid"]
+        &&connection::fresh(supervisor["updatedAt"].as_u64().unwrap_or(0),storage::now())&&connection::fresh(status["updatedAt"].as_u64().unwrap_or(0),storage::now());
+    let mut runtime_readiness=pocket_desktop_runtime::diagnostics::readiness(&status,storage::now());
+    if !authoritative{runtime_readiness["authoritative"]=json!(false);runtime_readiness["ready"]=json!(false);}
+    runtime_readiness["localDesktop"] = json!(pocket_desktop_runtime::desktop_presence::observe());
+    if consistent && installation["ui"]["runningVerified"] == true
+        && std::env::current_exe().ok().is_some_and(|exe|
+            pocket_desktop_runtime::local_update::is_staged_dashboard(&c.state, &exe, &c.bin)) {
+        installation["ui"]["state"] = json!("staged_dashboard");
+        installation["restartRequired"] = json!(["helper", "supervisor"].iter()
+            .any(|role| installation[*role]["state"] == "restart_required"));
+    }
+    let mut updates = if consistent { pocket_desktop_runtime::updates::public_status(&c.state) } else { Value::Null };
+    if authoritative && updates["phase"] == "waiting_idle" {
+        updates["waitReason"] = json!(pocket_desktop_runtime::diagnostics::update_wait_reason(&status, storage::now()));
+    }
+    let assistant=if authoritative{process::local_control(&c.state,"assistant/status",json!({})).unwrap_or(Value::Null)}else{Value::Null};
+    let available=authoritative&&desired.enabled&&supervisor["phase"]=="running"&&!readiness.ready_ids.is_empty();
     let phase=connection::phase(&desired,consistent,&supervisor,&status,storage::now());
-    let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"state":if r["online"]==true{"在线"}else{"离线"},"version":r["version"],"bridgeVersion":r["bridgeVersion"],"helperVersion":r["helperVersion"],"bridgeUpdatePending":r["bridgeUpdatePending"]})).collect();
+    let processes:Vec<_>=status["runtimes"].as_array().unwrap_or(&vec![]).iter().map(|r|json!({"name":r["source"].as_str().unwrap_or("Codex"),"role":r["role"]["kind"],"state":if authoritative&&r["online"]==true{"在线"}else{"未核验"},"version":r["version"],"bridgeVersion":r["bridgeVersion"],"helperVersion":r["helperVersion"],"bridgeUpdatePending":r["bridgeUpdatePending"]})).collect();
     let relay=config["relayUrl"].as_str().or(config["relay_url"].as_str()).unwrap_or("");
     let host=relay.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").split('@').next_back().unwrap_or("").split('?').next().unwrap_or("");
     json!({"computerName":config["computerName"].as_str().or(config["computer_name"].as_str()).unwrap_or("此电脑"),"desired":desired.enabled,"supervisor":supervisor,"startupStatus":if consistent{startup_cache_status(c)}else{"unknown"},
         "relay":{"state":status["state"].as_str().unwrap_or("unknown"),"host":host},"devices":paired,"processes":processes,"version":env!("CARGO_PKG_VERSION"),"startup":startup_on,
+        "runtimeReadiness":runtime_readiness,"assistantReadiness":assistant,"updates":updates,
         "backgroundRecovery":c.background_recovery.lock().ok().map(|v|json!(*v)),
         "installation":installation,"connection":{"phase":phase,"connected":phase=="connected","available":available,"configuredRoutes":readiness.configured,"usableRoutes":if available{readiness.ready_ids.len()}else{0},"readyRouteIds":if available{readiness.ready_ids}else{Vec::new()},"authenticatedPhone":status["authenticatedPhone"],"helperUpdatedAt":status["updatedAt"].as_u64().unwrap_or(0),"lastSuccessAt":status["lastActivityAt"],"desiredChangedAt":desired.changed_at},
         "issues":issues,"operationFailures":crate::operation_failures::history(c),"discoveryErrors":status["discoveryErrors"],"routes":routes,"cloudflareReceipt":if consistent {storage::read::<Value>(&storage::control(&c.state).join("connectivity/fixed-tunnel.json")).unwrap_or(Value::Null)}else{Value::Null},"connectivity":connectivity,"helperVersion":status["helperVersion"],"sessionPreferences":if consistent&&desired.enabled {process::local_control(&c.state,"session/preferences/read",json!({})).unwrap_or(Value::Null)}else{Value::Null}})
@@ -227,6 +250,47 @@ pub fn tray_status(c:&Context)->String{
 #[tauri::command]
 pub async fn dashboard(context:State<'_,Context>)->Result<Value,OperationError>{
     let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||snapshot(&c)).await.map_err(join_error)
+}
+#[tauri::command]
+pub async fn check_updates(context:State<'_,Context>)->Result<Value,OperationError>{
+    let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        core_preflight(&c)?;let root=storage::local_app_data().map_err(|e|fail("updates",e))?.join("CodexPocket");
+        pocket_desktop_runtime::updates::check_and_stage(&root,&c.state).map_err(|e|fail("updates",e))?;
+        pocket_desktop_runtime::manager_update::retry(&c.state).map_err(|e|fail("updates",e))?;
+        pocket_desktop_runtime::manager_update::reconcile(&root,&c.state).map_err(|e|fail("updates",e))?;
+        Ok(pocket_desktop_runtime::updates::public_status(&c.state))
+    }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn restart_update(context:State<'_,Context>,operation_id:String)->Result<Value,OperationError>{
+    let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        let _guard=c.operation.try_lock().map_err(|_|OperationError::new("updates","operation_busy",true))?;
+        let current=current_context(&c);core_preflight(&current)?;
+        let root=storage::local_app_data().map_err(|e|fail("updates",e))?.join("CodexPocket");
+        pocket_desktop_runtime::local_update::request_restart(&root,&c.state,&operation_id).map_err(|e|fail("updates",e))?;
+        Ok(pocket_desktop_runtime::updates::public_status(&c.state))
+    }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn set_automatic_updates(context:State<'_,Context>,enabled:bool)->Result<(),OperationError>{
+    let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        core_preflight(&c)?;pocket_desktop_runtime::updates::set_automatic(&c.state,enabled).map_err(|e|fail("updates",e))
+    }).await.map_err(join_error)?
+}
+#[tauri::command]
+pub async fn repair_assistant(context:State<'_,Context>)->Result<Value,OperationError>{
+    let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        let _guard=c.operation.try_lock().map_err(|_|OperationError::new("assistant","operation_busy",true))?;
+        core_preflight(&c)?;
+        process::local_control(&c.state,"assistant/prepare",json!({"commandId":format!("desktop-prepare-{}",storage::now())})).map_err(|e|fail("assistant",e))
+    }).await.map_err(join_error)?
+}
+fn current_context(c:&Context)->Context {
+    let mut current=c.clone();
+    if let Ok(root)=storage::local_app_data(){if let Ok((bin,state))=launcher::resolve_release(&root.join("CodexPocket")){
+        if state==c.state{current.bin=bin;}
+    }}
+    current
 }
 #[tauri::command]
 pub async fn request_upgrade(context:State<'_,Context>)->Result<Value,OperationError>{
@@ -406,7 +470,7 @@ fn diagnostics(report:&Value,now:u64)->Value {
         "listenerReady":r["listenerReady"]==true,"outerConnected":r["outerConnected"]==true,"innerHandshake":r["innerHandshake"]==true,
         "activeSessions":r["activeSessions"].as_u64().unwrap_or(0),
         "failure":if r["failure"].is_object(){json!({"stage":choices(&r["failure"]["stage"],&["lan_bind","mdns_start","mdns_service","mdns_register","mdns_announce","mdns_monitor","network_inventory"]),"code":choices(&r["failure"]["code"],&["listener_bind_failed","discovery_bind_failed","discovery_multicast_failed","discovery_queue_full","discovery_stopped","discovery_invalid_service","discovery_announcement_unconfirmed","discovery_failed","network_inventory_failed"]),"osCode":r["failure"]["osCode"].as_i64()})}else{Value::Null}})).collect();
-    json!({"schema":3,"version":env!("CARGO_PKG_VERSION"),"exportedAt":now,"remoteEnabled":report["desired"],"supervisor":supervisor,"connection":connection,"installation":installation,"issues":report["issues"],"operationFailures":crate::operation_failures::public_history(&report["operationFailures"]),"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"],"startupStatus":choices(&report["startupStatus"],&["pending","known","unknown"]),"routeStatus":routes,
+    json!({"schema":3,"version":env!("CARGO_PKG_VERSION"),"exportedAt":now,"remoteEnabled":report["desired"],"supervisor":supervisor,"connection":connection,"installation":installation,"issues":report["issues"],"operationFailures":crate::operation_failures::public_history(&report["operationFailures"]),"updates":report["updates"],"assistantReadiness":{"ready":report["assistantReadiness"]["ready"]==true,"runtimeReady":report["assistantReadiness"]["runtimeReady"]==true},"runtimeReadiness":pocket_desktop_runtime::diagnostics::public_readiness(&report["runtimeReadiness"]),"runtimeCount":report["processes"].as_array().map(Vec::len).unwrap_or(0),"pairedDevices":report["devices"].as_array().map(Vec::len).unwrap_or(0),"startup":report["startup"],"startupStatus":choices(&report["startupStatus"],&["pending","known","unknown"]),"routeStatus":routes,
         "routePolicy":choices(&report["routes"]["policy"],&["automatic","lan","public"]),
         "tunnel":{"phase":choices(&report["connectivity"]["phase"],&["starting","stopped","stopping","failed","waiting_network","tunnel_connected"]),"enabled":report["connectivity"]["enabled"]==true,"mode":choices(&report["connectivity"]["mode"],&["off","quick","fixed"]),"hasPublicAddress":report["connectivity"]["publicUrl"].as_str().is_some_and(|s|!s.is_empty()),"updatedAt":report["connectivity"]["updatedAt"].as_u64()}})
 }

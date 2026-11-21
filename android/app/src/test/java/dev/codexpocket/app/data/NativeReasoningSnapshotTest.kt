@@ -11,7 +11,7 @@ class NativeReasoningSnapshotTest {
           {"id":"native-turn","status":"$status","items":$items}]}
     """))
 
-    @Test fun midTurnOpeningRetainsSummaryAfterItemCompletionAndLaterTool() {
+    @Test fun midTurnOpeningKeepsEarlierSummaryInDataButHidesItAfterLaterWork() {
         val state = snapshot("""[
           {"id":"native-reason","type":"reasoning","summary":["First paragraph","Second paragraph"],"content":["private"],"completedAtMs":200},
           {"id":"native-command","type":"commandExecution","command":"check","status":"inProgress"}]
@@ -19,12 +19,11 @@ class NativeReasoningSnapshotTest {
         val item = state.items.values.first()
         assertFalse(item.liveStarted)
         assertTrue(item.complete)
-        val summary = ConversationPresentation.liveReasoning(state)!!
-        assertEquals(item.key, summary.key)
-        assertEquals(listOf("First paragraph", "Second paragraph"), summary.summaryParts)
+        assertNull(ConversationPresentation.liveReasoning(state))
+        assertEquals(listOf("First paragraph", "Second paragraph"), item.summaryParts)
         assertEquals(ConversationPresentation.LiveStatus.Working, ConversationPresentation.liveStatus(state))
         assertFalse(ConversationPresentation.rows(state).flatMap { it.items }.any { it.type == "reasoning" })
-        assertEquals(summary, ConversationPresentation.liveReasoning(snapshot("""[
+        assertNull(ConversationPresentation.liveReasoning(snapshot("""[
           {"id":"native-reason","type":"reasoning","summary":["First paragraph","Second paragraph"],"content":["private"],"completedAtMs":200},
           {"id":"native-command","type":"commandExecution","command":"check","status":"inProgress"}]
         """)))

@@ -1,7 +1,125 @@
 use super::*;
 use std::collections::BTreeMap;
 
+#[cfg(windows)]
+#[path = "release_trace.rs"]
+mod release_trace;
+
+/// Read-only diagnostic for a live, explicitly marked disposable fixture. It
+/// exercises the supervisor's release proof without issuing native/control RPC.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a live marked handoff fixture"]
+fn combined_handoff_release_evidence_probe() {
+    let root = PathBuf::from(std::env::var_os("POCKET_HANDOFF_DIAGNOSTIC_FIXTURE").expect("explicit fixture root"));
+    storage::unredirected(&root).unwrap();
+    assert!(root.is_absolute() && root.join(".fixture-owner").is_file());
+    let state = root.join("install/isolated state");
+    let status = super::super::read_status(&state).unwrap().unwrap();
+    assert_eq!(status.install_root, root.join("install"));
+    assert_eq!(status.state_directory, state);
+    let journal = maintenance::read_status(&state).unwrap().unwrap();
+    for identity in [&journal.request.supervisor, &journal.request.coordinator].into_iter().chain(journal.request.child.iter()) {
+        assert!(identity.executable.starts_with(&root), "fixture identity escaped root");
+    }
+    let mut request = journal.request;
+    request.action = Action::Release;
+    match release_proven(&state, &request) {
+        Ok(()) => println!("release-evidence=accepted"),
+        Err(error) => panic!("release-evidence=rejected: {error:#}"),
+    }
+}
+
 struct Files;
+/// Reads only the selected on-disk checkpoint; no control RPC or process action.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an explicitly selected real update state"]
+fn readonly_failed_checkpoint_diagnostic() {
+    let state = PathBuf::from(std::env::var_os("POCKET_QA_CHECKPOINT_STATE").unwrap());
+    let s = super::super::read_status(&state).unwrap().unwrap();
+    let mut a = Windows;
+    let d = load(&mut a, &s).unwrap();
+    let disk = agent_record(&mut a, &state).unwrap();
+    for id in [&s.operation_id, &d.active_id] {
+        let op = disk.operations.get(id).unwrap();
+        let cp = op.receipt.checkpoint.as_ref().unwrap();
+        let bytes = a.read(&state.join("handoff").join(format!("{}.json",cp.id)),MAX_IMAGE).unwrap();
+        let envelope: ImageEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let entries = envelope.snapshot["ledger"]["entries"].as_array().unwrap();
+        let result = image(&mut a, &state, cp, &d.computer_id);
+        println!("operation={id} phase={} release_input={} shutdown={} entries={} unknown={} submitted={} image={}",
+            op.receipt.phase,op.release_input.is_some(),op.receipt.shutdown_requested,entries.len(),
+            entries.iter().filter(|e|e["status"]=="Unknown").count(),
+            entries.iter().filter(|e|e["status"]=="Submitted").count(),
+            result.map(|_|"accepted".to_string()).unwrap_or_else(|e|format!("{e:#}")));
+    }
+    println!("cancelled_source={}", cancelled_before_release(&mut a,&s)
+        .map(|_|"verified".to_owned()).unwrap_or_else(|e|format!("{e:#}")));
+}
+
+fn unknown_entry() -> Value {
+    json!({"key":{"caller_id":"fixture","command_id":"retained-unknown"},"fingerprint":vec![7;32],
+        "status":"Unknown","generation":1,"created_at":1,"finished_at":null})
+}
+
+#[test]
+fn checkpoint_preserves_identified_unknown_tombstones_without_allowing_submitted_writes() {
+    let dir = state();
+    let mut snap = snapshot(dir.path());
+    snap["ledger"]["entries"] = json!([unknown_entry()]);
+    let cp = write_image(dir.path(), snap.clone());
+    let read = image(&mut Files, dir.path(), &cp, "fixture-computer").unwrap();
+    assert_eq!(read["ledger"],snap["ledger"]);
+    successor(&snap,&read).unwrap();
+    for replacement in [json!([]), json!([{ "status":"Accepted" }])] {
+        let mut changed=read.clone();changed["ledger"]["entries"]=replacement;
+        assert!(successor(&snap,&changed).is_err());
+    }
+    snap["ledger"]["entries"][0]["status"]=json!("Submitted");
+    let cp=write_image(dir.path(),snap);
+    assert!(image(&mut Files,dir.path(),&cp,"fixture-computer").is_err());
+}
+#[cfg(windows)]
+#[test]
+fn release_ack_retries_real_private_journal_sharing_failure_without_releasing_again() {
+    use std::os::windows::fs::OpenOptionsExt;
+    struct LockedAck {fake:Fake,hold:Option<std::fs::File>,reads:u32}
+    impl Adapter for LockedAck {
+        fn capture(&mut self,pid:u32)->Result<ProcessIdentity>{self.fake.capture(pid)}
+        fn presence(&mut self,p:&ProcessIdentity)->maintenance::Presence{self.fake.presence(p)}
+        fn read(&mut self,p:&Path,n:u64)->Result<Vec<u8>>{self.fake.read(p,n)}
+        fn rpc(&mut self,s:&Path,m:&str,p:Value)->Result<Value>{self.fake.rpc(s,m,p)}
+        fn spawn(&mut self,s:&UpgradeStatus,g:&str,c:&CheckpointRef,r:bool)->Result<u32>{self.fake.spawn(s,g,c,r)}
+        fn submit(&mut self,s:&Path,r:&Request)->Result<()>{self.fake.submit(s,r)}
+        fn tick(&mut self){}
+        fn ack(&mut self,state:&Path)->Result<Option<Journal>> {
+            self.reads+=1;
+            if self.hold.is_some(){
+                let result=maintenance::read_status(state);
+                let error=result.as_ref().unwrap_err();
+                assert_eq!(error.downcast_ref::<std::io::Error>().and_then(|e|e.raw_os_error()),Some(32));
+                println!("releasing_supervisor: real private maintenance journal read -> OS32");
+                self.hold.take();return result;
+            }
+            self.fake.ack(state)
+        }
+    }
+    let mut fake=Fake::new();let s=fake.s.clone();let mut d=begin(&mut fake,&s).unwrap();
+    ack(&mut fake,&s,&d,Action::Enter).unwrap();
+    fake.live.insert(d.current.agent.pid,maintenance::Presence::Gone);
+    d.stage="releasing_supervisor".into();
+    let path=storage::control(&s.state_directory).join("maintenance.json");
+    maintenance::write_private(&path,fake.journal.as_ref().unwrap()).unwrap();
+    let hold=std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+    let mut a=LockedAck{fake,hold:Some(hold),reads:0};
+    let result=ack(&mut a,&s,&d,Action::Release);
+    if let Err(error)=&result {maintenance::release_diagnostic(&s.state_directory,&request(&s,&d,Action::Release),"coordinator",&d.stage,error,json!({})).unwrap();}
+    assert!(result.is_ok(),"a temporary OS32 read entered rollback after the exact agent had exited: {result:?}");
+    assert_eq!(a.reads,2);
+    assert_eq!(a.fake.events.iter().filter(|e|e.as_str()=="maintenance/Release").count(),1);
+    assert!(!a.fake.rpc_requests.iter().any(|(m,_)|m=="upgrade/release"));
+}
 impl Adapter for Files {
     fn capture(&mut self, pid: u32) -> Result<ProcessIdentity> {
         Ok(ProcessIdentity {
@@ -162,6 +280,12 @@ fn complete_inventory_refuses_traversal_case_aliases_and_unlisted_payloads() {
     assert!(verify_generation_inventory(&bin).is_err());
 }
 struct Fake {
+    reject_one_release: bool,
+    submit_lock_conflicts: u32,
+    submit_access_denied: bool,
+    submit_attempts: u32,
+    defer_owned_recovery: bool,
+    pending_maintenance: Option<Request>,
     _root: tempfile::TempDir,
     s: UpgradeStatus,
     current: Owner,
@@ -230,6 +354,12 @@ impl Fake {
             .map(|p| (*p, maintenance::Presence::Alive))
             .collect();
         let mut f = Self {
+            reject_one_release: false,
+            submit_lock_conflicts: 0,
+            submit_access_denied: false,
+            submit_attempts: 0,
+            defer_owned_recovery: false,
+            pending_maintenance: None,
             _root: root,
             s,
             current,
@@ -263,7 +393,7 @@ impl Fake {
     fn cp(&mut self) -> CheckpointRef {
         let mut snap = snapshot(&self.s.state_directory);
         if self.unknown_inventory {
-            snap["ledger"]["entries"] = json!([{"status":"Unknown"}]);
+            snap["ledger"]["entries"] = json!([unknown_entry()]);
         }
         let mut cp = write_image(&self.s.state_directory, snap.clone());
         cp.generation = self.current.run.clone();
@@ -340,6 +470,16 @@ impl Adapter for Fake {
         Ok(())
     }
     fn submit(&mut self, _: &Path, r: &Request) -> Result<()> {
+        self.submit_attempts += 1;
+        if self.submit_access_denied {return Err(std::io::Error::from_raw_os_error(5).into())}
+        if self.submit_lock_conflicts > 0 {self.submit_lock_conflicts -= 1;return Err(std::io::Error::from_raw_os_error(33).into())}
+        if r.action == Action::Release && std::mem::take(&mut self.reject_one_release) {bail!("fixture first release rejected")}
+        ensure!(self.pending_maintenance.as_ref().is_none_or(|pending| pending == r), "Another maintenance request is pending");
+        if self.defer_owned_recovery && r.action == Action::Recover
+            && self.journal.as_ref().is_some_and(|j| j.phase == maintenance::Phase::Owned && j.request.coordinator == r.coordinator) {
+            self.pending_maintenance = Some(r.clone());
+            return Ok(());
+        }
         self.events.push(format!("maintenance/{:?}", r.action));
         if r.action == Action::Cancel && self.maintenance_cancel_error {
             bail!("fixture maintenance cancel unavailable");
@@ -372,7 +512,7 @@ impl Adapter for Fake {
         self.events.push(method.into());
         self.rpc_requests.push((method.into(), p.clone()));
         match method {
-            "status" => {
+            "status" | "helper/health" => {
                 let run = if self.stale_status_generation {
                     uuid::Uuid::new_v4().to_string()
                 } else {
@@ -538,6 +678,75 @@ impl Adapter for Fake {
         Ok(pid)
     }
 }
+fn cancelled_inventory_fixture() -> (Fake, UpgradeStatus, Durable) {
+    let mut f=Fake::new();f.unknown_inventory=true;
+    let mut s=f.s.clone();
+    let mut d=begin(&mut f,&s).unwrap();
+    ack(&mut f,&s,&d,Action::Enter).unwrap();
+    ready(&mut f,&s,&d).unwrap();
+    get_receipt(&mut f,&s,&d,"upgrade/cancel",None).unwrap();
+    d.active_id=d.verify_id.clone();
+    ready(&mut f,&s,&d).unwrap();
+    cancel_recovery_inventory(&mut f,&s,&d).unwrap();
+    save_stage(&mut f,&s,&mut d,"recovery_verifying").unwrap();
+    f.live.insert(d.coordinator.pid,maintenance::Presence::Gone);
+    s.phase=super::super::Phase::Failed;
+    s.failure=Some(super::super::Failure::RollbackFailed);
+    (f,s,d)
+}
+#[test]
+fn cancelled_pre_release_recovery_reads_the_source_without_replaying_or_fencing() {
+    let (mut f,s,_)=cancelled_inventory_fixture();
+    f.events.clear();
+    let handoff=std::fs::read(s.state_directory.join("handoff/state.json")).unwrap();
+    let context=std::fs::read(context_path(&s)).unwrap();
+    let v=cancelled_before_release(&mut f,&s).unwrap();
+    assert_eq!(v.generation,s.from_generation);
+    assert!(v.native_tasks_preserved);
+    assert!(f.events.iter().all(|event|matches!(event.as_str(),"helper/health"|"upgrade/capabilities"|"upgrade/status"|"routes/read")));
+    assert_eq!(std::fs::read(s.state_directory.join("handoff/state.json")).unwrap(),handoff);
+    assert_eq!(std::fs::read(context_path(&s)).unwrap(),context);
+}
+#[test]
+fn cancelled_recovery_rejects_release_spawn_live_coordinator_and_identity_uncertainty() {
+    for fault in ["release","shutdown","spawn","stage","coordinator_alive","coordinator_unknown","agent_identity","pending_maintenance","cancel_missing"] {
+        let (mut f,s,mut d)=cancelled_inventory_fixture();
+        match fault {
+            "release"=>{
+                let path=s.state_directory.join("handoff/state.json");
+                let mut record:Value=storage::read(&path).unwrap();
+                record["operations"][&s.operation_id]["releaseInput"]=json!(f.receipts[&s.operation_id].checkpoint);
+                storage::atomic(&path,&record).unwrap();
+            }
+            "shutdown"=>{f.receipts.get_mut(&s.operation_id).unwrap().shutdown_requested=true;f.persist_agent();}
+            "spawn"=>{d.spawn_pid=Some(20);f.save(&s,&d).unwrap();}
+            "stage"=>{d.stage="releasing_agent".into();f.save(&s,&d).unwrap();}
+            "coordinator_alive"=>{f.live.insert(d.coordinator.pid,maintenance::Presence::Alive);}
+            "coordinator_unknown"=>{f.live.insert(d.coordinator.pid,maintenance::Presence::Unknown);}
+            "agent_identity"=>f.bad_identity=true,
+            "pending_maintenance"=>std::fs::write(storage::control(&s.state_directory).join("maintenance-request.json"),b"pending").unwrap(),
+            "cancel_missing"=>{f.journal.as_mut().unwrap().phase=maintenance::Phase::Owned;}
+            _=>unreachable!(),
+        }
+        f.events.clear();
+        assert!(cancelled_before_release(&mut f,&s).is_err(),"{fault}");
+        assert!(!f.events.iter().any(|e|e.starts_with("spawn/")||e.starts_with("maintenance/")||matches!(e.as_str(),"upgrade/quiesce"|"upgrade/cancel"|"upgrade/release")));
+    }
+}
+#[test]
+fn recovery_can_verify_and_cancel_a_checkpoint_with_retained_unknown_tombstones() {
+    let mut f=Fake::new();f.unknown_inventory=true;
+    let s=f.s.clone();let mut d=begin(&mut f,&s).unwrap();
+    ack(&mut f,&s,&d,Action::Enter).unwrap();
+    ready(&mut f,&s,&d).unwrap();
+    save_stage(&mut f,&s,&mut d,"quiescing").unwrap();
+    assert_eq!(rollback(&mut f,&s).unwrap().generation,s.from_generation);
+    let restored=load(&mut f,&s).unwrap();
+    let read=image(&mut f,&s.state_directory,restored.ready.as_ref().unwrap(),&restored.computer_id).unwrap();
+    assert_eq!(read["ledger"]["entries"],json!([unknown_entry()]));
+    assert_eq!(f.journal.as_ref().unwrap().phase,maintenance::Phase::Cancelled);
+    assert!(!f.events.iter().any(|e|e.starts_with("spawn/")||e=="upgrade/release"));
+}
 #[test]
 fn source_status_capabilities_and_admission_must_match_the_live_owner() {
     for fenced in [false, true] {
@@ -548,6 +757,122 @@ fn source_status_capabilities_and_admission_must_match_the_live_owner() {
         assert!(begin(&mut f, &s).is_err());
         assert!(!f.events.iter().any(|v| v.starts_with("maintenance/")));
     }
+}
+
+#[test]
+fn combined_handoff_owned_recovery_must_not_leave_a_conflicting_release_mailbox() {
+    let mut f = Fake::new();
+    let s = f.s.clone();
+    let d = begin(&mut f, &s).unwrap();
+    ack(&mut f, &s, &d, Action::Enter).unwrap();
+    f.defer_owned_recovery = true;
+    ack(&mut f, &s, &d, Action::Recover).unwrap();
+    assert!(f.pending_maintenance.is_none(), "An already-owned recovery returned before its queued request was consumed; Release now conflicts");
+    assert_eq!(f.journal.as_ref().unwrap().phase, maintenance::Phase::Owned);
+}
+
+#[test]
+fn combined_handoff_owned_recovery_does_not_acknowledge_an_uncertain_owner() {
+    for supervisor in [true, false] {
+        let mut f = Fake::new();
+        let s = f.s.clone();
+        let d = begin(&mut f, &s).unwrap();
+        ack(&mut f, &s, &d, Action::Enter).unwrap();
+        let identity = if supervisor { &d.current.supervisor } else { &d.coordinator };
+        f.live.insert(identity.pid, maintenance::Presence::Unknown);
+        let submitted = f.submit_attempts;
+        assert!(ack(&mut f, &s, &d, Action::Recover).is_err());
+        assert_eq!(f.submit_attempts, submitted);
+        assert_eq!(f.journal.as_ref().unwrap().phase, maintenance::Phase::Owned);
+        assert!(f.pending_maintenance.is_none());
+    }
+}
+
+#[test]
+fn combined_handoff_release_failure_recovers_the_old_generation_without_resending_native_release() {
+    let mut f=Fake::new();let mut s=f.s.clone();let mut d=begin(&mut f,&s).unwrap();
+    let original=d.current.clone();
+    ack(&mut f,&s,&d,Action::Enter).unwrap();
+    let cp=ready(&mut f,&s,&d).unwrap();d.ready=Some(cp.clone());
+    s.checkpoint=Some(checkpoint(&s,&cp));f.save(&s,&d).unwrap();
+    f.reject_one_release=true;f.defer_owned_recovery=true;
+    assert!(stopped(&mut f,&s,&mut d).is_err());
+    assert_eq!(f.presence(&original.agent),maintenance::Presence::Gone);
+    s.phase=super::super::Phase::RollingBack;
+    assert_eq!(rollback(&mut f,&s).unwrap().generation,s.from_generation);
+    assert!(f.pending_maintenance.is_none());
+    assert_eq!(f.presence(&original.supervisor),maintenance::Presence::Gone);
+    assert_eq!(f.current.generation,s.from_generation);
+    assert_eq!(f.rpc_requests.iter().filter(|(method,_)|method=="upgrade/release").count(),1);
+}
+
+#[cfg(windows)]
+#[test]
+fn combined_handoff_submit_retries_lock_contention_but_not_permission_failure() {
+    let mut f=Fake::new();let s=f.s.clone();let d=begin(&mut f,&s).unwrap();
+    f.submit_lock_conflicts=1;
+    ack(&mut f,&s,&d,Action::Enter).unwrap();
+    assert_eq!(f.submit_attempts,2);
+    assert_eq!(f.events.iter().filter(|event|event.as_str()=="maintenance/Enter").count(),1);
+    f.submit_access_denied=true;
+    let attempts=f.submit_attempts;
+    assert!(ack(&mut f,&s,&d,Action::Cancel).is_err());
+    assert_eq!(f.submit_attempts,attempts+1);
+    assert_eq!(f.journal.as_ref().unwrap().phase,maintenance::Phase::Owned);
+}
+
+#[cfg(windows)]
+#[test]
+fn combined_handoff_release_intent_survives_temporary_checkpoint_sharing_conflict() {
+    release_contention_case(false);
+}
+#[cfg(windows)]
+#[test]
+fn combined_handoff_changed_checkpoint_after_contention_never_releases_owner() {
+    release_contention_case(true);
+}
+#[cfg(windows)]
+fn release_contention_case(tamper:bool) {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut f = Fake::new();
+    let mut s = f.s.clone();
+    let mut d = begin(&mut f, &s).unwrap();
+    // This protocol fixture has no live source child. u32::MAX is rejected by
+    // Win32 as an absent process; no real process is started, stopped or adopted.
+    d.current.agent.pid = u32::MAX;
+    let cp = f.cp();
+    d.ready = Some(cp.clone());
+    d.final_checkpoint = Some(cp.clone());
+    f.receipts.insert(d.active_id.clone(), Receipt {protocol:1,id:d.active_id.clone(),generation:d.current.run.clone(),phase:"released".into(),safe_to_exit:true,native_tasks_preserved:true,remote_enabled:false,accepting_writes:false,unconfirmed_writes:0,blockers:vec![],checkpoint:Some(cp.clone()),shutdown_requested:true});
+    f.persist_agent();
+    f.save(&s,&d).unwrap();
+    s.phase = super::super::Phase::Releasing;
+    s.checkpoint = Some(checkpoint(&s,&cp));
+    storage::atomic(&storage::control(&s.state_directory).join("upgrade.json"),&s).unwrap();
+    let release = request(&s,&d,Action::Release);
+    let mut enter = release.clone();enter.action=Action::Enter;
+    maintenance::write_private(&storage::control(&s.state_directory).join("maintenance.json"),&Journal {request:enter,phase:maintenance::Phase::Owned}).unwrap();
+    maintenance::submit(&s.state_directory,&release).unwrap();
+    let path=s.state_directory.join("handoff").join(format!("{}.json",cp.id));
+    let hold=std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+    let mut gate=maintenance::Gate::default();
+    let poll=|gate:&mut maintenance::Gate| gate.test_poll_with(&s.state_directory,Some(&release.from_generation),None,|_|Ok(release.supervisor.clone()),|p|if release.child.as_ref()==Some(p){maintenance::Presence::Gone}else{maintenance::Presence::Alive});
+    poll(&mut gate);
+    assert!(gate.blocks_respawn());
+    assert_eq!(gate.journal.as_ref().unwrap().phase,maintenance::Phase::Owned);
+    assert!(storage::control(&s.state_directory).join("maintenance-request.json").exists(), "A temporary proof read failure erased the only durable release intent");
+    drop(hold);
+    if tamper {std::fs::write(&path,b"changed immutable checkpoint").unwrap();}
+    poll(&mut gate);
+    if tamper {
+        assert_eq!(gate.journal.as_ref().unwrap().phase,maintenance::Phase::Owned);
+        assert_eq!(gate.error,Some(maintenance::Failure::RequestRejected));
+        assert!(gate.blocks_respawn());
+    } else {
+        assert_eq!(gate.journal.as_ref().unwrap().phase,maintenance::Phase::Released);
+        assert!(gate.error.is_none());
+    }
+    assert!(!storage::control(&s.state_directory).join("maintenance-request.json").exists());
 }
 #[test]
 fn startup_request_is_consumed_by_durable_adoption_even_without_a_health_poll() {
@@ -737,6 +1062,36 @@ fn full_local_sequence_orders_maintenance_final_bytes_exit_locks_and_verificatio
     assert!(position("maintenance/Release") < position("locks_free"));
     assert!(!f.remote);
     assert_eq!(d.stage, "verified");
+}
+#[test]
+fn owner_verification_uses_health_without_requesting_native_lifecycle() {
+    struct HealthOnly(Fake);
+    impl Adapter for HealthOnly {
+        fn capture(&mut self, p:u32)->Result<ProcessIdentity>{self.0.capture(p)}
+        fn presence(&mut self,p:&ProcessIdentity)->maintenance::Presence{self.0.presence(p)}
+        fn read(&mut self,p:&Path,n:u64)->Result<Vec<u8>>{self.0.read(p,n)}
+        fn rpc(&mut self,s:&Path,m:&str,p:Value)->Result<Value>{
+            ensure!(m!="status","owner verification requested an OS/native lifecycle scan");
+            if m=="helper/health" {
+                ensure!(p==json!({}),"health must be a parameterless read");
+                self.0.rpc(s,"status",p)
+            }else{self.0.rpc(s,m,p)}
+        }
+        fn spawn(&mut self,s:&UpgradeStatus,g:&str,c:&CheckpointRef,r:bool)->Result<u32>{self.0.spawn(s,g,c,r)}
+        fn submit(&mut self,s:&Path,r:&Request)->Result<()>{self.0.submit(s,r)}
+        fn ack(&mut self,s:&Path)->Result<Option<Journal>>{self.0.ack(s)}
+        fn locks_free(&mut self,s:&UpgradeStatus)->Result<()>{self.0.locks_free(s)}
+        fn tick(&mut self){}
+    }
+    let mut a=HealthOnly(Fake::new());let mut s=a.0.s.clone();
+    let mut d=begin(&mut a,&s).expect("identity read must not depend on OS scan latency");
+    ack(&mut a,&s,&d,Action::Enter).unwrap();let cp=ready(&mut a,&s,&d).unwrap();
+    d.ready=Some(cp.clone());a.save(&s,&d).unwrap();s.checkpoint=Some(checkpoint(&s,&cp));
+    stopped(&mut a,&s,&mut d).unwrap();launch(&mut a,&s,&mut d,&s.to_generation).unwrap();
+    assert!(verify(&mut a,&s,&mut d,&s.to_generation).unwrap().routes_read);
+    assert_eq!(d.stage,"verified");
+    assert!(a.0.events.iter().any(|m|m=="upgrade/quiesce"));
+    assert!(a.0.events.iter().any(|m|m=="upgrade/release"));
 }
 #[test]
 fn candidate_routes_failure_gracefully_rolls_back_and_repeated_rollback_is_read_only() {

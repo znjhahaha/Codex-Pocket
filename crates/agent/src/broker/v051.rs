@@ -146,18 +146,42 @@ impl Broker {
                     let (state, reason) = crate::capabilities::permission_discovery(&status);
                     let parsed = status
                         .get("nativeCapabilities")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        .and_then(|v| serde_json::from_value::<crate::capabilities::Capabilities>(v.clone()).ok());
                     if state == "ready" && parsed.is_none() {
                         unavailable = Some(("error", "native_schema_failed"));
                     }
                     let caps = parsed.unwrap_or_default();
+                    // The permission panel describes this read, independently of
+                    // the capabilities already confirmed for conversation writes.
+                    if state == "ready" && unavailable.is_none()
+                        && !caps.supports(
+                            "thread/settings/update",
+                            &crate::permission_policy::preset(thread, "request").unwrap(),
+                        ) && !caps.supports(
+                            "thread/settings/update",
+                            &json!({"threadId":thread,"permissions":"profile"}),
+                        )
+                    {
+                        unavailable = Some(("unsupported", "native_unsupported"));
+                    }
                     let mut s = self.state.lock().await;
                     let r = s
                         .runtimes
-                        .get_mut(runtime)
+                        .get(runtime)
                         .filter(|r| r.connection_id == generation && r.rpc.online())
                         .ok_or(RpcFailure::Disconnected)?;
-                    r.capabilities = caps;
+                    // A slow permission read must not erase a newer ready event.
+                    // Only fill missing native discovery from a complete ready
+                    // snapshot, through the broker's identity/readiness guard.
+                    let fills_discovery = r.capabilities.0.is_empty()
+                        && !r.role.is_auxiliary()
+                        && status["initialized"] == true
+                        && status["schemaState"] == "ready"
+                        && status["schemaPending"] != true
+                        && caps.supports("thread/read", &json!({"threadId":"probe","includeTurns":false}));
+                    if fills_discovery && Self::apply_desktop_status(&mut s, runtime, &generation, &status) {
+                        let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&s)}}));
+                    }
                     if state != "ready" {
                         unavailable = Some((state, reason));
                     }
@@ -613,6 +637,134 @@ fn context_envelope(runtime: &str, thread: &str, mut v: Value) -> Value {
 mod tests {
     use super::super::tests::{finish, fixture, loaded, peer};
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_backend_permission_late_pending_reply_preserves_ready_queue() {
+        for initialized in [false, true] {
+            let (_dir, b, mut native) = permission_fixture().await;
+            let caps = {
+                let mut state = b.state.lock().await;
+                let runtime = state.runtimes.get_mut("r").unwrap();
+                runtime.source = "desktop".into();
+                runtime.desktop_initialized = Some(false);
+                runtime.inventory_ready = false;
+                std::mem::take(&mut runtime.capabilities)
+            };
+            let reading = tokio::spawn({
+                let b = b.clone();
+                async move { b.request("phone", "thread/permissions/read", json!({"runtimeId":"r","threadId":"t"})).await }
+            });
+            let status = native.recv().await;
+            assert_eq!(status["method"], "pocket/status");
+            let mut events = b.subscribe();
+            native.send(json!({"method":"pocket/runtimeStatus","params":{"runtimeId":"r","initialized":true,"schemaPending":false,"schemaState":"ready","nativeCapabilities":caps}})).await;
+            let ready = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+            assert_eq!(ready["method"], "runtimes/changed");
+            native.reply(&status, json!({"runtimeId":"r","initialized":initialized,"schemaPending":true,"schemaState":"initializing","permissionProtocol":1,"nativeCapabilities":{}})).await;
+            assert_eq!(finish(reading).await.unwrap()["status"], "initializing");
+            {
+                let state = b.state.lock().await;
+                assert_eq!(state.runtimes["r"].desktop_initialized, Some(true));
+                assert_eq!(state.runtimes["r"].capabilities.0, caps.0);
+            }
+            let sending = tokio::spawn({
+                let b = b.clone();
+                async move { b.request("phone", "codex/request", json!({"commandId":"ready-queue","runtimeId":"r","method":"thread/queue/add","params":{"threadId":"t","clientUserMessageId":"fixture-message","input":[{"type":"text","text":"fixture"}]}})).await }
+            });
+            loaded(&mut native, &["t"]).await;
+            let queued = native.recv().await;
+            assert_eq!(queued["method"], "thread/queue/add");
+            native.reply(&queued, json!({"id":"queued"})).await;
+            assert_eq!(finish(sending).await.unwrap()["id"], "queued");
+            native.assert_idle().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_backend_permission_unusable_schema_keeps_ready_capabilities() {
+        for (schema, expected) in [(Value::Null, "error"), (json!({}), "unsupported")] {
+            let (_dir, b, mut native) = permission_fixture().await;
+            let caps = {
+                let mut state = b.state.lock().await;
+                let runtime = state.runtimes.get_mut("r").unwrap();
+                runtime.source = "desktop".into();
+                runtime.desktop_initialized = Some(true);
+                runtime.capabilities.clone()
+            };
+            let reading = tokio::spawn({
+                let b = b.clone();
+                async move { b.request("phone", "thread/permissions/read", json!({"runtimeId":"r","threadId":"t"})).await }
+            });
+            let status = native.recv().await;
+            assert_eq!(status["method"], "pocket/status");
+            native.reply(&status, json!({"runtimeId":"r","initialized":true,"schemaPending":false,"schemaState":"ready","permissionProtocol":1,"nativeCapabilities":schema})).await;
+            assert_eq!(finish(reading).await.unwrap()["status"], expected);
+            assert_eq!(b.state.lock().await.runtimes["r"].capabilities.0, caps.0);
+            native.assert_idle().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_backend_permission_initializing_does_not_publish_schema() {
+        let (_dir, b, mut native) = permission_fixture().await;
+        let caps = {
+            let mut state = b.state.lock().await;
+            let runtime = state.runtimes.get_mut("r").unwrap();
+            runtime.source = "desktop".into();
+            runtime.desktop_initialized = Some(false);
+            runtime.inventory_ready = false;
+            std::mem::take(&mut runtime.capabilities)
+        };
+        let reading = tokio::spawn({
+            let b = b.clone();
+            async move { b.request("phone", "thread/permissions/read", json!({"runtimeId":"r","threadId":"t"})).await }
+        });
+        let status = native.recv().await;
+        native.reply(&status, json!({"runtimeId":"r","initialized":false,"schemaPending":false,"schemaState":"ready","permissionProtocol":1,"nativeCapabilities":caps})).await;
+        assert_eq!(finish(reading).await.unwrap()["status"], "initializing");
+        {
+            let state = b.state.lock().await;
+            assert!(state.runtimes["r"].capabilities.0.is_empty());
+            assert_eq!(state.runtimes["r"].desktop_initialized, Some(false));
+            assert!(!state.runtimes["r"].inventory_ready);
+        }
+        native.assert_idle().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_backend_permission_ready_read_fills_missing_schema() {
+        let (_dir, b, mut native) = permission_fixture().await;
+        let caps = {
+            let mut state = b.state.lock().await;
+            let runtime = state.runtimes.get_mut("r").unwrap();
+            runtime.source = "desktop".into();
+            runtime.desktop_initialized = Some(false);
+            std::mem::take(&mut runtime.capabilities)
+        };
+        let mut events = b.subscribe();
+        let reading = tokio::spawn({
+            let b = b.clone();
+            async move { b.request("phone", "thread/permissions/read", json!({"runtimeId":"r","threadId":"t"})).await }
+        });
+        let status = native.recv().await;
+        native.reply(&status, json!({"runtimeId":"r","initialized":true,"schemaPending":false,"schemaState":"ready","permissionProtocol":1,"nativeCapabilities":caps})).await;
+        let proof = native.recv().await;
+        assert_eq!(proof["method"], "thread/read");
+        native.reply(&proof, json!({"thread":{"id":"t"}})).await;
+        let settings = native.recv().await;
+        assert_eq!(settings["method"], "pocket/threadSettings");
+        native.reply(&settings, json!({"threadId":"t","known":true,"settings":crate::permission_policy::preset("t", "request").unwrap()})).await;
+        assert_eq!(finish(reading).await.unwrap()["status"], "ready");
+        {
+            let state = b.state.lock().await;
+            assert_eq!(state.runtimes["r"].desktop_initialized, Some(true));
+            assert_eq!(state.runtimes["r"].capabilities.0, caps.0);
+        }
+        let changed = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        assert_eq!(changed["method"], "runtimes/changed");
+        native.assert_idle().await;
+    }
+
     fn usage(n: u64) -> Value {
         json!({"last":{"inputTokens":n,"outputTokens":2,"totalTokens":n+2},"total":{"inputTokens":100,"outputTokens":20,"totalTokens":120},"modelContextWindow":1000})
     }

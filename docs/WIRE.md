@@ -72,6 +72,22 @@ Unknown native errors remain conservative. Diagnostics and prior rejected-result
 
 While any `unknown` command remains in the journal (`uncertainSend`), mutating chat actions stay disabled with the reason "先确认上一条消息的发送结果" until the user runs 核对原生历史.
 
-## Answer directives
+## Persisted history and explicit takeover (2026-11-17)
+
+Windows helpers that advertise `runtime.ensure.cli` support `runtime/ensure` with `source: cli` to prepare the configured default profile for a new CLI chat. The broker reuses a verified shared daemon or asks the native CLI to start it; this never resumes a thread. `starting_cli` means startup was accepted, not that a runtime is ready. The client polls `runtimes/list` for a ready runtime in the returned `configStoreId` (and the returned `runtimeId` when present) before creating the chat. Existing `source: desktop` requests are unchanged.
+
+`threads/list` also includes configured profiles whose native runtime is offline. Rows are deduplicated by computer/configuration store/native thread ID and may use `runtimeId = history:<configStoreId>`. The extra fields `readable`, `controllable`, `controlReason`, `nativeSource`, and `ownerRuntimeId` are additive. A history alias is a read route, never permission to send. Existing ownership/conflict checks still govern all writes. Private assistant threads are excluded.
+
+`threads/history/read` is a read operation. Parameters are `configStoreId`, `threadId`, optional `computerId`, `cursor`, and `limit` (1–100, default 20). It returns `thread`, a chronological `data` page of turns, `nextCursor`, `historyState`, `readOnly: true`, and `readSource: persisted`. Cursors are opaque and bound to profile/thread. Empty history is distinguished from missing or unknown storage via `historyState` or `native_history_unavailable`; opening this route never starts/resumes native execution. Images are projected to existing authenticated `thread/media/read` references with the persisted history alias.
+
+`threads/control/read` locates the existing execution owner without starting or resuming a thread. Parameters are `configStoreId`, `threadId`, and optional `computerId`. It returns `runtimeId` and a fresh `runtimes` inventory, or a null ID with `reason`. On supported Windows desktop builds the helper verifies the registered package's named-pipe peer, original thread, loaded state and profile before attaching a `desktopFollower` runtime. Clients retain the same ThreadKey, drafts and paginated history; permissions and writes use the returned runtime. A cached desktop owner whose native thread is not loaded does not grant control. Forwarding timeout/disconnection remains an unknown mutation outcome and must not be replayed.
+
+Desktop follower snapshots publish `thread/settings/updated` only when the canonical settings change. Unchanged approval polls must not trigger permission reloads. Valid `latestTokenUsageInfo` is exposed through `thread/context/read` and the existing `thread/tokenUsage/updated` event; `last` describes the latest model request, `total` contains cumulative usage, and `modelContextWindow` is the reported capacity. Missing or invalid counters do not replace an existing verified snapshot. Background permission reads retain the confirmed mobile display while the next authoritative readback is pending.
+
+`threads/takeover` is a durable mutation, requiring the existing command ID/reconciliation rules. Parameters identify the same `configStoreId`, `threadId`, and optional `computerId`. `phase: ready` returns the verified `runtimeId` and `canSend: true`; `waiting_release` or `waiting_idle` returns a reason and `canSend: false`. Clients preserve the draft and do not resend a turn on these waiting responses. External process release, native capability, ownership, idle state, and connection generation are checked before resuming. Uncertain post-dispatch failures use the existing unknown-operation handling.
+
+`assistant/artifact/read` is a read operation on an existing assistant actor. Parameters are `artifactId` and optional byte `offset`. Replies bind `artifactId`, immutable `version`, `sha256`, `mimeType`, `name`, `sizeBytes`, `offset`, base64 `data`, and `eof`; a chunk is at most 192 KiB. Clients validate identity, version, ordered offsets, total size and final SHA256 and discard a download after computer/connection changes. The route does not grant filesystem paths or execution authority.
+
+## Native answer rendering
 
 Native agent messages may contain `:codex-<name>{key="value" ...}` or `::codex-<name>{...}` directives. The phone strips them outside fenced code. `codex-file-citation` entries become file chips (deduplicated by path); other directive names are dropped from display. Directives inside code fences are shown verbatim.

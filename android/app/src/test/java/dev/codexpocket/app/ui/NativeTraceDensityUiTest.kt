@@ -38,10 +38,11 @@ class NativeTraceDensityUiTest {
         compose.onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isNotEmpty()
     }
 
-    @Test fun rawCommandRowAndFoldedHeaderUse32dpAndKeepTrailingChevron() {
+    @Test fun scriptCommandRowAndFoldedHeaderUse32dpAndKeepTrailingChevron() {
         val command = item("""{"id":"command","type":"commandExecution","command":"pwsh.exe -NoProfile -Command 'Get-Content README.md'","status":"completed","exitCode":0}""")
         content { NativeActivityTrace(TranscriptRow("row", TranscriptKind.Activity, listOf(command)), "test", false, {}, {}) }
-        waitText("pwsh.exe -NoProfile")
+        waitText("Get-Content README.md")
+        compose.onNodeWithText("pwsh.exe", substring = true).assertDoesNotExist()
         val row = compose.onNodeWithTag("activity-toggle:${command.key}").fetchSemanticsNode().boundsInRoot
         assertEquals(32f * density, row.height, 1f)
         compose.onNodeWithContentDescription("展开详情").assertIsDisplayed()

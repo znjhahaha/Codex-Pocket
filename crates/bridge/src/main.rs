@@ -43,6 +43,8 @@ fn main() {
 async fn run() -> Result<i32> {
     let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let exe = std::env::current_exe()?;
+    // This immutable entry is separate from the management/update bootstrap.
+    let transparent = exe.file_name().is_some_and(|n| n.eq_ignore_ascii_case("pocket-native-proxy.exe"));
     let config = exe.with_file_name("pocket-original.json");
     let mut package_family = None;
     let original = if args.first().is_some_and(|a| a == "--original") {
@@ -55,6 +57,10 @@ async fn run() -> Result<i32> {
             args.remove(0);
         }
         p
+    } else if transparent {
+        let (binary, family) = pocket_bridge::discovery::registered_desktop().await?;
+        package_family = Some(family);
+        binary
     } else {
         let v: Value = serde_json::from_slice(
             &std::fs::read(config).context("Missing pocket-original.json")?,
@@ -74,43 +80,12 @@ async fn run() -> Result<i32> {
         cmd.env("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", family);
     }
     cmd.args(&args).env("CODEX_APP_RUNTIME_CLI_PATH", &original);
+    // The desktop owns the launch barrier. Native tools must not inherit it.
+    cmd.env_remove("POCKET_UPDATE_OPERATION").env_remove("POCKET_UPDATE_RELEASE_FILE");
     // Desktop callbacks must use the actual native executable, avoiding wrapper recursion.
     if std::env::var_os("CODEX_CLI_PATH").is_some() {
         cmd.env("CODEX_CLI_PATH", &original);
     }
-    if !args.iter().any(|a| a == "app-server")
-        || args.iter().any(|a| {
-            a == "generate-json-schema"
-                || a == "generate-ts"
-                || a == "daemon"
-                || a == "proxy"
-                || a == "--print-startup-config"
-                || a == "--help"
-                || a == "-h"
-                || a == "--version"
-                || a == "-V"
-        })
-    {
-        return Ok(cmd.status().await?.code().unwrap_or(1));
-    }
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()?;
-    #[cfg(windows)]
-    let native_process = Some(pocket_core::native_process::NativeProcess::capture(
-        child.id().context("native process id")?,
-    )?);
-    #[cfg(not(windows))]
-    let native_process: Option<pocket_core::native_process::NativeProcess> = None;
-    let mut child_input = child.stdin.take().context("stdin")?;
-    let child_output = child.stdout.take().context("stdout")?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let token = uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string();
     let runtime_id = uuid::Uuid::new_v4().to_string();
     let directory = std::env::var_os("POCKET_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -121,11 +96,82 @@ async fn run() -> Result<i32> {
             )
             .join("CodexPocket/runtimes")
         });
-    std::fs::create_dir_all(&directory)?;
+    let app_server = args.iter().any(|a| a == "app-server")
+        && !args.iter().any(|a| {
+            a == "generate-json-schema"
+                || a == "generate-ts"
+                || a == "daemon"
+                || a == "proxy"
+                || a == "--print-startup-config"
+                || a == "--help"
+                || a == "-h"
+                || a == "--version"
+                || a == "-V"
+        });
+    if !app_server {
+        // Policy/help/config probes belong to Codex, not Pocket's update
+        // lifecycle. In particular an MSIX caller must never create redirected
+        // Pocket state just to discover its native startup policy.
+        let probe = args.iter().any(|a| matches!(a.to_str(),Some("--version"|"-V"|"--help"|"-h"|"--print-startup-config"|"generate-json-schema"|"generate-ts")))
+            || args.windows(2).any(|a| a[0]=="debug" && a[1]=="policy-read")
+            || args.windows(2).any(|a| a[0]=="app-server" && (a[1]=="proxy" || a[1]=="daemon"));
+        let admission = if transparent || probe { None } else {
+            pocket_bridge::admission::begin(&exe,&directory,&runtime_id,false)?
+        };
+        let mut child = pocket_bridge::admission::spawn_native(&mut cmd,admission.as_ref())?;
+        let status = child.wait().await?;
+        if let Some(a)=admission {
+            drop(a.guard);
+            pocket_bridge::admission::unregister(&a.installation,&runtime_id).await;
+        }
+        return Ok(status.code().unwrap_or(1));
+    }
+    let mut admission = if transparent { None } else {
+        pocket_bridge::admission::begin(&exe, &directory, &runtime_id, true)?
+    };
+    let mut router = match std::env::var_os("POCKET_UPDATE_OPERATION").filter(|_| !transparent) {
+        Some(operation) => Router::with_startup_operation(
+            operation.into_string().map_err(|_|anyhow::anyhow!("Invalid startup update operation"))?,
+            std::env::var_os("POCKET_UPDATE_RELEASE_FILE").map(PathBuf::from),
+        )?,
+        None => {
+            if !transparent && std::env::var_os("POCKET_UPDATE_RELEASE_FILE").is_some() { bail!("Startup release requires an operation"); }
+            Router::default()
+        }
+    };
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    pocket_bridge::native_lifetime::bind_to_proxy()?;
+    let mut child = pocket_bridge::admission::spawn_native(&mut cmd, admission.as_ref())?;
+    #[cfg(windows)]
+    let native_process = Some(pocket_core::native_process::NativeProcess::capture(
+        child.id().context("native process id")?,
+    )?);
+    #[cfg(not(windows))]
+    let native_process: Option<pocket_core::native_process::NativeProcess> = None;
+    let mut child_input = child.stdin.take().context("stdin")?;
+    let child_output = child.stdout.take().context("stdout")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let token = uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string();
+    if let Some(a)=admission.as_mut() {
+        a.registration.native=native_process.clone();
+        a.registration.phase=pocket_core::admission::RegistrationPhase::Registered;
+        router.startup_admission=Some(a.registration.clone());
+    }
     let descriptor = directory.join(format!("{runtime_id}.json"));
-    let metadata = json!({"protocol":1,"runtimeId":runtime_id,"source":"desktop","pid":std::process::id(),"port":listener.local_addr()?.port(),"token":token,"binary":original,"cwd":std::env::current_dir()?,"configHome":std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(".codex"))});
-    descriptor::publish(&directory, &descriptor, &serde_json::to_vec(&metadata)?)?;
-    let _guard = DescriptorGuard(descriptor);
+    let metadata = json!({"protocol":1,"runtimeId":runtime_id,"source":"desktop","pid":std::process::id(),"nativeProcess":native_process,"proxyProcess":pocket_core::native_process::NativeProcess::capture(std::process::id()).ok(),"port":listener.local_addr()?.port(),"token":token,"binary":original,"startupAdmissionProtocol":if router.startup_admission.is_some(){1}else{0},"startupAdmission":router.startup_admission,"admission":pocket_bridge::admission::summary(router.startup_admission.as_ref()),"cwd":std::env::current_dir()?,"configHome":std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(".codex"))});
+    let _guard = if transparent { None } else {
+        descriptor::publish(&directory, &descriptor, &serde_json::to_vec(&metadata)?)?;
+        Some(DescriptorGuard(descriptor))
+    };
+    #[cfg(windows)]
+    let _publication = if transparent {
+        pocket_bridge::registry::pipe_name().ok().map(|pipe|pocket_bridge::registry::publish_until_closed(pipe,metadata))
+    } else { None };
     let (tx, mut rx) = mpsc::channel::<Input>(256);
     tokio::spawn(read_stream(
         tokio::io::stdin(),
@@ -202,16 +248,25 @@ async fn run() -> Result<i32> {
             });
         }
     });
-    let mut router = Router::default();
+    // Descriptor is durable and authenticated listener task is installed. Only
+    // now may updater's exclusive lock overtake this startup.
+    let admission_installation=if let Some(a)=admission.take() {
+        a.guard.registered(&a.registration)?;
+        drop(a.guard);
+        Some(a.installation)
+    } else { None };
     // Probe asynchronously so the original desktop's initialize is never delayed.
     let schema_binary = original.clone();
     let schema_tx = tx.clone();
-    tokio::spawn(async move {
-        let capabilities = pocket_bridge::capabilities::discover(&schema_binary).await.ok();
+    let schema_admission = router.startup_admission.clone();
+    let mut schema_task = tokio::spawn(async move {
+        let capabilities = pocket_bridge::admission::discover(&schema_binary, schema_admission.as_ref()).await.ok();
         let _ = schema_tx.send(Input::Schema(capabilities)).await;
     });
     let mut schema_pending = true;
     let mut schema_state = "initializing";
+    let mut schema_failures = 0u32;
+    let mut schema_retry_at = tokio::time::Instant::now();
     let mut remotes = HashMap::<String, Peer>::new();
     let mut desktop = tokio::io::stdout();
     let mut native_eof = false;
@@ -219,33 +274,61 @@ async fn run() -> Result<i32> {
     'messages: while let Some(input) = rx.recv().await {
         let routes = match input {
             Input::Message(c, v) => {
+                let previous_maintenance=router.maintenance_status();
+                router.refresh_startup();
                 if let Client::Remote(id) = &c
                     && !remotes.contains_key(id)
                 {
                     continue;
                 }
                 if matches!(c, Client::Remote(_)) && v["method"] == "pocket/status" {
-                    vec![Route::Client(
+                    let retry = schema_state == "error" && !schema_pending && tokio::time::Instant::now() >= schema_retry_at;
+                    if retry {
+                        schema_pending = true;
+                        schema_state = "initializing";
+                        let binary = original.clone();
+                        let schema_tx = tx.clone();
+                        let schema_admission = router.startup_admission.clone();
+                        schema_task = tokio::spawn(async move {
+                            let capabilities = pocket_bridge::admission::discover(&binary, schema_admission.as_ref()).await.ok();
+                            let _ = schema_tx.send(Input::Schema(capabilities)).await;
+                        });
+                    }
+                    let mut routes = vec![Route::Client(
                         c,
                         json!({"id":v["id"],"result":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)}),
-                    )]
+                    )];
+                    if retry || barrier_changed(&previous_maintenance,&router) {
+                        routes.push(Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)})));
+                    }
+                    routes
                 } else {
                     let initialized = router.initialized;
                     let mut routes = router.from_client(c, v);
-                    if router.initialized != initialized {
+                    if router.initialized != initialized || barrier_changed(&previous_maintenance,&router) {
                         routes.push(Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)})));
                     }
                     routes
                 }
             }
-            Input::Runtime(v) => router.from_runtime(v),
+            Input::Runtime(v) => {
+                let previous = (router.initialized, router.runtime_role);
+                let mut routes = router.from_runtime(v);
+                if previous != (router.initialized, router.runtime_role) {
+                    routes.push(Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)})));
+                }
+                routes
+            },
             Input::Schema(capabilities) => {
                 schema_pending = false;
                 if let Some(capabilities) = capabilities {
                     router.capabilities = capabilities;
                     schema_state = "ready";
+                    schema_failures = 0;
                 } else {
                     schema_state = "error";
+                    schema_failures = schema_failures.saturating_add(1);
+                    schema_retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs((5u64 << schema_failures.min(4).saturating_sub(1)).min(60));
                 }
                 vec![Route::Broadcast(json!({"method":"pocket/runtimeStatus","params":runtime_status(&router, &runtime_id, &native_process, schema_pending, schema_state)}))]
             }
@@ -316,6 +399,15 @@ async fn run() -> Result<i32> {
         let _ = child.kill().await;
         child.wait().await?
     };
+    // Stop accepting new work, then reap the bounded schema export too. Its
+    // shared guard and the registration cannot outlive their evidence owner.
+    drop(rx);
+    schema_task.await?;
+    if let Some(installation)=admission_installation {
+        // Never erase evidence on Drop/panic: only a reaped native permits
+        // normal cleanup. If updater holds exclusive, retain it for recovery.
+        pocket_bridge::admission::unregister(&installation,&runtime_id).await;
+    }
     if let Some(error) = failure {
         return Err(error);
     }
@@ -332,7 +424,11 @@ fn runtime_status(
     schema_pending: bool,
     schema_state: &str,
 ) -> Value {
-    json!({"runtimeId":runtime_id,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_pending,"schemaState":schema_state,"bridgeVersion":env!("CARGO_PKG_VERSION"),"permissionProtocol":pocket_bridge::capabilities::PERMISSION_PROTOCOL})
+    json!({"runtimeId":runtime_id,"runtimeRole":router.runtime_role,"nativeProcess":native_process,"initialized":router.initialized,"nativeVersion":router.native_version,"loadedThreadIds":router.loaded,"pendingApprovals":router.pending_approvals(),"nativeCapabilities":router.capabilities,"schemaPending":schema_pending,"schemaState":schema_state,"bridgeVersion":env!("CARGO_PKG_VERSION"),"permissionProtocol":pocket_bridge::capabilities::PERMISSION_PROTOCOL,"startupBarrierProtocol":1,"startupAdmissionProtocol":if router.startup_admission.is_some(){1}else{0},"startupAdmission":router.startup_admission,"admission":pocket_bridge::admission::summary(router.startup_admission.as_ref()),"maintenance":router.maintenance_status()})
+}
+fn barrier_changed(previous:&Value,router:&Router)->bool {
+    let current=router.maintenance_status();
+    previous["operationId"]!=current["operationId"] || previous["startupFenced"]!=current["startupFenced"]
 }
 async fn write_json<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, v: &Value) -> Result<()> {
     let mut b = serde_json::to_vec(v)?;

@@ -8,9 +8,11 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const management = new Set(['agents','exec','e','review','login','logout','mcp','plugin','app-server','remote-control','app','completion','update','doctor','sandbox','debug','apply','a','queue','archive','delete','migrate-rollouts','migrate-nfs-db','unarchive','cloud','exec-server','features','help']);
-const excluded = new Set(['--no-daemon','--config','--enable','--disable','--search','--profile','--oss','--local-provider','--remote','--remote-auth-token-env','--strict-config','--dangerously-bypass-hook-trust','--ignore-user-config','--ignore-rules','--model','--sandbox','--ask-for-approval','--approve-for-me','--dangerously-bypass-approvals-and-sandbox','--full-auto','--worktree']);
-const safeValues = new Set(['--cd','--image','--add-dir']);
-const safeFlags = new Set(['--no-alt-screen','--last','--all','--include-non-interactive']);
+const excluded = new Set(['--no-daemon','--config','--enable','--disable','--search','--profile','--oss','--local-provider','--remote','--remote-auth-token-env','--strict-config','--dangerously-bypass-hook-trust','--ignore-user-config','--ignore-rules']);
+// These remain per-thread arguments in native LocalDaemon mode; preparing the
+// daemon must not silently turn a model/permission/worktree choice into embedded.
+const safeValues = new Set(['--cd','--image','--add-dir','--model','--sandbox','--ask-for-approval']);
+const safeFlags = new Set(['--no-alt-screen','--last','--all','--include-non-interactive','--approve-for-me','--dangerously-bypass-approvals-and-sandbox','--full-auto','--worktree']);
 
 export function classifyLaunch(args, env = process.env) {
   for (const marker of ['CODEX_EXEC_SERVER_URL','OPENAI_FEDERATION_RULE_ID','OPENAI_IDENTITY_TOKEN_FILE','OPENAI_WORKLOAD_IDENTITY_CONTEXT']) {
@@ -34,8 +36,8 @@ export function classifyLaunch(args, env = process.env) {
       return {ensure:false,reason:'unrecognized option'};
     }
     if (arg.startsWith('-') && arg!=='-') {
-      if (/^-[cpmsa]/.test(arg)) return {ensure:false,reason:'explicit configuration, model, sandbox or approval option'};
-      if (/^-[Ci]/.test(arg)) {
+      if (/^-[cp]/.test(arg)) return {ensure:false,reason:'explicit configuration or profile option'};
+      if (/^-[Cimsa]/.test(arg)) {
         if (arg.length===2 && ++i>=args.length) return {ensure:false,reason:'missing option value'};
         continue;
       }

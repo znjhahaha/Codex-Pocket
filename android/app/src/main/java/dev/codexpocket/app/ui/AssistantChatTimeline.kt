@@ -13,6 +13,11 @@ internal sealed interface AssistantTimeline {
     data class Group(val group:AssistantGroup,val tasks:List<AssistantTask>,override val atMs:Long?):AssistantTimeline {override val key="group:${group.id}"}
     data class Task(val task:AssistantTask,override val atMs:Long?):AssistantTimeline {override val key="task:${task.id}"}
     data class Question(val operation:AssistantOperation,override val atMs:Long?):AssistantTimeline {override val key="question:${operation.id}"}
+    data class EndedQuestion(val input:AssistantHeldInput,override val atMs:Long?):AssistantTimeline {override val key="ended-question:${input.operationId}:${input.callId}"}
+    data class Recovery(val request:AssistantRecoveryRequest,override val atMs:Long?):AssistantTimeline {override val key="recovery:${request.operationId}:${request.requestId}"}
+    data class HandoffRecovery(val operation:AssistantOperation,override val atMs:Long?):AssistantTimeline {
+        override val key="handoff-recovery:${operation.id}:${operation.handoffRecovery?.generation}"
+    }
     data class Delivery(val delivery:AssistantDelivery):AssistantTimeline {override val key="delivery:${delivery.id}";override val atMs=delivery.atMs}
     data class History(val history:AssistantQuestionHistory):AssistantTimeline {override val key="question-history:${history.id}";override val atMs=history.atMs}
     data class Result(val operation:AssistantOperation,override val atMs:Long?):AssistantTimeline {override val key="result:${operation.id}"}
@@ -48,9 +53,17 @@ internal fun assistantTimeline(state:AssistantUiState):List<AssistantTimeline> {
             }
         }
         snapshot.tasks.distinctBy {it.id}.filter {it.id !in grouped}.forEach {add(AssistantTimeline.Task(it,at(it.activeRunId)))}
+        snapshot.operations.filter {it.handoffRecovery!=null && it.role=="Coordinator" && it.phase==AssistantOperationPhase.Paused && !it.suspended && it.threadId==null}
+            .distinctBy {it.id}.forEach {add(AssistantTimeline.HandoffRecovery(it,at(it.id,true)))}
         snapshot.deliveries.filter {it.status != "sent"}.distinctBy {it.id}.forEach {add(AssistantTimeline.Delivery(it))}
         snapshot.questionHistory.distinctBy {it.id}.forEach {add(AssistantTimeline.History(it))}
         snapshot.operations.filter {it.question!=null && snapshot.questionHistory.none {h -> h.operationId==it.id && h.requestId==it.question.requestId}}.distinctBy {it.id}.forEach {add(AssistantTimeline.Question(it,at(it.id,true)))}
+        snapshot.operations.distinctBy {it.id}.forEach {op ->
+            op.heldInputs.forEach {input -> add(AssistantTimeline.EndedQuestion(input,at(op.id,true)))}
+        }
+        // The native request can outlive a completed coordinator turn. Keep the original phase.
+        snapshot.recoveries.distinct().filter {request -> snapshot.operations.any {it.id==request.operationId && it.role=="Coordinator"}}
+            .forEach {add(AssistantTimeline.Recovery(it,at(it.operationId,true)))}
         snapshot.operations.filter {it.role=="Execution" && it.phase in setOf(AssistantOperationPhase.Completed,AssistantOperationPhase.Failed) && !it.result.isNullOrBlank() && snapshot.groups.none {group -> group.requiresSummary &&
                 (it.taskId in group.taskIds || snapshot.assignmentFor(it.taskId.orEmpty())?.groupId == group.id)} && messages.none {message -> message.role=="Assistant" && message.operationId==it.id && message.text==it.result}}
             .distinctBy {it.id}.forEach {add(AssistantTimeline.Result(it,at(it.id,true)))}

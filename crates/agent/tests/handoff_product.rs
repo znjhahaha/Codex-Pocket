@@ -389,7 +389,7 @@ impl Fixture {
         image
     }
     fn release(&mut self, agent: &mut Agent, local: &Local, operation: &Value) -> Value {
-        let ready = local.ok("upgrade/quiesce", operation);
+        let ready = quiesce_ready(local, operation);
         assert_ready(&ready);
         assert_eq!(
             local.ok("upgrade/quiesce", operation),
@@ -667,6 +667,17 @@ fn assert_ready(receipt: &Value) {
     assert_eq!(receipt["remoteEnabled"], false);
     assert_eq!(receipt["acceptingWrites"], false);
 }
+// Admission is fenced immediately; a concurrent discovery/configuration write
+// may still be draining. Exercise the protocol's status phase before release.
+fn quiesce_ready(local:&Local,operation:&Value)->Value {
+    let mut receipt=local.ok("upgrade/quiesce",operation);
+    let deadline=Instant::now()+Duration::from_secs(20);
+    while receipt["phase"]=="draining" && Instant::now()<deadline {
+        thread::sleep(Duration::from_millis(50));
+        receipt=local.ok("upgrade/status",operation);
+    }
+    assert_ready(&receipt);receipt
+}
 
 #[test]
 fn release_successor_cancel_rollback_and_automatic_recovery() {
@@ -703,7 +714,7 @@ fn release_successor_cancel_rollback_and_automatic_recovery() {
         "stale_generation",
     );
     let operation = params(&next);
-    let ready = live.ok("upgrade/quiesce", &operation);
+    let ready = quiesce_ready(&live, &operation);
     assert_ready(&ready);
     error(&live.call("pair", &json!({})), "write_fenced");
     error(
@@ -803,7 +814,7 @@ fn authenticated_validation_and_concurrent_quiesce_are_deterministic() {
     );
     // An overlapping capture may report draining. Repeated status converges to
     // one immutable ready checkpoint; no competing operation may enter.
-    let ready = local.ok("upgrade/status", &operation);
+    let ready = quiesce_ready(&local, &operation);
     assert_ready(&ready);
     assert_eq!(local.ok("upgrade/quiesce", &operation), ready);
     error(
@@ -932,7 +943,7 @@ fn failed_cancel_keeps_fence_until_durable_retry() {
     let local = agent.ready();
     let generation = local.ok("upgrade/capabilities", &json!({}))["generation"].clone();
     let operation = params(&generation);
-    assert_ready(&local.ok("upgrade/quiesce", &operation));
+    assert_ready(&quiesce_ready(&local, &operation));
     {
         let _obstruction = JournalObstruction::new(&f.state);
         error(&local.call("upgrade/cancel", &operation), "unavailable");
@@ -1029,7 +1040,7 @@ fn concurrent_release_reuses_one_final_checkpoint() {
     let local = agent.ready();
     let generation = local.ok("upgrade/capabilities", &json!({}))["generation"].clone();
     let operation = params(&generation);
-    let ready = local.ok("upgrade/quiesce", &operation);
+    let ready = quiesce_ready(&local, &operation);
     assert_ready(&ready);
     let mut release = operation;
     release["checkpoint"] = ready["checkpoint"].clone();

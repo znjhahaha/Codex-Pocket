@@ -15,11 +15,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 url = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+ring = "0.17"
+semver = "1"
+velopack = {version = "=1.2.161", features = ["public-utils"]}
 ssh2 = "0.9"
 pocket-network = {path="../../crates/network"}
+pocket-core = {path="../../crates/core"}
+pocket-runtime-ipc = {path="../../crates/runtime-ipc"}
+tokio = {version="1",features=["rt","net","time","io-util"]}
+
+[dev-dependencies]
+zip = {version="8.6.0",default-features=false,features=["deflate"]}
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_Packaging_Appx", "Win32_System_JobObjects", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Com"] }
 
 [[bin]]
 name = "pocket-supervisor"
@@ -32,3 +41,7 @@ path = "src/bin/launcher.rs"
 [[bin]]
 name = "pocket-upgrade"
 path = "src/bin/upgrade.rs"
+
+[[bin]]
+name = "pocket-setup"
+path = "src/bin/setup.rs"

@@ -3,7 +3,9 @@ package dev.codexpocket.app.ui
 import android.graphics.ImageDecoder
 import android.util.LruCache
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
@@ -28,11 +30,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -41,13 +41,16 @@ import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import dev.codexpocket.app.data.MentionedFile
@@ -235,18 +238,14 @@ internal fun ImageGrid(images: List<MentionedFile>, alignEnd: Boolean, modifier:
             // Geometry comes from count and parent constraints, never image intrinsic dimensions.
             // Reserve both states before either is drawn: expanding cannot move the scroll anchor.
             val geometry = multiImageGeometry(images.size, (maxWidth - 98.dp).coerceAtLeast(32.dp))
-            val progress by animateFloatAsState(if (open) 1f else 0f,
-                tween(pocketMotionMillis(200), easing = androidx.compose.animation.core.LinearEasing), label = "image-deck-reveal")
-            val shownOpen = progress >= .5f
-            val opacity = kotlin.math.abs(progress - .5f) * 2f
+            val preferences = rememberPocketGlassPreferences()
+            val motion = preferences.animatorsEnabled && !preferences.batterySaver && !preferences.highContrast
+            val progress = animateFloatAsState(if (open) 1f else 0f,
+                if (motion) tween(if (open) 220 else 360, easing = LinearEasing) else snap(), label = "image-deck-reveal")
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (alignEnd) DeckPill(open, images.size) { open = !open }
-                Box(Modifier.size(geometry.width, geometry.height).testTag("image-transition-frame").clipToBounds()
-                    .graphicsLayer { alpha = opacity; clip = true; compositingStrategy = CompositingStrategy.Offscreen },
-                    contentAlignment = if (alignEnd) Alignment.CenterEnd else Alignment.CenterStart) {
-                    // Only one subtree is mounted. A reversal cancels its fade and starts from current alpha.
-                    if (shownOpen) ImageCells(images, alignEnd, geometry.cell) { viewer = it }
-                    else ImageDeck(images, geometry.card) { viewer = 0 }
+                Box(Modifier.size(geometry.width, geometry.height).testTag("image-transition-frame").clipToBounds()) {
+                    ImageDeck(images, geometry, alignEnd, open, progress) { viewer = it }
                 }
                 if (!alignEnd) DeckPill(open, images.size) { open = !open }
             }
@@ -286,27 +285,79 @@ private fun ImageCells(images: List<MentionedFile>, alignEnd: Boolean, cellSize:
     }
 }
 
-/** Up to three cards: the first image on top, the next two peeking out to the right, slightly turned. */
+/** All distances are inside the reserved frame; neither bitmap size nor animation changes layout. */
+internal data class ImageDeckPose(val x: Dp, val y: Dp, val size: Dp, val rotation: Float, val gridFraction: Float)
+
+internal fun imageDeckPose(index: Int, count: Int, geometry: MultiImageGeometry, alignEnd: Boolean, progress: Float): ImageDeckPose {
+    val shown = count.coerceIn(2, 9)
+    val columns = if (shown == 2 || shown == 4) 2 else 3
+    val rows = (shown + columns - 1) / columns
+    val row = index / columns
+    val inRow = minOf(columns, shown - row * columns)
+    val gridHeight = geometry.cell * rows + ((rows - 1) * 4).dp
+    val rowWidth = geometry.cell * inRow + ((inRow - 1) * 4).dp
+    val depth = minOf(index, 2)
+    // One reversible clock, with a small stagger. Reversing never creates another card tree.
+    val delay = index * .025f
+    val phase = ((progress - delay) / (1f - delay)).coerceIn(0f, 1f)
+    val t = phase * phase * (3f - 2f * phase)
+    val fan = if (t == 0f || t == 1f) 0f else kotlin.math.sin(Math.PI * t).toFloat()
+    fun mix(a: Dp, b: Dp) = a + (b - a) * t
+    val size = mix(geometry.card, geometry.cell)
+    val rotation = depth * (3.5f * (1f - t) + 3f * fan)
+    val deckX = (if (alignEnd) geometry.width - geometry.card - 30.dp else 0.dp) + (depth * 9).dp
+    val gridX = (if (alignEnd) geometry.width - rowWidth else 0.dp) + (geometry.cell + 4.dp) * (index % columns)
+    val x = mix(deckX, gridX) + (depth * 3f * fan).dp
+    val y = mix((geometry.height - geometry.card) / 2, (geometry.height - gridHeight) / 2 + (geometry.cell + 4.dp) * row)
+    // Rotation must not clip corners against the fixed frame on narrow screens or a partial row.
+    val radians = Math.toRadians(rotation.toDouble())
+    val outset = (size.value * (kotlin.math.abs(kotlin.math.cos(radians)) + kotlin.math.abs(kotlin.math.sin(radians)) - 1) / 2).toFloat().dp
+    return ImageDeckPose(x.coerceIn(outset, geometry.width - size - outset),
+        y.coerceIn(outset, geometry.height - size - outset), size, rotation, t)
+}
+
+/** The same cards stay mounted from stack to grid, including during an interrupted transition. */
 @Composable
-private fun ImageDeck(images: List<MentionedFile>, card: Dp = 150.dp, onOpen: () -> Unit) {
-    val interaction = remember { MutableInteractionSource() }
-    val scale = pressScale(interaction)
-    val behind = minOf(images.size, 3) - 1
-    Box(Modifier.testTag("image-deck").padding(end = (behind * 9).dp, top = 6.dp, bottom = 6.dp).graphicsLayer { scaleX = scale; scaleY = scale }
-        .clickable(interactionSource = interaction, indication = null, role = Role.Image, onClick = onOpen)
-        .semantics { contentDescription = images.joinToString("、") { it.name } }) {
-        for (depth in behind downTo 1) {
-            val file = images[depth]
-            Box(Modifier.size(card).graphicsLayer {
-                translationX = (depth * 9).dp.toPx(); rotationZ = depth * 3.5f; transformOrigin = androidx.compose.ui.graphics.TransformOrigin(.5f, 1f)
-                alpha = 1f - depth * .12f
-            }.shadow((2 + depth).dp, RoundedCornerShape(16.dp), ambientColor = Color.Black.copy(alpha = .12f), spotColor = Color.Black.copy(alpha = .16f)).clip(RoundedCornerShape(16.dp))) {
-                ImageFill(rememberGalleryBitmap(file.path, 360), file)
+private fun ImageDeck(images: List<MentionedFile>, geometry: MultiImageGeometry, alignEnd: Boolean,
+    open: Boolean, progress: State<Float>, onOpen: (Int) -> Unit) {
+    // Do not fetch six concealed images before the first expansion. Once revealed, their
+    // loaders remain mounted when folded, so a gesture cannot cancel reference recovery.
+    var revealed by remember(images.size) { mutableStateOf(open) }
+    LaunchedEffect(open) { if (open) revealed = true }
+    val shown = images.take(9)
+    val columns = if (shown.size == 2 || shown.size == 4) 2 else 3
+    // The grid is the final readable size; scaling up for the stack must not shrink error labels.
+    val base = geometry.cell
+    Box(Modifier.fillMaxSize().then(if (!open) Modifier.testTag("image-deck") else Modifier)) {
+        shown.forEachIndexed { index, file -> key(index) {
+            val load = if (index < 3 || revealed) rememberGalleryBitmap(file.path, 360) else ImageLoad.Loading
+            val interaction = remember { MutableInteractionSource() }
+            val pressedScale = pressScale(interaction)
+            Box(Modifier.size(base).zIndex((shown.size - index).toFloat())
+                .graphicsLayer {
+                    // Read the clock only in the layer: no per-frame composition, measure or decode.
+                    val pose = imageDeckPose(index, images.size, geometry, alignEnd, progress.value)
+                    val ratio = pose.size / base
+                    scaleX = ratio * pressedScale; scaleY = ratio * pressedScale
+                    translationX = (pose.x - (base - pose.size) / 2).toPx()
+                    translationY = (pose.y - (base - pose.size) / 2).toPx()
+                    rotationZ = pose.rotation
+                    shape = cellShape(index, shown.size, columns, pose.gridFraction, ratio)
+                    clip = true
+                    shadowElevation = ((if (index < 3) 4f else 0f) * (1f - pose.gridFraction)).dp.toPx()
+                }.testTag("image-card:$index")) {
+                Box(Modifier.fillMaxSize()
+                    .clickable(enabled = open || index < 3, interactionSource = interaction, indication = null,
+                        role = Role.Image, onClick = { onOpen(index) })
+                    .then(if (!open && index >= 3) Modifier.clearAndSetSemantics { }
+                        else Modifier.semantics { contentDescription = file.name })) {
+                    ImageFill(load, file)
+                    if (index == 8 && images.size > 9) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .45f)), contentAlignment = Alignment.Center) {
+                        Text("+${images.size - 9}", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
             }
-        }
-        Box(Modifier.size(card).shadow(4.dp, RoundedCornerShape(16.dp), ambientColor = Color.Black.copy(alpha = .12f), spotColor = Color.Black.copy(alpha = .16f)).clip(RoundedCornerShape(16.dp))) {
-            ImageFill(rememberGalleryBitmap(images[0].path, 360), images[0])
-        }
+        } }
     }
 }
 
@@ -318,16 +369,18 @@ private fun DeckPill(open: Boolean, count: Int, onClick: () -> Unit) {
     Text(if (open) "收起" else "展开 $count", Modifier.width(88.dp).testTag("image-deck-toggle").graphicsLayer { scaleX = scale; scaleY = scale }
         .clip(PocketCapsule).background(c.surfaceContainerHigh)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
+        .semantics { stateDescription = if (open) "图片已展开" else "图片已收起" }
         .padding(horizontal = 14.dp, vertical = 7.dp), style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant,
         maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
 /** Outer corners are round, inner ones tight, so the group reads as one tile like iOS Photos. */
-private fun cellShape(index: Int, count: Int, columns: Int): RoundedCornerShape {
+private fun cellShape(index: Int, count: Int, columns: Int, gridFraction: Float = 1f, scale: Float = 1f): RoundedCornerShape {
     val rows = (count + columns - 1) / columns
     val row = index / columns; val column = index % columns
     val lastInRow = column == columns - 1 || index == count - 1
-    val big = 14.dp; val small = 4.dp
+    val big = (16.dp - 2.dp * gridFraction) / scale
+    val small = (16.dp - 12.dp * gridFraction) / scale
     return RoundedCornerShape(
         topStart = if (row == 0 && column == 0) big else small,
         topEnd = if (row == 0 && lastInRow) big else small,

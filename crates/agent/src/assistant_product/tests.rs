@@ -1,6 +1,835 @@
 use super::*;
 use std::sync::atomic::AtomicI64;
 
+#[tokio::test]
+async fn assistant_lifecycle_parks_single_consumer_and_stop_ack_releases_locks_with_clones_alive() {
+    let root=tempfile::tempdir().unwrap();let io=Fake::default();
+    let actor=Actor::start_with_io(root.path().into(),"pc".into(),"profile".into(),io.clone(),None,Arc::new(||1_000_000)).await.unwrap();
+    let retained=actor.clone();
+    assert!(!actor.park_for_runtime_transition().await.unwrap().is_empty());
+    assert!(actor.request("assistant/send",json!({"message":"must not dispatch"}),"parked-message".into(),None).await.is_err());
+    assert_eq!(io.count("turn/start"),0);
+    actor.resume_after_runtime_check().await.unwrap();
+    assert!(actor.request("assistant/read",json!({}),"read".into(),None).await.is_ok());
+    actor.park_for_runtime_transition().await.unwrap();actor.stop_parked_worker().await.unwrap();
+    assert!(!retained.is_alive());
+    let next=Actor::start_with_io(root.path().into(),"pc".into(),"profile".into(),io.clone(),None,Arc::new(||1_000_001)).await.unwrap();
+    assert_eq!(io.count("turn/start"),0);
+    next.park_for_runtime_transition().await.unwrap();next.stop_parked_worker().await.unwrap();
+}
+
+#[tokio::test]
+async fn assistant_attachment_product_acceptance_reaches_native_image_input_without_expiring_upload() {
+    let mut f=Fixture::new(false).await;
+    let path=f.root.path().join("durable-input.png");std::fs::write(&path,b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    let input=AssistantInput::Image{id:uuid::Uuid::new_v4().to_string(),name:"diagram.png".into(),path:path.clone()};
+    let p=json!({"message":"Inspect image","retainedAttachments":[input]});
+    f.call("assistant/send",p.clone(),"image-acceptance",false).await.unwrap();
+    f.call("assistant/send",p,"image-acceptance",false).await.unwrap();
+    let state=f.io.0.lock().unwrap();
+    let calls=state.calls.iter().filter(|(_,method,_)|method=="turn/start").collect::<Vec<_>>();
+    assert_eq!(calls.len(),1);assert_eq!(calls[0].2["input"][1],json!({"type":"localImage","path":path}));
+    drop(state);f.stop().await;
+}
+
+#[path = "tests/response_latency.rs"]
+mod response_latency;
+
+#[tokio::test]
+async fn terminal_generation_failed_proof_keeps_worker_ready_and_recovery_offers_fenced() {
+    let mut f=Fixture::new(false).await;
+    let first=f.send("terminal-before-cold-restart").await;
+    let original=Fixture::op(&first,"Coordinator");
+    f.io.complete(&Fixture::mapping(&original),"original finished");
+    let completed=f.read().await;
+    assert_eq!(Fixture::op(&completed,"Coordinator")["phase"],"Completed");
+    f.stop().await;
+    f.io.0.lock().unwrap().generation=Some("cold-new-host".into());
+    f.start().await;
+    for _ in 0..3 {
+        let snapshot=f.read().await;
+        assert_eq!(snapshot["executorGenerationReady"],false);
+        assert_eq!(snapshot["ready"],false);
+        assert_eq!(snapshot["reconciliationRequired"],true);
+        let stage=snapshot["startupStages"].as_array().unwrap().iter().find(|s|s["id"]=="coordinator").unwrap();
+        assert_eq!(stage["status"],"reconciling");
+        assert!(snapshot["operations"].as_array().unwrap().iter().all(|op|op.get("handoffRecovery").is_none()));
+        let retained=Fixture::op(&snapshot,"Coordinator");
+        assert_eq!(retained["mapping"],original["mapping"]);
+        assert_eq!(retained["expected_generation"],original["expected_generation"]);
+        assert_eq!(retained["phase"],"Completed");
+        assert_eq!(f.io.count("thread/start"),1);
+        assert_eq!(f.io.count("turn/start"),1);
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_retains_stopped_pending_and_explicitly_finishes_same_rejection() {
+    let mut f = Fixture::new(false).await;
+    let s = f.call("assistant/send", json!({"message":"Create a read-only task"}), "original-once", false).await.unwrap()["snapshot"].clone();
+    let op = Fixture::op(&s, "Coordinator");
+    let scope = Fixture::mapping(&op);
+    f.io.0.lock().unwrap().answer_before_dispatch_error = true;
+    f.io.tool(json!(1), &scope, "original-call", "assistant_create_task",
+        json!({"prompt":"Ask RED or BLUE, list immediate filenames", "directory":f.project.path(), "writes":false}));
+    let s = f.read().await;
+    assert_eq!(s["reconciliationRequired"], true);
+    assert!(f.io.answers().is_empty());
+    let pending = f.io.0.lock().unwrap().pending["1"].clone();
+    f.io.complete(&scope, "Submitted task");
+    f.io.0.lock().unwrap().pending.insert("1".into(), pending);
+    let s = f.read().await;
+    assert_eq!(Fixture::op(&s, "Coordinator")["phase"], "Completed");
+    assert_eq!(s["pendingRequests"].as_array().unwrap().len(), 1,
+        "A terminal turn is not evidence that the Host retired its request");
+    assert_eq!(s["pendingRequests"][0]["recoveryAction"], "reject_original_tool_answer");
+    f.stop().await;
+    f.start().await;
+    for _ in 0..2 { f.read().await; }
+    assert!(f.io.answers().is_empty(), "Reads/restart must never resend an unknown answer");
+    let p = json!({"operationId":op["id"], "requestId":"n:1", "response":{"Approval":{"approved":false}}});
+    f.call("assistant/respond", p.clone(), "explicit-reject", false).await.unwrap();
+    f.call("assistant/respond", p, "explicit-reject", false).await.unwrap();
+    let s = f.read().await;
+    assert_eq!(s["reconciliationRequired"], false, "{s}");
+    assert!(s["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(f.io.answers().len(), 1);
+    assert_eq!(f.io.answers()[0].0, 1);
+    assert_eq!(f.io.answers()[0].1["success"], false);
+    assert_eq!(f.io.answers()[0].1["contentItems"][0]["text"],
+        "{\"error\":\"Task directory not authorized by this handoff\"}");
+    assert_eq!(f.io.count("thread/start"), 1);
+    assert_eq!(f.io.count("turn/start"), 1);
+    let db = Connection::open(f.root.path().join("assistant/messages.db")).unwrap();
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM product_answers", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_confirmed_answer_receipt_clears_fence_without_resend() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("receipt-original").await;
+    let scope = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.0.lock().unwrap().lose_answer = true;
+    f.io.tool(json!(2), &scope, "confirmed-call", "assistant_list_sessions", json!({"limit":1}));
+    assert_eq!(f.read().await["reconciliationRequired"], true);
+    assert_eq!(f.io.answers().len(), 1);
+    f.io.0.lock().unwrap().answer_receipts.insert("2".into(), RuntimeReceipt {
+        generation:"host".into(), state:"completed".into(),
+        response:Some(json!({"id":2,"result":{"written":true}})),
+    });
+    assert_eq!(f.read().await["reconciliationRequired"], false);
+    f.stop().await;
+    f.start().await;
+    assert_eq!(f.read().await["reconciliationRequired"], false);
+    assert_eq!(f.io.answers().len(), 1);
+    assert_eq!(f.io.count("turn/start"), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_command_receipt_cannot_confirm_answer_zero() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("separate-answer-namespace").await;
+    let scope = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.0.lock().unwrap().lose_answer = true;
+    f.io.tool(json!(0), &scope, "answer-zero", "assistant_list_sessions", json!({"limit":1}));
+    assert_eq!(f.read().await["reconciliationRequired"], true);
+    f.io.0.lock().unwrap().receipts.insert("0".into(), RuntimeReceipt {
+        generation:"host".into(), state:"completed".into(),
+        response:Some(json!({"id":0,"result":{"written":true}})),
+    });
+    assert_eq!(f.read().await["reconciliationRequired"], true,
+        "A command with the same ID and even written=true is not an answer receipt");
+    assert_eq!(f.io.answers().len(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_legacy_answer_capability_gap_never_resends_or_releases_fence() {
+    let mut f = Fixture::new(false).await;
+    let s = f.call("assistant/send", json!({"message":"Create a read-only task"}),
+        "legacy-answer-capability", false).await.unwrap()["snapshot"].clone();
+    let op = Fixture::op(&s, "Coordinator");
+    let scope = Fixture::mapping(&op);
+    {
+        let mut state = f.io.0.lock().unwrap();
+        state.answer_before_dispatch_error = true;
+        state.answer_receipt_unavailable = true;
+    }
+    f.io.tool(json!(1), &scope, "legacy-call", "assistant_create_task",
+        json!({"prompt":"Read files", "directory":f.project.path(), "writes":false}));
+    assert_eq!(f.read().await["reconciliationRequired"], true);
+    f.stop().await;
+    f.start().await;
+    for _ in 0..2 { assert_eq!(f.read().await["reconciliationRequired"], true); }
+    let params = json!({"operationId":op["id"],"requestId":"n:1","response":{"Approval":{"approved":false}}});
+    assert!(f.call("assistant/respond", params, "explicit-legacy-reject", false).await.is_err());
+    let s = f.read().await;
+    assert_eq!(s["reconciliationRequired"], true);
+    assert!(f.io.answers().is_empty());
+    assert!(s["tasks"].as_array().unwrap().is_empty());
+    let db = Connection::open(f.root.path().join("assistant/messages.db")).unwrap();
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM product_answers", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_rejects_unknown_invalid_receipts_and_permission_expansion() {
+    let cases = [
+        ("submitted", None, "host"),
+        ("unknown", None, "host"),
+        ("completed", None, "host"),
+        ("completed", Some(json!({"id":1,"result":{"written":false}})), "host"),
+        ("completed", Some(json!({"id":99,"result":{"written":true}})), "host"),
+        ("missing", Some(json!({"id":1,"result":{"written":true}})), "host"),
+        ("missing", None, "other-host"),
+    ];
+    for (state, response, generation) in cases {
+        let mut f = Fixture::new(false).await;
+        let s = f.call("assistant/send", json!({"message":"Create a read-only task"}), "once", false).await.unwrap()["snapshot"].clone();
+        let op = Fixture::op(&s, "Coordinator");
+        let scope = Fixture::mapping(&op);
+        f.io.0.lock().unwrap().answer_before_dispatch_error = true;
+        f.io.tool(json!(1), &scope, "original", "assistant_create_task",
+            json!({"prompt":"Read files", "directory":f.project.path(), "writes":false}));
+        f.read().await;
+        f.io.0.lock().unwrap().answer_receipts.insert("1".into(), RuntimeReceipt {
+            generation:generation.into(), state:state.into(), response,
+        });
+        for approved in [true, false] {
+            let p = json!({"operationId":op["id"],"requestId":"n:1","response":{"Approval":{"approved":approved}}});
+            assert!(f.call("assistant/respond", p, &format!("reject-{approved}"), false).await.is_err());
+        }
+        assert_eq!(f.read().await["reconciliationRequired"], true);
+        assert!(f.io.answers().is_empty(), "{generation}/{state} is not proof of non-dispatch");
+        assert_eq!(f.io.count("turn/start"), 1);
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn coordinator_recovery_durable_confirmation_failure_keeps_product_fence() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("confirmation-save").await;
+    let scope = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.0.lock().unwrap().lose_answer = true;
+    f.io.tool(json!(3), &scope, "save-call", "assistant_list_sessions", json!({"limit":1}));
+    assert_eq!(f.read().await["reconciliationRequired"], true);
+    let db = Connection::open(f.root.path().join("assistant/executor.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_answer_confirm BEFORE UPDATE ON assistant_executor_state WHEN EXISTS(SELECT 1 FROM json_each(NEW.data,'$.answers') WHERE json_extract(value,'$.accepted')=1) BEGIN SELECT RAISE(FAIL,'answer confirmation persistence unavailable'); END;").unwrap();
+    f.io.0.lock().unwrap().answer_receipts.insert("3".into(), RuntimeReceipt {
+        generation:"host".into(), state:"completed".into(), response:Some(json!({"id":3,"result":{"written":true}})),
+    });
+    assert_eq!(f.read().await["reconciliationRequired"], true,
+        "Do not remove the product fence before executor confirmation is durable");
+    db.execute_batch("DROP TRIGGER fail_answer_confirm").unwrap();
+    assert_eq!(f.read().await["reconciliationRequired"], false);
+    assert_eq!(f.io.answers().len(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn coordinator_recovery_initial_confirmation_save_failure_keeps_answer_intent() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("initial-confirmation-save").await;
+    let scope = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    let db = Connection::open(f.root.path().join("assistant/executor.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_initial_confirm BEFORE UPDATE ON assistant_executor_state WHEN EXISTS(SELECT 1 FROM json_each(NEW.data,'$.answers') WHERE json_extract(value,'$.accepted')=1) BEGIN SELECT RAISE(FAIL,'initial answer confirmation unavailable'); END;").unwrap();
+    f.io.tool(json!(4), &scope, "initial-save-call", "assistant_list_sessions", json!({"limit":1}));
+    let s = f.read().await;
+    assert_eq!(s["reconciliationRequired"], true, "An in-memory confirmation cannot release the durable product intent");
+    assert_eq!(f.io.answers().len(), 1);
+    db.execute_batch("DROP TRIGGER fail_initial_confirm").unwrap();
+    assert_eq!(f.read().await["reconciliationRequired"], false);
+    assert_eq!(f.io.answers().len(), 1);
+    f.stop().await;
+}
+
+fn housekeeping_answer(io: &Fake, id: &Value) -> Value {
+    let answer = io
+        .answers()
+        .into_iter()
+        .find(|(native, _)| native == id)
+        .unwrap()
+        .1;
+    assert_eq!(answer["success"], true, "{answer}");
+    serde_json::from_str(answer["contentItems"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+fn generation_fixture_state(path: &Path, table: &str, edit: impl FnOnce(&mut Value)) {
+    let db = Connection::open(path).unwrap();
+    let data: String = db.query_row(&format!("SELECT data FROM {table}"), [], |r| r.get(0)).unwrap();
+    let mut value: Value = serde_json::from_str(&data).unwrap();
+    edit(&mut value);
+    db.execute(&format!("UPDATE {table} SET data=?1"), [value.to_string()]).unwrap();
+}
+
+#[tokio::test]
+async fn v070_generation_actor_recovers_legacy_preflight_without_redispatch() {
+    generation_actor_recovers_legacy_preflight("host", "host").await;
+}
+
+#[tokio::test]
+async fn v070_generation_three_generations_actor_preserves_original_intent() {
+    generation_actor_recovers_legacy_preflight("current-host-C", "next-host-D").await;
+}
+
+async fn generation_actor_recovers_legacy_preflight(current: &str, next: &str) {
+    let mut f = Fixture::new(false).await;
+    // Generate a real Service intent without any native mutating request.
+    f.io.0.lock().unwrap().unsupported = Some("thread/start".into());
+    let snapshot = f.send("legacy-first-message").await;
+    let original = Fixture::op(&snapshot, "Coordinator");
+    assert_eq!(original["expected_generation"], "host");
+    assert!(original["mapping"].is_null());
+    assert_eq!(f.io.count("thread/start"), 0);
+    assert_eq!(f.io.count("turn/start"), 0);
+    f.stop().await;
+    // Reproduce the old version's exact persisted shape in this disposable
+    // fixture: stale empty executor, newer unmapped Service Unknown intent.
+    generation_fixture_state(&f.root.path().join("assistant/executor.db"), "assistant_executor_state", |state| {
+        state["generation"] = json!("old-host");
+        state["cursor"] = json!(137);
+        for field in ["operations", "threads", "effects", "answers", "streaming", "streaming_order", "not_dispatched"] {
+            state[field] = json!({});
+        }
+        state["streaming_stopped"] = json!([]);
+        state["streaming_gap"] = json!(false);
+        state["clean_generation"] = Value::Null;
+    });
+    generation_fixture_state(&f.root.path().join("assistant/assistant.db"), "assistant_service_state", |state| {
+        state["operations"][original["id"].as_str().unwrap()]["phase"] = json!("Unknown");
+    });
+    f.io.0.lock().unwrap().unsupported = None;
+    f.io.0.lock().unwrap().generation = Some(current.into());
+    f.start().await;
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["reconciliationRequired"], false, "{snapshot}");
+    let recovered = Fixture::op(&snapshot, "Coordinator");
+    assert_eq!(recovered["id"], original["id"]);
+    assert_eq!(recovered["phase"], "Paused");
+    assert!(recovered["mapping"].is_null());
+    assert_eq!(recovered["user_message_ids"], original["user_message_ids"]);
+    assert_eq!(recovered["expected_generation"], original["expected_generation"]);
+    assert_eq!(f.io.count("turn/start"), 0);
+    assert_eq!(f.io.count("thread/start"), 0);
+    // The same user command ID and a second Actor restart are reconciliation
+    // only. They must never re-enqueue or dispatch the original handoff.
+    f.send("legacy-first-message").await;
+    f.stop().await;
+    f.io.0.lock().unwrap().generation = Some(next.into());
+    f.start().await;
+    let snapshot = f.read().await;
+    assert_eq!(Fixture::op(&snapshot, "Coordinator")["phase"], "Paused");
+    assert_eq!(Fixture::op(&snapshot, "Coordinator")["expected_generation"], original["expected_generation"]);
+    assert_eq!(snapshot["reconciliationRequired"], false);
+    assert_eq!(f.io.count("turn/start"), 0);
+    assert_eq!(snapshot["messages"].as_array().unwrap().iter().filter(|m| m["id"] == "user:legacy-first-message").count(), 1);
+    f.send("explicit-new-message").await;
+    assert_eq!(f.io.count("turn/start"), 1, "Only a new explicit intent may dispatch");
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_generation_actor_keeps_nonempty_old_generation_unknown() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("accepted-before-restart").await;
+    let original = Fixture::op(&snapshot, "Coordinator");
+    assert!(!original["mapping"].is_null());
+    f.stop().await;
+    f.io.0.lock().unwrap().generation = Some("new-host".into());
+    f.start().await;
+    for _ in 0..2 {
+        let snapshot = f.read().await;
+        assert_eq!(snapshot["reconciliationRequired"], true);
+        let current = Fixture::op(&snapshot, "Coordinator");
+        assert_eq!(current["id"], original["id"]);
+        assert_eq!(current["mapping"], original["mapping"]);
+        assert_eq!(current["phase"], "Unknown");
+        assert_eq!(f.io.count("turn/start"), 1);
+        assert_eq!(f.io.count("thread/start"), 1);
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_review_committed_housekeeping_actor_keeps_original_call_until_receipt_recovers() {
+    for schedule in [true, false] {
+        let mut f = Fixture::new(true).await;
+        let s = f.send("review-receipt").await;
+        let op = Fixture::op(&s, "Coordinator");
+        let lead = Fixture::mapping(&op);
+        let journal = format!("tool:{}:receipt-crash", op["id"].as_str().unwrap());
+        let db = Connection::open(f.root.path().join("assistant/assistant.db")).unwrap();
+        let record = if schedule { "OLD.data" } else { "NEW.data" };
+        db.execute_batch(&format!("CREATE TRIGGER fail_review_receipt BEFORE UPDATE ON assistant_service_state WHEN EXISTS(SELECT 1 FROM json_each({record},'$.journal') WHERE key='{journal}') BEGIN SELECT RAISE(FAIL,'review: committed effect, receipt unavailable'); END;")).unwrap();
+        let (name, arguments, collection) = if schedule {
+            (
+                "assistant_schedule_create",
+                json!({"user_message_id":"user:review-receipt","timezone":"UTC","kind":{"type":"once","at_ms":2_000_000},"prompt":"Read project status","directory":f.project.path(),"writes":false}),
+                "schedules",
+            )
+        } else {
+            (
+                "assistant_memory_add",
+                json!({"user_message_id":"user:review-receipt","text":"Include test evidence"}),
+                "memories",
+            )
+        };
+        let native = json!("review-receipt-native");
+        f.io.tool(native.clone(), &lead, "receipt-crash", name, arguments);
+        let s = f.read().await;
+        assert_eq!(s[collection].as_array().unwrap().len(), 1);
+        let identity = s[collection][0]["id"].clone();
+        eprintln!(
+            "committed {collection}: {}, actor answers: {:?}",
+            identity,
+            f.io.answers()
+        );
+        assert!(
+            f.io.answers().is_empty(),
+            "A committed local effect must not become success:false"
+        );
+        assert_eq!(s["reconciliationRequired"], true);
+        f.read().await;
+        assert!(f.io.answers().is_empty());
+        assert!(f.io.0.lock().unwrap().pending.contains_key(&key(&native)));
+        f.stop().await;
+        db.execute_batch("DROP TRIGGER fail_review_receipt")
+            .unwrap();
+        drop(db);
+        // Recovery sends only the held answer. Its lost receipt must still not resend.
+        f.io.0.lock().unwrap().lose_answer = true;
+        f.start().await;
+        let s = f.read().await;
+        assert_eq!(s[collection].as_array().unwrap().len(), 1);
+        assert_eq!(s[collection][0]["id"], identity);
+        assert_eq!(f.io.answers().len(), 1);
+        housekeeping_answer(&f.io, &native);
+        assert_eq!(s["reconciliationRequired"], true);
+        f.read().await;
+        f.stop().await;
+        f.start().await;
+        assert_eq!(f.read().await[collection][0]["id"], identity);
+        assert_eq!(f.io.answers().len(), 1);
+        f.io.resolve(native);
+        assert_eq!(f.read().await["reconciliationRequired"], false);
+        assert_eq!(f.io.answers().len(), 1);
+        assert_eq!(f.io.count("turn/start"), 1);
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn v070_housekeeping_natural_tools_persist_schedule_and_memory_crud() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("housekeeping").await;
+    let lead = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.tool(json!(9001), &lead, "schedule", "assistant_schedule_create",
+        json!({"user_message_id":"user:housekeeping","timezone":"Asia/Shanghai","kind":{"type":"daily","hour":9,"minute":30},"prompt":"Read the project status","directory":f.project.path(),"writes":false}));
+    let s = f.read().await;
+    assert_eq!(s["schedules"].as_array().unwrap().len(), 1);
+    let schedule = s["schedules"][0].clone();
+    assert_eq!(schedule["spec"]["zone"]["name"], "Asia/Shanghai");
+    assert_eq!(schedule["spec"]["zone"]["initial_offset_seconds"], 28800);
+    assert_eq!(
+        housekeeping_answer(&f.io, &json!(9001))["id"],
+        schedule["id"]
+    );
+    f.io.tool(
+        json!(9002),
+        &lead,
+        "schedule-list",
+        "assistant_schedule_list",
+        json!({"limit":20}),
+    );
+    f.read().await;
+    assert_eq!(
+        housekeeping_answer(&f.io, &json!(9002))["schedules"][0]["id"],
+        schedule["id"]
+    );
+    f.io.tool(
+        json!(9003),
+        &lead,
+        "memory",
+        "assistant_memory_add",
+        json!({"user_message_id":"user:housekeeping","text":"Use concise project reports"}),
+    );
+    let s = f.read().await;
+    let memory = s["memories"][0]["id"].clone();
+    assert_eq!(
+        housekeeping_answer(&f.io, &json!(9003))["result"]["value"],
+        memory
+    );
+    f.io.tool(
+        json!(9004),
+        &lead,
+        "memory-read",
+        "assistant_memory_read",
+        json!({"limit":20}),
+    );
+    f.read().await;
+    assert_eq!(
+        housekeeping_answer(&f.io, &json!(9004))["memories"][0]["text"],
+        "Use concise project reports"
+    );
+    f.io.tool(json!(9005), &lead, "memory-edit", "assistant_memory_update",
+        json!({"user_message_id":"user:housekeeping","memory_id":memory,"text":"Include test evidence"}));
+    f.read().await;
+    f.stop().await;
+    f.start().await;
+    let s = f.read().await;
+    assert_eq!(s["memories"][0]["text"], "Include test evidence");
+    assert_eq!(s["schedules"][0]["id"], schedule["id"]);
+    // The phone being absent does not stop the already entrusted scheduler.
+    f.at(schedule["next_ms"].as_i64().unwrap());
+    let s = f.read().await;
+    assert_eq!(s["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(s["tasks"][0]["prompt"], "Read the project status");
+    assert_eq!(s["tasks"][0]["writes"], false);
+    f.io.tool(
+        json!(9006),
+        &lead,
+        "schedule-delete",
+        "assistant_schedule_delete",
+        json!({"user_message_id":"user:housekeeping","schedule_id":schedule["id"]}),
+    );
+    f.read().await;
+    f.io.tool(
+        json!(9007),
+        &lead,
+        "memory-delete",
+        "assistant_memory_delete",
+        json!({"user_message_id":"user:housekeeping","memory_id":memory}),
+    );
+    let s = f.read().await;
+    assert!(s["schedules"].as_array().unwrap().is_empty());
+    assert!(s["memories"].as_array().unwrap().is_empty());
+    assert_eq!(f.io.answers().len(), 7);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_housekeeping_unknown_effect_answers_reconcile_without_repeating_after_restart() {
+    for schedule in [false, true] {
+        let mut f = Fixture::new(true).await;
+        let s = f.send("housekeeping").await;
+        let lead = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+        let (tool, args, collection) = if schedule {
+            (
+                "assistant_schedule_create",
+                json!({"user_message_id":"user:housekeeping","timezone":"UTC","kind":{"type":"once","at_ms":2_000_000},"prompt":"Read project","directory":f.project.path(),"writes":false}),
+                "schedules",
+            )
+        } else {
+            (
+                "assistant_memory_add",
+                json!({"user_message_id":"user:housekeeping","text":"Use test evidence"}),
+                "memories",
+            )
+        };
+        f.io.0.lock().unwrap().lose_answer = true;
+        f.io.tool(
+            json!("unknown-housekeeping"),
+            &lead,
+            "durable-local",
+            tool,
+            args.clone(),
+        );
+        let s = f.read().await;
+        assert_eq!(s[collection].as_array().unwrap().len(), 1);
+        let identity = s[collection][0]["id"].clone();
+        assert_eq!(s["reconciliationRequired"], true);
+        f.read().await;
+        f.stop().await;
+        f.start().await;
+        f.io.tool(
+            json!("unknown-housekeeping"),
+            &lead,
+            "durable-local",
+            tool,
+            args,
+        );
+        let s = f.read().await;
+        assert_eq!(s[collection].as_array().unwrap().len(), 1);
+        assert_eq!(s[collection][0]["id"], identity);
+        assert_eq!(f.io.answers().len(), 1, "Unknown answer must not be resent");
+        assert_eq!(s["reconciliationRequired"], true);
+        f.io.resolve(json!("unknown-housekeeping"));
+        let s = f.read().await;
+        assert_eq!(s["reconciliationRequired"], false);
+        assert_eq!(s["unconfirmedWrites"], 0);
+        assert_eq!(f.io.answers().len(), 1);
+        assert_eq!(f.io.count("turn/start"), 1);
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn v070_housekeeping_schedule_rejects_unknown_zone_and_revoked_project_writes() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("housekeeping").await;
+    let lead = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    let foreign = tempfile::tempdir().unwrap();
+    let base = json!({"user_message_id":"user:housekeeping","timezone":"UTC","kind":{"type":"daily","hour":9,"minute":30},"prompt":"Read project","directory":f.project.path(),"writes":false});
+    let mut bad_zone = base.clone();
+    bad_zone["timezone"] = json!("Not/AZone");
+    let mut bad_directory = base.clone();
+    bad_directory["directory"] = json!(foreign.path());
+    for (n, args) in [(9010, bad_zone), (9011, bad_directory)] {
+        f.io.tool(
+            json!(n),
+            &lead,
+            &format!("bad-{n}"),
+            "assistant_schedule_create",
+            args,
+        );
+        let s = f.read().await;
+        assert!(s["schedules"].as_array().unwrap().is_empty());
+        assert_eq!(f.io.answers().last().unwrap().1["success"], false);
+    }
+    // Permission is re-read at creation, even though no scheduled task is due yet.
+    f.io.0
+        .lock()
+        .unwrap()
+        .permissions
+        .get_mut("desktop-thread")
+        .unwrap()
+        .settings = crate::settings::canonical(
+        &json!({"sandbox":{"type":"readOnly"},"approvalPolicy":"on-request","approvalsReviewer":"user"}),
+    );
+    let mut writes = base.clone();
+    writes["writes"] = json!(true);
+    f.io.tool(
+        json!(9012),
+        &lead,
+        "revoked-write",
+        "assistant_schedule_create",
+        writes,
+    );
+    let s = f.read().await;
+    assert!(s["schedules"].as_array().unwrap().is_empty());
+    assert_eq!(f.io.answers().last().unwrap().1["success"], false);
+    f.io.tool(
+        json!(9013),
+        &lead,
+        "authorized-read",
+        "assistant_schedule_create",
+        base,
+    );
+    assert_eq!(f.read().await["schedules"].as_array().unwrap().len(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_housekeeping_workers_and_foreign_user_messages_cannot_mutate_private_state() {
+    let mut f = Fixture::new(false).await;
+    let s = f.send("housekeeping").await;
+    let lead = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    let s = f.create(&lead, 9020, "Read only entrusted work").await;
+    let child = Fixture::mapping(&Fixture::op(&s, "Execution"));
+    let calls = [
+        (
+            "assistant_schedule_create",
+            json!({"user_message_id":"user:housekeeping","timezone":"UTC","kind":{"type":"once","at_ms":2_000_000},"prompt":"Task","directory":f.project.path(),"writes":false}),
+        ),
+        (
+            "assistant_schedule_delete",
+            json!({"user_message_id":"user:housekeeping","schedule_id":"x"}),
+        ),
+        ("assistant_schedule_list", json!({"limit":20})),
+        ("assistant_memory_read", json!({"limit":20})),
+        (
+            "assistant_memory_add",
+            json!({"user_message_id":"user:housekeeping","text":"Inferred worker preference"}),
+        ),
+        (
+            "assistant_memory_update",
+            json!({"user_message_id":"user:housekeeping","memory_id":"x","text":"Changed"}),
+        ),
+        (
+            "assistant_memory_delete",
+            json!({"user_message_id":"user:housekeeping","memory_id":"x"}),
+        ),
+    ];
+    for (n, (name, args)) in calls.into_iter().enumerate() {
+        f.io.tool(json!(9030 + n), &child, &format!("child-{n}"), name, args);
+        f.read().await;
+        assert_eq!(f.io.answers().last().unwrap().1["success"], false);
+    }
+    f.io.tool(
+        json!(9040),
+        &lead,
+        "foreign-instruction",
+        "assistant_memory_add",
+        json!({"user_message_id":"user:untrusted","text":"Forged instruction"}),
+    );
+    let s = f.read().await;
+    assert_eq!(f.io.answers().last().unwrap().1["success"], false);
+    assert!(s["memories"].as_array().unwrap().is_empty());
+    assert!(s["schedules"].as_array().unwrap().is_empty());
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_housekeeping_unknown_memory_read_never_replays_deleted_text_or_resends() {
+    let mut f = Fixture::new(true).await;
+    let s = f.send("housekeeping").await;
+    let lead = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.call(
+        "assistant/memory/add",
+        json!({"text":"deleted-memory-sentinel"}),
+        "add",
+        false,
+    )
+    .await
+    .unwrap();
+    f.io.0.lock().unwrap().lose_answer = true;
+    f.io.tool(
+        json!("read-memory"),
+        &lead,
+        "read-memory",
+        "assistant_memory_read",
+        json!({"limit":20}),
+    );
+    assert_eq!(f.read().await["reconciliationRequired"], true);
+    // Simulate explicit local deletion while the native answer is unresolved.
+    let db = Connection::open(f.root.path().join("assistant/assistant.db")).unwrap();
+    db.execute("DELETE FROM assistant_memories", []).unwrap();
+    let state: String = db
+        .query_row("SELECT data FROM assistant_service_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(!state.contains("deleted-memory-sentinel"));
+    drop(db);
+    f.stop().await;
+    f.start().await;
+    f.io.tool(
+        json!("read-memory"),
+        &lead,
+        "read-memory",
+        "assistant_memory_read",
+        json!({"limit":20}),
+    );
+    let s = f.read().await;
+    assert!(s["memories"].as_array().unwrap().is_empty());
+    assert_eq!(s["reconciliationRequired"], true);
+    assert_eq!(f.io.answers().len(), 1);
+    f.io.resolve(json!("read-memory"));
+    assert_eq!(f.read().await["reconciliationRequired"], false);
+    assert_eq!(f.io.answers().len(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_startup_stages_are_separate_and_do_not_generate_an_idle_turn() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.read().await;
+    let stages = snapshot["startupStages"]
+        .as_array()
+        .expect("four startup stages");
+    assert_eq!(
+        stages
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["runtime", "account", "capabilities", "coordinator"]
+    );
+    assert_eq!(stages[0]["status"], "ready");
+    assert_eq!(stages[1]["status"], "ready");
+    assert_eq!(stages[2]["status"], "ready");
+    assert_eq!(stages[3]["status"], "ready");
+    assert_eq!(stages[3]["sessionCreated"], false);
+    assert_eq!(f.io.count("turn/start"), 0);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_login_failure_recovers_using_existing_provider_without_dispatch_or_resend() {
+    let mut f = Fixture::new(false).await;
+    f.io.0.lock().unwrap().account_reply = Some(json!({"requiresOpenaiAuth":true,"account":null}));
+    f.at(1_010_000);
+    let snapshot = f.read().await;
+    assert_eq!(snapshot["startupStages"][1]["status"], "blocked");
+    assert_eq!(
+        snapshot["startupStages"][1]["recoveryAction"],
+        "login_with_codex_cli"
+    );
+    assert_eq!(snapshot["ready"], false);
+    assert!(
+        f.call(
+            "assistant/send",
+            json!({"message":"work"}),
+            "before-login",
+            false
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.io.count("turn/start"), 0);
+    f.io.0.lock().unwrap().account_reply = Some(json!({"requiresOpenaiAuth":false,"account":null}));
+    f.at(1_020_000);
+    assert_eq!(f.read().await["ready"], true);
+    f.call(
+        "assistant/send",
+        json!({"message":"work"}),
+        "after-login",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.io.count("turn/start"), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn v070_stream_replay_restart_and_completion_keep_one_reply_identity() {
+    let mut f = Fixture::new(false).await;
+    let snapshot = f.send("streaming").await;
+    let coordinator = Fixture::mapping(&Fixture::op(&snapshot, "Coordinator"));
+    f.io.emit(
+        Value::Null,
+        "item/agentMessage/delta",
+        &coordinator,
+        json!({"itemId":"answer","delta":"First "}),
+    );
+    let first = f.read().await;
+    assert!(
+        first["runtimeEventCursor"].as_u64().unwrap()
+            > snapshot["runtimeEventCursor"].as_u64().unwrap()
+    );
+    let reply = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "Assistant")
+        .expect("stream visible");
+    let id = reply["id"].clone();
+    assert_eq!(reply["text"], "First ");
+    f.stop().await;
+    f.start().await;
+    f.io.emit(
+        Value::Null,
+        "item/agentMessage/delta",
+        &coordinator,
+        json!({"itemId":"answer","delta":"result"}),
+    );
+    assert_eq!(f.read().await["messages"][1]["text"], "First result");
+    f.io.complete(&coordinator, "First result");
+    let finished = f.read().await;
+    let replies = finished["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "Assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["id"], id);
+    assert_eq!(replies[0]["text"], "First result");
+    f.stop().await;
+}
+
 #[test]
 fn collaboration_public_answer_history_redacts_secret_answers() {
     let mapping = NativeMapping {
@@ -412,9 +1241,52 @@ async fn collaboration_actor_reassignment_attributes_history_to_original_operati
 }
 
 #[derive(Default)]
+struct RequestGate {
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+impl RequestGate {
+    fn release(&self) { *self.released.lock().unwrap()=true; self.wake.notify_all(); }
+}
+
+#[tokio::test]
+async fn dispatch_in_flight_actor_cache_reports_progress_without_ready_or_redispatch() {
+    let mut f=Fixture::new(false).await;
+    let gate=Arc::new(RequestGate::default());
+    f.io.0.lock().unwrap().request_gate=Some(("thread/start".into(),gate.clone()));
+    let actor=f.actor.as_ref().unwrap().clone();
+    let sender=actor.clone();
+    let directory=f.project.path().to_path_buf();
+    let send=tokio::spawn(async move {sender.request("assistant/send",json!({"message":"Start once","threadId":"desktop-thread"}),"in-flight".into(),Some(directory)).await});
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while !gate.entered.load(Ordering::Acquire) {tokio::time::sleep(Duration::from_millis(5)).await;}
+    }).await.unwrap();
+    let during=actor.snapshot();
+    gate.release();
+    send.await.unwrap().unwrap();
+    actor.request("assistant/read",json!({}),"dispatch-barrier".into(),None).await.unwrap();
+    let after=actor.snapshot();
+    drop(actor);
+    assert_eq!(f.io.count("thread/start"),1);
+    assert_eq!(f.io.count("turn/start"),1);
+    f.stop().await;
+    assert_eq!(during["dispatchInFlight"],true);
+    assert_eq!(during["ready"],false);
+    assert_eq!(during["fresh"],false);
+    assert_eq!(during["error"],Value::Null);
+    assert_ne!(after["dispatchInFlight"],true);
+}
+
+#[derive(Default)]
 struct State {
+    request_gate: Option<(String, Arc<RequestGate>)>,
+    generation: Option<String>,
+    account_reply: Option<Value>,
     calls: Vec<(Value, String, Value)>,
     receipts: BTreeMap<String, RuntimeReceipt>,
+    answer_receipts: BTreeMap<String, RuntimeReceipt>,
+    answer_receipt_unavailable: bool,
     hidden_receipts: BTreeSet<String>,
     threads: BTreeMap<String, Value>,
     permissions: BTreeMap<String, ProjectPermissionProof>,
@@ -426,6 +1298,7 @@ struct State {
     lose_method: Option<String>,
     unsupported: Option<String>,
     lose_answer: bool,
+    answer_before_dispatch_error: bool,
     ignore_interrupt: bool,
     offline: bool,
     fail_reads: bool,
@@ -434,8 +1307,16 @@ struct State {
     reject_steer: bool,
 }
 #[derive(Clone, Default)]
-struct Fake(Arc<Mutex<State>>);
+pub(crate) struct Fake(Arc<Mutex<State>>);
 impl Fake {
+    pub(crate) fn source_reader(&self, reader: Arc<dyn ProjectPermissionReader>) {
+        self.0.lock().unwrap().permission_reader = Some(reader);
+    }
+    pub(crate) fn read_threads(&self) -> Vec<String> {
+        self.0.lock().unwrap().calls.iter().filter(|(_,m,_)| m == "thread/read")
+            .filter_map(|(_,_,p)| p["threadId"].as_str().map(str::to_owned)).collect()
+    }
+    pub(crate) fn owners(&self) -> usize { Arc::strong_count(&self.0) }
     fn selected(&self, id: &str, root: &Path) {
         let mut state = self.0.lock().unwrap();
         state.threads.insert(
@@ -465,7 +1346,7 @@ impl Fake {
             message: v,
         });
     }
-    fn tool(&self, id: Value, m: &NativeMapping, call_id: &str, name: &str, arguments: Value) {
+    pub(crate) fn tool(&self, id: Value, m: &NativeMapping, call_id: &str, name: &str, arguments: Value) {
         self.emit(
             id,
             "item/tool/call",
@@ -502,11 +1383,21 @@ impl Fake {
             .filter(|(_, m, _)| m == method)
             .count()
     }
-    fn answers(&self) -> Vec<(Value, Value)> {
+    pub(crate) fn answers(&self) -> Vec<(Value, Value)> {
         self.0.lock().unwrap().answers.clone()
     }
 }
 impl RuntimeIo for Fake {
+    fn account(&mut self) -> Result<AccountReadiness> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .account_reply
+            .as_ref()
+            .map(AccountReadiness::from_native)
+            .unwrap_or(AccountReadiness::Ready))
+    }
     fn supports(&self, method: &str, _: &Value) -> bool {
         method == "turn/steer" && self.0.lock().unwrap().supports_steer
     }
@@ -533,7 +1424,16 @@ impl RuntimeIo for Fake {
             .context("Source permission projection unavailable")
     }
     fn request(&mut self, id: Value, method: &str, p: Value) -> Result<Value> {
+        let gate = self.0.lock().unwrap().request_gate.as_ref()
+            .filter(|(m,_)|m==method).map(|(_,g)|g.clone());
+        if let Some(gate)=gate {
+            gate.entered.store(true,Ordering::Release);
+            let released=gate.released.lock().unwrap();
+            let (_released, timeout)=gate.wake.wait_timeout_while(released,Duration::from_secs(10),|r| !*r).unwrap();
+            ensure!(!timeout.timed_out(),"Fixture request gate timed out");
+        }
         let mut s = self.0.lock().unwrap();
+        let generation = s.generation.clone().unwrap_or_else(|| "host".into());
         ensure!(!s.offline, "Fake offline");
         if s.unsupported.as_deref() == Some(method) {
             return Err(RuntimeUnsupported {
@@ -557,7 +1457,7 @@ impl RuntimeIo for Fake {
             s.receipts.insert(
                 key(&id),
                 RuntimeReceipt {
-                    generation: "host".into(),
+                    generation: generation.clone(),
                     state: "completed".into(),
                     response: Some(
                         json!({"id":id,"error":{"code":-32602,"message":"Turn already stopped"}}),
@@ -633,7 +1533,7 @@ impl RuntimeIo for Fake {
         s.receipts.insert(
             key(&id),
             RuntimeReceipt {
-                generation: "host".into(),
+                generation,
                 state: "completed".into(),
                 response: Some(json!({"id":id,"result":result})),
             },
@@ -649,7 +1549,7 @@ impl RuntimeIo for Fake {
         let s = self.0.lock().unwrap();
         if s.hidden_receipts.contains(&key(&id)) {
             return Ok(RuntimeReceipt {
-                generation: "host".into(),
+                generation: s.generation.clone().unwrap_or_else(|| "host".into()),
                 state: "unknown".into(),
                 response: None,
             });
@@ -658,10 +1558,18 @@ impl RuntimeIo for Fake {
             .get(&key(&id))
             .cloned()
             .unwrap_or(RuntimeReceipt {
-                generation: "host".into(),
+                generation: s.generation.clone().unwrap_or_else(|| "host".into()),
                 state: "missing".into(),
                 response: None,
             }))
+    }
+    fn answer_receipt(&mut self, id: Value) -> Result<RuntimeReceipt> {
+        let s = self.0.lock().unwrap();
+        ensure!(!s.answer_receipt_unavailable, "Authoritative answer receipt unavailable");
+        Ok(s.answer_receipts.get(&key(&id)).cloned().unwrap_or(RuntimeReceipt {
+            generation:s.generation.clone().unwrap_or_else(|| "host".into()),
+            state:"missing".into(), response:None,
+        }))
     }
     fn answer(&mut self, id: Value, result: Value) -> Result<()> {
         let mut s = self.0.lock().unwrap();
@@ -673,10 +1581,21 @@ impl RuntimeIo for Fake {
             !s.answers.iter().any(|(old, _)| old == &id),
             "Duplicate native answer"
         );
+        if std::mem::take(&mut s.answer_before_dispatch_error) {
+            anyhow::bail!("Answer transport refused before Host reservation");
+        }
         s.answers.push((id.clone(), result));
         if std::mem::take(&mut s.lose_answer) {
+            let generation = s.generation.clone().unwrap_or_else(|| "host".into());
+            s.answer_receipts.insert(key(&id), RuntimeReceipt {
+                generation, state:"unknown".into(), response:None,
+            });
             anyhow::bail!("Lost answer receipt");
         }
+        let generation = s.generation.clone().unwrap_or_else(|| "host".into());
+        s.answer_receipts.insert(key(&id), RuntimeReceipt {
+            generation, state:"completed".into(), response:Some(json!({"id":id,"result":{"written":true}})),
+        });
         let p = s.pending.remove(&key(&id)).unwrap();
         let sequence = s.events.len() as u64 + 1;
         s.events.push(RuntimeEvent{sequence,message:json!({"method":"serverRequest/resolved","params":{"requestId":id,"threadId":p["params"]["threadId"]}})});
@@ -693,7 +1612,7 @@ impl RuntimeIo for Fake {
             .cloned()
             .collect();
         Ok(RuntimeEvents {
-            generation: "host".into(),
+            generation: s.generation.clone().unwrap_or_else(|| "host".into()),
             next_after: events.last().map_or(after, |e| e.sequence),
             snapshot_required: false,
             events,
@@ -701,13 +1620,15 @@ impl RuntimeIo for Fake {
         })
     }
     fn health(&mut self) -> Result<RuntimeHealth> {
+        let s = self.0.lock().unwrap();
         Ok(RuntimeHealth {
             runtime_id: "runtime".into(),
-            generation: "host".into(),
-            online: !self.0.lock().unwrap().offline,
+            generation: s.generation.clone().unwrap_or_else(|| "host".into()),
+            online: !s.offline,
             initialized: true,
             protocol_verified: true,
             reconciliation_required: false,
+            scoped_admission:false,
         })
     }
 }
@@ -776,7 +1697,7 @@ impl Fixture {
         self.clock.store(at, Ordering::SeqCst);
     }
     async fn call(&self, method: &str, p: Value, id: &str, directory: bool) -> Result<Value> {
-        self.actor
+        let mut reply = self.actor
             .as_ref()
             .unwrap()
             .request(
@@ -785,7 +1706,14 @@ impl Fixture {
                 id.into(),
                 directory.then(|| self.project.path().into()),
             )
-            .await
+            .await?;
+        // Product acceptance no longer waits for native dispatch. Tests that
+        // inspect execution state explicitly request a subsequent worker read.
+        if !is_read(method) {
+            reply["snapshot"] = self.actor.as_ref().unwrap()
+                .request("assistant/read", json!({}), format!("barrier:{id}"), None).await?;
+        }
+        Ok(reply)
     }
     async fn read(&self) -> Value {
         self.call("assistant/read", json!({}), "read", false)
@@ -2027,17 +2955,17 @@ async fn idle_polls_are_coalesced_and_explicit_reads_wake_immediately() {
 }
 
 #[tokio::test]
-async fn lost_create_tool_answer_fences_queued_dispatch_until_authoritative_resolution() {
+async fn lost_create_tool_answer_does_not_replay_committed_task_or_block_its_dispatch() {
     let mut f = Fixture::new(false).await;
     let s = f.send("phone").await;
     let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
     f.io.0.lock().unwrap().lose_answer = true;
     let s = f.create(&cm, 701, "queued behind unknown answer").await;
-    assert_eq!(s["tasks"][0]["status"], "queued");
-    assert_eq!(f.io.count("turn/start"), 1);
+    assert_eq!(s["tasks"][0]["status"], "running");
+    assert_eq!(f.io.count("turn/start"), 2);
     f.read().await;
     assert_eq!(f.io.answers().len(), 1);
-    assert_eq!(f.io.count("turn/start"), 1);
+    assert_eq!(f.io.count("turn/start"), 2);
     f.io.resolve(json!(701));
     let s = f.read().await;
     assert_eq!(s["tasks"][0]["status"], "running");
@@ -2112,3 +3040,6 @@ fn native_answer_receipt_requires_confirmed_written_result() {
         .is_ok()
     );
 }
+
+#[path = "tests/product_flow.rs"]
+mod product_flow;

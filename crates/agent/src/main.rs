@@ -12,6 +12,8 @@ use pocket_agent::{
 use pocket_tunnel::ServerIdentity;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+#[cfg(windows)]
+mod cli_integration;
 
 struct Args {
     command: String,
@@ -131,6 +133,10 @@ impl Args {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let raw: Vec<_> = std::env::args().skip(1).collect();
+    if raw == ["--build-info"] {
+        println!("{}",json!({"version":env!("CARGO_PKG_VERSION"),"buildId":option_env!("POCKET_BUILD_ID").unwrap_or("development")}));
+        return std::process::ExitCode::SUCCESS;
+    }
     let structured = raw.iter().any(|a| a == "--json");
     let args = match Args::parse(&raw) {
         Ok(args) => args,
@@ -289,6 +295,16 @@ async fn execute(args: Args) -> Result<()> {
             broker.install_handoff(handoff.clone())?;
             handoff.sync_remote_gate(|enabled|broker.connection.set_remote_enabled(enabled));
             let mut tasks=tokio::task::JoinSet::new();
+            // The unpackaged background owns descriptor persistence. The MSIX
+            // native proxy only retains a live pipe and can reconnect after updates.
+            #[cfg(windows)]
+            let _native_registry = c.runtime_directories.first().cloned()
+                .and_then(|dir|match pocket_bridge::registry::Registry::start(dir) {
+                    Ok(registry)=>Some(registry),
+                    Err(_)=>{eprintln!("Native proxy registration unavailable; existing native execution is unaffected.");None}
+                });
+            #[cfg(windows)]
+            tasks.spawn(cli_integration::maintain(state.clone()));
             tasks.spawn(broker.clone().receive_events(events));
             tasks.spawn(broker.clone().discover());
             // Restoring a Host attaches its independent process and durable service; it never

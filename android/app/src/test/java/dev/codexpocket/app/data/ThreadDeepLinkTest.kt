@@ -4,6 +4,11 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ThreadDeepLinkTest {
+    @Test fun persistedDirectoryCanOpenWithoutLiveOwnerButStillKeepsProfileBoundary() {
+        val target=ChatEntity(ThreadKey("pc","store","thread"),"history:store","cli","Saved","","",0,"",false)
+        assertTrue(resolveThreadDeepLink("thread","pc",target.key,listOf(target),emptyList(),true) is ThreadLinkResolution.Open)
+        assertTrue(resolveThreadDeepLink("thread","pc",target.key.copy(configStoreId="other"),listOf(target),emptyList(),true) is ThreadLinkResolution.Rejected)
+    }
     private val id = "01a1c7fb-7bda-7a71-a782-a020229c9573"
     private val owner = ThreadKey("pc", "store", "01a1c7fb-7bda-7a71-a782-a020229c9574")
     private val target = ChatEntity(owner.copy(nativeId = id), "runtime", "cli", "Target", "", "D:/work", 0, "idle", false)

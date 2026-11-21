@@ -7,12 +7,18 @@ if (Test-Path -LiteralPath $OutputDirectory) { throw 'Release directory must not
 if (-not $env:POCKET_SIGNING_KEY_BASE64 -or -not $env:POCKET_SIGNING_PASSWORD -or $env:POCKET_EXPECTED_SIGNER -notmatch '^[A-Fa-f0-9]{64}$') {
     throw 'Configure the original Android signing key/password secrets and POCKET_EXPECTED_SIGNER repository variable. No replacement key will be created.'
 }
+if (!$env:POCKET_UPDATE_PRIVATE_KEY_PEM -or !$env:POCKET_UPDATE_TRUST_JSON -or !$env:POCKET_UPDATE_ASSET_BASE) {
+    throw 'Velopack releases require the existing Ed25519 update private key, public trust policy and trusted release asset base. No replacement identity is generated.'
+}
 $signing=Join-Path ([IO.Path]::GetTempPath()) ('pocket-signing-'+[guid]::NewGuid().ToString('N'))
 $previousRuntimeTestHost=$env:MANAGED_RUNTIME_TEST_HOST
 [void][IO.Directory]::CreateDirectory($signing)
 try {
     [IO.File]::WriteAllBytes((Join-Path $signing 'release.jks'),[Convert]::FromBase64String($env:POCKET_SIGNING_KEY_BASE64))
     [IO.File]::WriteAllText((Join-Path $signing 'password.txt'),$env:POCKET_SIGNING_PASSWORD,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $signing 'update-key.pem'),$env:POCKET_UPDATE_PRIVATE_KEY_PEM,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $signing 'update-trust.json'),$env:POCKET_UPDATE_TRUST_JSON,[Text.UTF8Encoding]::new($false))
+    Remove-Item Env:POCKET_UPDATE_PRIVATE_KEY_PEM
     Remove-Item Env:POCKET_SIGNING_KEY_BASE64
     Remove-Item Env:POCKET_SIGNING_PASSWORD
     Push-Location $root
@@ -32,12 +38,12 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Desktop runtime tests failed.' }
         & ./android/gradlew.bat -p android :wire:test :app:testDebugUnitTest :app:lintDebug --no-daemon
         if ($LASTEXITCODE -ne 0) { throw 'Android host checks failed.' }
-        & ./scripts/build-release.ps1 -SigningDirectory $signing -OutputDirectory $OutputDirectory
+        & ./scripts/build-release.ps1 -SigningDirectory $signing -OutputDirectory $OutputDirectory -UpdateTrustPath (Join-Path $signing 'update-trust.json')
         & cargo test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop
         if ($LASTEXITCODE -ne 0) { throw 'Desktop native command checks failed.' }
         $manifest=Get-Content -LiteralPath (Join-Path $OutputDirectory 'release-manifest.json') -Raw | ConvertFrom-Json
         if ($manifest.build.apkSignerSha256 -ne $env:POCKET_EXPECTED_SIGNER.ToLowerInvariant()) { throw 'APK signer differs from the approved original certificate.' }
-        & ./scripts/build-windows-installer.ps1 -ReleaseDirectory $OutputDirectory -OutputDirectory $OutputDirectory
+        & ./scripts/package-windows-release.ps1 -ReleaseDirectory $OutputDirectory -PrivateKeyPath (Join-Path $signing 'update-key.pem') -TrustPath (Join-Path $signing 'update-trust.json') -AssetBase $env:POCKET_UPDATE_ASSET_BASE
         if ($LASTEXITCODE -ne 0) { throw 'Windows installer creation failed.' }
         $source=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputDirectory))) ('pocket-source-'+[guid]::NewGuid().ToString('N'))
         & ./scripts/package-source.ps1 -OutputDirectory $source
@@ -50,7 +56,7 @@ try {
 } finally {
     $env:MANAGED_RUNTIME_TEST_HOST=$previousRuntimeTestHost
     # This exact temporary directory was created above; remove only its two known secret files.
-    foreach($name in @('release.jks','password.txt')) {
+    foreach($name in @('release.jks','password.txt','update-key.pem','update-trust.json')) {
         $path=Join-Path $signing $name
         if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force}
     }

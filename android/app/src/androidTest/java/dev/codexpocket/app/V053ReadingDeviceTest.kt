@@ -211,6 +211,37 @@ class V053ReadingDeviceTest {
         } }
     }
 
+    @Test(timeout = 120_000) fun imageDraftFastSwipesKeepComposerAndAnchorStable() = proof("image-draft-scroll") {
+        val app=instrumentation.targetContext
+        val imageId="11111111-1111-4111-8111-111111111111"
+        val imageFile=File(app.filesDir,"attachments/$imageId").apply { parentFile?.mkdirs() }
+        val bitmap=Bitmap.createBitmap(240,160,Bitmap.Config.ARGB_8888)
+        imageFile.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG,100,it) };bitmap.recycle()
+        state=fixtureState(fixtureTimeline(35)).copy(attachments=listOf(LocalAttachment(imageId,"fixture.png","image/png")))
+        mountChat()
+        compose.onNodeWithTag("composer-input").performClick().performTextInput("\n输入图片后的中文文字，保持草稿。")
+        repeat(8) {
+            transcript().performTouchInput { swipe(Offset(center.x,top+40f), Offset(center.x,bottom-30f),100) }
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        compose.onNodeWithTag("composer-input").assertExists()
+        val sizes=mutableListOf<Float>();val positions=mutableListOf<Float>()
+        repeat(15) {
+            compose.waitForIdle()
+            sizes+=compose.onNodeWithTag("composer-surface").fetchSemanticsNode().boundsInRoot.height
+            positions+=scrollValue()
+            SystemClock.sleep(40)
+        }
+        assertTrue("Composer oscillated: $sizes",sizes.max()-sizes.min()<2f)
+        assertTrue("Reading anchor oscillated: $positions",positions.max()-positions.min()<.001f)
+        compose.onNodeWithTag("composer-attachment-count").assertTextEquals("1")
+        observations["composerHeights"] = JsonArray(sizes.map { JsonPrimitive(it) })
+        observations["scrollPositions"] = JsonArray(positions.map { JsonPrimitive(it) })
+        capture("image-draft-stable")
+        assertEquals(0,connections.get())
+    }
+
     @Test(timeout = 180_000) fun mainTranscriptTypographyPlanAndMinimap() = proof("main-reading") {
         val original = fixtureTimeline(24)
         state = fixtureState(original)

@@ -1067,6 +1067,7 @@ fn assigned(
             group_id: group.map(str::to_owned),
             dependencies,
             completion_criteria: "Tests pass and explain the result".into(),
+            parent_task_id: None,
         },
     );
     result["result"]["value"]["id"].as_str().unwrap().into()
@@ -1876,6 +1877,7 @@ fn collaboration_idle_ticks_do_not_rewrite_durable_conversation() {
 
 #[derive(Clone, Default)]
 struct Fake {
+    project_grants: Vec<(PathBuf, bool)>,
     append_outcome: Option<AppendOutcome>,
     appends: Vec<(String, NativeMapping, String)>,
     requests: Vec<StartRequest>,
@@ -1886,6 +1888,7 @@ struct Fake {
     queries: usize,
     lose_start: bool,
     lose_response: bool,
+    lose_tool_response: bool,
 }
 impl Fake {
     fn launch(&mut self, req: StartRequest) -> Result<NativeMapping> {
@@ -1907,6 +1910,11 @@ impl Fake {
     }
 }
 impl Executor for Fake {
+    fn validate_directory(&mut self, directory: &Path, writes: bool) -> Result<()> {
+        let actual = canonical_directory(directory)?;
+        ensure!(self.project_grants.iter().any(|(root, writable)| actual == *root && (!writes || *writable)), "Fake project grant missing");
+        Ok(())
+    }
     fn append(
         &mut self,
         id: &str,
@@ -1967,12 +1975,31 @@ impl Executor for Fake {
     }
     fn tools(&mut self, reply: ToolResponse) -> Result<()> {
         self.replies.push(reply);
+        if std::mem::take(&mut self.lose_tool_response) {
+            anyhow::bail!("lost dynamic answer receipt");
+        }
         Ok(())
     }
 }
 struct Fixture {
     root: tempfile::TempDir,
     service: AssistantService<Fake>,
+}
+
+#[test]
+fn rebuild_unknown_branch_does_not_lock_main_or_unrelated_task() {
+    let mut f=Fixture::new();
+    let _original=f.task("first",false);
+    f.service.tick(1).unwrap();
+    let op=f.op(Role::Execution);
+    f.observe(&op,ExecutionStatus::Unknown,"lost",2);
+    let other=f.task("second",false);
+    f.service.submit("new-message","New independent objective",vec![f.root.path().join("work")],3).unwrap();
+    f.service.tick(4).unwrap();
+    assert!(f.service.operations().iter().any(|o|o.role==Role::Coordinator),"Unknown branch blocked main conversation");
+    assert!(f.service.operations().iter().any(|o|o.task_id.as_deref()==Some(&other.id)),"Unknown branch blocked unrelated task");
+    assert_eq!(f.service.executor.requests.iter().filter(|r|r.operation_id==op.id).count(),1);
+    assert_eq!(f.service.state.operations[&op.id].phase,OperationPhase::Unknown);
 }
 impl Fixture {
     fn new() -> Self {
@@ -2059,6 +2086,176 @@ fn phone_handoff_starts_native_coordinator_and_idle_never_calls_model() {
         .unwrap();
     f.service.tick(1).unwrap();
     assert_eq!(f.service.executor.requests.len(), 1);
+}
+
+fn coordinator_handoffs(request: &StartRequest) -> serde_json::Value {
+    let line = request.prompt.lines().next().unwrap();
+    serde_json::from_str(line.strip_prefix("User handoffs: ").unwrap()).unwrap()
+}
+
+fn paused_unmapped_handoff(f: &mut Fixture, id: &str, roots: Vec<PathBuf>) -> Operation {
+    f.service.submit(id, "Recover this exact original message", roots, 1).unwrap();
+    f.service.executor.lose_start = true;
+    f.service.tick(2).unwrap();
+    let original = f.op(Role::Coordinator);
+    assert!(original.mapping.is_none());
+    f.observe(&original, ExecutionStatus::NotDispatched, "proven-absent", 3);
+    f.service.operations().into_iter().find(|op| op.id == original.id).unwrap()
+}
+
+#[test]
+fn handoff_recovery_reuses_original_message_once_and_retains_original_operation() {
+    let mut f = Fixture::new();
+    let root = canonical_directory(&f.root.path().join("work")).unwrap();
+    f.service.executor.project_grants.push((root.clone(), false));
+    let original = paused_unmapped_handoff(&mut f, "original-handoff", vec![root.clone()]);
+    let messages = f.service.conversation_page(None, 100).unwrap();
+    f.service.resume_coordinator_handoff("recover-one", &original.id, 4).unwrap();
+    f.service.resume_coordinator_handoff("recover-one", &original.id, 5).unwrap();
+    assert!(f.service.resume_coordinator_handoff("recover-other-id", &original.id, 5).is_err());
+    assert_eq!(f.service.conversation_page(None, 100).unwrap(), messages);
+    let mut f = reopen_fixture(f);
+    f.service.resume_coordinator_handoff("recover-one", &original.id, 6).unwrap();
+    f.service.tick(7).unwrap();
+    assert_eq!(f.service.executor.requests.len(), 2);
+    let next = f.op(Role::Coordinator);
+    assert_ne!(next.id, original.id);
+    let retained = f.service.operations().into_iter().find(|op| op.id == original.id).unwrap();
+    assert_eq!(retained.phase, OperationPhase::Paused);
+    assert!(retained.mapping.is_none());
+    let handoffs = coordinator_handoffs(f.service.executor.requests.last().unwrap());
+    assert_eq!(handoffs[0]["sourceEntryId"], "user:original-handoff");
+    assert_eq!(handoffs[0]["message"], "Recover this exact original message");
+    assert_eq!(handoffs[0]["authorizedDirectories"], serde_json::json!([root]));
+    f.service.tick(8).unwrap();
+    assert_eq!(f.service.executor.requests.len(), 2);
+}
+
+#[test]
+fn handoff_recovery_checks_selected_roots_without_requiring_historical_grants() {
+    let mut f = Fixture::new();
+    let selected = canonical_directory(&f.root.path().join("work")).unwrap();
+    f.service.executor.project_grants.push((selected.clone(), false));
+    let original = paused_unmapped_handoff(&mut f, "selected-handoff", vec![selected]);
+    let historical = f.root.path().join("revoked-historical-project");
+    std::fs::create_dir(&historical).unwrap();
+    f.service.state.operations.get_mut(&original.id).unwrap().authorized_directories.push(canonical_directory(&historical).unwrap());
+    f.service.save().unwrap();
+    f.service.resume_coordinator_handoff("recover-selected", &original.id, 4).unwrap();
+    assert_eq!(f.service.state.inbox.len(), 1);
+    assert_eq!(f.service.state.inbox[0].directories.len(), 1);
+}
+
+#[test]
+fn handoff_recovery_unknown_or_mapped_or_revoked_never_dispatches() {
+    for defect in ["unknown", "mapped", "revoked", "missing-entry", "missing-scope", "takeover"] {
+        let mut f = Fixture::new();
+        let root = canonical_directory(&f.root.path().join("work")).unwrap();
+        f.service.executor.project_grants.push((root.clone(), false));
+        let original = paused_unmapped_handoff(&mut f, "guarded-handoff", vec![root]);
+        match defect {
+            "unknown" => {f.service.executor.statuses.insert(original.id.clone(), ExecutionStatus::Unknown);},
+            "mapped" => {f.service.state.operations.get_mut(&original.id).unwrap().mapping = Some(NativeMapping {host_generation:"host-1".into(), thread_id:"known-thread".into(), turn_id:"known-turn".into()});},
+            "revoked" => f.service.executor.project_grants.clear(),
+            "missing-entry" => {f.service.state.operations.get_mut(&original.id).unwrap().user_message_ids = vec!["user:unavailable".into()];},
+            "missing-scope" => {f.service.state.operations.get_mut(&original.id).unwrap().prompt = Some("User handoffs: []\nbody".into());},
+            "takeover" => f.service.state.paused = true,
+            _ => unreachable!(),
+        }
+        let before = serde_json::to_value(&f.service.state).unwrap();
+        assert!(f.service.resume_coordinator_handoff("blocked-recovery", &original.id, 4).is_err(), "accepted {defect}");
+        assert_eq!(serde_json::to_value(&f.service.state).unwrap(), before);
+        assert!(f.service.state.inbox.is_empty());
+        assert_eq!(f.service.executor.requests.len(), 1);
+    }
+}
+
+#[test]
+fn handoff_recovery_save_failure_preserves_original_fence_and_allows_same_intent() {
+    let mut f = Fixture::new();
+    let original = paused_unmapped_handoff(&mut f, "save-handoff", vec![]);
+    let before = serde_json::to_value(&f.service.state).unwrap();
+    f.service.store.db.execute_batch("CREATE TRIGGER fail_recovery_save BEFORE UPDATE ON assistant_service_state BEGIN SELECT RAISE(FAIL,'recovery save failed'); END").unwrap();
+    assert!(f.service.resume_coordinator_handoff("recover-save", &original.id, 4).is_err());
+    assert_eq!(serde_json::to_value(&f.service.state).unwrap(), before);
+    f.service.store.db.execute_batch("DROP TRIGGER fail_recovery_save").unwrap();
+    let mut f = reopen_fixture(f);
+    f.service.resume_coordinator_handoff("recover-save", &original.id, 5).unwrap();
+    assert_eq!(f.service.state.inbox.len(), 1);
+}
+
+#[test]
+fn handoff_recovery_does_not_adopt_a_later_unrelated_messages_project() {
+    let mut f = Fixture::new();
+    let selected = canonical_directory(&f.root.path().join("work")).unwrap();
+    f.service.executor.project_grants.push((selected.clone(), false));
+    let original = paused_unmapped_handoff(&mut f, "older-handoff", vec![selected.clone()]);
+    let other = f.root.path().join("later-project");
+    std::fs::create_dir(&other).unwrap();
+    let other = canonical_directory(&other).unwrap();
+    f.service.submit("later-handoff", "Read a different project", vec![other.clone()], 4).unwrap();
+    f.service.tick(5).unwrap();
+    let later = f.op(Role::Coordinator);
+    finish(&mut f, &later, 6);
+    f.service.resume_coordinator_handoff("recover-older", &original.id, 7).unwrap();
+    f.service.tick(8).unwrap();
+    let recovered = f.op(Role::Coordinator);
+    assert_eq!(recovered.authorized_directories, vec![selected]);
+    assert!(!recovered.authorized_directories.contains(&other));
+}
+
+#[test]
+fn phone_project_handoff_exposes_exact_directory_to_native_task_tool() {
+    let mut f = Fixture::new();
+    let coordinator = f.submit();
+    let request = &f.service.executor.requests[0];
+    let handoffs = coordinator_handoffs(request);
+    let root = canonical_directory(&f.root.path().join("work")).unwrap();
+    assert_eq!(handoffs[0]["authorizedDirectories"], serde_json::json!([root]));
+    assert_eq!(handoffs[0]["sourceEntryId"], "user:phone-1");
+    assert!(!request.writes && request.directory.is_none());
+    let directory = PathBuf::from(handoffs[0]["authorizedDirectories"][0].as_str().unwrap());
+    let command = ToolCall::CreateTask {
+        prompt: "List top-level file names without changes".into(),
+        directory,
+        writes: false,
+    };
+    let scope = coordinator.mapping.unwrap();
+    let receipt = f.service.tool(scope.clone(), "selected-project-task", command.clone(), 2).unwrap();
+    assert_eq!(f.service.tool(scope.clone(), "selected-project-task", command, 3).unwrap(), receipt);
+    assert_eq!(f.service.tasks().unwrap().len(), 1);
+    assert!(f.service.tool(scope, "unselected-project-task", ToolCall::CreateTask {
+        prompt: "Outside selected project".into(),
+        directory: f.root.path().into(),
+        writes: false,
+    }, 4).is_err());
+    assert_eq!(f.service.tasks().unwrap().len(), 1);
+}
+
+#[test]
+fn phone_project_handoff_preserves_per_message_selection_across_restart() {
+    let mut f = Fixture::new();
+    let one = f.root.path().join("work");
+    let two = f.root.path().join("second project");
+    std::fs::create_dir(&two).unwrap();
+    let fake_path = f.root.path().join("not selected");
+    f.service.submit("selected-a", "Inspect project A", vec![one.clone()], 1).unwrap();
+    f.service.submit("selected-b", "Inspect project B", vec![two.clone()], 2).unwrap();
+    f.service.submit("unselected", &format!("A path mentioned in text: {}", fake_path.display()), vec![], 3).unwrap();
+    let mut f = reopen_fixture(f);
+    f.service.tick(4).unwrap();
+    let handoffs = coordinator_handoffs(f.service.executor.requests.last().unwrap());
+    assert_eq!(handoffs.as_array().unwrap().len(), 3);
+    assert_eq!(handoffs[0]["authorizedDirectories"], serde_json::json!([canonical_directory(&one).unwrap()]));
+    assert_eq!(handoffs[1]["authorizedDirectories"], serde_json::json!([canonical_directory(&two).unwrap()]));
+    assert_eq!(handoffs[2]["authorizedDirectories"], serde_json::json!([]));
+    let lead = f.op(Role::Coordinator);
+    assert!(!lead.authorized_directories.contains(&fake_path));
+    finish(&mut f, &lead, 5);
+    f.service.submit("followup-without-selection", "Summarize progress", vec![], 6).unwrap();
+    f.service.tick(7).unwrap();
+    let followup = coordinator_handoffs(f.service.executor.requests.last().unwrap());
+    assert_eq!(followup[0]["authorizedDirectories"], serde_json::json!([]), "Historical scope must not be presented as this message's selected project");
 }
 
 #[test]
@@ -2376,6 +2573,583 @@ fn coordinator_input_holds_tool_call_until_human_response() {
     assert_eq!(f.service.executor.replies[0].result["answer"], "markdown");
 }
 
+fn held_input_lifetime_fixture() -> (Fixture, Operation, String) {
+    let mut f = Fixture::new();
+    let op = f.submit();
+    let question = format!("C:/完整路径/保留问题.txt\n{}", "选择甲或乙。".repeat(3000));
+    f.service
+        .tool(
+            op.mapping.clone().unwrap(),
+            "lifetime-call",
+            ToolCall::RequestInput {
+                request_id: "lifetime-question".into(),
+                text: question.clone(),
+            },
+            1,
+        )
+        .unwrap();
+    (f, op, question)
+}
+
+fn held_input_lifetime_json(service: &AssistantService<Fake>, id: &str) -> serde_json::Value {
+    serde_json::to_value(
+        service
+            .operations()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn held_input_lifetime_terminal_retains_complete_identity_and_never_reopens_answer() {
+    for terminal in ["completed", "failed", "interrupted"] {
+        let (mut f, op, question) = held_input_lifetime_fixture();
+        let mapping = op.mapping.clone().unwrap();
+        let status = match terminal {
+            "completed" => {
+                ExecutionStatus::Completed(mapping.clone(), "Waiting for your choice".into())
+            }
+            "failed" => ExecutionStatus::Failed(mapping.clone(), "Native failure".into()),
+            _ => ExecutionStatus::Interrupted(mapping.clone()),
+        };
+        f.observe(&op, status.clone(), "native-terminal", 2);
+        let snapshot = held_input_lifetime_json(&f.service, &op.id);
+        assert_eq!(
+            snapshot["phase"],
+            match terminal {
+                "completed" => "Completed",
+                "failed" => "Failed",
+                _ => "Paused",
+            }
+        );
+        assert!(snapshot["question"].is_null());
+        let held = &snapshot["held_inputs"][0];
+        assert!(
+            held["question"]["text"].as_str() == Some(question.as_str()),
+            "Terminal observation must retain the complete original question"
+        );
+        assert_eq!(held["question"]["request_id"], "lifetime-question");
+        assert_eq!(held["operation_id"], op.id);
+        assert_eq!(held["mapping"], serde_json::to_value(&mapping).unwrap());
+        assert_eq!(held["call_id"], "lifetime-call");
+        assert_eq!(held["native_terminal"], terminal);
+        assert_eq!(held["resolution"], "unresolved");
+        assert_eq!(held["answer_state"], "not_submitted");
+        let db = f.root.path().join("service.db");
+        let fake = f.service.executor.clone();
+        drop(f.service);
+        let mut reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
+        reopened.tick(3).unwrap();
+        assert_eq!(held_input_lifetime_json(&reopened, &op.id), snapshot);
+        assert!(
+            reopened
+                .respond(
+                    "late-answer",
+                    &op.id,
+                    "lifetime-question",
+                    HumanResponse::Answer("甲".into()),
+                    4
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .tool(
+                    mapping.clone(),
+                    "lifetime-call",
+                    ToolCall::RequestInput {
+                        request_id: "lifetime-question".into(),
+                        text: question
+                    },
+                    4
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .observe(
+                    &op.id,
+                    ExecutionStatus::Running(mapping),
+                    "false-revival",
+                    4
+                )
+                .is_err()
+        );
+        assert!(reopened.executor.replies.is_empty());
+        assert!(reopened.executor.responses.is_empty());
+        assert!(reopened.executor.interrupts.is_empty());
+        assert_eq!(reopened.executor.requests.len(), 1);
+    }
+}
+
+#[test]
+fn held_input_lifetime_authoritative_resolution_keeps_terminal_history() {
+    let (mut f, op, question) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(mapping.clone(), "Waiting".into()),
+        "terminal",
+        2,
+    );
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 3)
+        .unwrap();
+    let snapshot = held_input_lifetime_json(&f.service, &op.id);
+    assert!(snapshot["held_inputs"][0]["question"]["text"].as_str() == Some(question.as_str()));
+    assert_eq!(snapshot["held_inputs"][0]["resolution"], "resolved");
+    assert_eq!(snapshot["held_inputs"][0]["answer_state"], "not_submitted");
+    assert_eq!(snapshot["held_inputs"][0]["native_terminal"], "completed");
+    assert_eq!(snapshot["phase"], "Completed");
+    assert!(snapshot["question"].is_null());
+    assert!(snapshot["input_tool_call"].is_null());
+    let events = f.service.events(0, 256).unwrap().len();
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 4)
+        .unwrap();
+    assert_eq!(f.service.events(0, 256).unwrap().len(), events);
+    let db = f.root.path().join("service.db");
+    let fake = f.service.executor.clone();
+    drop(f.service);
+    let mut reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
+    reopened.tick(5).unwrap();
+    assert_eq!(held_input_lifetime_json(&reopened, &op.id), snapshot);
+    assert_eq!(reopened.executor.requests.len(), 1);
+    assert!(reopened.executor.replies.is_empty());
+}
+
+#[test]
+fn held_input_lifetime_unknown_and_wrong_scope_never_retire_or_relabel_terminal() {
+    let (mut f, op, question) = held_input_lifetime_fixture();
+    f.observe(&op, ExecutionStatus::Unknown, "offline", 2);
+    let before = held_input_lifetime_json(&f.service, &op.id);
+    assert!(before["held_inputs"][0]["question"]["text"].as_str() == Some(question.as_str()));
+    assert_eq!(before["held_inputs"][0]["resolution"], "unresolved");
+    assert!(before["held_inputs"][0]["native_terminal"].is_null());
+    assert!(
+        f.service
+            .respond(
+                "offline-answer",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                3
+            )
+            .is_err()
+    );
+    let mapping = op.mapping.clone().unwrap();
+    let mut wrong = mapping.clone();
+    wrong.host_generation = "host-2".into();
+    assert!(
+        f.service
+            .observe_tool_resolved(&wrong, "lifetime-call", 3)
+            .is_err()
+    );
+    wrong = mapping.clone();
+    wrong.turn_id = "other-turn".into();
+    f.service
+        .observe_tool_resolved(&wrong, "lifetime-call", 3)
+        .unwrap();
+    f.service
+        .observe_tool_resolved(&mapping, "other-call", 3)
+        .unwrap();
+    assert_eq!(held_input_lifetime_json(&f.service, &op.id), before);
+    f.observe(
+        &op,
+        ExecutionStatus::Failed(mapping, "failure".into()),
+        "failure",
+        4,
+    );
+    let terminal = held_input_lifetime_json(&f.service, &op.id);
+    f.observe(&op, ExecutionStatus::Unknown, "late-disconnect", 5);
+    assert_eq!(held_input_lifetime_json(&f.service, &op.id), terminal);
+    assert_eq!(terminal["held_inputs"][0]["native_terminal"], "failed");
+    assert!(f.service.executor.replies.is_empty());
+}
+
+#[test]
+fn held_input_lifetime_same_generation_rejection_receipt_is_not_question_resolution() {
+    let (mut f, op, _) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(mapping.clone(), "Waiting".into()),
+        "terminal",
+        2,
+    );
+    assert!(
+        !f.service
+            .tool_rejection_receipt("explicit-reject", &op.id, "n:4", Some(false))
+            .unwrap()
+    );
+    assert!(
+        !f.service
+            .tool_rejection_receipt("explicit-reject", &op.id, "n:4", None)
+            .unwrap()
+    );
+    assert_eq!(
+        held_input_lifetime_json(&f.service, &op.id)["held_inputs"][0]["resolution"],
+        "unresolved"
+    );
+    f.service
+        .tool_rejection_receipt("explicit-reject", &op.id, "n:4", Some(true))
+        .unwrap();
+    assert!(
+        f.service
+            .tool_rejection_receipt("explicit-reject", &op.id, "n:4", None)
+            .unwrap()
+    );
+    assert!(
+        f.service
+            .tool_rejection_receipt("explicit-reject", &op.id, "n:5", Some(true))
+            .is_err()
+    );
+    assert_eq!(
+        held_input_lifetime_json(&f.service, &op.id)["held_inputs"][0]["resolution"],
+        "unresolved"
+    );
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 3)
+        .unwrap();
+    let current = held_input_lifetime_json(&f.service, &op.id);
+    assert_eq!(current["held_inputs"][0]["resolution"], "resolved");
+    assert_eq!(current["held_inputs"][0]["answer_state"], "not_submitted");
+    assert_eq!(current["phase"], "Completed");
+    assert!(f.service.executor.replies.is_empty());
+}
+
+#[test]
+fn held_input_lifetime_unknown_answer_stays_unknown_after_terminal_resolution_and_restart() {
+    let (mut f, op, _) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.service.executor.lose_tool_response = true;
+    assert!(
+        f.service
+            .respond(
+                "uncertain-human",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                2
+            )
+            .is_err()
+    );
+    assert_eq!(f.service.executor.replies.len(), 1);
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(mapping.clone(), "Waiting".into()),
+        "terminal",
+        3,
+    );
+    assert_eq!(
+        held_input_lifetime_json(&f.service, &op.id)["held_inputs"][0]["answer_state"],
+        "unknown"
+    );
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 4)
+        .unwrap();
+    let snapshot = held_input_lifetime_json(&f.service, &op.id);
+    assert_eq!(snapshot["held_inputs"][0]["resolution"], "resolved");
+    assert_eq!(snapshot["held_inputs"][0]["answer_state"], "unknown");
+    let db = f.root.path().join("service.db");
+    let fake = f.service.executor.clone();
+    drop(f.service);
+    let mut reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
+    reopened.tick(5).unwrap();
+    assert_eq!(held_input_lifetime_json(&reopened, &op.id), snapshot);
+    assert!(
+        reopened
+            .respond(
+                "uncertain-human",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                6
+            )
+            .is_err()
+    );
+    assert!(
+        reopened
+            .respond(
+                "different-command",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                6
+            )
+            .is_err()
+    );
+    assert_eq!(reopened.executor.replies.len(), 1);
+    assert_eq!(reopened.executor.requests.len(), 1);
+}
+
+#[test]
+fn held_input_lifetime_previous_questions_are_not_overwritten_or_evicted() {
+    let (mut f, op, question) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.service
+        .respond(
+            "human",
+            &op.id,
+            "lifetime-question",
+            HumanResponse::Answer("甲".into()),
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        held_input_lifetime_json(&f.service, &op.id)["held_inputs"][0]["answer_state"],
+        "submitted"
+    );
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 3)
+        .unwrap();
+    for index in 1..32 {
+        let call = format!("later-call-{index}");
+        f.service
+            .tool(
+                mapping.clone(),
+                &call,
+                ToolCall::RequestInput {
+                    request_id: format!("later-question-{index}"),
+                    text: "Later question".into(),
+                },
+                4,
+            )
+            .unwrap();
+        f.service.observe_tool_resolved(&mapping, &call, 5).unwrap();
+    }
+    let before = held_input_lifetime_json(&f.service, &op.id);
+    assert_eq!(before["held_inputs"].as_array().unwrap().len(), 32);
+    assert!(before["held_inputs"][0]["question"]["text"].as_str() == Some(question.as_str()));
+    assert!(
+        f.service
+            .tool(
+                mapping,
+                "over-capacity",
+                ToolCall::RequestInput {
+                    request_id: "over-capacity-question".into(),
+                    text: "Must not displace history".into()
+                },
+                6
+            )
+            .is_err()
+    );
+    assert_eq!(held_input_lifetime_json(&f.service, &op.id), before);
+    assert_eq!(f.service.executor.replies.len(), 1);
+    assert_eq!(f.service.executor.requests.len(), 1);
+}
+
+#[test]
+fn held_input_lifetime_legacy_waiting_migrates_exact_question_and_unknown_answer() {
+    let (mut f, op, question) = held_input_lifetime_fixture();
+    f.service.executor.lose_tool_response = true;
+    assert!(
+        f.service
+            .respond(
+                "uncertain-human",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                2
+            )
+            .is_err()
+    );
+    let mut saved = serde_json::to_value(&f.service.state).unwrap();
+    saved["operations"][&op.id]
+        .as_object_mut()
+        .unwrap()
+        .remove("held_inputs");
+    f.service
+        .store
+        .db
+        .execute(
+            "UPDATE assistant_service_state SET data=?1 WHERE assistant_id=?2",
+            params![
+                serde_json::to_string(&saved).unwrap(),
+                f.service.assistant_id()
+            ],
+        )
+        .unwrap();
+    let db = f.root.path().join("service.db");
+    let fake = f.service.executor.clone();
+    drop(f.service);
+    let mut reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
+    reopened.tick(3).unwrap();
+    let snapshot = held_input_lifetime_json(&reopened, &op.id);
+    assert!(snapshot["held_inputs"][0]["question"]["text"].as_str() == Some(question.as_str()));
+    assert_eq!(snapshot["held_inputs"][0]["call_id"], "lifetime-call");
+    assert_eq!(snapshot["held_inputs"][0]["answer_state"], "unknown");
+    assert_eq!(snapshot["held_inputs"][0]["resolution"], "unresolved");
+    assert!(
+        reopened
+            .respond(
+                "new-command",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                4
+            )
+            .is_err()
+    );
+    assert_eq!(reopened.executor.replies.len(), 1);
+}
+
+#[test]
+fn held_input_lifetime_resolution_save_failure_does_not_retire_in_memory() {
+    let (mut f, op, _) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(mapping.clone(), "Waiting".into()),
+        "terminal",
+        2,
+    );
+    let before = held_input_lifetime_json(&f.service, &op.id);
+    f.service
+        .store
+        .db
+        .execute_batch("PRAGMA query_only=ON")
+        .unwrap();
+    assert!(
+        f.service
+            .observe_tool_resolved(&mapping, "lifetime-call", 3)
+            .is_err()
+    );
+    assert!(
+        held_input_lifetime_json(&f.service, &op.id) == before,
+        "Failed persistence must not retire the original held input"
+    );
+    f.service
+        .store
+        .db
+        .execute_batch("PRAGMA query_only=OFF")
+        .unwrap();
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 4)
+        .unwrap();
+    assert_eq!(
+        held_input_lifetime_json(&f.service, &op.id)["held_inputs"][0]["resolution"],
+        "resolved"
+    );
+    assert_eq!(
+        f.service
+            .events(0, 256)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "input_resolved")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn held_input_lifetime_legacy_terminal_missing_question_never_invents_identity() {
+    let (mut f, op, _) = held_input_lifetime_fixture();
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(
+            op.mapping.clone().unwrap(),
+            "Waiting for an unspecified choice".into(),
+        ),
+        "terminal",
+        2,
+    );
+    let mut saved = serde_json::to_value(&f.service.state).unwrap();
+    saved["operations"][&op.id]
+        .as_object_mut()
+        .unwrap()
+        .remove("held_inputs");
+    f.service
+        .store
+        .db
+        .execute(
+            "UPDATE assistant_service_state SET data=?1 WHERE assistant_id=?2",
+            params![
+                serde_json::to_string(&saved).unwrap(),
+                f.service.assistant_id()
+            ],
+        )
+        .unwrap();
+    let db = f.root.path().join("service.db");
+    let fake = f.service.executor.clone();
+    drop(f.service);
+    let mut reopened = AssistantService::open(&db, "pc", "profile", "host-2", fake).unwrap();
+    reopened.tick(3).unwrap();
+    let snapshot = held_input_lifetime_json(&reopened, &op.id);
+    assert_eq!(snapshot["held_inputs"], serde_json::json!([]));
+    assert_eq!(snapshot["phase"], "Completed");
+    assert_eq!(snapshot["input_tool_call"], "lifetime-call");
+    assert!(snapshot["question"].is_null());
+    assert!(
+        reopened
+            .respond(
+                "late-answer",
+                &op.id,
+                "lifetime-question",
+                HumanResponse::Answer("甲".into()),
+                4
+            )
+            .is_err()
+    );
+    assert!(
+        reopened
+            .observe_tool_resolved(&op.mapping.unwrap(), "lifetime-call", 4)
+            .is_err()
+    );
+    assert!(reopened.executor.replies.is_empty());
+    assert_eq!(reopened.executor.requests.len(), 1);
+}
+
+#[test]
+fn held_input_lifetime_reused_question_label_does_not_import_another_calls_answer() {
+    let (mut f, op, _) = held_input_lifetime_fixture();
+    let mapping = op.mapping.clone().unwrap();
+    f.service
+        .respond(
+            "first-human",
+            &op.id,
+            "lifetime-question",
+            HumanResponse::Answer("甲".into()),
+            2,
+        )
+        .unwrap();
+    f.service
+        .observe_tool_resolved(&mapping, "lifetime-call", 3)
+        .unwrap();
+    f.service
+        .tool(
+            mapping.clone(),
+            "distinct-call",
+            ToolCall::RequestInput {
+                request_id: "lifetime-question".into(),
+                text: "Distinct question with the same display label".into(),
+            },
+            4,
+        )
+        .unwrap();
+    f.observe(
+        &op,
+        ExecutionStatus::Completed(mapping, "Waiting".into()),
+        "terminal",
+        5,
+    );
+    let db = f.root.path().join("service.db");
+    let fake = f.service.executor.clone();
+    drop(f.service);
+    let reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
+    let snapshot = held_input_lifetime_json(&reopened, &op.id);
+    assert_eq!(snapshot["held_inputs"][0]["answer_state"], "submitted");
+    assert_eq!(snapshot["held_inputs"][1]["call_id"], "distinct-call");
+    assert_eq!(
+        snapshot["held_inputs"][1]["answer_state"], "not_submitted",
+        "A semantic question label is not the complete native call identity"
+    );
+    assert_eq!(snapshot["phase"], "Completed");
+    assert!(reopened.executor.replies.len() == 1);
+}
+
 #[test]
 fn takeover_interrupts_coordinator_and_waiting_turns_and_release_never_requeues() {
     let mut f = Fixture::new();
@@ -2498,20 +3272,21 @@ fn lost_native_start_receipt_is_reconciled_without_duplicate_dispatch() {
 }
 
 #[test]
-fn restart_unknown_blocks_fresh_work_and_not_dispatched_stays_paused() {
+fn restart_unknown_retains_its_attempt_and_not_dispatched_stays_paused() {
     let mut f = Fixture::new();
     let first = f.task("a", true);
     f.task("b", false);
     f.service.executor.lose_start = true;
     f.service.tick(0).unwrap();
-    let op = f.op(Role::Execution);
+    let op = f.service.operations().into_iter().find(|o|o.task_id.as_ref()==Some(&first.id)).unwrap();
     let mut fake = f.service.executor.clone();
     fake.statuses.clear();
     let db = f.root.path().join("service.db");
     drop(f.service);
     let mut reopened = AssistantService::open(&db, "pc", "profile", "host-1", fake).unwrap();
     reopened.tick(1).unwrap();
-    assert_eq!(reopened.executor.requests.len(), 1);
+    assert_eq!(reopened.executor.requests.len(), 2);
+    assert_eq!(reopened.executor.requests.iter().filter(|r|r.operation_id==op.id).count(),1);
     reopened
         .observe(
             &op.id,
@@ -2605,6 +3380,112 @@ fn settings_and_explicit_memory_crud_survive_reopen_without_text_copies() {
             .unwrap()
             .contains("unique-memory")
     );
+}
+
+#[test]
+fn v070_housekeeping_memory_reads_page_full_unicode_text_without_durable_copies() {
+    let mut f = Fixture::new();
+    let op = f.submit();
+    let mut ids = vec![];
+    let contents = ["资料".repeat(2000), "\u{1}".repeat(16384), "last-memory-sentinel".into()];
+    for (n, value) in contents.iter().enumerate() {
+        let CommandResult::Memory(id) = f.service.apply(&format!("memory-{n}"), Command::Remember {text:value.clone()}, 1).unwrap().result else {panic!()};
+        ids.push(id);
+    }
+    let scope = op.mapping.clone().unwrap();
+    let first = f.service.tool(scope.clone(), "page", ToolCall::Housekeeping(HousekeepingTool::MemoryRead {limit:2,after:None,memory_id:None,offset:0}), 2).unwrap();
+    assert_eq!(first["memories"].as_array().unwrap().len(), 2);
+    assert_eq!(first["nextAfter"], ids[1]);
+    assert!(serde_json::to_vec(&first).unwrap().len() < 65536);
+    let last = f.service.tool(scope.clone(), "last", ToolCall::Housekeeping(HousekeepingTool::MemoryRead {limit:2,after:Some(ids[1].clone()),memory_id:None,offset:0}), 2).unwrap();
+    assert_eq!(last["memories"][0]["id"], ids[2]);
+    assert!(last["nextAfter"].is_null());
+    let mut all = String::new();
+    let mut offset = 0;
+    loop {
+        let result = f.service.tool(scope.clone(), &format!("full-{offset}"), ToolCall::Housekeeping(HousekeepingTool::MemoryRead {limit:1,after:None,memory_id:Some(ids[0].clone()),offset}), 2).unwrap();
+        all.push_str(result["memories"][0]["text"].as_str().unwrap());
+        match result["memories"][0]["nextOffset"].as_u64() { Some(next) => offset=next as usize, None => break }
+    }
+    assert_eq!(all, contents[0]);
+    assert!(f.service.tool(scope.clone(), "mid-character", ToolCall::Housekeeping(HousekeepingTool::MemoryRead {limit:1,after:None,memory_id:Some(ids[0].clone()),offset:1}), 2).is_err());
+    f.service.tool(scope, "delete", ToolCall::Housekeeping(HousekeepingTool::MemoryDelete {user_message_id:"user:phone-1".into(),memory_id:ids[2].clone()}), 3).unwrap();
+    let state = serde_json::to_string(&f.service.state).unwrap();
+    assert!(!state.contains("last-memory-sentinel"));
+    assert!(!state.contains("资料"));
+    assert!(!state.contains("\\u0001"));
+}
+
+#[test]
+fn v070_housekeeping_memory_effect_survives_crash_before_answer_journal() {
+    for delete in [false, true] {
+        let mut f = Fixture::new();
+        let op = f.submit();
+        let CommandResult::Memory(id) = f.service.apply("initial-memory", Command::Remember {text:"original".into()}, 1).unwrap().result else {panic!()};
+        let call = ToolCall::Housekeeping(if delete {
+            HousekeepingTool::MemoryDelete {user_message_id:"user:phone-1".into(),memory_id:id}
+        } else {
+            HousekeepingTool::MemoryUpdate {user_message_id:"user:phone-1".into(),memory_id:id,text:"updated-once".into()}
+        });
+        let key = format!("tool:{}:crash", op.id);
+        f.service.store.db.execute_batch(&format!("CREATE TRIGGER fail_tool_journal BEFORE UPDATE ON assistant_service_state WHEN EXISTS(SELECT 1 FROM json_each(NEW.data,'$.journal') WHERE key='{key}') BEGIN SELECT RAISE(FAIL,'crash after committed memory effect'); END;")).unwrap();
+        assert!(f.service.tool(op.mapping.clone().unwrap(), "crash", call.clone(), 2).is_err());
+        assert!(f.service.executor.replies.is_empty());
+        f.service.store.db.execute_batch("DROP TRIGGER fail_tool_journal").unwrap();
+        let mut f = reopen_fixture(f);
+        f.observe(&op, ExecutionStatus::Running(op.mapping.clone().unwrap()), "reconcile-original", 3);
+        f.service.tool(op.mapping.clone().unwrap(), "crash", call, 4).unwrap();
+        if delete {assert!(f.service.memories().unwrap().is_empty());}
+        else {assert_eq!(f.service.memories().unwrap()[0].text,"updated-once");}
+        assert_eq!(f.service.executor.replies.len(), 1);
+        assert_eq!(f.service.executor.requests.len(), 1);
+    }
+}
+
+#[test]
+fn v070_housekeeping_schedule_creation_receipt_is_atomic_before_answer() {
+    let mut f = Fixture::new();
+    let op = f.submit();
+    let directory = canonical_directory(&f.root.path().join("work")).unwrap();
+    f.service.executor.project_grants.push((directory.clone(),false));
+    let call = ToolCall::Housekeeping(HousekeepingTool::ScheduleCreate {user_message_id:"user:phone-1".into(),timezone:"Asia/Shanghai".into(),kind:SchedulePattern::Daily {hour:9,minute:30},prompt:"Read status".into(),directory,writes:false});
+    let key = format!("tool:{}:crash", op.id);
+    // The creation saved its raw-call receipt; fail the subsequent answer save.
+    f.service.store.db.execute_batch(&format!("CREATE TRIGGER fail_second_save BEFORE UPDATE ON assistant_service_state WHEN EXISTS(SELECT 1 FROM json_each(OLD.data,'$.journal') WHERE key='{key}') BEGIN SELECT RAISE(FAIL,'crash after committed schedule'); END;")).unwrap();
+    assert!(f.service.tool(op.mapping.clone().unwrap(),"crash",call.clone(),0).is_err());
+    let created = f.service.schedules()[0].clone();
+    f.service.store.db.execute_batch("DROP TRIGGER fail_second_save").unwrap();
+    let mut f = reopen_fixture(f);
+    f.observe(&op,ExecutionStatus::Running(op.mapping.clone().unwrap()),"reconcile-schedule",2000);
+    // Revoked permissions cannot cause a committed receipt to be dispatched again.
+    f.service.executor.project_grants.clear();
+    f.service.tool(op.mapping.clone().unwrap(),"crash",call,2000).unwrap();
+    assert_eq!(f.service.schedules().len(),1);
+    assert_eq!(f.service.schedules()[0],created);
+    assert_eq!(f.service.executor.replies.len(),1);
+}
+
+#[test]
+fn v070_housekeeping_schedule_failed_persistence_cannot_report_or_fire_optimistic_effect() {
+    let mut f = Fixture::new();
+    let op = f.submit();
+    let directory = canonical_directory(&f.root.path().join("work")).unwrap();
+    f.service.executor.project_grants.push((directory.clone(),false));
+    let call = ToolCall::Housekeeping(HousekeepingTool::ScheduleCreate {user_message_id:"user:phone-1".into(),timezone:"UTC".into(),kind:SchedulePattern::Once {at_ms:2000},prompt:"Read status".into(),directory,writes:false});
+    let key = format!("tool:{}:create",op.id);
+    f.service.store.db.execute_batch(&format!("CREATE TRIGGER fail_create BEFORE UPDATE ON assistant_service_state WHEN EXISTS(SELECT 1 FROM json_each(NEW.data,'$.journal') WHERE key='{key}') BEGIN SELECT RAISE(FAIL,'schedule persistence failed'); END;")).unwrap();
+    assert!(f.service.tool(op.mapping.clone().unwrap(),"create",call.clone(),0).is_err());
+    assert!(f.service.schedules().is_empty());
+    assert!(f.service.executor.replies.is_empty());
+    f.service.store.db.execute_batch("DROP TRIGGER fail_create").unwrap();
+    f.service.tool(op.mapping.clone().unwrap(),"create",call,0).unwrap();
+    let id=f.service.schedules()[0].id.clone();
+    f.service.store.db.execute_batch("CREATE TRIGGER fail_delete BEFORE UPDATE ON assistant_service_state WHEN NOT EXISTS(SELECT 1 FROM json_each(NEW.data,'$.schedules')) BEGIN SELECT RAISE(FAIL,'schedule deletion failed'); END;").unwrap();
+    assert!(f.service.remove_schedule("delete",&id).is_err());
+    assert_eq!(f.service.schedules()[0].id,id);
+    f.service.store.db.execute_batch("DROP TRIGGER fail_delete").unwrap();
+    f.service.remove_schedule("delete",&id).unwrap();
+    assert!(f.service.schedules().is_empty());
 }
 
 #[test]
@@ -3004,3 +3885,8 @@ fn event_id_reuse_with_different_payload_is_rejected_before_transition() {
         TaskStatus::WaitingUser
     );
 }
+
+#[path = "service_product_tests.rs"]
+mod product_tests;
+#[path = "rebuild_tests.rs"]
+mod rebuild_tests;

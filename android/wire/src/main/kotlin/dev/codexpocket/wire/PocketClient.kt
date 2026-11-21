@@ -145,7 +145,7 @@ class PocketClient internal constructor(private val connector: TransportConnecto
         require(method.isNotBlank() && method.length <= 256) { "Invalid request method" }
         require(commandId == null || commandId.isNotBlank()) { "Invalid command ID" }
         val nativeMethod = (params["method"] as? JsonPrimitive)?.content
-        if (commandId == null && (method in MUTATIONS || method.startsWith("assistant/") && method != "assistant/read" || (method == "codex/request" && nativeMethod !in NATIVE_READS)))
+        if (commandId == null && (method in MUTATIONS || method.startsWith("assistant/") && method !in ASSISTANT_READS || (method == "codex/request" && nativeMethod !in NATIVE_READS)))
             throw WireException("invalid_request", "Mutating requests require a command ID")
         val item = Pending(UUID.randomUUID().toString(), commandId, method == "hello")
         val wireParams = if (item.hello) JsonObject(params + ("capabilities" to buildJsonArray {
@@ -290,13 +290,14 @@ class PocketClient internal constructor(private val connector: TransportConnecto
     private companion object {
         /** An actively streaming reply may take this many quiet windows in total. */
         const val QUIET_TIMEOUT_CAP = 6L
+        val ASSISTANT_READS = setOf("assistant/read", "assistant/project/read", "assistant/artifact/read")
         val MUTATIONS = setOf("approvals/respond", "attachment/upload", "devices/revoke", "push/register", "push/unregister", "extensions/update", "thread/edit/revert",
-            "session/preferences/update", "runtime/ensure", "thread/access/update", "thread/access/cancel", "thread/permissions/update")
-        val NATIVE_READS = setOf("thread/read", "thread/list", "thread/loaded/list", "thread/turns/list", "thread/queue/list", "thread/items/list", "thread/goal/get", "model/list", "collaborationMode/list", "skills/list", "plugin/list")
+              "session/preferences/update", "runtime/ensure", "thread/access/update", "thread/access/cancel", "thread/permissions/update", "threads/takeover")
+        val NATIVE_READS = setOf("thread/read", "thread/list", "thread/loaded/list", "thread/turns/list", "thread/queue/list", "thread/items/list", "thread/goal/get", "project/list", "project/read", "model/list", "collaborationMode/list", "skills/list", "plugin/list")
         val DEFINITE_REJECTIONS = setOf("rejected", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
             "revoked", "expired", "conflict", "busy", "offline", "protocol_mismatch", "already_paired", "device_revoked", "authentication_failed", "unsupported_method", "method_not_found", "-32601",
             "runtime_offline", "runtime_unavailable", "thread_owned_elsewhere", "version_conflict", "operation_in_progress")
-        val SAFE_ERROR_CODES = DEFINITE_REJECTIONS + setOf("request_timeout", "payload_too_large", "unknown", "rejected", "not_found", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
+        val SAFE_ERROR_CODES = DEFINITE_REJECTIONS + setOf("native_history_unavailable", "request_timeout", "payload_too_large", "unknown", "rejected", "not_found", "unauthorized", "forbidden", "invalid_request", "invalid_params", "unsupported",
             "revoked", "expired", "conflict", "busy", "offline", "internal_error", "protocol_mismatch", "already_paired", "device_revoked", "authentication_failed", "unsupported_method", "method_not_found", "-32601")
     }
 }

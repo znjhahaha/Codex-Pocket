@@ -5,6 +5,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.*
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
@@ -43,13 +45,14 @@ class AssistantScrollBehaviorTest {
         messages = history,
     )
 
-    private fun content(state: () -> AssistantUiState) {
+    private fun content(fontScale: Float = 1f, state: () -> AssistantUiState) {
         // Avoid MainActivity/PocketApplication: the fixture must never construct a repository.
         compose.runOnUiThread {
             activity = Robolectric.buildActivity(ComponentActivity::class.java).setup()
             activity.get().setContent {
                 PocketTheme("light") {
-                    CompositionLocalProvider(LocalPocketGlass provides false) {
+                    CompositionLocalProvider(LocalPocketGlass provides false,
+                        LocalDensity provides Density(LocalDensity.current.density, fontScale)) {
                         AssistantScreen(state(), emptyList(), listOf(AssistantRuntimeChoice("r", "Fixture")), emptyList(),
                             onAction = { actions += it }, onOpenThread = { _, _ -> fail("Unexpected thread navigation") }, onBack = {},
                             nowMs = baseTime)
@@ -90,6 +93,65 @@ class AssistantScrollBehaviorTest {
     }
 
     private fun incoming(id: String) = AssistantChatMessage(id, "Assistant", "New recorded reply", baseTime + 60_000L)
+
+    private fun assertTailAboveDock(tag: String) {
+        val tail = compose.onNodeWithTag(tag).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val chrome = compose.onNodeWithTag("assistant-top-chrome").fetchSemanticsNode().boundsInRoot
+        val dock = compose.onNodeWithTag("assistant-bottom-dock").fetchSemanticsNode().boundsInRoot
+        assertTrue("The initial tail must clear the measured header", tail.top >= chrome.bottom - 1f)
+        assertTrue("The initial tail must clear the measured composer", tail.bottom <= dock.top + 1f)
+        compose.onNodeWithTag("assistant-latest").assertDoesNotExist()
+        assertTrue(actions.isEmpty())
+    }
+
+    @Test fun initialTailClearsMeasuredChromeWithoutManualScrolling() {
+        val state = initialState(untimedTask = true)
+        content { state }
+        assertTailAboveDock("assistant-task:untimed-tail")
+    }
+
+    @Test fun initialTailUsesTheTaskActiveRunEventTime() {
+        val task = AssistantTask("todo", "Recorded device acceptance task", AssistantTaskStatus.Running, "running", false, null)
+        val event = AssistantEvent(1, "running-event", "running", "started", "Recorded task start", baseTime + 60_000L)
+        val state = initialState().let { it.copy(snapshot = it.snapshot!!.copy(tasks = listOf(task), events = listOf(event),
+            operations = listOf(AssistantOperation("running", "Execution", "todo", AssistantOperationPhase.Running,
+                false, "execution", null, null)))) }
+        val tail = assistantTimeline(state).last()
+        assertEquals("task:todo", tail.key)
+        assertEquals(event.atMs, tail.atMs)
+        content { state }
+        assertTailAboveDock("assistant-task:todo")
+    }
+
+    @Test fun initialTailClearsPreparationDockAtLargeText() {
+        val state = initialState(untimedTask = true).let { it.copy(snapshot = it.snapshot!!.copy(ready = false)) }
+        content(fontScale = 1.4f) { state }
+        compose.onNodeWithTag("assistant-prepare").assertIsDisplayed()
+        assertTailAboveDock("assistant-task:untimed-tail")
+    }
+
+    @Test fun lateMarkdownMeasurementKeepsTheLatestTaskVisible() {
+        var state by mutableStateOf(initialState(untimedTask = true))
+        content { state }
+        assertTailAboveDock("assistant-task:untimed-tail")
+        compose.runOnIdle {
+            state = state.copy(messages = state.messages.map { message ->
+                message.copy(role = "Assistant", text = "## Recorded result\n\n" +
+                    List(12) { "Measured native Markdown paragraph with several wrapped lines." }.joinToString("\n\n"))
+            })
+        }
+        compose.waitForIdle()
+        assertTailAboveDock("assistant-task:untimed-tail")
+    }
+
+    @Test fun initialTailIncludesOlderMessageControlAndCoordinatorWorkingRow() {
+        val state = initialState(untimedTask = true).let { it.copy(nextBefore = 1L, snapshot = it.snapshot!!.copy(
+            operations = listOf(AssistantOperation("working", "Coordinator", null, AssistantOperationPhase.Running,
+                false, "coordinator", null, null)))) }
+        content { state }
+        assertTailAboveDock("assistant-working")
+        compose.onNodeWithTag("assistant-task:untimed-tail").assertIsDisplayed()
+    }
 
     @Test fun timedMessageBeforeUntimedTaskPreservesReadingPositionAndShowsUnread() {
         var state by mutableStateOf(initialState(untimedTask = true))
@@ -156,7 +218,7 @@ class AssistantScrollBehaviorTest {
         readHistory()
 
         // Repository acknowledgments precede the history reload; no item is added here.
-        compose.runOnIdle { state = state.copy(pendingActions = emptySet(), sendAcknowledgement = 1) }
+        compose.runOnIdle { state = state.copy(pendingActions = emptySet()).acceptSend(actions.single()) }
         compose.waitForIdle()
 
         compose.onNodeWithTag("assistant-message:history-35").assertIsDisplayed()
@@ -164,5 +226,38 @@ class AssistantScrollBehaviorTest {
         compose.onNodeWithTag("assistant-message-input").assert(
             SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
         assertEquals(listOf("assistant/send"), actions.map { it.method })
+    }
+
+    @Test fun streamingTextGrowthAndDetailReturnPreserveTheReadersAnchor() {
+        val stream=AssistantChatMessage("stream","Assistant","Partial reply",baseTime+60_000L,"coordinator")
+        var state by mutableStateOf(initialState().copy(messages=history+stream))
+        content {state}
+        val anchor=readHistory()
+        compose.runOnIdle {state=state.copy(messages=history+stream.copy(text=(1..25).joinToString("\n") {"Recorded streaming line $it"}))}
+        compose.waitForIdle()
+        assertReadingAnchor(anchor)
+        compose.openAssistantPage("Tasks")
+        compose.returnToAssistantChat()
+        assertReadingAnchor(anchor)
+        assertTrue(actions.isEmpty())
+    }
+
+    @Test @Config(qualifiers = "w320dp-h710dp-xxhdpi")
+    fun largeTextPreparationLeavesRoomToReadAndExposesAllStages() {
+        val state=initialState().let {it.copy(snapshot=it.snapshot!!.copy(ready=false,
+            errorCode="service_reconciliation_required",preparationStatus="recoverable_error",
+            startupStages=listOf(AssistantStartupStage("runtime","ready"),AssistantStartupStage("account","ready"),
+                AssistantStartupStage("capabilities","ready"),AssistantStartupStage("coordinator","reconciling","reconcile_retained_native_receipts"))))}
+        content(fontScale=2f) {state}
+        val screen=compose.onNodeWithTag("assistant-screen").fetchSemanticsNode().boundsInRoot
+        val chrome=compose.onNodeWithTag("assistant-top-chrome").fetchSemanticsNode().boundsInRoot
+        val dock=compose.onNodeWithTag("assistant-bottom-dock").fetchSemanticsNode().boundsInRoot
+        assertTrue("Preparation chrome must leave a readable transcript viewport at large text",
+            dock.top-chrome.bottom >= screen.height*.22f)
+        compose.onNodeWithTag("assistant-startup-details").performClick()
+        compose.onNodeWithTag("assistant-stage:coordinator").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("assistant-startup-close").performClick()
+        compose.onNodeWithTag("assistant-message-input").assertIsDisplayed()
+        assertTrue(actions.isEmpty())
     }
 }

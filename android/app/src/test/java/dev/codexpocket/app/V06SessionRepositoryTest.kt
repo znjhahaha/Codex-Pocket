@@ -6,6 +6,9 @@ import androidx.test.core.app.ApplicationProvider
 import dev.codexpocket.app.data.*
 import dev.codexpocket.wire.*
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.*
@@ -50,6 +53,24 @@ class V06SessionRepositoryTest {
     }
 
     private suspend fun await(predicate: (PocketState) -> Boolean) = withTimeout(7000) { repo.state.first(predicate) }
+
+    @Test fun visibleConversationAutomaticallyRecoversStaleOwnershipWithoutManualButtons() = runBlocking<Unit> {
+        repo.editDraft("automatic recovery keeps draft")
+        server.conflict=true;server.ownershipReason="owner_uncertain"
+        repo.refresh().join();repo.refreshThreadAccess().join()
+        await {it.selected?.conflict==true}
+        server.accessFails=true
+        delay(300)
+        val observer=repo.observeConversation(key)
+        try {
+            delay(2500)
+            server.conflict=false;server.ownershipReason=null
+            server.accessFails=false
+            await {it.selected?.conflict==false&&it.ownershipVerifiedFor()}
+            assertEquals("automatic recovery keeps draft",repo.state.value.draft?.text)
+            assertFalse(server.calls.any {it.method in setOf("runtime/ensure","thread/access/update")})
+        } finally {observer.cancelAndJoin()}
+    }
 
     @Test fun ownershipRecheckRecoversSameRuntimeWithoutAnyHandoff() = runBlocking<Unit> {
         repo.editDraft("keep my draft")
@@ -112,23 +133,133 @@ class V06SessionRepositoryTest {
         server.conflict = true
         repo.refresh().join()
         await { it.selected?.conflict == true }
-        server.conflict = false
         server.ownerMissing = true
+        server.conflict = false // Never expose a transient permitted owner between fixture updates.
         repo.recheckThreadOwnership().join()
         assertTrue(db.dao().chat(key)!!.conflict)
         assertEquals(OwnershipCheck.Blocked, repo.state.value.ownershipChecks[key])
         assertFalse(repo.state.value.accessAllowsSending())
-        server.ownerMissing = false
         server.accessCanSend = false
+        server.ownerMissing = false
         repo.recheckThreadOwnership().join()
         assertTrue(db.dao().chat(key)!!.conflict)
         assertEquals(OwnershipCheck.Blocked, repo.state.value.ownershipChecks[key])
-        server.accessCanSend = true
         server.runtimeOnline = false
+        repo.refresh().join() // Publish offline inventory before offering a contradictory positive permission.
+        server.accessCanSend = true
         repo.recheckThreadOwnership().join()
         assertTrue(db.dao().chat(key)!!.conflict)
         assertEquals(OwnershipCheck.Blocked, repo.state.value.ownershipChecks[key])
         assertFalse(repo.state.value.ownershipVerifiedFor())
+        assertFalse(repo.state.value.accessAllowsSending())
+    }
+
+    @Test fun ownershipDirectoryCannotClearConflictWithoutNewAccessProof() = runBlocking<Unit> {
+        server.conflict = true
+        repo.refresh().join()
+        await { it.selected?.conflict == true }
+        repo.refreshThreadAccess().join()
+        server.ownerMissing = true
+        server.conflict = false
+        repo.refresh().join()
+        repo.refreshThreadAccess().join()
+        assertTrue("A readable directory row is not permission to clear the cached conflict", db.dao().chat(key)!!.conflict)
+        assertFalse(repo.state.value.ownershipVerifiedFor())
+        assertFalse(repo.state.value.accessAllowsSending())
+    }
+
+    @Test fun ownershipLateAccessReplyCannotClearNewDirectoryConflictOnUnselectedThread() = runBlocking<Unit> {
+        val held = HeldAccess()
+        server.heldAccess.set(held)
+        val oldRead = repo.refreshThreadAccess()
+        withTimeout(5_000) { held.entered.await() }
+        try {
+            // No selected-thread Room observer can mask the directory fence with a second access read.
+            val other = db.dao().chat(key)!!.copy(key = key.copy(nativeId = "other"))
+            db.dao().putChat(other)
+            repo.select(other).join()
+            server.conflict = true
+            repo.refresh().join()
+            assertTrue(db.dao().chat(key)!!.conflict)
+        } finally { held.release.complete(Unit); oldRead.join() }
+        assertTrue("The earlier permitted reply must lose to later directory conflict evidence", db.dao().chat(key)!!.conflict)
+        assertFalse(key in repo.state.value.accessFresh)
+        assertEquals("other", repo.state.value.selected?.key?.nativeId)
+    }
+
+    @Test fun ownershipConnectionReplacementDuringRoomReadCannotPublishOldPermission() = runBlocking<Unit> {
+        server.conflict = true
+        repo.refresh().join()
+        await { it.selected?.conflict == true }
+        repo.refreshThreadAccess().join()
+        val captured = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val armed = AtomicBoolean(true)
+        val original = db.dao()
+        val pausing = object : PocketDao by original {
+            override suspend fun chat(key: ThreadKey): ChatEntity? {
+                val publishing = Thread.currentThread().stackTrace.any { it.className.contains("publishAccess") || it.methodName.startsWith("publishAccess") }
+                val row = original.chat(key)
+                if (publishing && key == this@V06SessionRepositoryTest.key && armed.compareAndSet(true, false)) {
+                    captured.complete(Unit); release.await()
+                }
+                return row
+            }
+        }
+        PocketRepository::class.java.getDeclaredField("dao").apply { isAccessible = true }.set(repo, pausing)
+        server.conflict = false
+        val read = repo.refreshThreadAccess()
+        try {
+            withTimeout(5_000) { captured.await() }
+            val generation = PocketRepository::class.java.getDeclaredField("connectionGeneration")
+                .apply { isAccessible = true }.get(repo) as AtomicLong
+            generation.incrementAndGet()
+            @Suppress("UNCHECKED_CAST")
+            val state = PocketRepository::class.java.getDeclaredField("_state").apply { isAccessible = true }
+                .get(repo) as MutableStateFlow<PocketState>
+            state.update { it.copy(accessFresh = it.accessFresh - key) }
+        } finally { release.complete(Unit); read.join() }
+        assertTrue("The connection check must cover Room suspension, not just the RPC return", original.chat(key)!!.conflict)
+        assertFalse(key in repo.state.value.accessFresh)
+        assertFalse(repo.state.value.ownershipVerifiedFor())
+    }
+
+    @Test fun ownershipNewDeniedReadWinsWhileOldPublicationWaitsForRoom() = runBlocking<Unit> {
+        server.conflict = true
+        repo.refresh().join()
+        await { it.selected?.conflict == true }
+        repo.refreshThreadAccess().join()
+        val captured = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val armed = AtomicBoolean(true)
+        val original = db.dao()
+        val pausing = object : PocketDao by original {
+            override suspend fun chat(key: ThreadKey): ChatEntity? {
+                val publishing = Thread.currentThread().stackTrace.any { it.className.contains("publishAccess") || it.methodName.startsWith("publishAccess") }
+                val row = original.chat(key)
+                if (publishing && key == this@V06SessionRepositoryTest.key && armed.compareAndSet(true, false)) {
+                    captured.complete(Unit); release.await()
+                }
+                return row
+            }
+        }
+        PocketRepository::class.java.getDeclaredField("dao").apply { isAccessible = true }.set(repo, pausing)
+        server.conflict = false
+        val oldRead = repo.refreshThreadAccess()
+        var deniedRead: Job? = null
+        val denied = HeldAccess()
+        try {
+            withTimeout(5_000) { captured.await() }
+            server.ownerMissing = true
+            server.heldAccess.set(denied)
+            deniedRead = repo.refreshThreadAccess()
+            withTimeout(5_000) { denied.entered.await() }
+            // Its newer read ticket must invalidate the paused publisher.
+        } finally {
+            denied.release.complete(Unit); release.complete(Unit)
+            withTimeout(5_000) { oldRead.join(); deniedRead?.join() }
+        }
+        assertTrue(original.chat(key)!!.conflict)
+        assertNull(repo.state.value.accessFor()!!.ownerRuntimeId)
+        assertFalse(repo.state.value.accessAllowsSending())
     }
 
     @Test fun cliHistoryReadingDoesNotPrepareOrHandoffAndPreservesDraft() = runBlocking<Unit> {
@@ -177,6 +308,24 @@ class V06SessionRepositoryTest {
         assertTrue(server.calls.count { it.method == "runtimes/list" } >= 2)
         assertEquals(listOf("d"), server.calls.filter { it.method == "codex/request" && it.params.string("method") == "thread/start" }.map { it.params.string("runtimeId") })
     }
+    @Test fun coldCliCreationPreparesRuntimeBeforeStartingOneThread() = runBlocking<Unit> {
+        server.runtimeOnline = false
+        repo.refresh().join()
+        repo.create(SessionMode.Cli, "").join()
+        val ensure = server.calls.single { it.method == "runtime/ensure" }
+        assertEquals("cli", ensure.params.string("source"))
+        assertEquals(ensure.command, ensure.params.string("commandId"))
+        val starts = server.calls.filter { it.method == "codex/request" && it.params.string("method") == "thread/start" }
+        assertEquals(listOf("r"), starts.map { it.params.string("runtimeId") })
+        assertEquals("r", repo.state.value.selected!!.runtimeId)
+    }
+    @Test fun disconnectedRuntimeDoesNotMakeTheComputerOffline() = runBlocking<Unit> {
+        server.runtimeOnline = false
+        repo.refresh().join()
+        repo.refreshModels().join()
+        assertTrue(repo.state.value.online)
+        assertEquals("RuntimeUnavailable", repo.state.value.modelCatalogState.name)
+    }
     @Test fun newConversationDoesNotInheritPreviousHistoryFailureOrPagination() = runBlocking<Unit> {
         repo.editDraft("preserve previous conversation")
         server.historyFails = true
@@ -205,6 +354,77 @@ class V06SessionRepositoryTest {
         assertEquals(reads + 1, server.calls.count { it.method == "codex/request" && it.params.string("method") == "thread/read" })
     }
 
+    @Test fun recycledImageCellDoesNotCancelReferenceRenewal() = runBlocking<Unit> {
+        val old=userMessageMedia(repo.state.value.timeline.items.values.first()).single()
+        val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>()
+        server.historyRead={entered.complete(Unit);release.await()}
+        server.mediaId="b".repeat(32)
+        val cell=launch {repo.refreshToolMedia(old)}
+        withTimeout(5_000) {entered.await()}
+        cell.cancelAndJoin()
+        release.complete(Unit)
+        await {state -> state.timeline.items.values.any {item -> userMessageMedia(item).any {it.mediaId==server.mediaId}}}
+        assertEquals("b".repeat(32),userMessageMedia(repo.state.value.timeline.items.values.first()).single().mediaId)
+    }
+
+    @Test fun failedReferenceRenewalDoesNotThrottleTheNextAutomaticAttempt() = runBlocking<Unit> {
+        val old=userMessageMedia(repo.state.value.timeline.items.values.first()).single()
+        server.historyFails=true
+        repo.refreshToolMedia(old)
+        server.historyFails=false;server.mediaId="b".repeat(32)
+        repo.refreshToolMedia(old)
+        assertEquals(server.mediaId,userMessageMedia(repo.state.value.timeline.items.values.first()).single().mediaId)
+    }
+
+    @Test fun renewingAnOldPageImagePreservesTheWholeWindowAndReadingAnchor() = runBlocking<Unit> {
+        val old=repo.state.value.timeline.items.values.first()
+        val turns=(0..9).map { n -> buildJsonObject {
+            put("id",if(n==0) old.turnId else "new-$n");put("status","completed")
+            put("items",buildJsonArray {add(if(n==0) old.raw else buildJsonObject {
+                put("id","message-$n");put("type","agentMessage");put("text","Keep paragraph $n")
+            })})
+        } }
+        server.historyOverride=buildJsonObject {put("thread",buildJsonObject {put("id","t");put("turns",JsonArray(turns))})}
+        repo.reloadConversation().join()
+        repo.scroll(2,31,false,old.key)
+        val keys=repo.state.value.timeline.items.keys.toList()
+        val draft=repo.state.value.draft
+        val oldRef=itemMedia(repo.state.value.timeline.items[old.key]!!).single()
+        val changed=JsonObject(old.raw + ("content" to JsonArray(old.raw.array("content").map {part ->
+            JsonObject(part.asObject()+("mediaId" to JsonPrimitive("b".repeat(32))))
+        })))
+        server.historyOverride=buildJsonObject {put("thread",buildJsonObject {put("id","t");put("turns",buildJsonArray {})})}
+        server.historyPage={ params -> buildJsonObject {
+            val older=params.containsKey("cursor")
+            put("data",if(older) buildJsonArray {add(buildJsonObject {put("id",old.turnId);put("items",buildJsonArray {add(changed)})})}
+                else JsonArray(turns.drop(2).reversed()))
+            put("nextCursor",if(older) JsonNull else JsonPrimitive("old-page"))
+        } }
+        repo.refreshToolMedia(oldRef)
+        assertEquals("b".repeat(32),itemMedia(repo.state.value.timeline.items[old.key]!!).single().mediaId)
+        assertEquals(keys,repo.state.value.timeline.items.keys.toList())
+        assertEquals(draft,repo.state.value.draft)
+        assertEquals(listOf(null,"old-page"),server.calls.filter {it.params.string("method")=="thread/turns/list"}.map {
+            it.params.obj("params")["cursor"]?.jsonPrimitive?.content
+        })
+    }
+
+    @Test fun switchingConversationDiscardsALateImageRenewal() = runBlocking<Unit> {
+        val old=userMessageMedia(repo.state.value.timeline.items.values.first()).single()
+        val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>()
+        server.historyRead={entered.complete(Unit);release.await()}
+        server.mediaId="b".repeat(32)
+        val cell=launch {runCatching {repo.refreshToolMedia(old)}}
+        withTimeout(5_000) {entered.await()}
+        server.historyRead={}
+        val other=repo.state.value.selected!!.copy(key=key.copy(nativeId="other"))
+        db.dao().putChat(other);repo.select(other).join()
+        val expected=repo.state.value.timeline
+        release.complete(Unit);cell.join()
+        assertEquals(other.key,repo.state.value.selected!!.key)
+        assertEquals(expected,repo.state.value.timeline)
+    }
+
     @Test fun explicitHandoffUsesActualOwnerAndKeepsHistoricalSource() = runBlocking<Unit> {
         repo.editDraft("retained")
         repo.setThreadSessionMode(SessionMode.Desktop).join()
@@ -216,6 +436,16 @@ class V06SessionRepositoryTest {
         assertEquals("cli", repo.state.value.selected!!.source)
         assertEquals("retained", repo.state.value.draft!!.text)
         assertEquals("d", repo.state.value.accessFor()!!.ownerRuntimeId)
+    }
+
+    @Test fun directoryOwnerReplacementRefreshesSendingWithoutManualRecheck() = runBlocking<Unit> {
+        repo.editDraft("survive native restart")
+        server.desktop = true; server.completedHandoff = true
+        repo.refresh().join()
+        await { it.selected?.runtimeId == "d" && it.accessAllowsSending() }
+        assertEquals("survive native restart", repo.state.value.draft!!.text)
+        assertEquals("d", repo.state.value.accessFor()!!.ownerRuntimeId)
+        assertFalse(server.calls.any {it.method in setOf("runtime/ensure", "thread/access/update")})
     }
 
     @Test fun userMediaReadCarriesExactContentOwnerAndConnection() = runBlocking<Unit> {
@@ -310,13 +540,19 @@ class V06SessionRepositoryTest {
     }
 
     private data class Call(val method: String, val params: JsonObject, val command: String?)
+    private class HeldAccess {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+    }
     private class Fixture : PocketConnection {
         override val state = MutableStateFlow(LinkState.OFFLINE)
         override val notifications = emptyFlow<JsonObject>()
         val calls = CopyOnWriteArrayList<Call>()
+        val heldAccess = AtomicReference<HeldAccess?>()
         var directory: suspend () -> Unit = {}
         var desktop = false
         var ensureRequested = false
+        var ensureCli = false
         var inventoryPolls = 0
         var handoff = false
         var completedHandoff = false
@@ -324,15 +560,18 @@ class V06SessionRepositoryTest {
         var revision = 4
         var imageFails = false
         var historyFails = false
+        var historyRead: suspend () -> Unit = {}
+        var historyOverride: JsonObject? = null
+        var historyPage: suspend (JsonObject) -> JsonObject = { error("Unexpected history page") }
         var mediaId = "a".repeat(32)
         var imageRead: suspend () -> JsonElement? = { null }
         var fastSupported = false
-        var ownerMissing = false
-        var conflict = false
+        @Volatile var ownerMissing = false
+        @Volatile var conflict = false
         var ownershipReason: String? = null
-        var accessFails = false
-        var accessCanSend = true
-        var runtimeOnline = true
+        @Volatile var accessFails = false
+        @Volatile var accessCanSend = true
+        @Volatile var runtimeOnline = true
         var configuredMode: String? = null
         override suspend fun connect(config: ConnectionConfig) { state.value = LinkState.ONLINE }
         override fun close() { state.value = LinkState.OFFLINE }
@@ -341,7 +580,7 @@ class V06SessionRepositoryTest {
             listOf("r" to "cli", "d" to "desktop").filter { it.first != "d" || desktop }.forEach { (id, source) -> add(buildJsonObject {
                 put("id", id); put("source", source); put("configStoreId", "store"); put("online", id != "r" || runtimeOnline)
                 put("loadedThreadIds", buildJsonArray { add("t"); add("new") })
-                put("capabilities", buildJsonArray { listOf("thread/read", "thread/start", "model/list", "collaborationMode/list", "thread/media/read", "workspace/image", "thread/settings/update").forEach { add(it) } })
+                put("capabilities", buildJsonArray { listOf("thread/read", "thread/turns/list", "thread/start", "model/list", "collaborationMode/list", "thread/media/read", "workspace/image", "thread/settings/update").forEach { add(it) } })
                 put("capabilityFields", buildJsonObject { put("thread/settings/update", buildJsonArray { add("threadId"); if (fastSupported) add("serviceTier") }) })
             }) }
         }
@@ -361,8 +600,10 @@ class V06SessionRepositoryTest {
             calls += Call(method, params, commandId)
             return when (method) {
                 "hello" -> buildJsonObject { put("protocol", 1); put("computerId", "pc"); put("runtimes", runtimes())
-                    put("capabilities", JsonArray(BrokerCapability.entries.map { JsonPrimitive(it.method) })) }
-                "runtimes/list" -> { if (ensureRequested && ++inventoryPolls >= 2) desktop = true; obj("data" to runtimes()) }
+                    put("capabilities", JsonArray(BrokerCapability.entries.map { JsonPrimitive(it.method) } + JsonPrimitive("runtime.ensure.cli"))) }
+                "runtimes/list" -> { if (ensureRequested && ++inventoryPolls >= 2) {
+                    if (ensureCli) runtimeOnline = true else desktop = true
+                }; obj("data" to runtimes()) }
                 "threads/list" -> { directory(); buildJsonObject { put("data", buildJsonArray { add(buildJsonObject {
                     put("id", "t"); put("runtimeId", if (completedHandoff) "d" else "r"); put("configStoreId", "store"); put("source", "cli")
                     put("conflict", conflict); ownershipReason?.let { put("ownershipReason", it) }
@@ -370,7 +611,12 @@ class V06SessionRepositoryTest {
                 "sync" -> buildJsonObject { put("events", buildJsonArray {}); put("cursors", buildJsonObject {}); put("pendingRequests", buildJsonArray {}) }
                 "session/preferences/read" -> buildJsonObject { put("defaultMode", mode); put("revision", revision) }
                 "session/preferences/update" -> { check(commandId == params.string("commandId")); check(params.number("knownRevision") == revision.toLong()); mode = params.string("mode"); revision++; buildJsonObject {} }
-                "thread/access/read" -> { if (accessFails) throw WireException("request_timeout", "fixture"); access(params.string("threadId")) }
+                "thread/access/read" -> {
+                    if (accessFails) throw WireException("request_timeout", "fixture")
+                    val snapshot = access(params.string("threadId"))
+                    heldAccess.getAndSet(null)?.let { held -> held.entered.complete(Unit); held.release.await() }
+                    snapshot
+                }
                 "thread/settings/read" -> buildJsonObject {
                     put("runtimeId", params.string("runtimeId")); put("threadId", params.string("threadId")); put("known", true)
                     put("settings", buildJsonObject { put("model", "m"); put("effort", JsonNull); put("serviceTier", JsonNull) })
@@ -380,7 +626,8 @@ class V06SessionRepositoryTest {
                     if (ownerMissing) { ownerMissing = false; completedHandoff = true }
                     access("t")
                 }
-                "runtime/ensure" -> { check(commandId == params.string("commandId")); ensureRequested = true; buildJsonObject { put("phase", "starting_desktop"); put("runtimeId", JsonNull) } }
+                "runtime/ensure" -> { check(commandId == params.string("commandId")); ensureRequested = true; ensureCli = params.string("source") == "cli"
+                    buildJsonObject { put("phase", if (ensureCli) "starting_cli" else "starting_desktop"); put("runtimeId", JsonNull); if (ensureCli) put("configStoreId", "store") } }
                 "thread/media/read" -> buildJsonObject { put("mediaId", params.string("mediaId")); put("status", "ready"); put("mimeType", "image/png"); put("size", 10); put("offset", 0); put("eof", true); put("data", "fixture") }
                 "workspace/image" -> {
                     imageRead()?.let { return it }
@@ -389,7 +636,8 @@ class V06SessionRepositoryTest {
                 }
                 "codex/request" -> when (params.string("method")) {
                     "thread/start" -> buildJsonObject { put("thread", buildJsonObject { put("id", "new"); put("turns", buildJsonArray {}) }) }
-                    "thread/read" -> buildJsonObject { if (historyFails) throw WireException("remote_error", "fixture"); put("pocketCursor", buildJsonObject { put("epoch", "fixture"); put("sequence", 0) }); put("thread", buildJsonObject {
+                    "thread/turns/list" -> historyPage(params.obj("params"))
+                    "thread/read" -> { historyRead(); historyOverride ?: buildJsonObject { if (historyFails) throw WireException("remote_error", "fixture"); put("pocketCursor", buildJsonObject { put("epoch", "fixture"); put("sequence", 0) }); put("thread", buildJsonObject {
                         put("id", params.obj("params").string("threadId")); put("turns", buildJsonArray { add(buildJsonObject {
                             put("id", "turn"); put("status", "completed"); put("items", buildJsonArray { add(buildJsonObject {
                                 put("id", "user"); put("type", "userMessage"); put("content", buildJsonArray { add(buildJsonObject {
@@ -398,7 +646,7 @@ class V06SessionRepositoryTest {
                                 }) })
                             }) })
                         }) })
-                    }) }
+                    }) } }
                     "thread/settings/update" -> buildJsonObject {}
                     "model/list" -> buildJsonObject {
                         put("data", buildJsonArray { add(buildJsonObject { put("id", "m"); put("model", "m"); put("displayName", "Model");

@@ -1,17 +1,65 @@
 package dev.codexpocket.wire
 
+import java.io.InputStream
 import java.nio.ByteBuffer
+import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
+import java.util.ArrayDeque
 import java.util.Base64
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.*
 
 /** Owned by PocketClient's gate. Partial replies never escape as application events. */
 internal class ReplyChunks {
-    private data class Assembly(val bytes: ByteArray, var offset: Int = 0, var sequence: Int = 0)
+    private class Assembly(val total: Int) {
+        val blocks = ArrayDeque<ByteArray>()
+        var offset = 0
+        var sequence = 0
+        private val decoder = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        private val input = ByteBuffer.allocate(BLOCK + 4)
+        private val chars = CharBuffer.allocate(1024)
+
+        // kotlinx.serialization's stream reader replaces malformed UTF-8, so
+        // validate before parsing, carrying incomplete code points between blocks.
+        fun validate(block: ByteArray, last: Boolean) {
+            input.put(block).flip()
+            while (true) {
+                chars.clear()
+                val status = decoder.decode(input, chars, last)
+                if (status.isError) status.throwException()
+                if (status.isUnderflow) break
+            }
+            input.compact()
+            if (last) { chars.clear(); decoder.flush(chars).let { if (it.isError) it.throwException() } }
+        }
+    }
+    /** Consume original blocks; no joined byte array or whole-response String. */
+    private class BlockStream(private val blocks: ArrayDeque<ByteArray>) : InputStream() {
+        private var offset = 0
+        override fun read(): Int {
+            val block = blocks.peekFirst() ?: return -1
+            val value = block[offset++].toInt() and 0xff
+            if (offset == block.size) { blocks.removeFirst(); offset = 0 }
+            return value
+        }
+        override fun read(target: ByteArray, start: Int, length: Int): Int {
+            require(start >= 0 && length >= 0 && start <= target.size - length)
+            if (length == 0) return 0
+            val block = blocks.peekFirst() ?: return -1
+            val count = minOf(length, block.size - offset)
+            block.copyInto(target, start, offset, offset + count); offset += count
+            if (offset == block.size) { blocks.removeFirst(); offset = 0 }
+            return count
+        }
+        override fun close() { blocks.clear() }
+    }
     private val partial = mutableMapOf<String, Assembly>()
+    // Reserve declared totals even though storage grows only as blocks arrive.
     private var allocated = 0
-    fun discard(id: String) { partial.remove(id)?.let { allocated -= it.bytes.size } }
+    fun discard(id: String) { partial.remove(id)?.let { allocated -= it.total } }
     fun clear() { partial.clear(); allocated = 0 }
+    @OptIn(ExperimentalSerializationApi::class)
     fun accept(message: JsonObject, expected: Set<String>): JsonObject? {
         fun invalid(): Nothing = throw WireException("invalid_reply", "Invalid reply chunk")
         val p = message["params"] as? JsonObject ?: invalid()
@@ -27,16 +75,18 @@ internal class ReplyChunks {
         var entry = partial[id]
         if (entry == null) {
             if (sequence != 0 || allocated.toLong() + total > MAX_BUFFERED || partial.size >= 16) invalid()
-            entry = Assembly(ByteArray(total)); partial[id] = entry; allocated += total
+            entry = Assembly(total); partial[id] = entry; allocated += total
         }
-        if (entry.bytes.size != total || entry.sequence != sequence || block.size != minOf(BLOCK, total - entry.offset)) invalid()
-        block.copyInto(entry.bytes, entry.offset); entry.offset += block.size; entry.sequence++
+        if (entry.total != total || entry.sequence != sequence || block.size != minOf(BLOCK, total - entry.offset)) {
+            discard(id); invalid()
+        }
+        try { entry.validate(block, entry.offset + block.size == total) }
+        catch (_: Exception) { discard(id); invalid() }
+        entry.blocks.addLast(block); entry.offset += block.size; entry.sequence++
         if (entry.offset != total) return null
         discard(id)
         val result = try {
-            val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(entry.bytes)).toString()
-            Json.parseToJsonElement(text) as? JsonObject ?: invalid()
+            BlockStream(entry.blocks).use { Json.decodeFromStream(JsonObject.serializer(), it) }
         } catch (_: Exception) { invalid() }
         if ((result["id"] as? JsonPrimitive)?.takeIf { it.isString }?.content != id) invalid()
         if (result.containsKey("method") || result.containsKey("result") == result.containsKey("error")) invalid()

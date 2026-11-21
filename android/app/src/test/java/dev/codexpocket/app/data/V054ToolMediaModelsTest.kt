@@ -5,6 +5,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class V054ToolMediaModelsTest {
+    @Test fun imageViewUsesProjectedOpaqueMediaInsteadOfTheNativeFilePath() {
+        val raw=buildJsonObject {
+            put("id","tool");put("type","imageView");put("path","D:/private/chart.png")
+            put("toolOutputBlocks",JsonArray(listOf(image)))
+        }
+        val activity=NativeActivityPresentation.describe(TimelineItem.from("turn",raw))
+        val ref=activity.outputBlocks.filterIsInstance<ToolOutputBlock.Image>().single().media
+        assertTrue(ref.readable)
+        assertEquals("a".repeat(32),ref.mediaId)
+        assertFalse(ref.toString().contains("D:/private"))
+    }
     private fun item(type: String, content: JsonElement): TimelineItem = TimelineItem.from("turn", buildJsonObject {
         put("id", "tool"); put("type", type)
         when (type) {

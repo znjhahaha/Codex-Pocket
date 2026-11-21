@@ -1,5 +1,25 @@
 //! Resolve a package upgrade only for a new launch; never touch an active child.
 use std::path::{Path, PathBuf};
+
+/// Resolve registered packages on every new native launch. Never use a saved
+/// WindowsApps version path or require the Pocket installation to be readable.
+pub async fn registered_desktop() -> anyhow::Result<(PathBuf, String)> {
+    #[cfg(windows)] {
+        use anyhow::{Context, ensure};
+        let system = PathBuf::from(std::env::var_os("SystemRoot").context("System root unavailable")?);
+        let mut cmd = tokio::process::Command::new(system.join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+        cmd.args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop';$p=Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1;if(!$p){throw 'Codex not installed'};@{location=$p.InstallLocation;family=$p.PackageFamilyName}|ConvertTo-Json -Compress"#])
+            .env_remove("PSModulePath").stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .kill_on_drop(true).creation_flags(0x08000000);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15),cmd.output()).await??;
+        ensure!(output.status.success() && output.stdout.len()<65536,"Registered Codex package unavailable");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let native = PathBuf::from(value["location"].as_str().context("Package location missing")?).join("app/resources/codex.exe");
+        ensure!(native.is_file(), "Registered native runtime missing");
+        Ok((native,value["family"].as_str().context("Package family missing")?.to_owned()))
+    }
+    #[cfg(not(windows))] { anyhow::bail!("Registered desktop discovery requires Windows") }
+}
 fn package(path: &Path) -> Option<(String, Vec<u64>, String)> {
     let name = path.ancestors().find_map(|p| {
         let name = p.file_name()?.to_str()?;

@@ -105,6 +105,10 @@ impl CommandLedger {
     pub fn status(&self, key: &CommandKey) -> Option<&Status> {
         self.entries.get(key).map(|entry| &entry.status)
     }
+    /// Match independent completion evidence without reserving or expiring a key.
+    pub fn matches_fingerprint(&self, key: &CommandKey, fingerprint: &[u8; 32]) -> bool {
+        self.entries.get(key).is_some_and(|entry| &entry.fingerprint == fingerprint)
+    }
     pub fn begin(&mut self, key: CommandKey, body: &[u8], now: u64) -> Result<Begin, LedgerError> {
         if key.caller_id.is_empty() || key.command_id.is_empty() {
             return Err(LedgerError::InvalidIdentity);

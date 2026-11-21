@@ -17,7 +17,7 @@ async fn start() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut values = std::collections::BTreeMap::new();
     while let Some(key) = args.next() {
-        if !["--state", "--descriptor", "--binary", "--config-home"].contains(&key.as_str())
+        if !["--state", "--descriptor", "--binary", "--config-home", "--legacy-upgrade", "--expected-generation"].contains(&key.as_str())
             || values.contains_key(&key)
         {
             bail!("Invalid argument");
@@ -30,6 +30,15 @@ async fn start() -> Result<()> {
             .map(PathBuf::from)
             .context("Missing required path")
     };
+    if let Some(mode)=values.get("--legacy-upgrade") {
+        anyhow::ensure!(["check","retire"].contains(&mode.as_str()),"Unknown legacy upgrade action");
+        #[cfg(windows)] {
+            let result=pocket_runtime_host::legacy_upgrade::legacy_upgrade(&path("--state")?,&path("--descriptor")?,
+                &path("--config-home")?,values.get("--expected-generation").context("Expected generation required")?,mode=="retire").await?;
+            println!("{result}");return Ok(());
+        }
+        #[cfg(not(windows))] bail!("Legacy retirement is Windows-only");
+    }
     let config = HostConfig {
         state: path("--state")?,
         descriptor: path("--descriptor")?,

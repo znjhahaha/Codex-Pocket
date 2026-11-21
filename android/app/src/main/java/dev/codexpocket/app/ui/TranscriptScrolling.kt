@@ -13,6 +13,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.Velocity
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -22,11 +23,12 @@ import kotlin.math.abs
 internal class TranscriptGestureState {
     var contact by mutableStateOf(false)
     var released by mutableStateOf(false)
+    var flinging by mutableStateOf(false)
     var dragging = false
     var movedTowardTail = false
-    var tailItemKey: Any? = null
-    var tailItemCount = 0
-    fun cancelResume() { released = false; movedTowardTail = false; tailItemKey = null; tailItemCount = 0 }
+    var consumedItemCount = 0
+    var epoch by mutableIntStateOf(0)
+    fun cancelResume() { epoch++; released = false; flinging = false; movedTowardTail = false; consumedItemCount = 0 }
 }
 
 /** Only user dragging changes follow intent. Programmatic seeks never feed back into it. */
@@ -47,17 +49,27 @@ internal fun ObserveTranscriptDrag(list: LazyListState, gesture: TranscriptGestu
                     if (interaction is DragInteraction.Cancel) gesture.cancelResume()
                 }
             }
-            snapshotFlow { listOf(gesture.released, gesture.contact, list.isScrollInProgress, list.canScrollForward) }
-                .distinctUntilChanged().collect {
-                    if (gesture.released && !gesture.contact && !list.isScrollInProgress) {
-                        // Consume this gesture once. A later layout shrink/seek cannot adopt it.
-                        gesture.released = false
+            snapshotFlow {
+                val info=list.layoutInfo
+                val last=info.visibleItemsInfo.lastOrNull()
+                listOf(gesture.epoch, gesture.released, gesture.contact, gesture.flinging, list.isScrollInProgress, list.canScrollForward,
+                    info.totalItemsCount, last?.key, last?.offset, last?.size, info.afterContentPadding, info.viewportEndOffset)
+            }.distinctUntilChanged().collectLatest {
+                    if (gesture.released && !gesture.contact && !gesture.flinging && !list.isScrollInProgress) {
+                        val epoch=gesture.epoch
+                        // Pointer-up can precede the fling mutator and its final layout.
+                        // Wait for stable frames; a new drag/seek cancels this gesture's ticket.
+                        repeat(2) { withFrameNanos { } }
+                        if (gesture.epoch!=epoch || !gesture.released || gesture.contact || gesture.flinging || list.isScrollInProgress)
+                            return@collectLatest
                         val info = list.layoutInfo
                         val last = info.visibleItemsInfo.lastOrNull()
-                        if (gesture.movedTowardTail && gesture.tailItemKey != null && gesture.tailItemCount == info.totalItemsCount &&
-                            last != null && last.key == gesture.tailItemKey && last.index == info.totalItemsCount - 1 &&
-                            last.offset + last.size + info.afterContentPadding <= info.viewportEndOffset && !list.canScrollForward) callback(true)
-                        gesture.movedTowardTail = false
+                        val reachedTail=gesture.movedTowardTail && gesture.consumedItemCount == info.totalItemsCount &&
+                            last != null && last.index == info.totalItemsCount - 1 &&
+                            last.offset + last.size + info.afterContentPadding <= info.viewportEndOffset + 1 && !list.canScrollForward
+                        // Consume once before expanding the composer changes content padding.
+                        gesture.cancelResume()
+                        if (reachedTail) callback(true)
                     }
                 }
         }
@@ -73,6 +85,14 @@ internal fun Modifier.transcriptUserGesture(list: LazyListState, gesture: Transc
         object : NestedScrollConnection {
             private var beforeIndex = 0
             private var beforeOffset = 0
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (gesture.dragging && gesture.movedTowardTail) gesture.flinging = true
+                return Velocity.Zero
+            }
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                gesture.flinging = false
+                return Velocity.Zero
+            }
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 // SideEffect deltas count only during this released user's fling; explicit
                 // seeks cancel that ticket and cannot supply evidence for resuming follow.
@@ -90,20 +110,19 @@ internal fun Modifier.transcriptUserGesture(list: LazyListState, gesture: Transc
                 if ((source == NestedScrollSource.UserInput && gesture.contact) || gesture.released) {
                     val movedForward = list.firstVisibleItemIndex > beforeIndex ||
                         (list.firstVisibleItemIndex == beforeIndex && list.firstVisibleItemScrollOffset > beforeOffset)
+                    val movedBackward = list.firstVisibleItemIndex < beforeIndex ||
+                        (list.firstVisibleItemIndex == beforeIndex && list.firstVisibleItemScrollOffset < beforeOffset)
                     // Actual transcript consumption is required. A tool's own scroll or a
                     // boundary overscroll does not mean the reader asked to follow the tail.
                     if (movedForward && consumed.y < 0f) {
                         gesture.movedTowardTail = true
                         val info = list.layoutInfo
-                        val last = info.visibleItemsInfo.lastOrNull()
-                        if (last != null && last.index == info.totalItemsCount - 1 && !list.canScrollForward &&
-                            last.offset + last.size + info.afterContentPadding <= info.viewportEndOffset) {
-                            gesture.tailItemKey = last.key
-                            gesture.tailItemCount = info.totalItemsCount
-                        }
-                    } else if (consumed.y != 0f || available.y > 0f) {
+                        // Lazy layout may not expose the final item until after this callback.
+                        // Bind movement to this item set, then inspect its settled geometry.
+                        gesture.consumedItemCount = info.totalItemsCount
+                    } else if (movedBackward || (source == NestedScrollSource.UserInput && gesture.contact && available.y > 0f)) {
                         gesture.movedTowardTail = false
-                        gesture.tailItemKey = null
+                        gesture.consumedItemCount = 0
                     }
                 }
                 return Offset.Zero

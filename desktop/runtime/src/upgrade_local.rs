@@ -390,6 +390,19 @@ pub(super) fn no_agent_handoff(state: &Path) -> Result<bool> {
     record.validate()?;
     Ok(record.operations.is_empty() && record.recovery_checkpoint.is_none())
 }
+// A cold start does not consume a live checkpoint or assert that a retained
+// command completed. Historical cancelled operations do not fence a new boot.
+pub(crate) fn cold_agent_boot_allowed(state: &Path) -> Result<bool> {
+    let path = state.join("handoff/state.json");
+    storage::unredirected(&path)?;
+    if !path.try_exists()? {
+        return Ok(true);
+    }
+    let d = agent_record(&mut Windows, state)?;
+    Ok(d.recovery_checkpoint.as_ref().is_none_or(|cp| cp.generation != d.generation)
+        && d.operations.values().all(|op| op.receipt.generation != d.generation
+            || op.receipt.phase == "cancelled"))
+}
 fn startup_request_pending(a: &mut impl Adapter, state: &Path, cp: &CheckpointRef) -> Result<bool> {
     cp.validate()?;
     let d = agent_record(a, state)?;
@@ -414,7 +427,7 @@ fn startup_request_pending(a: &mut impl Adapter, state: &Path, cp: &CheckpointRe
         Ok(false)
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Owner {
     supervisor: ProcessIdentity,
@@ -612,6 +625,12 @@ fn capabilities(a: &mut impl Adapter, state: &Path) -> Result<String> {
     let c = a.rpc(state, "upgrade/capabilities", json!({}))?;
     capability_generation(&c)
 }
+pub(crate) fn legacy_gate(state: &Path, method: &str, id: &str, run: &str) -> Result<Value> {
+    ensure!(matches!(method, "upgrade/quiesce" | "upgrade/status" | "upgrade/cancel") && canonical_uuid(id) && canonical_uuid(run), "Invalid restart fence");
+    let receipt = Windows.rpc(state, method, params(id, run, None))?;
+    serde_json::from_value::<Receipt>(receipt.clone())?.bind(id, run)?;
+    Ok(receipt)
+}
 fn capability_generation(c: &Value) -> Result<String> {
     if c["supported"] == false {
         bail!(Unsupported);
@@ -729,7 +748,9 @@ fn owner(a: &mut impl Adapter, s: &UpgradeStatus, generation: &str) -> Result<(O
             .context("Agent child missing")?,
     )?;
     checked_process(a, s, &agent, generation, "pocket-agent.exe")?;
-    let health = a.rpc(&s.state_directory, "status", json!({}))?;
+    // Owner identity is independent of potentially slow native/OS idle scans.
+    // Checkpoints and bound handoff receipts still prove native preservation.
+    let health = a.rpc(&s.state_directory, "helper/health", json!({}))?;
     let run = capabilities(a, &s.state_directory)?;
     validate_health(s, &agent, generation, &run, &health)?;
     checked_process(a, s, &agent, generation, "pocket-agent.exe")?;
@@ -833,15 +854,62 @@ fn request(s: &UpgradeStatus, d: &Durable, action: Action) -> Request {
 }
 fn ack(a: &mut impl Adapter, s: &UpgradeStatus, d: &Durable, action: Action) -> Result<()> {
     let r = request(s, d, action);
-    a.submit(&s.state_directory, &r)?;
     let phase = match action {
         Action::Enter | Action::Recover => maintenance::Phase::Owned,
         Action::Cancel => maintenance::Phase::Cancelled,
         Action::Release => maintenance::Phase::Released,
     };
     let end = Instant::now() + Duration::from_secs(12);
+    if action == Action::Recover {
+        let mut expected = r.clone();
+        expected.action = Action::Enter;
+        if a.ack(&s.state_directory)?
+            .is_some_and(|j| j.request == expected && j.phase == phase)
+        {
+            // Recovering the same live owner is already satisfied. Do not queue
+            // a no-op Recover and then mistake the old Owned journal for its
+            // consumption: a subsequent Release would collide with that mailbox.
+            ensure!(
+                a.presence(&r.supervisor) == maintenance::Presence::Alive
+                    && a.presence(&r.coordinator) == maintenance::Presence::Alive,
+                "Maintenance recovery owner unverified"
+            );
+            return Ok(());
+        }
+    }
     loop {
-        if let Some(j) = a.ack(&s.state_directory)? {
+        match a.submit(&s.state_directory, &r) {
+            Ok(()) => break,
+            Err(error) if maintenance::file_contention(&error) => {
+                ensure!(
+                    Instant::now() < end
+                        && a.presence(&r.supervisor) == maintenance::Presence::Alive
+                        && a.presence(&r.coordinator) == maintenance::Presence::Alive,
+                    "Maintenance submission unavailable"
+                );
+                // Stable local mailbox intent only; never resend native RPC.
+                a.tick();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        let journal = match a.ack(&s.state_directory) {
+            Ok(journal) => journal,
+            Err(error) if maintenance::file_contention(&error) => {
+                // Release may already be durable and the supervisor naturally
+                // gone. Temporary read contention is uncertainty, not rollback
+                // evidence. Wait within the ORIGINAL deadline; only an exact
+                // journal acknowledgement below can complete this operation.
+                let _ = maintenance::release_diagnostic(&s.state_directory,&r,"ack_read",&d.stage,&error,json!({"action":action}));
+                ensure!(Instant::now() < end
+                    && a.presence(&r.coordinator) == maintenance::Presence::Alive,
+                    "Maintenance acknowledgement unavailable");
+                a.tick();continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(j) = journal {
             let mut expected = r.clone();
             expected.action = Action::Enter;
             if j.request == expected && j.phase == phase {
@@ -875,7 +943,7 @@ fn ensure_owner(a: &mut impl Adapter, s: &UpgradeStatus, d: &Durable) -> Result<
         capabilities(a, &s.state_directory)? == d.current.run,
         "Agent run changed"
     );
-    let health = a.rpc(&s.state_directory, "status", json!({}))?;
+    let health = a.rpc(&s.state_directory, "helper/health", json!({}))?;
     validate_health(
         s,
         &d.current.agent,
@@ -1005,17 +1073,26 @@ fn image(a: &mut impl Adapter, state: &Path, cp: &CheckpointRef, computer: &str)
             && snap["questionReceipts"]["records"].is_array(),
         "Invalid checkpoint snapshot"
     );
-    ensure!(
-        !snap["ledger"]["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| matches!(
-                e["status"].as_str(),
-                Some("Submitted" | "Unknown" | "submitted" | "unknown")
-            )),
-        "Unconfirmed ledger writes"
-    );
+    let mut unknown = BTreeMap::new();
+    for entry in snap["ledger"]["entries"].as_array().unwrap() {
+        use pocket_core::ledger::{CommandKey, Status};
+        match serde_json::from_value::<Status>(entry["status"].clone())? {
+            Status::Submitted => bail!("Unconfirmed ledger writes"),
+            Status::Unknown => {
+                // A fenced receipt proves no writer remains. Unknown is an
+                // immutable deduplication tombstone, not permission to replay.
+                let key: CommandKey = serde_json::from_value(entry["key"].clone())?;
+                let fingerprint: [u8; 32] = serde_json::from_value(entry["fingerprint"].clone())?;
+                ensure!(!key.caller_id.is_empty() && !key.command_id.is_empty()
+                    && entry["generation"].is_u64() && entry["created_at"].is_u64()
+                    && entry["generation"].as_u64() <= snap["ledger"]["generation"].as_u64()
+                    && entry["created_at"].as_u64() <= snap["ledger"]["last_now"].as_u64()
+                    && entry.get("finished_at").is_some_and(Value::is_null)
+                    && unknown.insert(key, fingerprint).is_none(), "Invalid Unknown tombstone");
+            }
+            Status::Accepted { .. } | Status::Rejected { .. } => {}
+        }
+    }
     ensure!(
         !snap["pending"]
             .as_object()
@@ -1539,7 +1616,17 @@ impl HandoffBackend for LocalBackend {
     fn release_old(&mut self, s: &UpgradeStatus) -> Result<()> {
         let mut a = Windows;
         let mut d = load(&mut a, s)?;
-        stopped(&mut a, s, &mut d)
+        let result = stopped(&mut a, s, &mut d);
+        if let Err(error) = &result {
+            // Preserve the FIRST failure before Coordinator rollback replaces
+            // this context. Diagnostic failure must not change the release Err.
+            let journal = maintenance::read_status(&s.state_directory).ok().flatten();
+            let _ = maintenance::release_diagnostic(&s.state_directory, &request(s, &d, Action::Release),
+                "coordinator", &d.stage, error, json!({"sourceSupervisor":maintenance::identity_evidence(&d.source.supervisor),
+                    "sourceAgent":maintenance::identity_evidence(&d.source.agent),"currentGeneration":d.current.generation,
+                    "maintenance":journal,"upgradePhase":s.phase}));
+        }
+        result
     }
     fn released_checkpoint(&mut self, s: &UpgradeStatus) -> Result<Option<Checkpoint>> {
         let mut a = Windows;
@@ -1781,6 +1868,57 @@ fn rollback(a: &mut impl Adapter, s: &UpgradeStatus) -> Result<Verification> {
     }
     launch(a, s, &mut d, &s.from_generation)?;
     verify(a, s, &mut d, &s.from_generation)
+}
+
+/// Reconcile only a failed inventory whose cancellation completed before any
+/// release. This reads the still-running source; it neither fences it again nor
+/// adopts a checkpoint after writes have reopened.
+pub(super) fn cancelled_source(s: &UpgradeStatus) -> Result<Verification> {
+    cancelled_before_release(&mut Windows, s)
+}
+fn cancelled_before_release(a: &mut impl Adapter, s: &UpgradeStatus) -> Result<Verification> {
+    let d = load(a, s)?;
+    ensure!(s.checkpoint.is_none() && d.ready.is_none() && d.final_checkpoint.is_none()
+        && d.spawn_pid.is_none() && d.spawn_identity.is_none()
+        && d.stage == "recovery_verifying" && d.current == d.source
+        && d.source.generation == s.from_generation && d.active_id == d.verify_id,
+        "Failed handoff may have released or replaced its source");
+    ensure!(a.presence(&d.coordinator) == maintenance::Presence::Gone,
+        "Failed handoff coordinator is still present or unverified");
+    for generation in [&s.from_generation, &s.to_generation] {
+        super::verified_generation(&s.install_root, generation)?;
+    }
+    let mailbox=storage::control(&s.state_directory).join("maintenance-request.json");
+    storage::unredirected(&mailbox)?;
+    ensure!(!mailbox.try_exists()?, "Maintenance request still pending");
+    let j=a.ack(&s.state_directory)?.context("Cancellation acknowledgement missing")?;
+    ensure!(j.phase == maintenance::Phase::Cancelled
+        && j.request == request(s,&d,Action::Enter), "Maintenance cancellation differs");
+    let disk=agent_record(a,&s.state_directory)?;
+    ensure!(disk.generation == d.source.run, "Source run changed after cancellation");
+    for id in [&s.operation_id, &d.active_id] {
+        let op=disk.operations.get(id).context("Cancelled operation missing")?;
+        let r=&op.receipt;
+        r.bind(id,&d.source.run)?;
+        ensure!(op.release_input.is_none() && r.phase == "cancelled"
+            && !r.safe_to_exit && !r.shutdown_requested && r.native_tasks_preserved
+            && r.accepting_writes && r.remote_enabled == d.prior_remote
+            && op.prior_remote == d.prior_remote, "Source cancellation unverified");
+        let live: Receipt=serde_json::from_value(a.rpc(&s.state_directory,"upgrade/status",params(id,&d.source.run,None))?)?;
+        ensure!(serde_json::to_value(r)? == serde_json::to_value(live)?, "Cancelled receipt changed");
+    }
+    ensure!(disk.recovery_checkpoint.as_ref().is_none_or(|cp|cp.generation != d.source.run)
+        && disk.operations.values().all(|o|o.receipt.generation != d.source.run
+            || o.receipt.phase == "cancelled" && !o.receipt.shutdown_requested && o.release_input.is_none()),
+        "Another agent handoff remains pending");
+    let (live,health)=owner(a,s,&s.from_generation)?;
+    ensure!(live == d.source && health["computerId"] == d.computer_id
+        && health["acceptingWrites"] == true && health["remoteEnabled"] == d.prior_remote,
+        "Source admission or identity changed");
+    ensure!(a.rpc(&s.state_directory,"routes/read",json!({}))?["routePreferences"] == d.routes["routePreferences"],
+        "Source routes changed");
+    Ok(Verification {operation_id:s.operation_id.clone(),generation:s.from_generation.clone(),control_protocol:1,
+        routes_read:true,checkpoint_sha256:None,native_tasks_preserved:true,components_verified:true})
 }
 fn recover_final(a: &mut impl Adapter, s: &UpgradeStatus, d: &mut Durable) -> Result<()> {
     let v: Value = decode(a, &s.state_directory.join("handoff/state.json"), MAX_IMAGE)?;

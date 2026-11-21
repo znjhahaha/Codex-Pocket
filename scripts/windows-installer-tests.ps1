@@ -58,7 +58,8 @@ function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$M
     if($script:shortcutFailure){Invoke-PocketInstallStep 'shortcut' 'IPersistFile.Save' {throw [Runtime.InteropServices.COMException]::new('fixture-secret-shortcut',-2147467259)}}
     & $script:realShortcutBytes @PSBoundParameters
 }
-function Invoke-PocketDesktopBuild([string]$Root,[string]$Target) { $script:desktopBuilt=$true }
+function Invoke-PocketDesktopBuild([string]$Root,[string]$Target,[string]$DesktopTargetDirectory) { $script:desktopBuilt=$true }
+function Get-PocketSourceDigest([string]$Root) { return 'fixture-source-digest' } # synthetic build roots are not Git checkouts
 function Assert-PocketWindowsPrerequisites { } # Host runtime availability is not a fixture prerequisite.
 function Enter-PocketInstallLifecycle { return @{processesStopped=0} }
 function Complete-PocketInstallLifecycle { return @{processesStarted=0;runtimeVerification='verified'} }
@@ -115,6 +116,21 @@ Test 'package allowlist and complete SHA256 inventory' {
     Assert ($manifest.files.Count -ge 13) 'Required delivery artifacts missing'
     Expect-Failure { New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $packageRoot -Version '0.1.0' -BuildEvidence @{fixture=$true} } 'already exists'
     Expect-Failure { New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -ApkPath $apk -OutputDirectory (Join-Path $testRoot 'unbuilt') -Version '0.1.0' -BuildEvidence @{} } 'requires a fresh build'
+}
+
+Test 'candidate migration notes are inventoried and tampering or extra files are rejected' {
+    $notes='Candidate migration and rollback fixture'
+    Put (Join-Path $packageInputs 'docs\v0.1.1-candidate.md') $notes
+    $candidate=Join-Path $testRoot 'candidate-notes'
+    New-PocketReleasePackage -Root $packageInputs -BinaryDirectory $binarySource -DesktopBinaryDirectory $binarySource -ApkPath $apk -OutputDirectory $candidate -Version '0.1.1' -BuildEvidence @{fixture=$true} | Out-Null
+    $manifest=Test-PocketReleaseDirectory $candidate
+    Assert (@($manifest.files | Where-Object {$_.path -eq 'MIGRATION-ROLLBACK.md'}).Count -eq 1) 'Migration notes missing from release inventory'
+    $notesPath=Join-Path $candidate 'MIGRATION-ROLLBACK.md'
+    Put $notesPath 'tampered notes'
+    Expect-Failure { Test-PocketReleaseDirectory $candidate } 'integrity|hash'
+    Put $notesPath $notes
+    Put (Join-Path $candidate 'unexpected.txt') 'must not ship'
+    Expect-Failure { Test-PocketReleaseDirectory $candidate } 'Unlisted delivery inventory'
 }
 
 $source = Join-Path $packageRoot 'windows'
@@ -198,7 +214,8 @@ Test 'install and uninstall dry-runs are read-only' {
 }
 Test 'apply, idempotence, and preserved shortcut backup' {
     Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
-    $script:installedCliPath = $script:fakeCliPath
+    Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Pocket replaced the original Codex global runtime override'
+    $script:installedCliPath = Join-Path $context.InstallRoot 'pocket-launcher.exe'
     Assert ([IO.File]::Exists($script:installedCliPath)) 'Bridge not installed'
     $before = (Get-FileHash -LiteralPath (Join-Path $context.InstallRoot 'desktop-install.json')).Hash
     Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
@@ -210,7 +227,7 @@ Test 'apply, idempotence, and preserved shortcut backup' {
     Assert (Test-PocketTaskLogon $script:fakeTask) 'Current-user logon task missing'
     Assert (-not (Test-Path -LiteralPath (Join-Path $context.Startup 'Codex Pocket.lnk'))) 'Legacy startup link was not migrated'
     Invoke-PocketWindowsInstall @argsInstall -Uninstall | Out-Null
-    Assert ($script:fakeCliPath -eq $script:installedCliPath) 'Uninstall dry-run changed environment'
+    Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Uninstall dry-run changed environment'
 }
 Test 'shortcut and environment drift refuse overwrite' {
     $installedBytes = [IO.File]::ReadAllBytes($shortcut)
@@ -220,7 +237,7 @@ Test 'shortcut and environment drift refuse overwrite' {
     [IO.File]::WriteAllBytes($shortcut, $installedBytes)
     $script:fakeCliPath = 'external override'
     Expect-Failure { Invoke-PocketWindowsInstall @argsInstall -Apply } 'changed|drift'
-    $script:fakeCliPath = $script:installedCliPath
+    $script:fakeCliPath = 'C:\original fixture\codex.exe'
 }
 Test 'shortcut publication refuses an edit made after its snapshot' {
     $path=Join-Path $testRoot 'concurrently edited.lnk'
@@ -263,7 +280,7 @@ Test 'locked shortcut causes reversible partial uninstall and supports retry' {
     try { Expect-Failure { Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply } 'denied|another process|being used|access|使用|拒绝' }
     finally { $lock.Dispose() }
     Assert (Test-Path -LiteralPath (Join-Path $context.InstallRoot 'desktop-install.json')) 'Recovery metadata removed'
-    Assert ($script:fakeCliPath -eq $script:installedCliPath) 'Environment not rolled back'
+    Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Environment not rolled back'
     Invoke-PocketWindowsInstall @argsInstall -Uninstall -Apply | Out-Null
     Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Retry failed'
 }
@@ -335,7 +352,7 @@ Test 'desktop package replacement keeps the stable launcher and immutable genera
     $script:fakePackage=[pscustomobject]@{InstallLocation=$native2;PackageFamilyName='fixture-family'}
     Invoke-PocketWindowsInstall @argsInstall -Apply | Out-Null
     Assert ((Get-PocketFileHash (Join-Path $context.InstallRoot 'desktop-install.json')) -eq $beforeRecord) 'Desktop update rewrote the immutable generation'
-    Assert ($script:fakeCliPath -eq $script:installedCliPath) 'Stable entry point changed'
+    Assert ($script:fakeCliPath -eq 'C:\original fixture\codex.exe') 'Desktop update replaced the original global runtime'
 }
 Test 'delivery upgrade and rollback restore integration byte for byte' {
     $recordBefore=Get-PocketFileHash (Join-Path $context.InstallRoot 'desktop-install.json')
@@ -361,7 +378,7 @@ Test 'failed scheduled task registration keeps verified core and retries only st
     $recordPath=Join-Path $context.InstallRoot 'desktop-install.json'
     $partial=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($result.state -eq 'installed_incomplete' -and $result.coreInstalled) 'Optional task failure lost verified core'
-    Assert ($script:fakeCliPath -ne $cliBefore -and [IO.File]::Exists($script:fakeCliPath)) 'Verified CLI publication was rolled back'
+    Assert ($script:fakeCliPath -eq $cliBefore -and [IO.File]::Exists($script:installedCliPath)) 'Optional task failure changed the original global runtime'
     Assert ((Get-PocketFileHash $shortcut) -ne $shortcutBefore) 'Successful shortcut was rolled back'
     Assert ($partial.integration.startup.stage -eq 'startup_register' -and $partial.integration.startup.hresult -eq '0x80004005') 'Task failure attribution missing'
     Assert ($null -eq $script:fakeTask) 'Task failure left a task behind'
@@ -505,9 +522,69 @@ Test 'unset original environment and missing shortcuts restore to absence' {
     $emptyContext = @{InstallRoot=(Join-Path $testRoot 'empty-install');Programs=(Join-Path $testRoot 'empty-programs');Startup=(Join-Path $testRoot 'empty-startup')}
     $script:fakeCliPath = $null
     Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $emptyContext -Apply | Out-Null
+    Assert ($script:fakeCliPath -eq (Join-Path $emptyContext.InstallRoot ('bin\'+(Get-PocketFileHash (Join-Path $source 'windows-manifest.json'))+'\pocket-native-proxy.exe'))) 'Fresh installation did not select the native-only proxy'
     Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'missing-source') -StateDirectory $state -Context $emptyContext -Uninstall -Apply | Out-Null
     Assert ($null -eq $script:fakeCliPath) 'Unset environment did not restore to absence'
     Assert (-not (Test-Path -LiteralPath (Join-Path $emptyContext.Programs 'Codex Pocket.lnk'))) 'Absent shortcut restored as a file'
+}
+Test 'legacy Pocket runtime overrides migrate to native-only proxy and stay stable on repeat apply' {
+    $cliOriginal=$script:fakeCliPath; $kindOriginal=$script:fakeCliKind
+    $custom=@{InstallRoot=(Join-Path $testRoot 'scoped-install');Programs=(Join-Path $testRoot 'scoped-programs');Startup=(Join-Path $testRoot 'scoped-startup')}
+    $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json'
+    try {
+        $script:fakeCliPath=$null; $script:fakeCliKind='String'
+        Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+        $record=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $record.previousCliPath=Join-Path $custom.InstallRoot 'pocket-launcher.exe'
+        Write-PocketJson $recordPath $record
+        $script:fakeCliPath=Join-Path $custom.InstallRoot ('bin\'+$record.generation+'\pocket-launcher.exe')
+        Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+        $expectedProxy=Join-Path $custom.InstallRoot ('bin\'+$record.generation+'\pocket-native-proxy.exe')
+        Assert ($script:fakeCliPath -eq $expectedProxy) 'Legacy manager override was not replaced by native-only proxy'
+        Assert ($null -eq (Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json).previousCliPath) 'Pocket self-reference remained as the uninstall target'
+        $recordHash=Get-PocketFileHash $recordPath
+        Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+        Assert ($script:fakeCliPath -eq $expectedProxy -and (Get-PocketFileHash $recordPath) -eq $recordHash) 'Repeat apply changed the native proxy or installation record'
+        Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+        Assert ($null -eq $script:fakeCliPath) 'Uninstall restored the legacy Pocket override'
+        $snapshot=Get-PocketScopedCliSnapshot @{cli=(Join-Path $custom.InstallRoot 'pocket-launcher.exe');cliKind='String'} @{previousCliPath='%USERPROFILE%\custom\codex.exe';previousCliKind='ExpandString'} $custom.InstallRoot
+        Assert ($snapshot.cli -eq '%USERPROFILE%\custom\codex.exe' -and $snapshot.cliKind -eq 'ExpandString') 'Real original override or its registry kind was lost'
+        $foreign=Get-PocketScopedCliSnapshot @{cli='C:\different-install\pocket-launcher.exe';cliKind='String'} $null $custom.InstallRoot
+        Assert ($foreign.cli -eq 'C:\different-install\pocket-launcher.exe') 'Foreign installation override changed'
+    } finally { $script:fakeCliPath=$cliOriginal; $script:fakeCliKind=$kindOriginal }
+}
+Test 'legacy rollback preserves the true original runtime and supports repeat apply and uninstall' {
+    $cliOriginal=$script:fakeCliPath;$kindOriginal=$script:fakeCliKind;$taskOriginal=$script:fakeTask
+    try {
+        foreach($selfReference in @($false,$true)){
+            $slot=[int]$selfReference
+            $custom=@{InstallRoot=(Join-Path $testRoot ('scoped-rb-'+$slot));Programs=(Join-Path $testRoot ('scoped-rb-p-'+$slot));Startup=(Join-Path $testRoot ('scoped-rb-s-'+$slot))}
+            $recordPath=Join-Path $custom.InstallRoot 'desktop-install.json';$launcher=Join-Path $custom.InstallRoot 'pocket-launcher.exe'
+            $expectedCli=if($selfReference){$null}else{'%USERPROFILE%\custom\codex.exe'}
+            $expectedKind=if($selfReference){'String'}else{'ExpandString'}
+            $script:fakeCliPath=$expectedCli;$script:fakeCliKind=$expectedKind;$script:fakeTask=$null
+            Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+            if($selfReference){
+                $record=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $record.previousCliPath=$launcher;Write-PocketJson $recordPath $record
+            }
+            $legacyHash=Get-PocketFileHash $recordPath
+            $script:fakeCliPath=$launcher;$script:fakeCliKind='String'
+            Invoke-PocketWindowsInstall -SourceDirectory (Join-Path $testRoot 'release-v02\windows') -StateDirectory $state -Context $custom -Apply | Out-Null
+            $upgraded=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $upgradeCli=if($selfReference){$upgraded.nativeProxy}else{$expectedCli}
+            Assert ($script:fakeCliPath -ceq $upgradeCli -and $script:fakeCliKind -ceq $expectedKind) 'Upgrade lost the native proxy or true original runtime'
+            Invoke-PocketWindowsInstall -Context $custom -Rollback -Apply | Out-Null
+            Assert ((Get-PocketFileHash $recordPath) -eq $legacyHash) 'Rollback changed the archived legacy record'
+            $rolled=Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $rollbackCli=if($selfReference){$rolled.nativeProxy}else{$expectedCli}
+            Assert ($script:fakeCliPath -ceq $rollbackCli -and $script:fakeCliKind -ceq $expectedKind) 'Rollback lost the prior native proxy or original registry kind'
+            Invoke-PocketWindowsInstall -SourceDirectory $source -StateDirectory $state -Context $custom -Apply | Out-Null
+            Assert ($script:fakeCliPath -ceq $rollbackCli -and $script:fakeCliKind -ceq $expectedKind) 'Repeat apply rejected or replaced the restored runtime'
+            Invoke-PocketWindowsInstall -Context $custom -Uninstall -Apply | Out-Null
+            Assert ($script:fakeCliPath -ceq $expectedCli -and $script:fakeCliKind -ceq $expectedKind) 'Uninstall replaced the restored runtime'
+        }
+    } finally {$script:fakeCliPath=$cliOriginal;$script:fakeCliKind=$kindOriginal;$script:fakeTask=$taskOriginal}
 }
 Test 'preserved user Startup link does not replace the previous-generation rollback on repeat install' {
     $custom=@{InstallRoot=(Join-Path $testRoot 'user-link-install');Programs=(Join-Path $testRoot 'user-link-programs');Startup=(Join-Path $testRoot 'user-link-startup')}

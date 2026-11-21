@@ -67,6 +67,6 @@ class V051NativeActivityPresentationTest {
         assertEquals(reasoning, ConversationPresentation.liveReasoning(timeline))
         assertEquals(parts, ConversationPresentation.liveReasoning(timeline)!!.summaryParts)
         val command = TimelineItem("t", "c", "commandExecution", "check")
-        assertEquals(reasoning, ConversationPresentation.liveReasoning(timeline.copy(items = timeline.items + (command.key to command))))
+        assertNull(ConversationPresentation.liveReasoning(timeline.copy(items = timeline.items + (command.key to command))))
     }
 }

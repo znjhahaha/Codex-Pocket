@@ -2,7 +2,7 @@ import {test,expect,type Page} from '@playwright/test';
 import {mkdir} from 'node:fs/promises';
 import {resolve} from 'node:path';
 
-type FixtureOptions={noLan?:boolean;detectionFailure?:boolean;missingPrefs?:boolean;staleBind?:boolean};
+type FixtureOptions={observed?:"desktop"|"cli";noLan?:boolean;detectionFailure?:boolean;missingPrefs?:boolean;staleBind?:boolean};
 async function fixture(page:Page,existing=false,localReady=false,options:FixtureOptions={}) {
  await page.addInitScript(({existing,localReady,options})=>{
   const w=window as any;
@@ -17,7 +17,7 @@ async function fixture(page:Page,existing=false,localReady=false,options:Fixture
    if(cmd==='dashboard'){
     if(w.failNextRead){w.failNextRead=false;w.guideReady=false;w.readyIdsOverride=[];}
     const configured=routes(),readyIds=w.readyIdsOverride??(w.guideReady?configured.map((r:any)=>r.id):[]);
-    return {computerName:'Fixture PC',desired,supervisor:{phase:desired?'running':'stopped',updatedAt:Date.now()/1000,failures:0},relay:{state:existing?'connected':'waiting',host:''},devices:existing?[{id:'old',name:'已有手机'}]:[],processes:runtime?[{name:'desktop',state:'在线'}]:[],version:'fixture',startup:false,installation:{consistent:true},issues:w.readIssue?[w.readIssue]:[],routes:{routes:configured,...(!w.missingPrefs?{routePreferences:preferences}:{})},connection:{phase:existing?'connected':desired?'connecting':'setup_required',connected:existing&&desired,available:desired&&readyIds.length>0,helperUpdatedAt:desired?Date.now()/1000:0,configuredRoutes:configured.length,usableRoutes:desired?readyIds.length:0,readyRouteIds:desired?readyIds:[]},connectivity:{phase:w.guidePhase,mode:publicMethod==='cloudflare'?'quick':'off',enabled:publicMethod==='cloudflare',...(w.guidePhase==='tunnel_connected'?{publicUrl:'https://fixture.trycloudflare.com'}:{})}};
+    return {computerName:'Fixture PC',desired,supervisor:{phase:desired?'running':'stopped',updatedAt:Date.now()/1000,failures:0},relay:{state:existing?'connected':'waiting',host:''},devices:existing?[{id:'old',name:'已有手机'}]:[],runtimeReadiness:options.observed?{authoritative:true,updatedAt:Date.now()/1000,ready:false,historyReadable:true,nativeObservation:{[options.observed]:{state:'detected'}},runtimes:[{role:'managedHost',ready:true,online:true}]}:runtime?{authoritative:true,ready:true,updatedAt:Date.now()/1000,runtimes:[{role:'desktop',ready:true,online:true}]}:undefined,processes:options.observed?[{name:'cli',state:'在线'}]:runtime?[{name:'desktop',state:'在线'}]:[],version:'fixture',startup:false,startupStatus:'known',installation:{consistent:true},issues:w.readIssue?[w.readIssue]:[],routes:{routes:configured,...(!w.missingPrefs?{routePreferences:preferences}:{})},connection:{phase:existing?'connected':desired?'connecting':'setup_required',connected:existing&&desired,available:desired&&readyIds.length>0,helperUpdatedAt:desired?Date.now()/1000:0,configuredRoutes:configured.length,usableRoutes:desired?readyIds.length:0,readyRouteIds:desired?readyIds:[]},connectivity:{phase:w.guidePhase,mode:publicMethod==='cloudflare'?'quick':'off',enabled:publicMethod==='cloudflare',...(w.guidePhase==='tunnel_connected'?{publicUrl:'https://fixture.trycloudflare.com'}:{})}};
    }
    if(cmd==='configure_routes'){if(w.deferSave)await new Promise<void>(resolve=>{w.finishSave=resolve});Object.assign(preferences,args.preferences);w.savedPreferences=args.preferences;return {routes:routes(),routePreferences:preferences};}
    if(cmd==='set_remote'){desired=args.enabled;return;}
@@ -149,7 +149,7 @@ test('zero networks leaves LAN unavailable while Cloudflare still starts with au
  await fixture(page,false,false,{noLan:true});await choose(page,'暂不配置公网');
  await expect(page.getByText(/局域网暂不可用/)).toBeVisible();
  await expect(page.getByRole('button',{name:'保存并启用自动连接',exact:true})).toBeDisabled();
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeDisabled();
  expect(await mutations(page)).toEqual([]);
  await page.getByRole('button',{name:'上一步',exact:true}).click();
  await page.getByRole('button',{name:'Cloudflare 隧道',exact:true}).click();
@@ -223,9 +223,9 @@ test('LAN saves the selected subnet, enables sequentially, offers explicit UAC, 
  await page.evaluate(()=>{(window as any).guideReady=true});
  await expect(page.getByText('局域网已就绪',{exact:true})).toBeVisible();
  await expect(page.getByRole('heading',{name:'一切就绪，接着聊。'})).toHaveCount(0);
- await page.getByRole('button',{name:'下一步：打开 Codex',exact:true}).click();
+ await page.getByRole('button',{name:'下一步：检查 Codex',exact:true}).click();
  await page.getByRole('button',{name:'打开 Codex 桌面',exact:true}).click();
- await expect(page.getByText('Codex 已就绪',{exact:true})).toBeVisible();
+ await expect(page.getByText('已识别正在运行的 Codex 桌面',{exact:true})).toBeVisible();
  await page.getByRole('button',{name:'生成配对二维码',exact:true}).click();
  await expect(page.getByRole('dialog')).toContainText('后失效');
  await page.screenshot({path:info.outputPath('lan-qr.png'),fullPage:true});
@@ -237,17 +237,17 @@ test('Cloudflare waiting, failure, explicit retry, public URL and readiness rema
  expect(await mutations(page)).toEqual([]);
  await page.getByRole('button',{name:'开启临时公网连接',exact:true}).click();
  await expect(page.getByText('正在等待 Cloudflare 隧道',{exact:true})).toBeVisible();
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeDisabled();
  await page.evaluate(()=>{(window as any).guidePhase='failed'});
  await expect(page.getByRole('alert')).toContainText('Cloudflare 隧道没有连接成功');
  await page.getByRole('button',{name:'重试连接',exact:true}).click();
  await expect(page.getByText('正在等待 Cloudflare 隧道',{exact:true})).toBeVisible();
  await page.evaluate(()=>{(window as any).guidePhase='tunnel_connected'});
  await expect(page.getByText('https://fixture.trycloudflare.com',{exact:true})).toBeVisible();
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeDisabled();
  await page.evaluate(()=>{(window as any).guideReady=true});
  await expect(page.getByText('Cloudflare 隧道已就绪',{exact:true})).toBeVisible();
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeEnabled();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeEnabled();
  expect((await mutations(page)).filter((c:any)=>c.cmd==='configure_connectivity')).toHaveLength(2);
  expect((await mutations(page)).filter((c:any)=>c.cmd==='pair_device')).toHaveLength(0);
 });
@@ -284,10 +284,10 @@ test('only IDs for the selected route can unlock pairing, and the final snapshot
  await page.getByRole('textbox',{name:'中转地址',exact:true}).fill('wss://relay.invalid');
  await page.getByRole('button',{name:'保存并启用中转',exact:true}).click();
  await page.evaluate(()=>{const w=window as any;w.guideReady=true;w.readyIdsOverride=['other-lan']});
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeDisabled();
  await page.evaluate(()=>{(window as any).readyIdsOverride=['manual']});
- await expect(page.getByRole('button',{name:'下一步：打开 Codex',exact:true})).toBeEnabled();
- await page.getByRole('button',{name:'下一步：打开 Codex',exact:true}).click();
+ await expect(page.getByRole('button',{name:'下一步：检查 Codex',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'下一步：检查 Codex',exact:true}).click();
  await page.getByRole('button',{name:'打开 Codex 桌面',exact:true}).click();
  await expect(page.getByRole('button',{name:'生成配对二维码',exact:true})).toBeEnabled();
  await page.evaluate(()=>{(window as any).failNextRead=true});
@@ -368,3 +368,18 @@ test('capture real fixture UI in light, dark and narrow layouts',async({page})=>
  await expect(page.getByRole('button',{name:'保存并启用自动连接',exact:true})).toBeEnabled();
  await page.screenshot({path:resolve(directory,'auto-lan-config-narrow-dark.png'),fullPage:true,animations:'disabled'});
 });
+
+for (const source of ['desktop','cli'] as const) {
+ test(`pair with an independently launched ${source} and readable history`, async ({page})=>{
+  await fixture(page,false,true,{observed:source});
+  await choose(page,'暂不配置公网');
+  await page.getByRole('button',{name:'保存并启用自动连接',exact:true}).click();
+  await page.getByRole('button',{name:/^下一步/}).click();
+  const guide=page.getByRole('region',{name:'连接引导'});
+  await expect(guide.getByText(source==='desktop'?'已识别正在运行的 Codex 桌面':'已识别正在运行的 Codex CLI',{exact:true})).toBeVisible();
+  await expect(guide).toContainText('可在手机查看已保存的对话');
+  await guide.getByRole('button',{name:'生成配对二维码'}).click();
+  await expect(page.getByRole('dialog')).toContainText('后失效');
+  expect((await mutations(page)).filter((c:any)=>c.cmd==='open_codex')).toHaveLength(0);
+ });
+}

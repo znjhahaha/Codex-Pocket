@@ -48,7 +48,7 @@ function Assert($Condition,[string]$Message) { if(-not $Condition){throw $Messag
 function Test([string]$Name,[scriptblock]$Body) { if($TestName -and $TestName -cne $Name){return}; & $Body; $script:passed++; Write-Output ('PASS '+$Name) }
 function Put([string]$Path,[string]$Text) { [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path));[IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false)) }
 function Get-PocketUserCliPath { return $script:cli }
-function Get-PocketUserCliKind { return 'String' }
+function Get-PocketUserCliKind { return $script:cliKind }
 function Set-PocketUserCliPath { throw 'FORBIDDEN environment mutation' }
 function Send-PocketEnvironmentChanged { throw 'FORBIDDEN environment broadcast' }
 function Initialize-PocketPrivateState { throw 'FORBIDDEN identity initialization' }
@@ -95,7 +95,7 @@ function New-Fixture {
     $icon=Join-Path $context.InstallRoot ('resources\'+(Get-PocketFileHash (Join-Path $bin 'codex-pocket.ico'))+'\codex-pocket.ico')
     Put $icon ([IO.File]::ReadAllText((Join-Path $bin 'codex-pocket.ico')))
     $script:state=Join-Path $root 'private-state';[void][IO.Directory]::CreateDirectory($script:state);Put (Join-Path $script:state 'sentinel') 'fixture-private-state'
-    $script:cli=$launcher;$script:task=$null;$script:taskUnknown=$false;$script:taskFail=$false;$script:taskReads=0;$script:taskWrites=0;$script:linkWrites=0;$script:linkFail=$false
+    $script:cli=$launcher;$script:cliKind='String';$script:task=$null;$script:taskUnknown=$false;$script:taskFail=$false;$script:taskReads=0;$script:taskWrites=0;$script:linkWrites=0;$script:linkFail=$false
     $links=@((Join-Path $context.Programs 'Codex Pocket.lnk'),(Join-Path $context.Programs 'Codex Pocket Desktop.lnk'),(Join-Path $context.Startup 'Codex Pocket.lnk'))
     $entries=@();foreach($p in $links){$entries+=@{path=$p;original=$null;originalHash=$null;installed=$null;installedHash=$null}}
     $record=@{version=3;singleEntry=$true;coreInstalled=$true;installationState='installed_incomplete';runtimeVerification='pending';installRoot=$context.InstallRoot;generation=$generation;releaseHash=$generation;bridge=$launcher;launcherHash=(Get-PocketFileHash $launcher);stateDirectory=$script:state;previousCliPath=$null;previousCliKind='String';previousTask=$null;previousTaskKnown=$true;shortcuts=$entries;rollback=$null;startupPreference='Preserve';integration=@{shortcuts=@((New-PocketPendingIntegration 'shortcut'),(New-PocketPendingIntegration 'shortcut'),(New-PocketPendingIntegration 'shortcut'));startup=(New-PocketPendingIntegration 'startup_register')}}
@@ -113,6 +113,36 @@ function Assert-SafeResult($Result) {
 }
 Test 'repair function and closed CLI parameters exist' {
     Assert ($null -ne (Get-Command Invoke-PocketIntegrationRepair -ErrorAction SilentlyContinue)) 'Missing fixed repair protocol'
+}
+Test 'scoped runtime settings allow every repair and check without environment changes' {
+    foreach($original in @(@{cli=$null;kind='String'},@{cli='%USERPROFILE%\custom\codex.exe';kind='ExpandString'})){
+        $f=New-Fixture;$script:cli=$original.cli;$script:cliKind=$original.kind
+        $f.Record.previousCliPath=$original.cli;$f.Record.previousCliKind=$original.kind;Write-PocketJson $f.Manifest $f.Record
+        foreach($step in @('shortcut_0','shortcut_1','shortcut_2','startup')){
+            $id=[guid]::NewGuid().ToString('D');$r=Repair $f $step $id
+            Assert ($r.state -eq 'completed') ('Scoped repair failed: '+$step);Assert-SafeResult $r
+            $hash=Get-PocketFileHash $f.Manifest;$writes=$script:linkWrites+$script:taskWrites
+            Assert ((Repair $f $step $id -Check).state -eq 'completed') 'Scoped repair check rejected the completed operation'
+            Assert ((Get-PocketFileHash $f.Manifest) -eq $hash -and ($script:linkWrites+$script:taskWrites) -eq $writes) 'Scoped check replayed integration'
+            Assert ($script:cli -ceq $original.cli -and $script:cliKind -ceq $original.kind) 'Scoped repair changed the runtime setting or kind'
+        }
+    }
+}
+Test 'scoped startup recovery preserves the original runtime value and kind' {
+    $f=New-Fixture;$script:cli='%USERPROFILE%\custom\codex.exe';$script:cliKind='ExpandString'
+    $f.Record.previousCliPath=$script:cli;$f.Record.previousCliKind=$script:cliKind;Write-PocketJson $f.Manifest $f.Record
+    $script:taskFail=$true;$id=[guid]::NewGuid().ToString('D');$r=Repair $f startup $id
+    Assert ($r.state -eq 'recovery-needed' -and [IO.File]::Exists($f.Journal)) 'Scoped startup failure did not retain recovery'
+    $script:taskUnknown=$false;$r=Repair $f startup $id -Check
+    Assert ($r.state -eq 'failed' -and $null -eq $script:task -and -not [IO.File]::Exists($f.Journal)) 'Scoped recovery did not restore the task'
+    Assert ($script:cli -ceq '%USERPROFILE%\custom\codex.exe' -and $script:cliKind -ceq 'ExpandString') 'Scoped recovery changed the runtime setting'
+    Assert ((Repair $f startup).state -eq 'completed') 'Scoped startup could not be retried with a fresh operation'
+}
+Test 'runtime registry kind drift refuses repair publication' {
+    $f=New-Fixture;$script:cli='%USERPROFILE%\custom\codex.exe';$script:cliKind='String'
+    $f.Record.previousCliPath=$script:cli;$f.Record.previousCliKind='ExpandString';Write-PocketJson $f.Manifest $f.Record
+    $hash=Get-PocketFileHash $f.Manifest;$r=Repair $f shortcut_0
+    Assert ($r.state -eq 'failed' -and $script:linkWrites -eq 0 -and (Get-PocketFileHash $f.Manifest) -eq $hash) 'Registry kind drift authorized repair'
 }
 Test 'shortcut zero repairs only entry and same operation never replays' {
     $f=New-Fixture;$id=[guid]::NewGuid().ToString('D');$original=[IO.File]::ReadAllBytes($f.Launcher)

@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskAssignment {
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
     pub member_id: Option<String>,
     pub group_id: Option<String>,
     #[serde(default)]
@@ -303,6 +305,8 @@ pub enum CollaborationTool {
         #[serde(default)]
         dependencies: Vec<String>,
         completion_criteria: String,
+        #[serde(default)]
+        parent_task_id: Option<String>,
     },
     SendToMember {
         member_id: String,
@@ -327,8 +331,14 @@ pub enum CollaborationTool {
 
 impl<E: Executor> AssistantService<E> {
     pub fn import_legacy_conversation(&mut self, entries: Vec<ConversationEntry>) -> Result<()> {
-        if self.state.collaboration.conversation.is_empty() {
-            self.state.collaboration.conversation = entries;
+        let mut changed=false;
+        for entry in entries {
+            if !self.state.collaboration.conversation.iter().any(|old|old.id==entry.id) {
+                self.state.collaboration.conversation.push(entry);changed=true;
+            }
+        }
+        if changed {
+            self.state.collaboration.conversation.sort_by_key(|m|m.at_ms);
             self.save()?;
         }
         Ok(())
@@ -544,9 +554,10 @@ impl<E: Executor> AssistantService<E> {
                 .and_then(|id| self.state.operations.get(id))
                 .and_then(|op| op.mapping.clone());
             let Some(mapping) = mapping else { continue };
+            let inputs=self.delivery_inputs(&delivery.id);
             let outcome = self
                 .executor
-                .append_status(&delivery.id, &mapping, &delivery.message);
+                .append_inputs_status(&delivery.id, &mapping, &delivery.message,&inputs);
             let status = match outcome {
                 Ok(AppendOutcome::Delivered) => "sent",
                 Ok(AppendOutcome::Unsupported | AppendOutcome::Rejected)
@@ -835,6 +846,7 @@ impl<E: Executor> AssistantService<E> {
                 group_id,
                 dependencies,
                 completion_criteria,
+                parent_task_id,
             } => {
                 text(&prompt, 65536)?;
                 text(&completion_criteria, 8192)?;
@@ -869,7 +881,13 @@ impl<E: Executor> AssistantService<E> {
                 for id in &dependencies {
                     self.store.task(id)?;
                 }
+                if let Some(parent)=&parent_task_id {
+                    let parent=self.store.task(parent)?;
+                    ensure!(within_directory(&directory,&parent.directory),"Child task exceeds parent scope");
+                    ensure!(!writes || parent.writes,"Child task cannot gain write authority");
+                }
                 let assignment = TaskAssignment {
+                    parent_task_id,
                     member_id,
                     group_id,
                     dependencies,
@@ -886,12 +904,14 @@ impl<E: Executor> AssistantService<E> {
                         assignment,
                     },
                 )?;
+                if let CommandResult::Task(task)=&receipt.result {self.inherit_task_inputs(&task.id,op);}
                 Ok(serde_json::to_value(receipt)?)
             }
             CollaborationTool::SendToMember { member_id, message } => {
                 let member = self.authorized_member(&member_id)?;
                 self.authorize_task_directory(op, &member.directory)?;
-                self.submit_targeted(journal, &message, Some(&member_id), None, false, now)?;
+                let inputs=self.operation_inputs(op);
+                self.submit_targeted_with_inputs(journal, &message, Some(&member_id), None, false,inputs, now)?;
                 if let Some(entry) = self
                     .state
                     .collaboration
@@ -915,12 +935,14 @@ impl<E: Executor> AssistantService<E> {
                     task.directory == member.directory,
                     "Reassignment must retain the authorized directory"
                 );
-                self.submit_targeted(
+                let inputs=self.operation_inputs(op);
+                self.submit_targeted_with_inputs(
                     journal,
                     &message,
                     Some(&member_id),
                     Some(&task_id),
                     true,
+                    inputs,
                     now,
                 )?;
                 if let Some(entry) = self
@@ -956,11 +978,15 @@ impl<E: Executor> AssistantService<E> {
         reassign: bool,
         now: i64,
     ) -> Result<()> {
+        self.submit_targeted_with_inputs(id,message,member_id,task_id,reassign,vec![],now)
+    }
+    pub fn submit_targeted_with_inputs(&mut self,id:&str,message:&str,member_id:Option<&str>,task_id:Option<&str>,reassign:bool,inputs:Vec<AssistantInput>,now:i64)->Result<()> {
         text(id, 512)?;
         text(message, 65536)?;
         clock(now)?;
         let receipt_id = format!("delivery:{id}");
-        let hash = fingerprint(&(message, member_id, task_id, reassign))?;
+        super::super::inputs::validate_inputs(&inputs)?;
+        let hash = if inputs.is_empty() {fingerprint(&(message, member_id, task_id, reassign))?} else {fingerprint(&(message,member_id,task_id,reassign,&inputs))?};
         if self.replay(&receipt_id, &hash)?.is_some() {
             return Ok(());
         }
@@ -1071,10 +1097,12 @@ impl<E: Executor> AssistantService<E> {
             .deliveries
             .insert(id.into(), delivery);
         self.state.collaboration.last_delivery_sequence = sequence;
+        let display=super::super::inputs::message_label(message,&inputs);
+        if !inputs.is_empty() {self.state.message_inputs.insert(format!("user:{id}"),inputs);}
         self.remember_entry(ConversationEntry {
             id: format!("user:{id}"),
             role: "User".into(),
-            text: message.into(),
+            text: display,
             at_ms: now,
             member_id: resolved_member,
             task_id: latest.as_ref().map(|t| t.id.clone()),
@@ -1185,6 +1213,9 @@ impl<E: Executor> AssistantService<E> {
                         message: delivery.message.clone(),
                     },
                 )?;
+                let mut inputs=self.state.task_inputs.get(task_id).cloned().unwrap_or_default();
+                for input in self.delivery_inputs(&delivery.id) {if !inputs.iter().any(|old|old.id()==input.id()) {inputs.push(input);}}
+                if !inputs.is_empty() {self.state.task_inputs.insert(task_id.into(),inputs);}
                 let current = self
                     .state
                     .collaboration
@@ -1215,9 +1246,10 @@ impl<E: Executor> AssistantService<E> {
                             .unwrap()
                             .status = "sending".into();
                         self.save()?;
+                        let inputs=self.delivery_inputs(&delivery.id);
                         let outcome =
                             self.executor
-                                .append(&delivery.id, mapping, &delivery.message);
+                                .append_inputs(&delivery.id, mapping, &delivery.message,&inputs);
                         let current = self
                             .state
                             .collaboration
@@ -1301,6 +1333,9 @@ impl<E: Executor> AssistantService<E> {
             let CommandResult::Task(task) = receipt.result else {
                 unreachable!()
             };
+            let mut inputs=delivery.task_id.as_ref().and_then(|id|self.state.task_inputs.get(id)).cloned().unwrap_or_default();
+            for input in self.delivery_inputs(&delivery.id) {if !inputs.iter().any(|old|old.id()==input.id()) {inputs.push(input);}}
+            if !inputs.is_empty() {self.state.task_inputs.insert(task.id.clone(),inputs);}
             let current = self
                 .state
                 .collaboration
@@ -1310,11 +1345,6 @@ impl<E: Executor> AssistantService<E> {
             current.status = "sent".into();
             current.delivered_task_id = Some(task.id);
             self.save()?;
-        }
-        if self.uncertain_deliveries() {
-            // Each delivery transition was already saved before/after its
-            // effect. Do not rewrite the conversation just to wait for receipts.
-            return Ok(());
         }
         let mut changed = false;
         let tasks = self.store.tasks()?;
@@ -1378,6 +1408,15 @@ impl<E: Executor> AssistantService<E> {
         let tasks = self.store.tasks()?;
         let mut eligible = BTreeSet::new();
         for task in &tasks {
+            // Unconfirmed deliveries reserve their exact task/member. The
+            // existing store separately holds the original writer directory.
+            if self.state.collaboration.deliveries.values().any(|d| matches!(d.status.as_str(),"sending"|"unknown")
+                && !d.operation_id.as_ref().and_then(|id|self.state.operations.get(id)).is_some_and(|op|self.state.released_generations.contains(&op.expected_generation))
+                && (d.task_id.as_deref()==Some(&task.id) || d.member_id.as_ref().is_some_and(|m|
+                    task.assignment.as_ref().and_then(|a|a.member_id.as_ref())==Some(m)))) {continue;}
+            if task.assignment.as_ref().and_then(|a|a.member_id.as_ref()).is_some_and(|m|
+                self.state.operations.values().any(|o|o.phase.live() && !self.state.released_generations.contains(&o.expected_generation) && self.state.collaboration.operation_assignments.get(&o.id)
+                    .and_then(|a|a.member_id.as_ref())==Some(m))) {continue;}
             if task.assignment.as_ref().is_some_and(|a| {
                 a.member_id
                     .as_ref()

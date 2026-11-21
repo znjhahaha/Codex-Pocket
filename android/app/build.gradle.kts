@@ -30,11 +30,15 @@ android {
     }
     compileSdk = 36
     defaultConfig {
-        applicationId = "dev.codexpocket.app"
+        // An isolated instrumented build must not replace the user's paired app.
+        applicationId = providers.gradleProperty("pocketApplicationId").orElse("dev.codexpocket.app").get().also {
+            require(it in setOf("dev.codexpocket.app", "dev.codexpocket.app.qa", "dev.codexpocket.app.qa20261117"))
+        }
         minSdk = 28
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.6.6"
+        versionCode = 48
+        versionName = "0.7.1-rc.20261121.46"
+        buildConfigField("String", "POCKET_BUILD_ID", "\"${providers.environmentVariable("POCKET_BUILD_ID").orElse("development").get().also { require(it.matches(Regex("[A-Za-z0-9._-]{1,96}"))) }}\"")
         buildConfigField("String", "HUAWEI_APP_ID", "\"$huaweiAppId\"")
         manifestPlaceholders["pocketHuaweiAppId"] = huaweiAppId
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -83,6 +87,7 @@ dependencies {
     implementation("io.github.kyant0:backdrop:1.0.0")
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     implementation("androidx.room:room-runtime:2.7.2")
     implementation("androidx.room:room-ktx:2.7.2")
     kapt("androidx.room:room-compiler:2.7.2")

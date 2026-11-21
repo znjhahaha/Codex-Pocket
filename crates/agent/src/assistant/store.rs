@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS assistant_runs (
     decision TEXT,
     receipt TEXT
 );
+CREATE TABLE IF NOT EXISTS assistant_resource_releases (
+    assistant_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    original_generation TEXT NOT NULL, verified_generation TEXT NOT NULL,
+    PRIMARY KEY(assistant_id,run_id)
+);
 "#;
 
 pub struct AssistantStore {
@@ -72,6 +77,21 @@ impl Task {
 }
 
 impl AssistantStore {
+    pub(super) fn release_ended_resources(&mut self,verified:&str,runs:&[(String,String,String)])->Result<()> {
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (task_id,run_id,generation) in runs {
+            ensure!(generation!=verified,"Cannot release current generation resources");
+            let mut task=read_task(&tx,&self.assistant_id,task_id)?;
+            if task.active_run_id.as_ref()!=Some(run_id) {continue;}
+            tx.execute("INSERT OR IGNORE INTO assistant_resource_releases VALUES(?1,?2,?3,?4)",
+                params![self.assistant_id,run_id,generation,verified])?;
+            // Execution outcome is still unverified. Only the concurrency slot
+            // and write-directory reservation are released after native death.
+            task.active_run_id=None;task.reconciliation_required=true;task.status=TaskStatus::Paused;
+            save_task(&tx,&task)?;
+        }
+        tx.commit()?;Ok(())
+    }
     /// The caller supplies a private, local database path; its parent must exist.
     /// Opening another handle does not fence workers. Recovery is explicit.
     pub fn open(path: &Path, computer_id: &str) -> Result<Self> {
@@ -194,7 +214,7 @@ impl AssistantStore {
                     "Task is terminal"
                 );
                 task.status = TaskStatus::Paused;
-                task.reconciliation_required = task.active_run_id.is_some();
+                task.reconciliation_required |= task.active_run_id.is_some();
                 save_task(&tx, &task)?;
                 CommandResult::Task(task)
             }
@@ -210,6 +230,14 @@ impl AssistantStore {
                 );
                 task.status = TaskStatus::Queued;
                 save_task(&tx, &task)?;
+                CommandResult::Task(task)
+            }
+            Command::RetryTask { task_id } => {
+                let mut task=read_task(&tx,&self.assistant_id,&task_id)?;
+                ensure!(task.status==TaskStatus::Failed && !task.reconciliation_required && task.active_run_id.is_none(),
+                    "Only a confirmed failed task can retry");
+                task.status=TaskStatus::Queued;
+                save_task(&tx,&task)?;
                 CommandResult::Task(task)
             }
             Command::ReassignTask {
@@ -312,6 +340,17 @@ impl AssistantStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub(super) fn memory_page(&self, after: Option<&str>, id: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
+        ensure!((1..=101).contains(&limit), "Memory page limit");
+        let sequence = match after {
+            Some(cursor) => self.db.query_row("SELECT sequence FROM assistant_memories WHERE assistant_id=?1 AND id=?2", params![self.assistant_id, cursor], |r| r.get::<_, i64>(0)).optional()?.context("Memory cursor no longer exists")?,
+            None => -1,
+        };
+        let mut stmt = self.db.prepare("SELECT id,text FROM assistant_memories WHERE assistant_id=?1 AND sequence>?2 AND (?3 IS NULL OR id=?3) ORDER BY sequence LIMIT ?4")?;
+        let result = stmt.query_map(params![self.assistant_id,sequence,id,limit], |r| Ok(Memory { id:r.get(0)?,text:r.get(1)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(id.is_none() || !result.is_empty(), "Memory not found");
+        Ok(result)
     }
     pub fn taken_over(&self) -> Result<bool> {
         takeover(&self.db, &self.assistant_id)

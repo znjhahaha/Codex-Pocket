@@ -25,6 +25,7 @@ pub struct StartRequest {
     pub role: Role,
     pub thread_id: Option<String>,
     pub prompt: String,
+    pub inputs: Vec<super::AssistantInput>,
     pub directory: Option<PathBuf>,
     pub writes: bool,
     pub settings: Settings,
@@ -110,6 +111,21 @@ pub enum AppendOutcome {
 /// ambiguous, not proof that the Host rejected or never accepted the request.
 /// `status` resolves persisted operation IDs after a lost native start receipt.
 pub trait Executor {
+    fn append_inputs(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[super::AssistantInput])->Result<AppendOutcome> {
+        if inputs.is_empty() {self.append(id,mapping,message)} else {Ok(AppendOutcome::Unsupported)}
+    }
+    fn append_inputs_status(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[super::AssistantInput])->Result<AppendOutcome> {
+        if inputs.is_empty() {self.append_status(id,mapping,message)} else {Ok(AppendOutcome::Uncertain)}
+    }
+    /// Verify existing controller grants. This must never create or expand a grant.
+    fn validate_directory(&mut self, _directory: &Path, _writes: bool) -> Result<()> {
+        anyhow::bail!("Verified project authorization unavailable")
+    }
+    /// True only when a tool answer was already accepted/resolved. Unknown answers
+    /// return an error; this is receipt reconciliation and must not resend.
+    fn reconcile_tool_answer(&mut self, _scope: &NativeMapping, _call_id: &str) -> Result<bool> {
+        Ok(false)
+    }
     fn needs_tool_upgrade(&self, _thread: &str) -> Result<bool> {
         Ok(false)
     }

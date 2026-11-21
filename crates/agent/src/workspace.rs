@@ -10,6 +10,21 @@ pub const MAX_READ: usize = 256 * 1024;
 pub const MAX_ENTRIES: usize = 256;
 pub const MAX_IMAGE: u64 = 24 * 1024 * 1024;
 pub const IMAGE_CHUNK: usize = 192 * 1024;
+/// Only native metadata may supply this root; phone paths keep the strict
+/// lexical policy below. Codex uses extended-length spelling for local drives.
+pub fn native_image_root(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_str().context("Native image root is not Unicode")?;
+    #[cfg(windows)]
+    let raw = if let Some(drive) = raw.strip_prefix(r"\\?\") {
+        let bytes = drive.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+            bail!("Native image root is not a local drive");
+        }
+        drive
+    } else { raw };
+    let workspace = Workspace::new(vec![PathBuf::from(raw)])?;
+    Ok(workspace.roots[0].clone())
+}
 pub struct Workspace {
     roots: Vec<PathBuf>,
     root_aliases: Vec<PathBuf>,
@@ -315,6 +330,17 @@ fn guard(path: &Path) -> Result<Vec<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn native_image_root_accepts_extended_local_drive_without_relaxing_phone_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(native_image_root(&native).unwrap(), dunce::canonicalize(dir.path()).unwrap());
+        assert!(Workspace::new(vec![native]).is_err());
+        for path in [r"\\?\UNC\server\share", r"\\.\C:\", r"\\?\GLOBALROOT\Device\HarddiskVolume1", r"\\?\C:\..\private", r"\\?\C:relative"] {
+            assert!(native_image_root(Path::new(path)).is_err(), "{path}");
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn native_path_alias_keeps_canonical_containment() {

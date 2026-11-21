@@ -276,10 +276,12 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
                 TraceLine(onClick = onExpand, active = expanded, modifier = Modifier.testTag(if (index == 0) "activity-toggle:${item.key}" else "activity-step:${item.key}:$index")
                     .semantics { stateDescription = "$status · $expansionState" }) {
                     StatusGlyph(running, stepIcon(step.kind))
+                    ActivityTextFlow(running,item.liveStarted,Modifier.weight(1f,fill=false)) {
                     Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
                         style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                     if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneSubject())
+                    }
                     if (state == ActivityStatus.Failed) Text(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
                         maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
                     ActivityExpansionIcon(expanded)
@@ -301,17 +303,21 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             // The robot glyph remains recognisable even while its native call is running.
             if (value?.kind == ActivityKind.Agents) TraceGlyph(PocketIcons.RobotOutline)
             else StatusGlyph(running, kindIcon(value?.kind, value?.webAction))
+            ActivityTextFlow(running,item.liveStarted,Modifier.weight(1f,fill=false)) {
             Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
                 style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
             if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp),
                 color = toneSubject())
+            }
             if (state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) Text(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
                 maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
             else if (state == ActivityStatus.Interrupted) Text(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = toneText())
             if (!empty && (value?.kind != ActivityKind.Agents || expanded)) ActivityExpansionIcon(expanded)
         }
-        if (!expanded && value != null) {
+        // Image activities have one disclosure owner; a collapsed preview would keep
+        // drawing the very content the arrow just hid. Other tool results keep their teaser.
+        if (!image && !expanded && value != null) {
             val media = value.outputBlocks.filterIsInstance<ToolOutputBlock.Image>().map { it.media }
             if (media.isNotEmpty()) ToolMediaGrid(media, Modifier.padding(start = 26.dp, top = 4.dp, bottom = 8.dp))
         }
@@ -320,7 +326,9 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             exit = fadeOut(tween(pocketMotionMillis(100))) + shrinkVertically(tween(pocketMotionMillis(180), easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top)) {
             // Viewed and generated images open as the picture itself, never as an empty text result.
             val path = item.raw.string("path", item.raw.string("savedPath"))
-            if (path.isNotBlank()) ImageGrid(listOf(MentionedFile(name = compactFileName(path), path = path, image = true)), alignEnd = false,
+            val media = value.outputBlocks.filterIsInstance<ToolOutputBlock.Image>().map { it.media }
+            if (media.isNotEmpty()) ToolMediaGrid(media, Modifier.padding(start = 26.dp, top = 2.dp, bottom = 8.dp))
+            else if (path.isNotBlank()) ImageGrid(listOf(MentionedFile(name = compactFileName(path), path = path, image = true)), alignEnd = false,
                 modifier = Modifier.padding(start = 26.dp, top = 2.dp, bottom = 8.dp))
             else ActivityDetail(item, value, scope, state) { onDetail(item) }
         }
@@ -337,13 +345,10 @@ private fun TraceGlyph(icon: androidx.compose.ui.graphics.vector.ImageVector) {
     Icon(icon, null, Modifier.size(16.dp), tint = toneText().copy(alpha = .85f))
 }
 
-/** The breathing dot of a running step morphs into its kind glyph when it finishes (scale + fade on a spring). */
+/** Keep the action recognisable while its own glyph animates; completion never moves the row. */
 @Composable
 private fun StatusGlyph(running: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    androidx.compose.animation.AnimatedContent(running, Modifier.size(16.dp), contentAlignment = Alignment.Center, transitionSpec = {
-        (fadeIn(tween(pocketMotionMillis(160))) + androidx.compose.animation.scaleIn(androidx.compose.animation.core.spring(dampingRatio = .55f, stiffness = 700f), initialScale = .4f)) togetherWith
-            (fadeOut(tween(pocketMotionMillis(100))) + androidx.compose.animation.scaleOut(tween(pocketMotionMillis(120)), targetScale = .4f))
-    }, label = "trace-status") { busy -> if (busy) Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) { RunningDot() } else TraceGlyph(icon) }
+    NativeActivityIcon(icon,running,toneText().copy(alpha=.85f))
 }
 
 internal fun stepIcon(kind: StepKind) = when (kind) {
@@ -396,7 +401,7 @@ private fun traceSentence(item: TimelineItem, value: PresentedActivity?, state: 
     val running = state == ActivityStatus.Running || state == ActivityStatus.Waiting
     return when (value.kind) {
         ActivityKind.Command -> {
-            commandActionLabel(state) to compactCommandLabel(value.command?.command ?: value.title)
+            commandActionLabel(state) to compactCommandLabel(value.command?.display ?: value.title)
         }
         ActivityKind.Files -> stringResource(if (running) R.string.v04_trace_editing else R.string.v04_trace_edited) to ""
         ActivityKind.Web -> stringResource(when (value.webAction) {
@@ -538,8 +543,8 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
             }
         } }
         val command = value.command
-        // Keep the original invocation in details so launchers, quoting and arguments remain inspectable.
-        val shownCommand = command?.command?.trim().orEmpty()
+        // Default to the native script; the full-details viewer retains the original invocation.
+        val shownCommand = command?.display?.trim().orEmpty()
         val showCommand = command != null && shownCommand.isNotBlank()
         val hasBlocks = value.outputBlocks.isNotEmpty()
         val hasOutput = value.output.text.isNotBlank() && !hasBlocks

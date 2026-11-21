@@ -5,7 +5,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
-import androidx.compose.ui.test.junit4.ComposeContentTestRule
+import androidx.compose.ui.test.junit4.ComposeTestRule
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.text.AnnotatedString
 import dev.codexpocket.app.MainActivity
@@ -18,17 +18,22 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
-internal fun ComposeContentTestRule.openAssistantPage(page: String) {
+internal fun ComposeTestRule.openAssistantPage(page: String) {
     onNodeWithTag("assistant-more").assertIsDisplayed().performClick()
     onNodeWithTag("assistant-tab:$page").assertIsDisplayed().performClick()
 }
 
-internal fun ComposeContentTestRule.returnToAssistantChat() {
+internal fun AssistantUiState.acceptSend(action: AssistantAction, status: String = "accepted"): AssistantUiState {
+    val binding=action.composerBinding ?: requireNotNull(snapshot).composerBinding(computerId)
+    return copy(sendReceipts = listOf(AssistantSendReceipt(requireNotNull(action.commandId),binding.computerId,binding.runtimeId,binding.conversationId,status)))
+}
+
+internal fun ComposeTestRule.returnToAssistantChat() {
     onNodeWithContentDescription("返回助理对话").assertIsDisplayed().performClick()
     onNodeWithContentDescription("返回原页面").assertIsDisplayed()
 }
 
-internal fun ComposeContentTestRule.selectAssistantWorkspace(threadId: String) {
+internal fun ComposeTestRule.selectAssistantWorkspace(threadId: String) {
     // The selected context chip replaces the tools-panel entry after a choice.
     if (onAllNodesWithTag("assistant-workspace").fetchSemanticsNodes().isEmpty()) {
         onNodeWithTag("assistant-tools").assertIsDisplayed().performClick()
@@ -37,10 +42,12 @@ internal fun ComposeContentTestRule.selectAssistantWorkspace(threadId: String) {
     onNodeWithTag("assistant-workspace:$threadId").assertIsDisplayed().performClick()
 }
 
-internal fun ComposeContentTestRule.expandAssistantTask(taskId: String) {
+internal fun ComposeTestRule.expandAssistantTask(taskId: String) {
+    if(onAllNodesWithTag("assistant-detail-list").fetchSemanticsNodes().isNotEmpty()) onNodeWithTag("assistant-back").performClick()
     onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.ScrollToIndex)).onFirst()
         .performScrollToNode(hasTestTag("assistant-task:$taskId"))
-    onNodeWithTag("assistant-task:$taskId").assertHasClickAction().performClick()
+    if(onAllNodesWithTag("assistant-task-detail:$taskId").fetchSemanticsNodes().isEmpty()) onNodeWithTag("assistant-task-expand:$taskId").performClick()
+    onNodeWithTag("assistant-task-detail:$taskId").performClick()
 }
 
 /** Deterministic UI actions only; no repository, transport, or model execution. */
@@ -77,6 +84,17 @@ class AssistantChatNavigationTest {
             }
         }
         compose.waitForIdle()
+    }
+
+    @Test fun desktopProjectIsSelectableForTheDedicatedAssistantWithoutRewritingItsSource() {
+        val actions=mutableListOf<AssistantAction>()
+        content({AssistantUiState(snapshot.copy(runtimeId="managed"))},actions)
+        compose.selectAssistantWorkspace("authorized-thread")
+        compose.onNodeWithTag("assistant-message-input").performTextInput("Read this selected project")
+        compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
+        assertEquals("managed",actions.single().params.string("runtimeId"))
+        assertEquals("r",actions.single().params.string("sourceRuntimeId"))
+        assertEquals("authorized-thread",actions.single().params.string("threadId"))
     }
 
     @Test fun draftAndSelectedProjectSurviveMemoryAndSettingsBack() {
@@ -148,7 +166,7 @@ class AssistantChatNavigationTest {
 
     @Test fun repeatedSendStaysBlockedUntilTheMatchingDraftIsAcknowledged() {
         val actions = mutableListOf<AssistantAction>()
-        var state by mutableStateOf(AssistantUiState(snapshot, sendAcknowledgement = 7))
+        var state by mutableStateOf(AssistantUiState(snapshot))
         content({ state }, actions)
         compose.onNodeWithTag("assistant-message-input").performTextInput("只发送一次")
         compose.onNodeWithTag("assistant-send").performClick()
@@ -167,7 +185,7 @@ class AssistantChatNavigationTest {
         compose.onNodeWithTag("assistant-send").assertIsNotEnabled().performTouchInput { click() }
         assertEquals(1, actions.size)
 
-        compose.runOnIdle { state = state.copy(sendAcknowledgement = 8) }
+        compose.runOnIdle { state = state.acceptSend(actions.single()) }
         compose.onNodeWithTag("assistant-message-input").assert(
             SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
         compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
@@ -175,6 +193,18 @@ class AssistantChatNavigationTest {
         compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
         assertEquals(listOf("assistant/send", "assistant/send"), actions.map { it.method })
         assertEquals(listOf("只发送一次", "只发送一次"), actions.map { it.params.string("message") })
+    }
+
+    @Test fun submittedFeedbackDoesNotDiscardTheDraftAwaitingAcknowledgement() {
+        val actions=mutableListOf<AssistantAction>()
+        var state by mutableStateOf(AssistantUiState(snapshot))
+        content({state},actions)
+        compose.onNodeWithTag("assistant-message-input").performTextInput("一次发送")
+        compose.onNodeWithTag("assistant-send").performClick()
+        compose.runOnIdle {state=state.copy(pendingActions=setOf("assistant/send"),error="原操作结果尚未确认，正在核对；不会重复提交")}
+        compose.runOnIdle {state=state.copy(pendingActions=emptySet(),error=null).acceptSend(actions.single())}
+        compose.onNodeWithTag("assistant-message-input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
+        assertEquals(1,actions.size)
     }
 
     @Test fun acknowledgementKeepsANewerDraftEditableAndSendable() {
@@ -193,10 +223,42 @@ class AssistantChatNavigationTest {
         compose.runOnIdle { state = state.copy(pendingActions = emptySet()) }
         compose.onNodeWithTag("assistant-send").assertIsNotEnabled().performTouchInput { click() }
         assertEquals(1, actions.size)
-        compose.runOnIdle { state = state.copy(pendingActions = emptySet(), sendAcknowledgement = 1) }
+        compose.runOnIdle { state = state.copy(pendingActions = emptySet()).acceptSend(actions.single()) }
         compose.onNodeWithTag("assistant-message-input").assertTextEquals("还未发送的新草稿")
         compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
         assertEquals(listOf("上一条消息", "还未发送的新草稿"), actions.map { it.params.string("message") })
+    }
+
+    @Test fun foreignOrOldReceiptsCannotConsumeThePendingComposerAndRejectionKeepsText() {
+        val actions=mutableListOf<AssistantAction>()
+        var state by mutableStateOf(AssistantUiState(snapshot,computerId="pc"))
+        content({state},actions)
+        compose.onNodeWithTag("assistant-message-input").performTextInput("保留原稿")
+        compose.onNodeWithTag("assistant-send").performClick()
+        val receipt=state.acceptSend(actions.single()).sendReceipts.single()
+        for(other in listOf(receipt.copy(commandId="old"),receipt.copy(computerId="other"),receipt.copy(runtimeId="other"),receipt.copy(conversationId="other"))) {
+            compose.runOnIdle {state=state.copy(sendReceipts=listOf(other))}
+            compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留原稿")
+            compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        }
+        compose.runOnIdle {state=state.acceptSend(actions.single(),"rejected")}
+        compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留原稿")
+        compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
+        assertEquals(2,actions.size)
+        assertNotEquals(actions[0].commandId,actions[1].commandId)
+    }
+
+    @Test fun editingBackToTheSameTextIsStillANewerDraft() {
+        val actions=mutableListOf<AssistantAction>()
+        var state by mutableStateOf(AssistantUiState(snapshot))
+        content({state},actions)
+        compose.onNodeWithTag("assistant-message-input").performTextInput("相同内容")
+        compose.onNodeWithTag("assistant-send").performClick()
+        compose.onNodeWithTag("assistant-message-input").performTextReplacement("新内容")
+        compose.onNodeWithTag("assistant-message-input").performTextReplacement("相同内容")
+        compose.runOnIdle {state=state.acceptSend(actions.single())}
+        compose.onNodeWithTag("assistant-message-input").assertTextEquals("相同内容")
+        compose.onNodeWithTag("assistant-send").assertIsEnabled()
     }
 
     @Test fun moreMenuAndChildPageNavigationNeverDispatchActionsOrOpenThreads() {
@@ -235,7 +297,7 @@ class AssistantChatNavigationTest {
         val opens = mutableListOf<Pair<String, String>>()
         content({ AssistantUiState(snapshot) }, actions, opens)
         compose.openAssistantPage("Tasks")
-        compose.onNodeWithTag("assistant-task:task").assertIsDisplayed().assertHasClickAction()
+        compose.onNodeWithTag("assistant-task-expand:task").assertIsDisplayed().assertHasClickAction()
         compose.onNodeWithTag("assistant-task-pause:task").assertDoesNotExist()
         compose.onNodeWithTag("assistant-native-thread:native-task").assertDoesNotExist()
         compose.onNodeWithText("真实任务详情").assertDoesNotExist()

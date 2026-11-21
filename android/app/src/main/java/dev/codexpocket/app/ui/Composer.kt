@@ -126,6 +126,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
     focusRequest: Int = 0,
     // Parent checks before == current draft text, then rebases/persists with the supplied native edit range.
     onTextEdit: ((before: String, after: String, edit: ReferenceTextEdit?) -> Unit)? = null,
+    stableLayout: Boolean = false,
 ) {
     val menuBinding = LocalComposerMenuBinding.current
     val reportAnchor = onModelAnchor ?: menuBinding.onAnchor
@@ -149,6 +150,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
     var savedEnd by rememberSaveable { mutableIntStateOf(0) }
     val savedSelection = TextRange(savedStart, savedEnd)
     var editor by remember { mutableStateOf(TextFieldValue(text, savedSelection)) }
+    val pendingDraftEchoes = remember { mutableListOf<String>() }
     var editorReferences by remember { mutableStateOf(validReferenceSpans(text, referenceSpans)) }
     var appliedReferences by remember { mutableStateOf(referenceSpans) }
     var editorMounted by remember { mutableStateOf(true) }
@@ -173,6 +175,14 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
         }
     }
     LaunchedEffect(text, referenceSpans) {
+        // StateFlow/recomposition can deliver an earlier accepted keystroke
+        // after the editor has already accepted more input. Acknowledge that
+        // echo without replacing the current text, caret, or IME composition.
+        val acknowledgement=pendingDraftEchoes.indexOf(text)
+        if(acknowledgement>=0) {
+            repeat(acknowledgement+1) {pendingDraftEchoes.removeAt(0)}
+            if(pendingDraftEchoes.isNotEmpty()) return@LaunchedEffect
+        } else if(text!=editor.text) pendingDraftEchoes.clear()
         if (text != editor.text) {
             editorReferences = validReferenceSpans(text, referenceSpans)
             editor = editor.copy(text = text,
@@ -189,6 +199,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
         savedStart = value.selection.start
         savedEnd = value.selection.end
         if (changed) {
+            pendingDraftEchoes.add(value.text)
             if (onTextEdit != null) onTextEdit(before.text, value.text, edit) else onText(value.text)
         }
     }
@@ -233,7 +244,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
         else if (keyboardVisible) keyboardWasVisible = true
     }
     val compact = composerIsCompact(readingHistory, (focused && !metadataHistoryFocusBlocked) || restoreInlineFocus,
-        expanded, addMenu || menuExpanded || permissionsExpanded || referenceMetadataOpen, keyboardVisible)
+        expanded, addMenu || menuExpanded || permissionsExpanded || referenceMetadataOpen, keyboardVisible,stableLayout)
     val reportReferenceMetadata: (Boolean) -> Unit = { open ->
         referenceMetadataOpen = open
         if (!open && readingHistory && !keyboardVisible) metadataHistoryFocusBlocked = true
@@ -279,7 +290,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
         val editorLimit = (maxHeight - 172.dp - if (showSuggestions) suggestionLimit else 0.dp).coerceIn(48.dp, 176.dp)
         val showSteerLabel = maxWidth >= 320.dp
         val composerWidth by animateDpAsState(composerWidthDp(maxWidth.value, compact).dp,
-            if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap(), label = "composer-width")
+            if (motion && !stableLayout) tween(220) else snap(), label = "composer-width")
         Column(Modifier.width(composerWidth)) {
             if (showSuggestions) ComposerSuggestions(activeTrigger!!, suggestions!!, suggestionLimit,
                 onSelect = selectSuggestion, onDismiss = { dismissedTrigger = activeTrigger },
@@ -289,11 +300,11 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
             val showModel = !compact
             AnimatedVisibility(showModel, modifier = Modifier.align(Alignment.End),
                 enter = fadeIn(tween(pocketMotionMillis(110))) + androidx.compose.animation.slideInVertically(
-                    if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap()) { it / 2 } +
-                    expandVertically(if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap(), expandFrom = Alignment.Bottom),
+                    if (motion) tween(220) else snap()) { it / 2 } +
+                    expandVertically(if (motion) tween(220) else snap(), expandFrom = Alignment.Bottom),
                 exit = fadeOut(tween(pocketMotionMillis(90))) + androidx.compose.animation.slideOutVertically(
-                    if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap()) { it / 2 } +
-                    shrinkVertically(if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap(), shrinkTowards = Alignment.Bottom)) {
+                    if (motion) tween(220) else snap()) { it / 2 } +
+                    shrinkVertically(if (motion) tween(220) else snap(), shrinkTowards = Alignment.Bottom)) {
                 Box(Modifier.padding(end = 4.dp, bottom = 6.dp).onGloballyPositioned { reportAnchor(it.boundsInRoot()) }) {
                     ComposerModelChip(model, detail, menuExpanded, modelChevron, modelDescription, onModels)
                 }
@@ -302,8 +313,8 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 .semantics { stateDescription = if (compact) "紧凑" else "多行" }
                 .onGloballyPositioned { if (!showModel) reportAnchor(it.boundsInRoot()) }, shape = RoundedCornerShape(28.dp), dense = true) {
                 // Fixed composition slots retain the editor's focus, cursor and IME composition as the layout changes.
-                Layout(modifier = Modifier.fillMaxWidth().animateContentSize(
-                    if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap()), content = {
+                Layout(modifier = Modifier.fillMaxWidth().then(if(stableLayout) Modifier else Modifier.animateContentSize(
+                    if (motion) tween(220) else snap())), content = {
                     val addTurn by animateFloatAsState(if (addMenu) 45f else 0f, pocketPressSpring(), label = "composer-add-turn")
                     Box(Modifier.size(48.dp).onGloballyPositioned { addAnchor = it.boundsInRoot() }, contentAlignment = Alignment.Center) {
                         Box(Modifier.graphicsLayer { rotationZ = addTurn }) {
@@ -394,8 +405,8 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 }
             }
             AnimatedVisibility(!compact, modifier = Modifier.align(Alignment.CenterHorizontally),
-                enter = fadeIn(tween(pocketMotionMillis(110))) + expandVertically(if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap()),
-                exit = fadeOut(tween(pocketMotionMillis(90))) + shrinkVertically(if (motion) spring(dampingRatio = .9f, stiffness = 900f) else snap())) {
+                enter = fadeIn(tween(pocketMotionMillis(110))) + expandVertically(if (motion) tween(220) else snap()),
+                exit = fadeOut(tween(pocketMotionMillis(90))) + shrinkVertically(if (motion) tween(220) else snap())) {
                 Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     Icon(PocketIcons.Lock, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(permissionLabel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

@@ -11,6 +11,8 @@ pub(crate) struct Record {
     pub at: i64,
     pub provider_id: String,
     pub model: String,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
     pub status: i64,
     pub tokens: Option<[u64; 4]>,
     pub token_anomaly: bool,
@@ -41,6 +43,7 @@ impl Amount {
     fn finish(self) -> CostAmount {
         CostAmount {
             known_usd: self.sum.text(),
+            value_usd: (self.known > 0).then(|| self.sum.text()),
             known_rows: self.known,
             missing_rows: self.missing,
             invalid_rows: self.invalid,
@@ -68,8 +71,7 @@ impl Accumulator {
         }
         if r.token_anomaly {
             self.counts.tokens.invalid_rows += 1;
-        }
-        if let Some([fresh, read, write, output]) = r.tokens {
+        } else if let Some([fresh, read, write, output]) = r.tokens {
             let t = &mut self.counts.tokens;
             let total = fresh
                 .checked_add(read)
@@ -105,6 +107,7 @@ pub(crate) struct Aggregate {
     buckets: Vec<Accumulator>,
     providers: BTreeMap<String, Accumulator>,
     models: BTreeMap<String, Accumulator>,
+    sessions: BTreeMap<String, (Option<String>, Accumulator)>,
     pub first: Option<i64>,
     pub last: Option<i64>,
 }
@@ -117,6 +120,7 @@ impl Aggregate {
                 .collect(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             first: None,
             last: None,
         }
@@ -133,7 +137,20 @@ impl Aggregate {
             .or_default()
             .add(&r)?;
         self.models.entry(r.model.clone()).or_default().add(&r)?;
-        if self.providers.len() > super::MAX_GROUPS || self.models.len() > super::MAX_GROUPS {
+        if let Some(id) = &r.session_id {
+            let (title, totals) = self.sessions.entry(id.clone()).or_default();
+            // Stable choice if retained records disagree; never infer a title from model/provider.
+            if let Some(candidate) = &r.session_title {
+                if title.as_ref().is_none_or(|old| candidate < old) {
+                    *title = Some(candidate.clone());
+                }
+            }
+            totals.add(&r)?;
+        }
+        if self.providers.len() > super::MAX_GROUPS
+            || self.models.len() > super::MAX_GROUPS
+            || self.sessions.len() > super::MAX_GROUPS
+        {
             return Err(Failure::Limit);
         }
         self.first = Some(self.first.map_or(r.at, |v| v.min(r.at)));
@@ -143,7 +160,12 @@ impl Aggregate {
     pub fn provider_ids(&self) -> impl Iterator<Item = &String> {
         self.providers.keys()
     }
-    pub fn finish(self, q: &UsageQuery, names: BTreeMap<String, Option<String>>) -> UsageData {
+    pub fn finish(
+        self,
+        q: &UsageQuery,
+        names: BTreeMap<String, Option<String>>,
+        recent_requests: RequestDetailsPage,
+    ) -> UsageData {
         let trend = self
             .buckets
             .into_iter()
@@ -177,6 +199,18 @@ impl Aggregate {
             trend,
             provider_groups: page(providers, q.provider_page),
             model_groups: page(models, q.model_page),
+            session_groups: page(
+                self.sessions
+                    .into_iter()
+                    .map(|(session_id, (title, a))| SessionGroup {
+                        session_id,
+                        title,
+                        totals: a.finish(),
+                    })
+                    .collect(),
+                q.session_page,
+            ),
+            recent_requests,
         }
     }
 }

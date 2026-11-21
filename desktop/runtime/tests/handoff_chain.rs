@@ -99,8 +99,6 @@ impl Fixture {
             "PATHEXT",
             "COMSPEC",
             "SYSTEMDRIVE",
-            "USERPROFILE",
-            "LOCALAPPDATA",
         ] {
             if let Some(value) = std::env::var_os(key) {
                 c.env(key, value);
@@ -108,7 +106,9 @@ impl Fixture {
         }
         for (key, name) in [
             ("HOME", "home"),
-            ("APPDATA", "appdata"),
+            ("USERPROFILE", "home"),
+            ("APPDATA", "home/AppData/Roaming"),
+            ("LOCALAPPDATA", "home/AppData/Local"),
             ("CODEX_HOME", "codex-home"),
             ("TEMP", "tmp"),
             ("TMP", "tmp"),
@@ -125,6 +125,7 @@ impl Fixture {
     fn generation(root: &Path, label: &str, agent: &Path) -> String {
         let staged = root.join(label);
         fs::create_dir(&staged).unwrap();
+        let trace = std::env::var_os("POCKET_HANDOFF_TRACE_COORDINATOR").map(PathBuf::from);
         for (name, source) in [
             ("pocket-agent.exe", agent),
             (
@@ -133,7 +134,7 @@ impl Fixture {
             ),
             (
                 "pocket-upgrade.exe",
-                Path::new(env!("CARGO_BIN_EXE_pocket-upgrade")),
+                trace.as_deref().unwrap_or(Path::new(env!("CARGO_BIN_EXE_pocket-upgrade"))),
             ),
         ] {
             fs::copy(source, staged.join(name)).unwrap();
@@ -178,8 +179,9 @@ impl Fixture {
         );
         let root = test_support::tempdir();
         storage::private_dir(root.path()).unwrap();
-        for name in ["home", "appdata", "localappdata", "codex-home", "tmp"] {
-            fs::create_dir(root.path().join(name)).unwrap();
+        fs::write(root.path().join(".fixture-owner"), b"handoff-chain-test").unwrap();
+        for name in ["home/AppData/Local", "home/AppData/Roaming", "codex-home", "tmp"] {
+            storage::private_dir(&root.path().join(name)).unwrap();
         }
         let old = Self::generation(root.path(), "old", &agent);
         let new = Self::generation(root.path(), "new", &agent);
@@ -226,6 +228,9 @@ impl Fixture {
             .arg(old_bin.join("pocket-agent.exe"))
             .arg("--owner-directory")
             .arg(root.path().join("control"));
+        cmd.stderr(Stdio::from(
+            fs::File::create(root.path().join("source-supervisor.stderr.log")).unwrap(),
+        ));
         let source = cmd.spawn().unwrap();
         let f = Self {
             root,
@@ -279,14 +284,51 @@ impl Fixture {
                 .join(&self.new)
                 .join("pocket-upgrade.exe"),
         );
-        cmd.arg("--install-root")
-            .arg(self.root.path())
-            .arg("--state")
-            .arg(&self.state)
-            .arg("--operation-id")
-            .arg(id);
+        if std::env::var_os("POCKET_HANDOFF_TRACE_COORDINATOR").is_some() {
+            cmd.args(["supervisor::upgrade::local::tests::release_trace::actual_release_trace_coordinator", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("POCKET_TRACE_FIXTURE", self.root.path())
+                .env("POCKET_TRACE_OPERATION", id)
+                .stdout(Stdio::from(fs::File::create(self.root.path().join(format!("coordinator-{id}.stdout.log"))).unwrap()));
+        } else {
+            cmd.arg("--install-root")
+                .arg(self.root.path())
+                .arg("--state")
+                .arg(&self.state)
+                .arg("--operation-id")
+                .arg(id);
+        }
+        cmd.stderr(Stdio::from(
+            fs::File::create(
+                self.root
+                    .path()
+                    .join(format!("coordinator-{id}.stderr.log")),
+            )
+            .unwrap(),
+        ));
         let mut c = cmd.spawn().unwrap();
-        let exit = wait_for(|| c.try_wait().unwrap());
+        // A coordinator includes a 45s successor-adoption wait plus separate
+        // quiesce/release/verify waits. The harness deadline must cover them.
+        let started = Instant::now();
+        let mut last_phase = None;
+        let exit = loop {
+            if let Some(exit) = c.try_wait().unwrap() {
+                break exit;
+            }
+            if let Ok(Some(status)) = upgrade::read_status(&self.state) {
+                if last_phase != Some(status.phase) {
+                    eprintln!("coordinator {id}: {:?} at {:.1}s", status.phase, started.elapsed().as_secs_f32());
+                    last_phase = Some(status.phase);
+                }
+            }
+            if started.elapsed() >= Duration::from_secs(180) {
+                let health = rpc(&self.state, "helper/health", json!({})).ok().map(|v| json!({
+                    "acceptingWrites":v["acceptingWrites"],"remoteEnabled":v["remoteEnabled"],"helperRuntime":v["helperRuntime"]}));
+                storage::atomic(&self.root.path().join("coordinator-timeout.json"), &json!({
+                    "status":upgrade::read_status(&self.state).ok().flatten(),"health":health})).unwrap();
+                panic!("coordinator exceeded all bounded protocol waits; isolated diagnostics retained");
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
         let result = upgrade::read_status(&self.state).unwrap().unwrap();
         assert!(
             matches!(
@@ -301,6 +343,52 @@ impl Fixture {
     }
     fn shutdown(&self) -> Result<()> {
         shutdown_fixture(self.root.path(), &self.state, &self.new)
+    }
+    fn cleanup(&self) -> Result<()> {
+        // Coordinators deliberately break away from the harness job. On a
+        // failed assertion, clean only copied images beneath this marked root.
+        // The installer API rechecks SID, creation time and image on its handle.
+        let script = r#"
+$ErrorActionPreference='Stop'
+$root=[IO.Path]::GetFullPath($env:POCKET_CHAIN_FIXTURE)
+if([IO.File]::ReadAllText((Join-Path $root '.fixture-owner')) -ne 'handoff-chain-test'){throw 'fixture marker missing'}
+. (Join-Path $env:POCKET_CHAIN_SCRIPTS 'windows-install.ps1')
+. (Join-Path $env:POCKET_CHAIN_SCRIPTS 'windows-upgrade-fixture-processes.ps1')
+Initialize-PocketFixtureProcessSnapshot
+for($attempt=0;$attempt -lt 10;$attempt++){
+ $rows=@([PocketFixtureSnapshot]::Read($root))
+ if($rows.Count -eq 0){[IO.File]::WriteAllText((Join-Path $root 'fixture-finished.txt'),'No executable beneath this private fixture root remains.');exit 0}
+ foreach($row in @($rows|Sort-Object @{Expression={if($_.Name -eq 'pocket-supervisor.exe'){0}elseif($_.Name -eq 'pocket-upgrade.exe'){1}else{2}}})){
+  $identity=Get-PocketInstallProcessIdentity $row.ProcessId
+  if($null -eq $identity){continue}
+  if(-not $identity.executable.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'fixture identity escaped root'}
+  $captured=@{pid=$identity.pid;createdAt=$identity.createdAt;executable=$identity.executable;sha256=(Get-PocketFileHash $identity.executable)}
+  Stop-PocketInstallProcess $captured
+ }
+ Start-Sleep -Milliseconds 100
+}
+throw 'fixture cleanup incomplete'
+"#;
+        let mut c = Self::command(self.root.path(), &storage::powershell());
+        let output = c
+            .env("POCKET_CHAIN_FIXTURE", self.root.path())
+            .env(
+                "POCKET_CHAIN_SCRIPTS",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts"),
+            )
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        fs::write(self.root.path().join("cleanup.log"), &output.stderr)?;
+        ensure!(output.status.success(), "fixture cleanup failed");
+        Ok(())
     }
 }
 fn shutdown_fixture(root: &Path, state: &Path, target: &str) -> Result<()> {
@@ -377,15 +465,38 @@ fn shutdown_fixture(root: &Path, state: &Path, target: &str) -> Result<()> {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if thread::panicking() {
+        let cleanup = self.cleanup();
+        if thread::panicking() || cleanup.is_err() {
             eprintln!(
-                "Fixture diagnostics directory: {}",
-                self.root.path().display()
+                "Fixture diagnostics directory: {}; cleanup: {:?}",
+                self.root.path().display(),
+                cleanup
             );
             self.root.disable_cleanup(true);
         }
+        if !thread::panicking() {
+            assert!(
+                cleanup.is_ok(),
+                "fixture cleanup must complete: {cleanup:?}"
+            );
+        }
     }
 }
+#[test]
+#[ignore = "requires a freshly built agent; run with POCKET_HANDOFF_CHAIN_AGENT and --ignored"]
+fn diagnose_actual_release_handoff() {
+    assert!(std::env::var_os("POCKET_HANDOFF_TRACE_COORDINATOR").is_some());
+    let mut f = Fixture::new();
+    f.root.disable_cleanup(true);
+    let coordinator = upgrade::Coordinator::request(f.root.path(), &f.state, &f.old).unwrap();
+    let id = coordinator.status().operation_id.clone();
+    drop(coordinator);
+    let result = f.run(&id);
+    storage::atomic(&f.root.path().join("trace-result.json"), &json!({"operationId":id,"phase":result.phase,"failure":result.failure})).unwrap();
+    eprintln!("Release diagnostic fixture: {}; phase {:?}; failure {:?}", f.root.path().display(), result.phase, result.failure);
+    assert!(f.root.path().join("release-trace.jsonl").is_file(), "release stage was not reached");
+}
+
 #[test]
 #[ignore = "requires a freshly built agent; run with POCKET_HANDOFF_CHAIN_AGENT and --ignored"]
 fn actual_supervisor_coordinator_agent_handoff_and_recovery() {
@@ -413,5 +524,44 @@ fn actual_supervisor_coordinator_agent_handoff_and_recovery() {
     let status = f.healthy(&f.old);
     assert_eq!(status["remoteEnabled"], false);
     assert_eq!(fs::read(f.state.join("config.json")).unwrap(), original);
+    f.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires a freshly built agent; run with POCKET_HANDOFF_CHAIN_AGENT and --ignored"]
+fn actual_two_consecutive_handoffs_and_second_generation_rollback() {
+    let mut f = Fixture::new();
+    let original = fs::read(f.state.join("config.json")).unwrap();
+    let agent = PathBuf::from(std::env::var_os("POCKET_HANDOFF_CHAIN_AGENT").unwrap());
+    let third = Fixture::generation(f.root.path(), "third", &agent);
+    for (source, target) in [(f.old.clone(), f.new.clone()), (f.new.clone(), third)] {
+        f.new = target.clone();
+        let record_path = f.root.path().join("desktop-install.json");
+        let mut record: Value = storage::read(&record_path).unwrap();
+        record["generation"] = json!(target);
+        record["releaseHash"] = json!(target);
+        storage::atomic(&record_path, &record).unwrap();
+        let c = upgrade::Coordinator::request(f.root.path(), &f.state, &source).unwrap();
+        let id = c.status().operation_id.clone();
+        drop(c);
+        eprintln!("handoff {source} -> {target}: {}", f.root.path().display());
+        let result = f.run(&id);
+        assert_eq!(result.phase, upgrade::Phase::Succeeded);
+        let status = f.healthy(&target);
+        assert_eq!(status["remoteEnabled"], false);
+        assert_eq!(status["runtimes"], json!([]));
+        assert_eq!(fs::read(f.state.join("config.json")).unwrap(), original);
+        if source != f.old {
+            let mut interrupted = result;
+            interrupted.phase = upgrade::Phase::RollingBack;
+            storage::atomic(
+                &storage::control(&f.state).join("upgrade.json"),
+                &interrupted,
+            )
+            .unwrap();
+            assert_eq!(f.run(&id).phase, upgrade::Phase::RolledBack);
+            f.healthy(&source);
+        }
+    }
     f.shutdown().unwrap();
 }

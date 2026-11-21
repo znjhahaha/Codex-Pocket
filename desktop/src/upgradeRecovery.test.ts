@@ -32,6 +32,37 @@ function missingBackend():Snapshot {
 }
 
 describe('home upgrade and background recovery policy',()=>{
+ it.each(['failed','rolled_back','succeeded'])('keeps a superseded %s journal as history when the installed background is verified',phase=>{
+  const s=record(snapshot(),phase,'rollback_failed');
+  s.installation!.upgrade!.toGeneration='c'.repeat(64);
+  s.installation!.upgrade!.bridgeRestartRequired=true;
+  s.installation!.upgrade!.updatedAt=80;
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'current',visible:false,blockMutations:false,upgradeHistorical:true});
+  expect(upgradeRecovery(s,100).bridge).toBeUndefined();
+  expect(recoveryBlocksMutations(s,100)).toBe(false);
+  expect(s.installation!.upgrade!.phase).toBe(phase);
+ });
+ it('does not dismiss the failed operation for the current installation',()=>{
+  expect(upgradeRecovery(record(snapshot(),'failed','verification_failed'),100)).toMatchObject({kind:'failed',blockMutations:true});
+  const rolledBack=record(snapshot(),'rolled_back','verification_failed');
+  rolledBack.installation!.upgrade!.fromGeneration=target;
+  rolledBack.installation!.upgrade!.toGeneration='c'.repeat(64);
+  expect(recoveryBlocksMutations(rolledBack,100)).toBe(true);
+ });
+ it('requires complete current evidence before retiring an unrelated failure from active status',()=>{
+  const s=record(snapshot(),'rolled_back','rollback_failed');s.installation!.upgrade!.toGeneration='c'.repeat(64);
+  expect(recoveryBlocksMutations(s,120)).toBe(true);
+  for(const stage of ['state_read','supervisor_read','helper_control','upgrade_read']){
+   expect(recoveryBlocksMutations({...s,issues:[{stage,code:'read_failed',message:'Fixture',operationId:'fixture',retryable:true}]},100)).toBe(true);
+  }
+  s.installation!.helper!.runningVerified=false;
+  expect(recoveryBlocksMutations(s,100)).toBe(true);
+ });
+ it('retains a live bridge warning even when an unrelated journal is historical',()=>{
+  const s=record(snapshot(),'rolled_back');s.installation!.upgrade!.toGeneration='c'.repeat(64);
+  s.processes=[{name:'desktop',state:'在线',bridgeUpdatePending:true}];
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'bridge',bridge:'pending',blockMutations:false,upgradeHistorical:true});
+ });
  it('detects an old generation even when all version numbers are identical',()=>{
   expect(upgradeRecovery(oldBackend(),100)).toMatchObject({kind:'old_backend',action:'request_upgrade'});
  });
@@ -47,6 +78,20 @@ describe('home upgrade and background recovery policy',()=>{
   const s=oldBackend();s.installation!.installedGeneration=generation;
   expect(upgradeRecovery(s,100)).toMatchObject({kind:'unknown',blockMutations:true});
   expect(upgradeRecovery(s,100).action).toBeUndefined();
+ });
+ it('keeps the verified newer dashboard open while the production backend waits',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:true,phase:'waiting_idle',generation:source,version:'0.7.1',downloadedBytes:0,totalBytes:0};
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'staged_dashboard',blockMutations:false});
+  s.updates.generation='c'.repeat(64);
+  expect(upgradeRecovery(s,100).kind).toBe('ui_outdated');
+ });
+ it('keeps the retry button usable after a cancelled legacy handoff',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'failed',failure:'legacy_restart_unverified',generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1};
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'staged_dashboard',blockMutations:false});
  });
  it('sends an older UI to the Start menu and prevents changes',()=>{
   const s=oldBackend();s.installation!.ui={state:'restart_required',generation:source,runningVerified:true};

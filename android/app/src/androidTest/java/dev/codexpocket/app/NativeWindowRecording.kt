@@ -12,7 +12,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Opt-in sampled window recording. Never enabled during performance measurements. */
-internal class NativeWindowRecording(private val activity: Activity, directory: File) : AutoCloseable {
+internal class NativeWindowRecording(private val activity: Activity, directory: File,
+    private val intervalMillis: Long = 150, private val maxFrames: Int = 360) : AutoCloseable {
     private val running = AtomicBoolean(true)
     private val frames = File(directory, "window-frames").apply { mkdirs() }
     private val main = Handler(Looper.getMainLooper())
@@ -21,7 +22,7 @@ internal class NativeWindowRecording(private val activity: Activity, directory: 
         val started = SystemClock.elapsedRealtime()
         var index = 0
         try {
-            while (running.get() && index < 360) {
+            while (running.get() && index < maxFrames) {
                 val latch = CountDownLatch(1)
                 var result = -1
                 main.post {
@@ -37,7 +38,7 @@ internal class NativeWindowRecording(private val activity: Activity, directory: 
                     File(frames, name).outputStream().use { bitmap!!.compress(Bitmap.CompressFormat.JPEG, 85, it) }
                     File(frames, "frames.tsv").appendText("$name\t${SystemClock.elapsedRealtime() - started}\n")
                 }
-                SystemClock.sleep(150)
+                SystemClock.sleep(intervalMillis)
             }
         } finally { bitmap?.recycle() }
     }, "pocket-window-recording").apply { isDaemon = true; start() }

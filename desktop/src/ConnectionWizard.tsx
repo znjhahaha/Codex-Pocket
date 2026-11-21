@@ -1,3 +1,4 @@
+import {nativePresence} from './nativePresence';
 import {useEffect,useRef,useState} from 'react';
 import {invoke} from '@tauri-apps/api/core';
 import {RelaySetup} from './RelaySetup';
@@ -53,7 +54,8 @@ export function ConnectionWizard({data,now,busy,action,refresh,onExit,onPair}:Pr
  const activateSsh=async()=>{if(!relayCurrent())return;const latest=await latestSnapshot();if(!relayCurrent())return;if(!latest.desired)await invoke('set_remote',{enabled:true});if(relayCurrent())markActivated()};
  const useExisting=()=>void run(async current=>{const latest=await latestSnapshot();if(!current())return;await prepareAutomaticLan({lanBind,autoLan:!adjusted.current},latest,(cmd,args)=>invoke(cmd,args),current);if(!current())return;if(!latest.desired)await invoke('set_remote',{enabled:true});if(current())markActivated()});
  const readiness=guideReadiness(data,now,method),ready=activated&&readiness.canPair,selectedReady=activated&&readiness.selectedReady,lanOnly=activated&&readiness.lanOnly;
- const runtimeMode=data.sessionPreferences?.defaultMode==='cli'?'cli':'desktop',runtimeReady=data.processes.some(p=>p.name===runtimeMode&&p.state==='在线');
+ const native=nativePresence(data.runtimeReadiness,now);
+ const cliPreferred=data.sessionPreferences?.defaultMode==='cli';
  const pendingFailure=activated&&status!=='applying'&&!selectedReady&&(method==='cloudflare'&&data.connectivity?.phase==='failed'?'tunnel_failed':data.connection?.phase==='failed'?'route_not_ready':now-startedAt>90?'guide_timeout':'');
  const shownIssue=issue||routeReadIssue(data)||(pendingFailure?guideError(Error(pendingFailure)):null);
  const waitingText=method==='lan'?'正在等待局域网就绪':method==='cloudflare'?'正在等待 Cloudflare 隧道':'正在等待中转就绪';
@@ -71,8 +73,8 @@ export function ConnectionWizard({data,now,busy,action,refresh,onExit,onPair}:Pr
   {activated&&data.routes?.routePreferences?.lan?.bind&&<div className="wizard-firewall"><button className="button" disabled={busy} onClick={()=>void run(async current=>{const result=await invoke<{configured:boolean}>('allow_lan_firewall');if(current()){setFirewall(result.configured?'已允许此局域网端口通过专用网络防火墙。':'授权未完成，请重试。');setStatus('waiting')}})}>允许局域网通过防火墙</button><p>点击后 Windows 将请求管理员授权（UAC），仅允许已保存端口、专用网络和本地子网。若手机在同一 Wi-Fi 仍无法连接，可完成此步骤。</p>{firewall&&<p role="status">{firewall}</p>}</div>}
  </div>;
  return <section className="connection-wizard" aria-label="连接引导">
-  <div className="wizard-heading"><div><span className="eyebrow">连接引导 · {step==='choose'?'01':step==='route'?'02':'03'} / 04</span><h1>{advanced?'高级连接设置':step==='choose'?'选择公网连接（可选）':step==='route'?(method==='lan'?'自动连接局域网':methods.find(item=>item.id===method)!.title):'打开 Codex，准备扫码'}</h1><p>{step==='choose'?'局域网会自动检测并优先使用。选择外出时使用的公网，也可以暂不配置。':step==='route'?'自动切换局域网与已配置的公网，确认实际可用线路后再扫码。':'电脑保持开机，在 Codex 中完成登录，再用手机扫码。'}</p></div><button className="button" onClick={onExit}>取消引导</button></div>
-  <ol className="wizard-steps" aria-label="连接步骤">{['公网可选','配置并验证','打开 Codex','扫码配对'].map((label,index)=><li key={label} aria-current={index===(step==='choose'?0:step==='route'?1:2)?'step':undefined}><span>0{index+1}</span>{label}</li>)}</ol>
+  <div className="wizard-heading"><div><span className="eyebrow">连接引导 · {step==='choose'?'01':step==='route'?'02':'03'} / 04</span><h1>{advanced?'高级连接设置':step==='choose'?'选择公网连接（可选）':step==='route'?(method==='lan'?'自动连接局域网':methods.find(item=>item.id===method)!.title):'连接手机'}</h1><p>{step==='choose'?'局域网会自动检测并优先使用。选择外出时使用的公网，也可以暂不配置。':step==='route'?'自动切换局域网与已配置的公网，确认实际可用线路后再扫码。':'在手机上打开 Codex Pocket，选择扫码配对。'}</p></div><button className="button" onClick={onExit}>取消引导</button></div>
+  <ol className="wizard-steps" aria-label="连接步骤">{['公网可选','配置并验证','检查 Codex','扫码配对'].map((label,index)=><li key={label} aria-current={index===(step==='choose'?0:step==='route'?1:2)?'step':undefined}><span>0{index+1}</span>{label}</li>)}</ol>
   {shownIssue&&<div className="notice error" role="alert"><Info size={18}/><span>{shownIssue.message}<small className="error-stage">阶段 {shownIssue.stage} · {shownIssue.code}{shownIssue.exitCode!==undefined?` · 退出码 ${shownIssue.exitCode}`:''}</small>{shownIssue.operationId&&<small className="error-stage">操作 {shownIssue.operationId}</small>}</span></div>}
   {step==='choose'?<><div className="method-cards">{methods.map(item=><button key={item.id} className="method-card" aria-label={item.title} disabled={busy} onClick={()=>select(item.id)}><span className="setting-icon">{item.id==='lan'?<Wifi size={26}/>:item.id==='cloudflare'?<ShieldCheck size={26}/>:<Computer size={26}/>}</span><strong>{item.title}</strong><p>{item.description}</p><small>{item.hint}</small></button>)}</div><p className="wizard-note">{probeBusy?'正在自动检测局域网…':lanAvailable?`局域网已自动匹配 ${lanBind}，保存时启用。`:'当前未检测到可用局域网，可继续配置公网。'} 已有公网设置会保留。</p>{probeError&&<p className="wizard-note" role="status">{probeError}</p>}</>:advanced?<div className="wizard-content"><p>完成后返回此连接引导，确认局域网或所选公网实际就绪再扫码。</p>{!data.desired&&<div className="route-actions"><button className="button" disabled={busy||probeBusy} onClick={useExisting}>启用电脑助手</button></div>}<ConnectionSettings data={data} busy={busy} action={fn=>run(async()=>{await fn()})}/><button className="button primary" disabled={busy} onClick={()=>{setAdvanced(false);setIssue(null)}}>返回连接引导</button></div>:<div className="wizard-content">
    {step==='route'&&<>
@@ -83,8 +85,26 @@ export function ConnectionWizard({data,now,busy,action,refresh,onExit,onPair}:Pr
     {activated&&status!=='applying'&&<div className={`wizard-status ${ready?'ready':''}`} role="status">{ready?<Check size={20}/>:<LoaderCircle size={18} className="spin"/>}<div><strong>{ready?readyText:waitingText}</strong><p>{lanOnly?'所选公网尚未就绪，现在只能在同一局域网扫码和连接。离开此网络前请完成公网配置。':ready?'线路已可用。局域网与已配置的公网保持自动切换。':'正在读取线路实际状态，暂时不能扫码。'}</p>{method==='cloudflare'&&data.connectivity?.publicUrl&&<code>{data.connectivity.publicUrl}</code>}<p>已配置 {data.connection?.configuredRoutes??'待确认'} 条 · 可用 {data.connection?.usableRoutes??'待确认'} 条</p></div></div>}
     {shownIssue&&<div className="route-actions">{requiresRouteRead(shownIssue)?<button className="button" disabled={busy} onClick={retryRead}>重新检查</button>:!(method==='relay'&&relayMode==='ssh')&&<button className="button primary" disabled={busy||probeBusy||method==='lan'&&!lanAvailable} onClick={start}>重试连接</button>}{activated&&!requiresRouteRead(shownIssue)&&<button className="button" disabled={busy} onClick={retryRead}>重新检查</button>}{method==='relay'&&relayMode==='ssh'&&!requiresRouteRead(shownIssue)&&<p>请使用 SSH 服务器检查、部署或使用此中转按钮重试。</p>}</div>}{activated&&<div className="route-actions"><button className="button" disabled={busy} onClick={edit}>编辑连接设置</button></div>}
    </>}
-   {step==='codex'&&<><h2>{runtimeMode==='cli'?'当前使用 Codex CLI':'在电脑上打开 Codex 桌面'}</h2><p>{runtimeMode==='cli'?'高级设置已选择 CLI。请保持所选 Codex CLI 运行。':'打开 Codex 桌面并登录账号，手机会继续电脑上的会话。'}</p>{lanOnly&&<div className="notice" role="status"><Wifi size={18}/><span>仅当前局域网可用。请保持手机和电脑连接同一个路由器，离开前完成公网设置。</span></div>}<div className="route-actions"><button className="button" disabled={busy} onClick={()=>void run(async current=>{await invoke('open_codex');if(current()){setStartedAt(Date.now()/1000);setStatus('waiting')}})}>打开 Codex 桌面</button><button className="button" disabled={busy} onClick={retryRead}>重新检查</button></div><div className="wizard-status" role="status">{runtimeReady?<Check size={20}/>:<LoaderCircle size={18} className="spin"/>}<div><strong>{runtimeReady?'Codex 已就绪':'等待 Codex 就绪'}</strong><p>{runtimeReady?'在手机安装并打开 Codex Pocket，选择扫码配对。':'启动命令已提交不代表完成，请等待确认运行状态。'}</p>{!ready&&<p>当前线路暂不可用，请返回上一页检查连接。</p>}</div></div></>}
-   <div className="wizard-navigation"><button className="button" onClick={back}>上一步</button>{step==='route'?<button className="button primary" disabled={busy||!ready} onClick={()=>{setStep('codex');setIssue(null)}}>{lanOnly?'下一步：仅局域网连接':'下一步：打开 Codex'}</button>:<button className="button primary" disabled={busy||!ready||!runtimeReady} onClick={()=>void onPair(readiness.pairMethod)}>生成配对二维码</button>}</div>
+   {step==='codex'&&<>
+    <h2>这台电脑上的 Codex</h2>
+    <div className="wizard-status" role="status">
+     {native.desktop||native.cli?<Check size={20}/>:<Computer size={20}/>}
+     <div>
+      {native.desktop&&<div><strong>已识别正在运行的 Codex 桌面</strong>{native.desktopVersion&&<small> · {native.desktopVersion}</small>}</div>}
+      {native.cli&&<div><strong>已识别正在运行的 Codex CLI</strong></div>}
+      {!native.desktop&&!native.cli&&<strong>{native.current?'尚未发现正在运行的 Codex':'正在检查 Codex 运行状态'}</strong>}
+      {native.history&&<p>配对后可在手机查看已保存的对话。</p>}
+      <p>{native.desktopControl||native.cliControl?'已接入的会话可在手机继续。':'实时续聊需要会话接入，手机可以先配对。'}</p>
+      {!ready&&<p>当前线路暂不可用，请返回上一页检查连接。</p>}
+     </div>
+    </div>
+    {lanOnly&&<div className="notice" role="status"><Wifi size={18}/><span>仅当前局域网可用。请保持手机和电脑连接同一个路由器，离开前完成公网设置。</span></div>}
+    <div className="route-actions">
+     {!native.desktop&&!cliPreferred&&<button className="button" disabled={busy} onClick={()=>void run(async current=>{await invoke('open_codex');if(current()){setStartedAt(Date.now()/1000);setStatus('waiting')}})}>打开 Codex 桌面</button>}
+     <button className="button" disabled={busy} onClick={retryRead}>重新检查</button>
+    </div>
+   </>}
+   <div className="wizard-navigation"><button className="button" onClick={back}>上一步</button>{step==='route'?<button className="button primary" disabled={busy||!ready} onClick={()=>{setStep('codex');setIssue(null)}}>{lanOnly?'下一步：仅局域网连接':'下一步：检查 Codex'}</button>:<button className="button primary" disabled={busy||!ready} onClick={()=>void onPair(readiness.pairMethod)}>生成配对二维码</button>}</div>
   </div>}
  </section>;
 }

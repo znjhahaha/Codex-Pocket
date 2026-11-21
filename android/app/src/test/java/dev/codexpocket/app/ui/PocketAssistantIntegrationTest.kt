@@ -142,7 +142,7 @@ class PocketAssistantIntegrationTest {
             compose.onNodeWithTag("assistant-message-input").assertTextEquals("离线仍可修改草稿")
             compose.onNodeWithTag("assistant-send").assertIsNotEnabled().performTouchInput {click()}
             db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
-            assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
+            assertTrue(repo.state.value.assistant.sendReceipts.isEmpty())
         } finally {readGate.unlock()}
     }
 
@@ -201,7 +201,7 @@ class PocketAssistantIntegrationTest {
         db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
         assertTrue(repo.state.value.assistant.pendingActions.isEmpty())
         assertTrue(repo.state.value.assistant.messages.isEmpty())
-        assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
+        assertTrue(repo.state.value.assistant.sendReceipts.isEmpty())
         assertEquals(snapshot,repo.state.value.assistant.snapshot)
     }
 
@@ -233,9 +233,13 @@ class PocketAssistantIntegrationTest {
             AssistantActions.schedule("managed",workspace,AssistantScheduleDraft("定时事项","Daily","2030-01-02","09:00",0,"60","UTC",false),1_893_456_000_000L),
             AssistantActions.respond("managed","operation","request","回答"),AssistantActions.approve("managed","operation","request",false))
         runBlocking {actions.forEach {repo.assistantAction(it).join()}}
-        assertEquals("Offline must be checked before writing a command or calling the retained transport",emptyList<String>(),transport.calls.toList())
-        db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
-        assertEquals(0L,repo.state.value.assistant.sendAcknowledgement)
+        assertEquals("Offline mutations must never call the retained transport",emptyList<String>(),transport.calls.toList())
+        db.openHelper.readableDatabase.query("SELECT method,status,draftText FROM commands").use {cursor->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("assistant/send",cursor.getString(0));assertEquals("rejected",cursor.getString(1))
+            assertTrue(cursor.getString(2).contains("真实 fixture 消息"));assertFalse(cursor.moveToNext())
+        }
+        assertTrue(repo.state.value.assistant.sendReceipts.none {it.status=="accepted"})
     }
 
     @Test fun actualManagementUsageTabRendersTheRepositoryRpcPipeline()=fixture {repo,_->
@@ -264,7 +268,7 @@ class PocketAssistantIntegrationTest {
         compose.onNodeWithText("用量").performClick()
         compose.waitUntil(5_000) {repo.state.value.usage.visibleSnapshot!=null}
         compose.onNodeWithTag("usage-screen").assertIsDisplayed()
-        compose.onNodeWithText("用量统计").assertExists()
+        compose.onNodeWithText("调用统计").assertExists()
         assertTrue(calls.contains("usage/read"))
         assertTrue(calls.all {it in setOf("usage/read","devices/list")})
         assertEquals(24L,repo.state.value.usage.visibleSnapshot!!.response.source.schemaVersion)

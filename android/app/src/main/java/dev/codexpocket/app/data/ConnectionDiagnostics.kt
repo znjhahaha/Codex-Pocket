@@ -11,7 +11,7 @@ internal class ConnectionDiagnostics {
     private val started = SystemClock.elapsedRealtime()
     @Synchronized fun record(generation: Long, stage: String, code: String, failure: Throwable? = null) {
         val safeStage = stage.takeIf { it.matches(Regex("[a-z_]{1,40}")) } ?: "unknown"
-        val safeCode = code.takeIf { it in allowed } ?: "unknown"
+        val safeCode = code.takeIf { it in allowed || it in setOf("invalid_request", "invalid_params", "rejected", "runtime_offline", "runtime_unavailable") } ?: "unknown"
         // Type and our own source location only: exception messages may contain native payloads.
         val type = failure?.javaClass?.simpleName?.takeIf { it.matches(Regex("[A-Za-z0-9_]{1,80}")) }
         val frame = failure?.stackTrace?.firstOrNull { it.className.startsWith("dev.codexpocket.") }

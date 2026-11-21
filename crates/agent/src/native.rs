@@ -22,6 +22,8 @@ use tokio::{
 
 #[path = "native_host.rs"]
 pub mod host;
+#[cfg(windows)]
+pub mod desktop_ipc;
 
 #[derive(Debug, Clone)]
 pub enum RpcFailure {
@@ -46,6 +48,8 @@ enum Outgoing {
 }
 #[derive(Clone)]
 pub struct Rpc {
+    #[cfg(windows)]
+    desktop_ipc: Option<Arc<desktop_ipc::Client>>,
     tx: mpsc::Sender<Outgoing>,
     response_tx: Option<mpsc::Sender<Outgoing>>,
     host_stop: Option<tokio::sync::watch::Sender<bool>>,
@@ -79,6 +83,7 @@ pub enum NativeEvent {
     },
 }
 pub struct Connected {
+    pub initial_status: Option<Value>,
     pub role: NativeRole,
     pub bridge_version: Option<String>,
     pub capabilities: crate::capabilities::Capabilities,
@@ -96,12 +101,30 @@ pub struct Connected {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum NativeRole {
     Desktop,
+    DesktopFollower,
+    #[serde(rename = "auxiliary")]
+    DesktopAuxiliary,
     CliDaemon,
     ManagedHost {
         generation: String,
         #[serde(rename = "reconciliationRequired")]
         reconciliation_required: bool,
     },
+}
+
+impl NativeRole {
+    pub fn is_auxiliary(&self) -> bool { matches!(self, Self::DesktopAuxiliary) }
+}
+
+pub(crate) fn desktop_role(status: &Value) -> NativeRole {
+    let identity = status["nativeVersion"].as_str().unwrap_or_default().to_ascii_lowercase().replace('_', "-");
+    // Old bridges have no role field. Their authenticated native user agent still
+    // identifies browser helpers, so a mixed-version upgrade remains safe.
+    if status["runtimeRole"] == "auxiliary" || identity == "codex-browser-use" || identity.starts_with("codex-browser-use/") {
+        NativeRole::DesktopAuxiliary
+    } else {
+        NativeRole::Desktop
+    }
 }
 
 enum Connection {
@@ -160,6 +183,8 @@ impl Rpc {
         method: &str,
         params: Value,
     ) -> std::result::Result<Value, RpcFailure> {
+        #[cfg(windows)]
+        if let Some(client)=&self.desktop_ipc {return Box::pin(client.call(id,method,params)).await;}
         if pocket_runtime_ipc::support::key(&id).is_none() {
             return Err(RpcFailure::Native(json!({"message":"Invalid operation ID"})));
         }
@@ -175,6 +200,8 @@ impl Rpc {
             .map_err(|_| RpcFailure::Disconnected)?
     }
     pub async fn respond(&self, id: Value, response: Value) -> std::result::Result<(), RpcFailure> {
+        #[cfg(windows)]
+        if let Some(client)=&self.desktop_ipc {return client.respond(id,response).await;}
         let (flushed, receiver)=oneshot::channel();
         self.response_tx.as_ref().unwrap_or(&self.tx)
             .send(Outgoing::Response{value:json!({"id":id,"result":response}),flushed})
@@ -186,6 +213,8 @@ impl Rpc {
 
     /// The broker calls this after storing Connected, so replay cannot race registration.
     pub fn activate_events(&self) {
+        #[cfg(windows)]
+        if let Some(client)=&self.desktop_ipc {client.activate_events();}
         if let Some(start) = &self.host_event_start { start.notify_one(); }
     }
     /// Detach IPC only. This does not stop the host or its native process.
@@ -236,6 +265,8 @@ fn spawn(
             .await;
     });
     Rpc {
+        #[cfg(windows)]
+        desktop_ipc: None,
         tx,
         response_tx: None,
         host_stop: None,
@@ -251,6 +282,8 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         bail!("Invalid runtime descriptor")
     };
     let v: Value = serde_json::from_slice(&bytes)?;
+    if v.get("proxyProcess").and_then(|p|serde_json::from_value::<NativeProcess>(p.clone()).ok())
+        .is_some_and(|p|p.terminated()) {bail!("Desktop proxy exited")}
     let runtime_id = v["runtimeId"].as_str().context("runtime ID")?.to_owned();
     let port = u16::try_from(v["port"].as_u64().context("port")?)?;
     let stream = tokio::time::timeout(
@@ -271,7 +304,8 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         connection_id.clone(),
         events,
     );
-    let status = rpc.call("pocket/status", json!({})).await?;
+    let status = tokio::time::timeout(Duration::from_secs(3), rpc.call("pocket/status", json!({})))
+        .await.context("Desktop registration timed out")??;
     if status["runtimeId"].as_str() != Some(runtime_id.as_str()) {
         bail!("Desktop runtime identity mismatch");
     }
@@ -290,7 +324,7 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
     // Ready notifications and discovery refresh this initial status in the broker.
     let capabilities = status
         .get("nativeCapabilities")
-        .filter(|_| status["initialized"] == true && status["schemaState"] == "ready" && status["schemaPending"] != true)
+        .filter(|_| !desktop_role(&status).is_auxiliary() && status["initialized"] == true && status["schemaState"] == "ready" && status["schemaPending"] != true)
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let version = status["nativeVersion"]
@@ -298,7 +332,8 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
         .unwrap_or("unknown")
         .to_owned();
     Ok(Connected {
-        role: NativeRole::Desktop,
+        initial_status: Some(status.clone()),
+        role: desktop_role(&status),
         bridge_version: status["bridgeVersion"].as_str().map(str::to_owned),
         capabilities,
         rpc,
@@ -368,6 +403,7 @@ pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Conne
     );
     rpc.capability_failed = capability_failed;
     Ok(Connected {
+        initial_status: None,
         role: NativeRole::CliDaemon,
         bridge_version: None,
         capabilities,
@@ -450,6 +486,7 @@ pub(crate) mod test_peer {
         let (read, write) = server.into_split();
         (
             Connected {
+                initial_status: None,
                 role: if source == "desktop" { NativeRole::Desktop } else { NativeRole::CliDaemon },
                 bridge_version: Some(env!("CARGO_PKG_VERSION").into()),
                 capabilities: crate::capabilities::Capabilities::from_schema(

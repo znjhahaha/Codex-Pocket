@@ -5,6 +5,7 @@ use crate::protocol::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{io::Read, path::Path, time::Duration};
 use tokio::{
@@ -15,6 +16,55 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
+
+pub const ANSWER_EVIDENCE_PAGE_SIZE: usize = 64;
+
+/// Cold, payload-free terminal evidence. `completed` is not semantic success.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnswerEvidence {
+    pub generation: String,
+    pub request_id: Value,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnswerEvidencePage {
+    pub schema: u32,
+    pub namespace: String,
+    pub runtime_id: String,
+    pub generation: String,
+    pub snapshot_digest: String,
+    pub offset: usize,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub records: Vec<AnswerEvidence>,
+}
+
+impl AnswerEvidencePage {
+    pub fn validate(&self, runtime: &str, generation: &str, digest: &str, offset: usize) -> Result<()> {
+        ensure!(self.schema == 1 && self.namespace == "answer" && self.runtime_id == runtime
+            && self.generation == generation && self.snapshot_digest == digest
+            && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Answer evidence identity mismatch");
+        ensure!(self.offset == offset && self.total <= crate::protocol::MAX_RECOVERY_RECORDS
+            && offset <= self.total, "Answer evidence pagination invalid");
+        let count = (self.total - offset).min(ANSWER_EVIDENCE_PAGE_SIZE);
+        let end = offset + count;
+        ensure!(self.records.len() == count && self.next_offset == (end < self.total).then_some(end),
+            "Answer evidence page incomplete");
+        let mut seen = std::collections::BTreeSet::new();
+        for record in &self.records {
+            ensure!(!record.generation.is_empty() && record.generation.len() <= 256
+                && !record.generation.contains('\0'), "Answer evidence generation invalid");
+            let id = key(&record.request_id).context("Answer evidence request identity invalid")?;
+            ensure!(!id.contains('\0') && seen.insert((record.generation.clone(), id)),
+                "Answer evidence identity repeated");
+        }
+        Ok(())
+    }
+}
 
 pub enum Discovery {
     Missing,
@@ -191,6 +241,30 @@ impl HostClient {
         )
     }
 
+    /// Native answers have a separate ID namespace from broker commands.
+    /// Unsupported legacy Hosts fail closed; neither command receipts nor
+    /// aggregate recovery counters establish whether an answer was written.
+    pub async fn answer_receipt(&mut self, id: Value) -> Result<Receipt> {
+        ensure!(key(&id).is_some(), "Invalid native request ID");
+        let value = self.control("host/answer/receipt", json!({
+            "generation":self.descriptor.generation,"requestId":id,
+        })).await.context("Authoritative answer receipt unavailable")?;
+        decode_answer_receipt(value, &id, &self.descriptor.generation)
+    }
+
+    /// Enumerate all retained answer identities, pinned to one recovery snapshot.
+    /// Legacy Hosts fail closed; a command receipt is never an answer substitute.
+    pub async fn answer_evidence(&mut self, offset: usize, snapshot_digest: &str) -> Result<AnswerEvidencePage> {
+        ensure!(offset <= crate::protocol::MAX_RECOVERY_RECORDS && snapshot_digest.len() == 64
+            && snapshot_digest.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid answer evidence request");
+        let value = self.control("host/answer/evidence", json!({"generation":self.descriptor.generation,
+            "offset":offset,"snapshotDigest":snapshot_digest})).await
+            .context("Authoritative answer evidence unavailable")?;
+        let page: AnswerEvidencePage = decode_reply(value)?;
+        page.validate(&self.descriptor.runtime_id, &self.descriptor.generation, snapshot_digest, offset)?;
+        Ok(page)
+    }
+
     /// Response must contain exactly one of result/error. Only a live pending native ID is accepted.
     pub async fn respond(&mut self, request_id: Value, response: Value) -> Result<Receipt> {
         ensure!(key(&request_id).is_some(), "Invalid native request ID");
@@ -241,6 +315,10 @@ impl HostClient {
             while let Some(value) = transport.incoming.recv().await {
                 if value["id"] == id {
                     if value.get("error").is_some() {
+                        if frame["method"]=="host/request" && value["error"]["code"]=="reconciliation_required"
+                            && value["error"]["notDispatched"]==true {
+                            return Err(AdmissionRejected.into());
+                        }
                         bail!("Host request refused");
                     }
                     if native_id.is_some() {
@@ -277,6 +355,29 @@ impl HostClient {
 
 fn decode_reply<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| anyhow::anyhow!("Invalid host reply"))
+}
+
+/// Authenticated host/request reply proved refusal before durable reservation
+/// and before native write. Timeouts, old Host errors and native errors are not this proof.
+#[derive(Debug)]
+pub struct AdmissionRejected;
+impl std::fmt::Display for AdmissionRejected {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Runtime scope requires reconciliation before dispatch")}
+}
+impl std::error::Error for AdmissionRejected {}
+
+fn decode_answer_receipt(value: Value, id: &Value, generation: &str) -> Result<Receipt> {
+    ensure!(value["namespace"] == "answer" && value.get("requestId") == Some(id),
+        "Answer receipt namespace or identity mismatch");
+    let receipt: Receipt = decode_reply(value)?;
+    ensure!(receipt.generation == generation, "Answer receipt generation mismatch");
+    ensure!(matches!(receipt.state.as_str(), "missing" | "unknown" | "completed"),
+        "Invalid answer receipt state");
+    if let Some(response) = &receipt.response {
+        ensure!(receipt.state == "completed" && response.get("id") == Some(id),
+            "Invalid answer receipt response");
+    }
+    Ok(receipt)
 }
 
 pub fn load_descriptor(path: &Path, config_home: &Path) -> Result<Descriptor> {
@@ -433,6 +534,129 @@ pub fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_refusal_requires_host_request_outer_identity_and_explicit_pre_dispatch_proof() {
+        for (method, reply, rejected, success) in [
+            ("host/request", json!({"id":"outer","error":{"code":"reconciliation_required","notDispatched":true}}), true, false),
+            ("host/request", json!({"id":"outer","error":{"code":"reconciliation_required"}}), false, false),
+            ("host/status", json!({"id":"outer","error":{"code":"reconciliation_required","notDispatched":true}}), false, false),
+            ("host/request", json!({"id":"native","error":{"code":"reconciliation_required","notDispatched":true}}), false, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            let (_read, write) = socket.into_split();
+            let (send, incoming) = mpsc::channel(1);
+            let reader = tokio::spawn(async move {
+                let mut peer = BufReader::new(peer);
+                let request = read_frame(&mut peer).await.unwrap().unwrap();
+                assert_eq!(request["id"], "outer");
+                send.send(reply).await.unwrap();
+            });
+            let (events, _) = broadcast::channel(1);
+            let mut client = HostClient {
+                descriptor: Descriptor {protocol: PROTOCOL, runtime_id:"fixture".into(), generation:uuid::Uuid::new_v4().to_string(),
+                    pid:1,native_pid:2,native_process:None,host_process:None,port:listener.local_addr().unwrap().port(),
+                    token:"a".repeat(64),config_home:std::env::temp_dir(),source:"cli".into()},
+                transport:Some(Transport {write,incoming,reader:reader.abort_handle()}),events,
+            };
+            let result = client.exchange("outer", &json!({"id":"outer","method":method}), Some(&json!("native"))).await;
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(result.as_ref().err().is_some_and(|e|e.downcast_ref::<AdmissionRejected>().is_some()), rejected);
+            reader.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn scoped_admission_is_optional_and_does_not_change_legacy_capabilities() {
+        let legacy = json!({"protocol":PROTOCOL,"runtimeId":"r","generation":"g","pid":1,"nativePid":2,
+            "initialized":true,"capabilities":crate::protocol::Capabilities::default(),"activeTurns":0,
+            "pendingRequests":0,"reconciliationRequired":true});
+        let old: Health = decode_reply(legacy.clone()).unwrap();
+        assert_eq!(old.scoped_admission, 0);
+        let mut next = legacy;
+        next["scopedAdmission"] = json!(1);
+        let next: Health = decode_reply(next).unwrap();
+        assert_eq!(next.scoped_admission, 1);
+        assert_eq!(next.capabilities, old.capabilities);
+        assert!(next.reconciliation_required);
+    }
+
+    #[test]
+    fn answer_evidence_decoder_requires_exact_namespace_snapshot_and_complete_page() {
+        let digest="a".repeat(64);
+        let valid=json!({"schema":1,"namespace":"answer","runtimeId":"runtime","generation":"current",
+            "snapshotDigest":digest,"offset":0,"total":2,"nextOffset":null,"records":[
+                {"generation":"original","requestId":0,"completed":true},
+                {"generation":"original","requestId":"0","completed":false}]});
+        let page:AnswerEvidencePage=decode_reply(valid.clone()).unwrap();
+        page.validate("runtime","current",&digest,0).unwrap();
+        for fault in ["namespace","runtime","generation","digest","offset","total","partial","next","duplicate","invalid-id","invalid-generation","payload","missing-completed"] {
+            let mut bad=valid.clone();
+            match fault {
+                "namespace"=>bad["namespace"]=json!("command"),
+                "runtime"=>bad["runtimeId"]=json!("foreign"),
+                "generation"=>bad["generation"]=json!("original"),
+                "digest"=>bad["snapshotDigest"]=json!("b".repeat(64)),
+                "offset"=>bad["offset"]=json!(1),
+                "total"=>bad["total"]=json!(8193),
+                "partial"=>{bad["records"].as_array_mut().unwrap().pop();},
+                "next"=>bad["nextOffset"]=json!(2),
+                "duplicate"=>bad["records"][1]=bad["records"][0].clone(),
+                "invalid-id"=>bad["records"][0]["requestId"]=json!({"id":0}),
+                "invalid-generation"=>bad["records"][0]["generation"]=json!(""),
+                "payload"=>bad["records"][0]["result"]=json!("private"),
+                "missing-completed"=>{bad["records"][0].as_object_mut().unwrap().remove("completed");},
+                _=>unreachable!(),
+            }
+            assert!(decode_reply::<AnswerEvidencePage>(bad).and_then(|p|p.validate("runtime","current",&digest,0)).is_err(),"accepted {fault}");
+        }
+    }
+
+    #[test]
+    fn answer_evidence_decoder_enforces_page_continuity_and_shared_capacity() {
+        let digest="a".repeat(64);
+        let mut page=AnswerEvidencePage {schema:1,namespace:"answer".into(),runtime_id:"r".into(),generation:"g".into(),
+            snapshot_digest:digest.clone(),offset:0,total:65,next_offset:Some(64),records:(0..64).map(|id|AnswerEvidence {
+                generation:"old".into(),request_id:json!(id),completed:true}).collect()};
+        page.validate("r","g",&digest,0).unwrap();
+        page.offset=64;page.next_offset=None;page.records=vec![AnswerEvidence {generation:"old".into(),request_id:json!(64),completed:true}];
+        page.validate("r","g",&digest,64).unwrap();
+        assert!(page.validate("r","g",&digest,63).is_err());
+        page.records.clear();
+        assert!(page.validate("r","g",&digest,64).is_err());
+    }
+
+    #[test]
+    fn answer_receipt_decoder_rejects_ambiguous_namespace_and_identity() {
+        let valid = json!({"namespace":"answer","requestId":0,"generation":"generation",
+            "state":"completed","response":{"id":0,"result":{"written":true}}});
+        assert_eq!(decode_answer_receipt(valid.clone(), &json!(0), "generation").unwrap().state, "completed");
+        for (field, value) in [
+            ("namespace", Value::Null), ("namespace", json!("command")),
+            ("requestId", json!("0")), ("generation", json!("other")),
+            ("state", json!("submitted")),
+            ("response", json!({"id":"0","result":{"written":true}})),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(decode_answer_receipt(invalid, &json!(0), "generation").is_err(), "{field}");
+        }
+        let mut absent = valid.clone();
+        absent.as_object_mut().unwrap().remove("requestId");
+        assert!(decode_answer_receipt(absent, &json!(0), "generation").is_err());
+        let mut missing = valid.clone();
+        missing["state"] = json!("missing");
+        assert!(decode_answer_receipt(missing.clone(), &json!(0), "generation").is_err());
+        missing["response"] = Value::Null;
+        assert_eq!(decode_answer_receipt(missing.clone(), &json!(0), "generation").unwrap().state, "missing");
+        missing["state"] = json!("unknown");
+        assert_eq!(decode_answer_receipt(missing.clone(), &json!(0), "generation").unwrap().state, "unknown");
+        // Cold completed tombstones preserve the fence; they do not prove written=true.
+        missing["state"] = json!("completed");
+        assert!(decode_answer_receipt(missing, &json!(0), "generation").unwrap().response.is_none());
+    }
 
     #[cfg(windows)]
     #[test]

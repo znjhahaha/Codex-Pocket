@@ -15,8 +15,14 @@ param(
     [string]$RepairStep,
     [string]$OperationId,
     [string]$ExpectedGeneration,
-    [switch]$CheckRepair
+    [switch]$CheckRepair,
+    [ValidateSet('Inventory','Launch')][string]$NativeUpdateMode,
+    [string]$InstallRoot,
+    [string]$UpdateOfferPath,
+    [string]$TrustedUpdatePublicKey
 )
+$installerArguments=@{}
+foreach($entry in $PSBoundParameters.GetEnumerator()){$installerArguments[$entry.Key]=$entry.Value}
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 # Read-only Setup probe, before identity creation or OS integration.
 if ($CheckWebViewOnly -and -not ($PSBoundParameters.ContainsKey('RepairStep') -or $PSBoundParameters.ContainsKey('OperationId') -or $PSBoundParameters.ContainsKey('ExpectedGeneration') -or $PSBoundParameters.ContainsKey('CheckRepair'))) { if (Test-PocketWebView2) { exit 0 }; exit 42 }
@@ -171,7 +177,9 @@ function Copy-PocketState([string]$Source, [string]$Destination) {
         # Failed copies retain their private staging directory for owner recovery.
     }
 }
-. (Join-Path $PSScriptRoot 'windows-startup.ps1')
+# Dot-sourced script parameters share this scope. Preserve the explicit root
+# and use the original installer argument map for all entry validation.
+. (Join-Path $PSScriptRoot 'windows-startup.ps1') -InstallRoot $InstallRoot
 
 function New-PocketShortcutBytes([string]$Temporary,[string]$Launcher,[string]$Mode,[string]$IconPath) {
     Invoke-PocketInstallStep 'shortcut' 'Initialize-PocketShellLink' { Initialize-PocketShellLink } | Out-Null
@@ -189,6 +197,11 @@ function Test-PocketShortcutTarget([string]$Path,[string]$Launcher,[string]$Mode
     Initialize-PocketShellLink
     try { $value=[PocketShellLink]::Read($Path); return $value[0] -eq $Launcher -and $value[1] -eq $Mode }
     catch { return $false } # An unreadable or user-modified link is never deleted as ours.
+}
+function Test-PocketManagerShortcut([string]$Path,[string]$Root) {
+    $local=Get-PocketLocalAppData
+    if($Root -ne (Join-Path $local 'CodexPocket')){return $false}
+    return Test-PocketShortcutTarget $Path (Join-Path $local 'CodexPocketManager\Codex Pocket.exe') ''
 }
 function Get-PocketBackup([string]$Path) {
     $hash = Get-PocketFileHash $Path
@@ -353,9 +366,32 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 public sealed class PocketInstallIdentity {
-    public int pid; public ulong createdAt; public string executable;
+    public int pid; public ulong createdAt; public string executable; public int parentPid;
+}
+public sealed class PocketInstallRow {
+    public int ProcessId; public int ParentProcessId; public string Name,ExecutablePath,CommandLine;
 }
 public static class PocketInstallProcess {
+    [DllImport("kernel32.dll",EntryPoint="GetSystemDirectoryW",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetSystemDirectory(StringBuilder path,uint count);
+    public static string ConsoleHostPath() {
+        var path=new StringBuilder(32768);uint count=GetSystemDirectory(path,(uint)path.Capacity);
+        if(count==0 || count>=path.Capacity) throw new Win32Exception();
+        return System.IO.Path.Combine(path.ToString(),"conhost.exe");
+    }
+    [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct ProcessEntry {
+        public uint size,usage,pid; public UIntPtr heap; public uint module,threads,parent;
+        public int priority; public uint flags;
+        [MarshalAs(UnmanagedType.ByValTStr,SizeConst=260)] public string image;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct UnicodeString {public ushort length,maximum;public IntPtr buffer;}
+    [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags,uint pid);
+    [DllImport("kernel32.dll",EntryPoint="Process32FirstW",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ProcessFirst(IntPtr snapshot,ref ProcessEntry entry);
+    [DllImport("kernel32.dll",EntryPoint="Process32NextW",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ProcessNext(IntPtr snapshot,ref ProcessEntry entry);
+    [DllImport("ntdll.dll",EntryPoint="NtQueryInformationProcess")] static extern int QueryProcessBuffer(IntPtr h,int kind,IntPtr data,int size,out int returned);
+    [StructLayout(LayoutKind.Sequential)] struct BasicInformation {
+        public IntPtr reserved1,peb,reserved2,reserved3,uniquePid,parentPid;
+    }
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h,int kind,out BasicInformation info,int size,out int returned);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint rights,bool inherit,int pid);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint ms);
@@ -366,6 +402,44 @@ public static class PocketInstallProcess {
     [DllImport("shell32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CommandLineToArgvW(string line,out int count);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
     [DllImport("iphlpapi.dll")] static extern uint GetExtendedTcpTable(IntPtr table,ref uint size,bool ordered,int family,int tableClass,uint reserved);
+    static string CommandLine(IntPtr h) {
+        int needed;QueryProcessBuffer(h,60,IntPtr.Zero,0,out needed);
+        if(needed<Marshal.SizeOf(typeof(UnicodeString)) || needed>131072) return null;
+        IntPtr data=Marshal.AllocHGlobal(needed);
+        try {
+            int returned;if(QueryProcessBuffer(h,60,data,needed,out returned)!=0 || returned>needed) return null;
+            var text=(UnicodeString)Marshal.PtrToStructure(data,typeof(UnicodeString));
+            long offset=text.buffer.ToInt64()-data.ToInt64();
+            if(text.length%2!=0 || text.length>text.maximum || offset<Marshal.SizeOf(typeof(UnicodeString)) || offset>needed-text.length) return null;
+            return Marshal.PtrToStringUni(text.buffer,text.length/2);
+        } finally {Marshal.FreeHGlobal(data);}
+    }
+    // Win32 enumeration avoids dependence on WMI availability. This is discovery
+    // only: every selected member is still independently captured and hashed.
+    public static PocketInstallRow[] Snapshot() {
+        var result=new System.Collections.Generic.List<PocketInstallRow>();
+        IntPtr snapshot=CreateToolhelp32Snapshot(2,0);
+        if(snapshot==new IntPtr(-1)) throw new Win32Exception();
+        try {
+            var entry=new ProcessEntry();entry.size=(uint)Marshal.SizeOf(typeof(ProcessEntry));
+            bool found=ProcessFirst(snapshot,ref entry);
+            if(!found && Marshal.GetLastWin32Error()!=18) throw new Win32Exception();
+            while(found) {
+                if(result.Count>=32768) throw new InvalidOperationException("Process snapshot exceeds limit");
+                var row=new PocketInstallRow{ProcessId=checked((int)entry.pid),ParentProcessId=checked((int)entry.parent),Name=entry.image};
+                IntPtr h=OpenProcess(0x1000|0x100000,false,row.ProcessId);
+                if(h!=IntPtr.Zero) {
+                    try {
+                        var path=new StringBuilder(32768);int size=path.Capacity;
+                        if(QueryFullProcessImageName(h,0,path,ref size)) {row.ExecutablePath=path.ToString();row.CommandLine=CommandLine(h);}
+                    } finally {CloseHandle(h);}
+                }
+                result.Add(row);found=ProcessNext(snapshot,ref entry);
+                if(!found && Marshal.GetLastWin32Error()!=18) throw new Win32Exception();
+            }
+            return result.ToArray();
+        } finally {CloseHandle(snapshot);}
+    }
     static PocketInstallIdentity Read(IntPtr h,int pid) {
         uint presence=WaitForSingleObject(h,0);
         if(presence==0) return null;
@@ -382,8 +456,11 @@ public static class PocketInstallProcess {
         if(!GetProcessTimes(h,out created,out exit,out kernel,out user)) throw new Win32Exception();
         var path=new StringBuilder(32768);int size=path.Capacity;
         if(!QueryFullProcessImageName(h,0,path,ref size)) throw new Win32Exception();
+        BasicInformation basic;int returned;
+        if(NtQueryInformationProcess(h,0,out basic,Marshal.SizeOf(typeof(BasicInformation)),out returned)!=0 || returned!=Marshal.SizeOf(typeof(BasicInformation)))
+            throw new InvalidOperationException("Pocket process parent identity unavailable");
         if(WaitForSingleObject(h,0)!=258) throw new InvalidOperationException("Pocket process changed during capture");
-        return new PocketInstallIdentity {pid=pid,createdAt=(ulong)created,executable=path.ToString()};
+        return new PocketInstallIdentity {pid=pid,createdAt=(ulong)created,executable=path.ToString(),parentPid=checked((int)basic.parentPid.ToInt64())};
     }
     public static PocketInstallIdentity Capture(int pid) {
         if(pid<=0) throw new InvalidOperationException("Invalid Pocket PID");
@@ -445,7 +522,8 @@ function Stop-PocketInstallProcess($Identity) {
     if ((Get-PocketFileHash $Identity.executable) -ne $Identity.sha256) { throw 'Pocket process image changed; refusing termination.' }
     [PocketInstallProcess]::Stop($Identity.pid,$Identity.createdAt,$Identity.executable)
 }
-function Get-PocketInstallProcesses { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
+function Get-PocketInstallProcesses { Initialize-PocketInstallProcessApi; return @([PocketInstallProcess]::Snapshot()) }
+function Get-PocketConsoleHostPath { Initialize-PocketInstallProcessApi; return [PocketInstallProcess]::ConsoleHostPath() }
 function Get-PocketInstallControlOwner([string]$StateDirectory) {
     $endpoint=Read-PocketRepairJson (Join-Path $StateDirectory 'control.json') 4096
     if($endpoint.protocol -ne 1){throw 'Invalid legacy control endpoint.'}
@@ -534,7 +612,7 @@ function Archive-PocketInstallShadowLauncher($Lifecycle,[string]$LifecyclePath) 
     }
     $alias.state='archived';Write-PocketRepairDurableJson $LifecyclePath $Lifecycle
 }
-function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
+function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory,[switch]$InspectOnly) {
     $prefix=(Join-Path $InstallRoot 'bin')+'\'
     $rows=@(Get-PocketInstallProcesses)
     $group=@();$verified=@{}
@@ -570,6 +648,7 @@ function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
         $identity=Get-PocketInstallProcessIdentity ([int]$row.ProcessId)
         if ($null -eq $identity) { continue }
         if ($identity.executable -ne $path) { throw 'Pocket process image changed during inventory.' }
+        if(-not $row.CommandLine){throw 'Pocket process command line unavailable; refusing incomplete inventory.'}
         $args=Get-PocketInstallArguments $row.CommandLine
         if ($name -in @('pocket-supervisor.exe','pocket-agent.exe','pocket-runtime-host.exe','pocket-upgrade.exe')) {
             $indices=@(for($i=0;$i -lt $args.Count;$i++){if($args[$i] -eq '--state'){$i}})
@@ -595,7 +674,9 @@ function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
     }
     $package=Get-PocketDesktopPackage
     $desktopPaths=@((Join-Path $package.InstallLocation 'app\Codex.exe'),(Join-Path $package.InstallLocation 'app\ChatGPT.exe'))
-    foreach($seed in @($group | Where-Object {$_.name -in @('pocket-bridge.exe','pocket-launcher.exe')})) {
+    # A verified bridge can connect a desktop to its native runtime. A launcher
+    # can also be servicing the UI or supervisor below an unrelated Codex shell.
+    foreach($seed in @($group | Where-Object {$_.name -eq 'pocket-bridge.exe'})) {
         $parent=$seed.parentPid;$childCreated=$seed.createdAt;$seen=@{}
         for($depth=0;$depth -lt 12 -and $parent -gt 0 -and -not $seen.ContainsKey($parent);$depth++) {
             $seen[$parent]=$true;$ancestors=@($rows | Where-Object {$_.ProcessId -eq $parent})
@@ -616,6 +697,8 @@ function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
                 }
                 break
             }
+            # Only walk through a launcher already verified for this installation.
+            if (-not @($group | Where-Object {$_.name -eq 'pocket-launcher.exe' -and $_.pid -eq $parent -and $_.createdAt -eq $ancestor.createdAt}).Count) { break }
             $childCreated=$ancestor.createdAt;$parent=[int]$row.ParentProcessId
         }
     }
@@ -635,7 +718,7 @@ function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
     # Killing an ancestor of this installer can cut off installation mid-write.
     # Setup is a separate process; a CLI invoked from Codex must be detached first.
     $selfRows=@($rows|Where-Object {$_.ProcessId -eq $PID})
-    if($selfRows.Count -eq 1) {
+    if($selfRows.Count -eq 1 -and -not $InspectOnly) {
         $parent=[int]$selfRows[0].ParentProcessId;$seen=@{}
         while($parent -gt 0 -and -not $seen.ContainsKey($parent)) {
             if(@($group|Where-Object {$_.pid -eq $parent}).Count -gt 0){throw 'detached_installer_required: updater is running under a process it must restart.'}
@@ -644,6 +727,81 @@ function Get-PocketInstallGroup([string]$InstallRoot,[string]$StateDirectory) {
         }
     }
     return ,$group
+}
+function Get-PocketNativeInventory([string]$InstallRoot,[string]$StateDirectory) {
+    $group=Get-PocketInstallGroup $InstallRoot $StateDirectory -InspectOnly
+    $desktops=@($group|Where-Object {$_.name -eq 'associated-desktop'})
+    $bridges=@($group|Where-Object {$_.name -eq 'pocket-bridge.exe'})
+    if($desktops.Count -eq 0 -and $bridges.Count -eq 0){
+        $package=Get-PocketDesktopPackage
+        $paths=@((Join-Path $package.InstallLocation 'app\Codex.exe'),(Join-Path $package.InstallLocation 'app\ChatGPT.exe'))
+        if(@(Get-PocketInstallProcesses|Where-Object {$_.ExecutablePath -in $paths}).Count){throw 'desktop_startup_or_unmanaged'}
+        return @{group=@();descriptors=@()}
+    }
+    # One exact desktop may own multiple native connections. Every Bridge must
+    # be included; an unrelated desktop, detached Bridge or Host is not ours.
+    if($desktops.Count -ne 1 -or $bridges.Count -lt 1 -or $bridges.Count -gt 16){throw 'native_tree_ambiguous'}
+    $rows=@(Get-PocketInstallProcesses);$ids=@{};$parents=@{}
+    $rootIdentity=Get-PocketInstallProcessIdentity ([int]$desktops[0].pid)
+    if($null -eq $rootIdentity -or $rootIdentity.createdAt -ne $desktops[0].createdAt -or $rootIdentity.executable -ne $desktops[0].executable){throw 'native_tree_changed'}
+    $ids[[int]$rootIdentity.pid]=$rootIdentity
+    do {
+        $added=$false
+        foreach($row in $rows){
+            $childPid=[int]$row.ProcessId;$parentPid=[int]$row.ParentProcessId
+            if(-not $ids.ContainsKey($parentPid) -or $ids.ContainsKey($childPid)){continue}
+            $parent=$ids[$parentPid];$child=Get-PocketInstallProcessIdentity $childPid
+            # ParentProcessId alone may name a reused PID. Bind this edge to
+            # current handle identities and require strict per-edge birth order.
+            if($null -eq $child -or $child.parentPid -ne $parentPid -or $child.executable -ne $row.ExecutablePath -or $child.createdAt -le $parent.createdAt){throw 'native_parent_identity_unverified'}
+            $ids[$childPid]=$child;$parents[$childPid]=$parent;$added=$true
+            if($ids.Count -gt 128){throw 'native_tree_limit'}
+        }
+    }while($added)
+    if($ids.Count -gt 128){throw 'native_tree_limit'}
+    foreach($bridge in $bridges){if(-not $ids.ContainsKey([int]$bridge.pid)){throw 'native_parent_unverified'}}
+    $tree=@($group|Where-Object {$ids.ContainsKey([int]$_.pid)})
+    foreach($member in $tree){
+        $identity=$ids[[int]$member.pid]
+        if($identity.createdAt -ne $member.createdAt -or $identity.executable -ne $member.executable){throw 'native_tree_changed'}
+    }
+    foreach($row in $rows|Where-Object {$ids.ContainsKey([int]$_.ProcessId)}){
+        if(@($tree|Where-Object {$_.pid -eq $row.ProcessId}).Count){continue}
+        $identity=$ids[[int]$row.ProcessId]
+        if($identity.executable -eq (Get-PocketConsoleHostPath)) {
+            $parent=@($tree|Where-Object {$_.pid -eq $identity.parentPid -and $_.name -in @('associated-desktop','associated-native','desktop-child','pocket-bridge.exe','pocket-launcher.exe')})
+            if($parent.Count -ne 1){throw 'native_unfenced_console_parent'}
+            Assert-PocketUnredirectedPath $identity.executable
+            $tree+=@{pid=$identity.pid;createdAt=$identity.createdAt;executable=$identity.executable;sha256=(Get-PocketFileHash $identity.executable);name='console-host';parentPid=$identity.parentPid}
+            continue
+        }
+        if($identity.executable -ne $desktops[0].executable){throw 'native_unfenced_descendant'}
+        $tree+=@{pid=$identity.pid;createdAt=$identity.createdAt;executable=$identity.executable;sha256=(Get-PocketFileHash $identity.executable);name='desktop-child';parentPid=[int]$row.ParentProcessId}
+    }
+    if(@($tree|Where-Object {$_.name -notin @('associated-desktop','associated-native','desktop-child','pocket-bridge.exe','pocket-launcher.exe','console-host')}).Count){throw 'native_unfenced_descendant'}
+    foreach($member in $tree){
+        $identity=$ids[[int]$member.pid];$actual=Get-PocketInstallProcessIdentity ([int]$member.pid)
+        if($null -eq $actual -or $actual.createdAt -ne $identity.createdAt -or $actual.executable -ne $identity.executable -or $actual.parentPid -ne $identity.parentPid){throw 'native_tree_changed'}
+        if($parents.ContainsKey([int]$member.pid)){
+            $parent=$parents[[int]$member.pid]
+            Set-PocketProperty $member 'parentPid' $parent.pid
+            Set-PocketProperty $member 'parentIdentity' @{pid=$parent.pid;createdAt=$parent.createdAt;executable=$parent.executable}
+        }
+    }
+    $natives=@($tree|Where-Object {$_.name -eq 'associated-native'})
+    if($natives.Count -ne $bridges.Count){throw 'native_connection_incomplete'}
+    foreach($bridge in $bridges){
+        if(@($natives|Where-Object {$_.parentPid -eq $bridge.pid}).Count -ne 1){throw 'native_connection_ambiguous'}
+    }
+    $directory=Join-Path $InstallRoot 'runtimes';Assert-PocketUnredirectedPath $directory
+    $descriptors=@(if([IO.Directory]::Exists($directory)){foreach($file in Get-ChildItem -LiteralPath $directory -File -Filter '*.json'){
+        $d=Read-PocketRepairJson $file.FullName 16384
+        if(@($bridges|Where-Object {$_.pid -eq $d.pid}).Count){$file.FullName}
+    }})
+    foreach($bridge in $bridges){
+        if(@($descriptors|Where-Object {(Read-PocketRepairJson $_ 16384).pid -eq $bridge.pid}).Count -ne 1){throw 'native_descriptor_missing_or_ambiguous'}
+    }
+    return @{group=$tree;descriptors=$descriptors}
 }
 function Assert-PocketInstallLocksFree([string]$InstallRoot,[string]$StateDirectory,$Group=@()) {
     $locks=@();$locked=@()
@@ -663,9 +821,10 @@ function Assert-PocketInstallLocksFree([string]$InstallRoot,[string]$StateDirect
     } finally {foreach($file in $locked){$file.Unlock(0,[long]::MaxValue)};foreach($file in $locks){$file.Dispose()}}
 }
 function Invoke-PocketInstallControl([string]$StateDirectory,[string]$Method,$Params=@{}) {
-    # Only authenticated status and exact cancellation. No CLI fallback, model
-    # requests, command replay, native thread/turn methods or handoff release.
-    if ($Method -notin @('status','routes/read','upgrade/cancel')) { throw 'Unsupported installer control method.' }
+    # Authenticated reads, exact cancellation and the bounded assistant recovery
+    # path below. Preparation is serialized by the broker and does not generate.
+    # No CLI fallback, native task replay, thread/turn calls or handoff release.
+    if ($Method -notin @('status','routes/read','upgrade/cancel','assistant/status','assistant/prepare')) { throw 'Unsupported installer control method.' }
     $path=Join-Path $StateDirectory 'control.json'
     Assert-PocketUnredirectedPath $path
     $endpoint=Read-PocketRepairJson $path 4096
@@ -794,6 +953,25 @@ function Assert-PocketLifecycleArchives($Prior) {
         if ($null -eq $archiveHash -and $null -eq $sourceHash) { throw 'Interrupted lifecycle lost its recovery evidence.' }
     }
 }
+function Test-PocketInstallerIdle($Health,[long]$Now=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) {
+    if((Get-PocketProperty $Health 'protocol' 0) -ne 1 -or (Get-PocketProperty $Health 'acceptingWrites' $false) -ne $true -or
+       (Get-PocketProperty $Health 'remoteControlProtocol' 0) -ne 1 -or (Get-PocketProperty $Health 'remoteEnabled' $null) -ne $false){return $false}
+    $activity=Get-PocketProperty $Health 'lifecycle' $null
+    if((Get-PocketProperty $activity 'idle' $false) -ne $true -or (Get-PocketProperty $activity 'nativeTasksPreserved' $false) -ne $true){return $false}
+    $updated=Get-PocketProperty $Health 'updatedAt' 0;$observed=Get-PocketProperty $activity 'observedAt' 0
+    foreach($stamp in @($updated,$observed)) {if(($stamp -isnot [int] -and $stamp -isnot [long] -and $stamp -isnot [uint64]) -or $stamp -le 0 -or $stamp -gt ($Now+2) -or ($Now-$stamp) -gt 10){return $false}}
+    if($observed -lt $updated){return $false}
+    foreach($field in @('activeTurns','pendingQuestions','pendingWrites','unknownOperations')) {
+        $count=Get-PocketProperty $activity $field $null
+        if(($count -isnot [int] -and $count -isnot [long] -and $count -isnot [uint64]) -or $count -ne 0){return $false}
+    }
+    return $true
+}
+function Set-PocketInstallerDeferred($Lifecycle,[string]$Path,[string]$Reason) {
+    $Lifecycle.phase='waiting_idle';$Lifecycle.nativeTasksPreserved=$true;$Lifecycle.nativeRestartRequired=$true;$Lifecycle.deferredReason=$Reason
+    Write-PocketRepairDurableJson $Path $Lifecycle
+    return $Lifecycle
+}
 function Enter-PocketInstallLifecycle([string]$InstallRoot,[string]$StateDirectory,$Saved) {
     $group=Get-PocketInstallGroup $InstallRoot $StateDirectory
     $agents=@($group | Where-Object {$_.name -eq 'pocket-agent.exe'})
@@ -811,7 +989,7 @@ function Enter-PocketInstallLifecycle([string]$InstallRoot,[string]$StateDirecto
     if ([IO.File]::Exists($path)) {
         $prior=Read-PocketRepairJson $path
         if ($prior.schema -ne 1 -or $prior.installRoot -ne $InstallRoot -or $prior.stateDirectory -ne $StateDirectory -or $prior.operationId -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$') { throw 'Invalid retained installer lifecycle.' }
-        if ($prior.phase -notin @('captured','cancelling','stopping','stopped','starting','verifying','verification_failed','install_failed','verified')) { throw 'Invalid retained lifecycle phase.' }
+        if ($prior.phase -notin @('captured','waiting_idle','cancelling','stopping','stopped','starting','verifying','verification_failed','install_failed','verified')) { throw 'Invalid retained lifecycle phase.' }
         Assert-PocketLifecycleArchives $prior
         $priorAlias=Get-PocketProperty $prior 'shadowLauncher' $null
         if ($null -ne $priorAlias) {
@@ -852,11 +1030,25 @@ function Enter-PocketInstallLifecycle([string]$InstallRoot,[string]$StateDirecto
         $lifecycle.recoveredFrom=@{operationId=$prior.operationId;phase=$prior.phase;sha256=$hash;archive=$archive}
     }
     Write-PocketRepairDurableJson $path $lifecycle
+    if($group.Count -gt 0) {
+        # Full Setup never closes native/bridge/Host sessions, even after an idle
+        # sample. Use the signed checkpoint updater or an explicit later close.
+        if(@($group | Where-Object {$_.name -in @('associated-desktop','associated-native','pocket-bridge.exe','pocket-runtime-host.exe')}).Count -gt 0){return Set-PocketInstallerDeferred $lifecycle $path 'native_restart_required'}
+        if(-not (Test-PocketInstallerIdle $health)){return Set-PocketInstallerDeferred $lifecycle $path 'runtime_idle_unverified'}
+    }
     Cancel-PocketInstallerHandoff $StateDirectory $health $group $lifecycle $path
+    if($group.Count -gt 0) {
+        $latest=Invoke-PocketInstallControl $StateDirectory 'status'
+        Get-PocketAuthenticatedInstallerAgent $latest @($group | Where-Object {$_.name -eq 'pocket-agent.exe'}) $StateDirectory | Out-Null
+        if(-not (Test-PocketInstallerIdle $latest)){return Set-PocketInstallerDeferred $lifecycle $path 'runtime_became_busy'}
+        $currentGroup=Get-PocketInstallGroup $InstallRoot $StateDirectory
+        if($currentGroup.Count -ne $group.Count -or @($currentGroup | Where-Object {$item=$_;@($group | Where-Object {$_.pid -eq $item.pid -and $_.createdAt -eq $item.createdAt -and $_.executable -eq $item.executable}).Count -ne 1}).Count -gt 0){return Set-PocketInstallerDeferred $lifecycle $path 'runtime_group_changed'}
+    }
     $lifecycle.phase='stopping';Write-PocketRepairDurableJson $path $lifecycle
-    # This restart may abort related native tasks. Durable unknown outcomes are
-    # retained and never replayed. Only captured identities are terminated.
-    foreach($name in @('associated-desktop','pocket-launcher.exe','pocket-upgrade.exe','pocket-supervisor.exe','pocket-desktop.exe','pocket-agent.exe','pocket-runtime-host.exe','pocket-bridge.exe','associated-native','cloudflared.exe')) {
+    $lifecycle.mode='idle_background_restart';$lifecycle.nativeTasksPreserved=$true;$lifecycle.restartDesktop=$false
+    # Admission is paused and both live samples proved idle. Native, bridge and
+    # Host groups were deferred above; only exact background identities remain.
+    foreach($name in @('pocket-launcher.exe','pocket-upgrade.exe','pocket-supervisor.exe','pocket-desktop.exe','pocket-agent.exe','cloudflared.exe')) {
         foreach($identity in @($group | Where-Object {$_.name -eq $name})) {
             Stop-PocketInstallProcess $identity
             $lifecycle.processesStopped++
@@ -881,11 +1073,19 @@ function Start-PocketInstalledSupervisor([string]$InstallRoot) {
     $child=[Diagnostics.Process]::Start($info)
     $child.Dispose()
 }
-function Start-PocketInstalledDesktop([string]$InstallRoot) {
+function Start-PocketInstalledDesktop([string]$InstallRoot,[string]$Launcher) {
     $info=[Diagnostics.ProcessStartInfo]::new()
-    $info.FileName=Join-Path $InstallRoot 'pocket-launcher.exe';$info.Arguments='--pocket-desktop'
+    $info.FileName=if($Launcher){$Launcher}else{Join-Path $InstallRoot 'pocket-launcher.exe'};$info.Arguments='--pocket-desktop'
     $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$InstallRoot
+    $info.EnvironmentVariables['POCKET_INSTALL_ROOT']=$InstallRoot
     $child=[Diagnostics.Process]::Start($info);$child.Dispose()
+}
+function Get-PocketNativeUpdateLauncher([string]$InstallRoot,[string]$ToolsDirectory) {
+    $tools=Get-PocketDirectoryPath $ToolsDirectory
+    $generation=Get-PocketFileHash (Join-Path $tools 'windows-manifest.json')
+    if($tools -cne (Join-Path $InstallRoot ('bin\'+$generation))){throw 'Native launcher tools generation changed'}
+    Test-PocketWindowsDirectory $tools | Out-Null
+    return Join-Path $tools 'pocket-launcher.exe'
 }
 function Start-PocketInstalledUi([string]$InstallRoot) {
     # Setup's finish page uses the same mode; the UI single-instance handler
@@ -895,8 +1095,32 @@ function Start-PocketInstalledUi([string]$InstallRoot) {
     $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$InstallRoot
     $child=[Diagnostics.Process]::Start($info);$child.Dispose()
 }
+function Invoke-PocketInstallerAssistantRecovery([string]$StateDirectory,$Diagnostics,[scriptblock]$BeforeDispatch=$null) {
+    # Called only after authenticating the helper's process/generation/admission.
+    # Native registry ownership checks remain in assistant/prepare. No helper
+    # restart and no replay of tasks or unknown operations occurs here.
+    $assistant=Invoke-PocketInstallControl $StateDirectory 'assistant/status'
+    if ((Get-PocketProperty $assistant 'ready' $false) -eq $true -and (Get-PocketProperty $assistant 'runtimeReady' $false) -eq $true -and (Get-PocketProperty $assistant 'reconciliationRequired' $false) -ne $true) { return $true }
+    $code=[string](Get-PocketProperty $assistant 'error' '')
+    # An authenticated, attached assistant may be waiting for its first user login.
+    if ($code -eq 'assistant_needs_login' -and (Get-PocketProperty $assistant 'runtimeReady' $false) -eq $true -and (Get-PocketProperty $assistant 'reconciliationRequired' $true) -eq $false) {
+        if ($null -ne $Diagnostics) { Set-PocketProperty $Diagnostics 'assistantAccess' 'needs_login' }
+        return $true
+    }
+    if ($code -ne 'assistant_runtime_start_failed' -or $null -eq $Diagnostics) { return $false }
+    $attempts=[int](Get-PocketProperty $Diagnostics 'assistantRecoveryAttempts' 0)
+    if ($attempts -ge 3) { return $false }
+    Set-PocketProperty $Diagnostics 'assistantRecoveryAttempts' ($attempts+1)
+    $id=[Guid]::NewGuid().ToString('D')
+    Set-PocketProperty $Diagnostics 'assistantRecoveryOperationId' $id
+    if($null -ne $BeforeDispatch){& $BeforeDispatch}
+    # Successful dispatch is still pending: a later authenticated status must
+    # prove both readiness stages before installation verification completes.
+    Invoke-PocketInstallControl $StateDirectory 'assistant/prepare' @{commandId=$id} | Out-Null
+    return $false
+}
 function Test-PocketInstalledRuntime([string]$InstallRoot,[string]$StateDirectory,[string]$Generation,[bool]$RequireDesktop=$false,[bool]$RequireUi=$false,$Diagnostics=$null) {
-    $group=Get-PocketInstallGroup $InstallRoot $StateDirectory
+    $group=Get-PocketInstallGroup $InstallRoot $StateDirectory -InspectOnly
     $supervisors=@($group | Where-Object {$_.name -eq 'pocket-supervisor.exe'})
     $agents=@($group | Where-Object {$_.name -eq 'pocket-agent.exe'})
     if ($supervisors.Count -ne 1 -or $agents.Count -ne 1 -or @($group | Where-Object {$null -ne $_.generation -and $_.generation -ne $Generation}).Count -ne 0) { throw 'Installed process generation not verified.' }
@@ -923,7 +1147,8 @@ function Test-PocketInstalledRuntime([string]$InstallRoot,[string]$StateDirector
     $assistantProfile=Join-Path $StateDirectory 'assistant\profile.json'
     Assert-PocketUnredirectedPath $assistantProfile
     if ([IO.File]::Exists($assistantProfile)) {
-        if ($null -ne $assistantError) { throw 'Assistant restoration not verified.' }
+        if ($null -ne $Diagnostics -and -not (Invoke-PocketInstallerAssistantRecovery $StateDirectory $Diagnostics {Write-PocketRepairDurableJson (Join-Path $InstallRoot 'installer-lifecycle.json') $Diagnostics})) { throw 'Assistant restoration not verified.' }
+        if ($null -eq $Diagnostics -and $null -ne $assistantError) { throw 'Assistant restoration not verified.' }
         $assistantRuntimes=@((Get-PocketProperty $health 'runtimes' @()) | Where-Object {
             (Get-PocketProperty $_ 'online' $false) -eq $true -and (Get-PocketProperty (Get-PocketProperty $_ 'role' $null) 'kind' '') -eq 'managedHost'
         })
@@ -1079,7 +1304,7 @@ function Assert-PocketRepairScope($Journal,[string]$Manifest,[string[]]$Links,[s
     foreach($snapshot in @($Journal.before,$Journal.after)){
         if($null -eq $snapshot.manifest.bytes -or ([Convert]::FromBase64String($snapshot.manifest.bytes)).Length -gt 1MB){throw 'Repair record exceeds the stable launcher limit.'}
     }
-    if($Journal.before.cli -cne $Journal.after.cli -or $Journal.before.cliKind -cne $Journal.after.cliKind -or $Journal.before.cli -cne $Launcher -or $Journal.before.cliKind -cne 'String'){throw 'Repair cannot change CLI environment.'}
+    if($Journal.before.cli -cne $Journal.after.cli -or $Journal.before.cliKind -cne $Journal.after.cliKind){throw 'Repair cannot change CLI environment.'}
     for($i=0;$i -lt 3;$i++){
         if($Step -cne ('shortcut_'+$i) -and -not (Test-PocketRepairValueEqual $Journal.before.links[$i] $Journal.after.links[$i])){throw 'Repair journal contains another shortcut mutation.'}
     }
@@ -1091,6 +1316,7 @@ function Assert-PocketRepairScope($Journal,[string]$Manifest,[string[]]$Links,[s
             $record.bridge -cne $Launcher -or $record.installRoot -cne [IO.Path]::GetDirectoryName($Manifest) -or $record.coreInstalled -ne $true -or
             $record.shortcuts.Count -ne 3 -or $record.integration.shortcuts.Count -ne 3){throw 'Repair journal has an invalid committed core.'}
     }
+    if(-not (Test-PocketRepairCliSnapshot $Journal.before $before)){throw 'Repair CLI environment differs from the committed runtime setting.'}
     # Derive the only permitted after-record from the before-record. No generic
     # restoration is authorized until every other field and integration is equal.
     if($Step -eq 'startup'){
@@ -1160,7 +1386,7 @@ function Assert-PocketRepairInstalled($Record,$Context,[string]$Generation,[Coll
     if($state -cne $Record.stateDirectory -or ($state+'\').StartsWith((Join-Path $root 'bin')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Invalid installed state path.'}
     Assert-PocketUnredirectedPath $state
     Assert-PocketInitializedState $state
-    if((Get-PocketUserCliPath) -cne $launcher -or (Get-PocketUserCliKind) -cne 'String'){throw 'Current CLI environment is not the committed launcher.'}
+    if(-not (Test-PocketRepairCliSnapshot @{cli=(Get-PocketUserCliPath);cliKind=(Get-PocketUserCliKind)} $Record)){throw 'Current CLI environment differs from the committed runtime setting.'}
     $links=@((Join-Path $Context.Programs 'Codex Pocket.lnk'),(Join-Path $Context.Programs 'Codex Pocket Desktop.lnk'),(Join-Path $Context.Startup 'Codex Pocket.lnk'))
     for($i=0;$i -lt 3;$i++){
         if($Record.shortcuts[$i].path -cne $links[$i]){throw 'Invalid fixed shortcut path.'}
@@ -1293,12 +1519,12 @@ function Invoke-PocketIntegrationRepair {
             }else{
                 $slot=[int]$RepairStep.Substring(9);$entry=$candidate.shortcuts[$slot];$backup=$snapshot.links[$slot]
                 $stage='shortcut';$call='New-PocketShortcutBytes';$code='integration_repair_failed'
-                if($slot -eq 0){
+                if($slot -eq 0 -and !(Test-PocketManagerShortcut $links[$slot] $root)){
                     $temporary=Join-Path $root ($OperationId+'.lnk');Assert-PocketUnredirectedPath $temporary
                     if(Test-Path -LiteralPath $temporary){throw 'Repair temporary shortcut is already present.'}
                     $bytes=New-PocketShortcutBytes $temporary $launcher '--pocket-ui' $installed.Icon
                     $backup=@{path=$links[$slot];bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
-                }elseif($backup.hash -cne $entry.originalHash -and (Test-PocketShortcutTarget $links[$slot] $launcher $(if($slot -eq 1){'--pocket-desktop'}else{'--pocket-ui'}))){
+                }elseif($slot -gt 0 -and $backup.hash -cne $entry.originalHash -and (Test-PocketShortcutTarget $links[$slot] $launcher $(if($slot -eq 1){'--pocket-desktop'}else{'--pocket-ui'}))){
                     $backup=@{path=$links[$slot];bytes=$entry.original;hash=$entry.originalHash}
                 }
                 $entry.installed=$backup.bytes;$entry.installedHash=$backup.hash;$targetLinks[$slot]=$backup
@@ -1339,6 +1565,39 @@ function Save-PocketIntegrationRecord($Record,[string]$Manifest,[string[]]$Links
     $before=Get-PocketIntegrationSnapshot $Manifest $Links -SkipTask
     $after=@{manifest=(Get-PocketRecordBackup $Record $Manifest);links=$before.links;cli=$before.cli;cliKind=$before.cliKind;task=$before.task;taskKnown=$before.taskKnown}
     Invoke-PocketInstallTransaction $before $after $Journal $Manifest $Links $Launcher | Out-Null
+}
+function Test-PocketOwnedCliPath([AllowNull()]$Value,[string]$InstallRoot) {
+    if ($null -eq $Value) { return $false }
+    $prefix=[regex]::Escape($InstallRoot.TrimEnd('\','/'))
+    return [string]$Value -match ('(?i)^'+$prefix+'\\(?:pocket-launcher\.exe|bin\\[a-f0-9]{64}\\pocket-(?:launcher|bridge|native-proxy)\.exe)$')
+}
+function Get-PocketTransparentCliSnapshot($Before,$Saved,[string]$InstallRoot,[string]$Bin) {
+    # A custom pre-existing native override retains its meaning. The installer
+    # owns only an empty setting or its own previously committed integration.
+    if ($Before.cli -and -not (Test-PocketOwnedCliPath $Before.cli $InstallRoot)) { return @{cli=$Before.cli;cliKind=$Before.cliKind} }
+    $original=Get-PocketOriginalCliSnapshot $Saved $InstallRoot
+    if($original.cli){return $original}
+    $proxy=Join-Path $Bin 'pocket-native-proxy.exe'
+    if([IO.File]::Exists($proxy)){return @{cli=$proxy;cliKind='String'}}
+    return Get-PocketScopedCliSnapshot $Before $Saved $InstallRoot
+}
+function Get-PocketScopedCliSnapshot($Before,$Saved,[string]$InstallRoot) {
+    if (-not (Test-PocketOwnedCliPath $Before.cli $InstallRoot)) { return @{cli=$Before.cli;cliKind=$Before.cliKind} }
+    return Get-PocketOriginalCliSnapshot $Saved $InstallRoot
+}
+function Get-PocketOriginalCliSnapshot($Saved,[string]$InstallRoot) {
+    $previous=Get-PocketProperty $Saved 'previousCliPath' $null
+    if (Test-PocketOwnedCliPath $previous $InstallRoot) { $previous=$null }
+    return @{cli=$previous;cliKind=$(if($null -eq $previous){'String'}else{Get-PocketProperty $Saved 'previousCliKind' 'String'})}
+}
+function Test-PocketRepairCliSnapshot($Snapshot,$Record) {
+    $original=Get-PocketOriginalCliSnapshot $Record $Record.installRoot
+    if($original.cliKind -notin @('String','ExpandString')){return $false}
+    return ($Snapshot.cli -ceq $original.cli -and $Snapshot.cliKind -ceq $original.cliKind) -or
+        ($Snapshot.cli -ceq $Record.bridge -and $Snapshot.cliKind -ceq 'String') -or
+        ((Get-PocketProperty $Record 'nativeProxyProtocol' 0) -eq 1 -and
+            $Snapshot.cli -ceq (Get-PocketProperty $Record 'nativeProxy' $null) -and $Snapshot.cliKind -ceq 'String' -and
+            $Snapshot.cli -ceq (Join-Path $Record.installRoot ('bin\'+$Record.generation+'\pocket-native-proxy.exe')))
 }
 function Invoke-PocketWindowsInstall {
     [CmdletBinding()]
@@ -1395,7 +1654,8 @@ function Invoke-PocketWindowsInstall {
             if ($saved.version -notin @(2,3) -or $saved.installRoot -ne $installRoot -or $saved.shortcuts.Count -ne 3 -or $saved.generation -notmatch '^[a-f0-9]{64}$') { throw 'Unsupported installation record.' }
             $expected=if($saved.version -eq 2){Join-Path $installRoot ('bin\'+$saved.generation+'\pocket-bridge.exe')}else{$launcher}
             if ($saved.bridge -ne $expected) { throw 'Invalid installation record path.' }
-            if ($before.cli -ne $saved.bridge -and $before.cli -ne $saved.previousCliPath) { throw 'CODEX_CLI_PATH changed outside this installer; refusing drift.' }
+            $originalCli=if(Test-PocketOwnedCliPath $saved.previousCliPath $installRoot){$null}else{$saved.previousCliPath}
+            if ($before.cli -ne $saved.bridge -and $before.cli -ne $saved.previousCliPath -and $before.cli -ne $originalCli -and -not (Test-PocketOwnedCliPath $before.cli $installRoot)) { throw 'CODEX_CLI_PATH changed outside this installer; refusing drift.' }
             for($i=0;$i -lt 3;$i++) {
                 $entry=$saved.shortcuts[$i]
                 if ($entry.path -ne $links[$i]) { throw 'Invalid shortcut record path.' }
@@ -1449,14 +1709,34 @@ function Invoke-PocketWindowsInstall {
                 Enter-PocketInstallLifecycle $installRoot $StateDirectory $saved
             }
             $plan.processesStopped=$lifecycle.processesStopped
+            if((Get-PocketProperty $lifecycle 'phase' '') -eq 'waiting_idle') {
+                $plan.applied=$false;$plan.state='update_deferred';$plan.exitCode=4;$plan.runtimeVerification='deferred'
+                $plan.nativeTasksPreserved=$true;$plan.nativeRestartRequired=$true;$plan.deferredReason=$lifecycle.deferredReason
+                $plan.message='更新已延后：现有任务、待处理问题或原生运行状态尚未安全退出。没有关闭现有进程，也没有切换安装版本。请使用签名后台更新，或在完成任务后关闭原生会话并暂停远程连接，再重试安装。'
+                return $plan
+            }
         }
         if ($Rollback) {
             $after=Read-PocketRollbackSnapshot $saved.rollback $installRoot
             Assert-PocketSnapshot $after $manifestPath $links
+            # Preserve the archived record bytes, but migrate its legacy global
+            # Pocket override to the true original runtime rather than absence.
+            $restored=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($after.manifest.bytes)) | ConvertFrom-Json
+            $restoredCli=Get-PocketOriginalCliSnapshot $restored $installRoot
+            if((Get-PocketProperty $restored 'nativeProxyProtocol' 0) -eq 1 -and
+                (Test-PocketOwnedCliPath (Get-PocketProperty $restored 'nativeProxy' $null) $installRoot)) {
+                $restoredBin=Join-Path $installRoot ('bin\'+$restored.generation)
+                Test-PocketWindowsDirectory $restoredBin | Out-Null
+                if($restored.nativeProxy -ne (Join-Path $restoredBin 'pocket-native-proxy.exe') -or
+                    -not [IO.File]::Exists($restored.nativeProxy)){throw 'Rollback native proxy is unavailable.'}
+                $restoredCli=@{cli=$restored.nativeProxy;cliKind='String'}
+            }
+            $after.cli=$restoredCli.cli;$after.cliKind=$restoredCli.cliKind
             # Unknown snapshots never authorize a task mutation on rollback.
             if (-not (Get-PocketProperty $after 'taskKnown' $true)) { $after.task=$before.task; $after.taskKnown=$before.taskKnown }
         } elseif ($Uninstall) {
-            $after=@{manifest=$before.manifest;cli=$saved.previousCliPath;cliKind=(Get-PocketProperty $saved 'previousCliKind' 'String');task=$(if($saved.version -eq 3 -and (Get-PocketProperty $saved 'previousTaskKnown' $true)){$saved.previousTask}else{$before.task});taskKnown=$before.taskKnown;links=@()}
+            $restoredCli=Get-PocketOriginalCliSnapshot $saved $installRoot
+            $after=@{manifest=$before.manifest;cli=$restoredCli.cli;cliKind=$restoredCli.cliKind;task=$(if($saved.version -eq 3 -and (Get-PocketProperty $saved 'previousTaskKnown' $true)){$saved.previousTask}else{$before.task});taskKnown=$before.taskKnown;links=@()}
             foreach($entry in $saved.shortcuts) { $after.links+=@{path=$entry.path;bytes=$entry.original;hash=$entry.originalHash} }
         } else {
             if ($fresh) {
@@ -1469,8 +1749,19 @@ function Invoke-PocketWindowsInstall {
             Assert-PocketPlainPath $bin
             if (-not [IO.Directory]::Exists($bin)) {
                 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($bin))
-                $stage=$bin+'.staging-'+[guid]::NewGuid().ToString('N'); [void][IO.Directory]::CreateDirectory($stage)
-                foreach($name in @((Get-PocketWindowsFiles))+@('windows-manifest.json')) { [IO.File]::Copy((Join-Path $SourceDirectory $name),(Join-Path $stage $name),$false) }
+                # Keep the same-volume atomic rename without adding the full
+                # 64-character generation to a temporary name. Windows
+                # PowerShell 5.1's File.Copy still has the legacy path limit.
+                $stage=Join-Path ([IO.Path]::GetDirectoryName($bin)) ('.staging-'+[guid]::NewGuid().ToString('N'))
+                Assert-PocketUnredirectedPath $stage
+                [void][IO.Directory]::CreateDirectory($stage)
+                $stagedInventory=Test-PocketWindowsDirectory $SourceDirectory
+                foreach($name in @($stagedInventory.files | ForEach-Object {$_.path})+@('windows-manifest.json')) {
+                    $target=Join-Path $stage $name
+                    Assert-PocketUnredirectedPath $target
+                    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+                    [IO.File]::Copy((Join-Path $SourceDirectory $name),$target,$false)
+                }
                 Test-PocketWindowsDirectory $stage | Out-Null
                 if ((Get-PocketFileHash (Join-Path $stage 'windows-manifest.json')) -ne $releaseHash) { throw 'Staged manifest hash does not match the planned generation.' }
                 Move-PocketStagedDirectory $stage $bin
@@ -1494,7 +1785,7 @@ function Invoke-PocketWindowsInstall {
                         $candidate.shortcuts[$i].installedHash=$before.links[$i].hash
                     }
                 }
-                if ($before.cli -ne $launcher -or ($before.taskKnown -and $null -eq $before.task)) { $candidate.integration.startup=New-PocketPendingIntegration 'startup_register' }
+                if ($before.taskKnown -and $null -eq $before.task) { $candidate.integration.startup=New-PocketPendingIntegration 'startup_register' }
                 if ($UiStartup -ne 'Preserve' -and ($UiStartup -ne (Get-PocketProperty $candidate 'startupPreference' 'Preserve') -or ($before.taskKnown -and (Test-PocketTaskLogon $before.task) -ne ($UiStartup -eq 'Enable')))) {
                     if ($candidate.integration.startup.state -eq 'completed') { Set-PocketProperty $candidate 'rollback' (Save-PocketRollbackSnapshot $before $installRoot) }
                     $candidate.integration.startup=New-PocketPendingIntegration 'startup_register'
@@ -1516,6 +1807,15 @@ function Invoke-PocketWindowsInstall {
                     if (-not [IO.File]::Exists($archive)) { Write-PocketAtomic $archive ([Convert]::FromBase64String($before.manifest.bytes)) }
                 }
             }
+            # Native-only proxy never writes MSIX-redirected state or depends on
+            # the updater. Each generation stays immutable while native tasks
+            # use it; registry publication and rollback select future launches.
+            $scopedCli=Get-PocketTransparentCliSnapshot $before $saved $installRoot $bin
+            Set-PocketProperty $candidate 'nativeProxy' $scopedCli.cli
+            Set-PocketProperty $candidate 'nativeProxyProtocol' 1
+            $normalizedPrevious=if(Test-PocketOwnedCliPath $candidate.previousCliPath $installRoot){$null}else{$candidate.previousCliPath}
+            $previousChanged=$candidate.previousCliPath -ne $normalizedPrevious
+            if($previousChanged){Set-PocketProperty $candidate 'previousCliPath' $normalizedPrevious;Set-PocketProperty $candidate 'previousCliKind' 'String'}
             Update-PocketInstallState $candidate
             if (-not $before.taskKnown -and (Get-PocketProperty $before 'taskFailure' $null)) {
                 $candidate.integration.startup=$before.taskFailure
@@ -1524,8 +1824,8 @@ function Invoke-PocketWindowsInstall {
             $recordBackup=Get-PocketRecordBackup $candidate $manifestPath
             # A completed repeat apply preserves the exact record bytes, including
             # any legacy JSON formatting, and never changes its rollback archive.
-            if ($sameGeneration -and $candidate.installationState -eq 'installed' -and $UiStartup -eq 'Preserve') { $recordBackup=$before.manifest }
-            $after=@{manifest=$recordBackup;cli=$launcher;cliKind='String';task=$before.task;taskKnown=$before.taskKnown;links=$before.links}
+            if ($sameGeneration -and -not $previousChanged -and $candidate.installationState -eq 'installed' -and $UiStartup -eq 'Preserve') { $recordBackup=$before.manifest }
+            $after=@{manifest=$recordBackup;cli=$scopedCli.cli;cliKind=$scopedCli.cliKind;task=$before.task;taskKnown=$before.taskKnown;links=$before.links}
         }
         $taskManaged=($Uninstall -or $Rollback) -and $before.task -cne $after.task
         if ($taskManaged) {
@@ -1545,10 +1845,10 @@ function Invoke-PocketWindowsInstall {
                     if ($snapshot.links[$i].hash -ne $entry.installedHash) { throw 'Shortcut changed after core publication; refusing drift.' }
                 } | Out-Null
                 $backup=$snapshot.links[$i]
-                if ($i -eq 0) {
+                if ($i -eq 0 -and !(Test-PocketManagerShortcut $links[$i] $installRoot)) {
                     $bytes=New-PocketShortcutBytes (Join-Path $installRoot ([guid]::NewGuid().ToString('N')+'.lnk')) $launcher '--pocket-ui' $icon
                     $backup=@{path=$links[$i];bytes=[Convert]::ToBase64String($bytes);hash=(Get-PocketBytesHash $bytes)}
-                } elseif ($saved -and $snapshot.links[$i].hash -eq $saved.shortcuts[$i].installedHash -and $snapshot.links[$i].hash -ne $saved.shortcuts[$i].originalHash -and
+                } elseif ($i -gt 0 -and $saved -and $snapshot.links[$i].hash -eq $saved.shortcuts[$i].installedHash -and $snapshot.links[$i].hash -ne $saved.shortcuts[$i].originalHash -and
                     (Test-PocketShortcutTarget $links[$i] $launcher $(if($i -eq 1){'--pocket-desktop'}else{'--pocket-ui'}))) {
                     $backup=@{path=$links[$i];bytes=$entry.original;hash=$entry.originalHash}
                 }
@@ -1616,9 +1916,58 @@ function Invoke-PocketWindowsInstall {
     } finally { if($owns){$mutex.ReleaseMutex()}; if($mutex){$mutex.Dispose()} }
 }
 if ($MyInvocation.InvocationName -ne '.') {
-    if($PSBoundParameters.ContainsKey('RepairStep') -or $PSBoundParameters.ContainsKey('OperationId') -or $PSBoundParameters.ContainsKey('ExpectedGeneration') -or $PSBoundParameters.ContainsKey('CheckRepair')){
+    # A signed local installation may introduce the first updater key, but only
+    # through an explicit installer/operator anchor. Feed data never selects it.
+    # Live installations use the same queued Rust checkpoint/native consumer as
+    # the supervisor. Setup does not force the full-process shutdown path.
+    if($UpdateOfferPath){
+        $ErrorActionPreference='Stop'
+        if(-not $Apply -or $Uninstall -or $Rollback -or $Initialize -or $NativeUpdateMode -or $RepairStep){throw 'Signed local update requires an existing installation and -Apply'}
+        if(-not $InstallRoot){$InstallRoot=Join-Path (Get-PocketLocalAppData) 'CodexPocket'}
+        $InstallRoot=Get-PocketDirectoryPath $InstallRoot
+        $record=Read-PocketRepairJson (Join-Path $InstallRoot 'desktop-install.json')
+        if($StateDirectory -and $StateDirectory -ne $record.stateDirectory){throw 'Existing update state differs'}
+        $StateDirectory=$record.stateDirectory
+        if(-not $SourceDirectory){$SourceDirectory=$PSScriptRoot}
+        Test-PocketWindowsDirectory $SourceDirectory | Out-Null
+        # This entry point must be delivered by a locally authorized installer.
+        # Keep its trusted verifier separate from an arbitrary downloaded source:
+        # a payload must never execute its own verifier before signature checks.
+        Test-PocketWindowsDirectory $PSScriptRoot | Out-Null
+        $coordinator=Join-Path $PSScriptRoot 'pocket-upgrade.exe'
+        $localArgs=@('--local-install','--install-root',('"'+$InstallRoot+'"'),'--state',('"'+$StateDirectory+'"'),'--source',('"'+$SourceDirectory+'"'),'--offer',('"'+$UpdateOfferPath+'"'))
+        if($TrustedUpdatePublicKey){$localArgs+=@('--trusted-key',$TrustedUpdatePublicKey)}
+        $updateStart=[Diagnostics.ProcessStartInfo]::new()
+        $updateStart.FileName=$coordinator
+        $updateStart.Arguments=$localArgs -join ' '
+        $updateStart.UseShellExecute=$false
+        $updateStart.CreateNoWindow=$true
+        $updateProcess=[Diagnostics.Process]::Start($updateStart)
+        $updateProcess.WaitForExit()
+        if($updateProcess.ExitCode -ne 0){throw 'signed_local_update_rejected: inspect authenticated state; no forced native restart was performed'}
+        $updateStatus=Read-PocketRepairJson (Join-Path $StateDirectory 'desktop\updates\status.json')
+        if($updateStatus.phase -in @('failed','rolled_back')){throw ('signed_local_update_'+$updateStatus.phase+': '+$updateStatus.failure)}
+        Write-Output '已验证本地签名并排队更新；后台在任务空闲且身份与屏障均可验证时切换。旧版缺少屏障时会保留原生进程。'
+        exit 0
+    }
+    if($NativeUpdateMode){
+        $ErrorActionPreference='Stop'
+        if(@($installerArguments.Keys|Where-Object {$_ -notin @('NativeUpdateMode','InstallRoot','StateDirectory')}).Count){throw 'Invalid native consumer arguments'}
+        $InstallRoot=Get-PocketDirectoryPath $InstallRoot;$StateDirectory=Get-PocketDirectoryPath $StateDirectory
+        $record=Read-PocketRepairJson (Join-Path $InstallRoot 'desktop-install.json')
+        if($record.installRoot -ne $InstallRoot -or $record.stateDirectory -ne $StateDirectory){throw 'Native consumer installation changed'}
+        if($NativeUpdateMode -eq 'Inventory'){Get-PocketNativeInventory $InstallRoot $StateDirectory | ConvertTo-Json -Depth 16 -Compress}
+        else {
+            if((Get-PocketFileHash (Join-Path $InstallRoot 'pocket-launcher.exe')) -ne $record.launcherHash){throw 'Launcher integrity failed'}
+            $nativeLauncher=Get-PocketNativeUpdateLauncher $InstallRoot $PSScriptRoot
+            Start-PocketInstalledDesktop $InstallRoot $nativeLauncher
+            '{"launched":true}'
+        }
+        exit 0
+    }
+    if($installerArguments.ContainsKey('RepairStep') -or $installerArguments.ContainsKey('OperationId') -or $installerArguments.ContainsKey('ExpectedGeneration') -or $installerArguments.ContainsKey('CheckRepair')){
         $allowed=@('RepairStep','OperationId','ExpectedGeneration','CheckRepair')
-        if(@($PSBoundParameters.Keys|Where-Object{$_ -notin $allowed}).Count -gt 0){
+        if(@($installerArguments.Keys|Where-Object{$_ -notin $allowed}).Count -gt 0){
             $result=ConvertTo-PocketPublicRepairResult (New-PocketRepairResult $OperationId $RepairStep $ExpectedGeneration 'failed' 'invalid_params')
         }else{$result=Invoke-PocketIntegrationRepair -RepairStep $RepairStep -OperationId $OperationId -ExpectedGeneration $ExpectedGeneration -CheckRepair:$CheckRepair}
         ConvertTo-PocketPublicRepairResult $result | ConvertTo-Json -Depth 10 -Compress
@@ -1629,6 +1978,12 @@ if ($MyInvocation.InvocationName -ne '.') {
     try {
         if ($Apply) { $logPath=Start-PocketInstallDiagnostics }
         $result=Invoke-PocketWindowsInstall -SourceDirectory $SourceDirectory -StateDirectory $StateDirectory -ExistingStateDirectory $ExistingStateDirectory -Apply:$Apply -Uninstall:$Uninstall -Rollback:$Rollback -Initialize:$Initialize -UiStartup $UiStartup
+        if((Get-PocketProperty $result 'state' '') -eq 'update_deferred') {
+            Write-PocketInstallEvent @{stage='runtime_idle';call='install';state='deferred';reason=$result.deferredReason;nativeTasksPreserved=$true;processesStopped=0}
+            Write-Output $result.message
+            Write-Output ('更新已延后；安装版本保持原状。诊断：'+$logPath)
+            exit 4
+        }
         if ($Apply -and -not ($Uninstall -or $Rollback) -and (Get-PocketProperty $result 'runtimeVerification' 'pending') -ne 'verified') {
             throw 'runtime_recovery_required: installation retained but background was not verified.'
         }

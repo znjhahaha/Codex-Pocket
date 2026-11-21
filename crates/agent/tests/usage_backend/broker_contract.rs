@@ -73,18 +73,58 @@ mod tests {
     }
     #[tokio::test]
     async fn revocation_while_usage_waits_suppresses_the_response() {
+        for method in ["usage/read", "usage/dashboard/read", "usage/requests/read"] {
+            let dir = tempfile::tempdir().unwrap();
+            let b = broker(dir.path().into());
+            let service = UsageService::test_service(Some(dir.path().join("missing.db")));
+            let _permits = service.hold_slots_for_test().await;
+            let params = json!({});
+            let read = b.usage_with_service("phone", method, &params, &service);
+            let revoke = async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                b.state.lock().await.devices.remove("phone");
+            };
+            let (result, _) = tokio::join!(read, revoke);
+            assert_eq!(error::code(&result.unwrap_err()), Code::Revoked);
+        }
+    }
+    #[tokio::test]
+    async fn new_usage_methods_share_read_authorization_and_fixed_source_validation() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(dir.path().into());
         let service = UsageService::test_service(Some(dir.path().join("missing.db")));
-        let _permits = service.hold_slots_for_test().await;
-        let params = json!({});
-        let read = b.usage_with_service("phone", "usage/read", &params, &service);
-        let revoke = async {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            b.state.lock().await.devices.remove("phone");
-        };
-        let (result, _) = tokio::join!(read, revoke);
-        assert_eq!(error::code(&result.unwrap_err()), Code::Revoked);
+        for method in ["usage/dashboard/read", "usage/requests/read"] {
+            assert_eq!(
+                error::code(
+                    &b.usage_with_service("unknown", method, &json!({}), &service)
+                        .await
+                        .unwrap_err()
+                ),
+                Code::Revoked
+            );
+            assert_eq!(
+                error::code(
+                    &b.usage_with_service("phone", method, &json!({"path":"private"}), &service)
+                        .await
+                        .unwrap_err()
+                ),
+                Code::InvalidParams
+            );
+            let r = b
+                .usage_with_service("phone", method, &json!({}), &service)
+                .await
+                .unwrap();
+            assert_eq!(r["result"]["availability"], "missing");
+            assert!(r["result"]["data"].is_null());
+        }
+        assert_eq!(
+            error::code(
+                &b.usage_with_service("phone", "usage/write", &json!({}), &service)
+                    .await
+                    .unwrap_err()
+            ),
+            Code::Unsupported
+        );
     }
     #[tokio::test]
     async fn diagnostics_child_uses_existing_bridge_versions_and_unknown_host() {

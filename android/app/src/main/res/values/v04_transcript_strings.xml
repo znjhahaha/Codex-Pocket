@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="v04_transcript_loading">正在读取会话…</string>
-    <string name="v04_transcript_refreshing">正在更新此会话，已有内容仍可阅读</string>
+    <string name="v04_transcript_refreshing">更新中</string>
     <string name="v04_transcript_failed">暂时无法读取此会话，请重试。</string>
     <string name="v04_transcript_retry">重新读取</string>
     <string name="v04_transcript_cwd">目录：%1$s</string>

@@ -31,9 +31,9 @@ describe('home recovery presentation',()=>{
  it('explains the unsupported old backend and the Windows login boundary',()=>{
   const html=render(snapshot('waiting_restart','handoff_unsupported'));
   expect(html).toContain('当前旧后台不支持安全交接');
-  expect(html).toContain('保存并结束当前 Codex 任务');
-  expect(html).toContain('退出并重新登录 Windows');
-  expect(html).toContain('仅重开 Codex 不保证更新常驻后台');
+  expect(html).toContain('运行新版 Pocket 安装包');
+  expect(html).not.toContain('重新登录 Windows');
+  expect(html).toContain('当前会话');
   expect(html).not.toContain('检查并更新后台');expect(html).not.toContain('恢复后台</button>');
  });
  it('does not call a capability read failure unsupported',()=>{

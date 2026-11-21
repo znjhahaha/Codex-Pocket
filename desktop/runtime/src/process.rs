@@ -54,8 +54,11 @@ impl ChildJob{
 /// Current-user authenticated broker control. Never dispatches a native model request.
 pub fn local_control(state:&std::path::Path,method:&str,params:serde_json::Value)->Result<serde_json::Value>{
     use std::io::Write;
-    if !["session/preferences/read","session/preferences/update","runtime/ensure"].contains(&method){bail!("Unsupported desktop control method")}
-    let control:serde_json::Value=crate::storage::read(&state.join("control.json"))?;
+    if !["status","diagnostics","devices","routes/read","assistant/status","assistant/prepare","session/preferences/read","session/preferences/update","runtime/ensure"].contains(&method){bail!("Unsupported desktop control method")}
+    let mut file=crate::supervisor::maintenance::open_agent_private(&state.join("control.json"))?;
+    let mut endpoint=Vec::new();Read::by_ref(&mut file).take(4097).read_to_end(&mut endpoint)?;
+    if endpoint.len()>4096{bail!("Control endpoint exceeds limit")}
+    let control:serde_json::Value=serde_json::from_slice(&endpoint)?;
     if control["protocol"]!=1{bail!("Unknown local control protocol")}
     let port=control["port"].as_u64().filter(|p|*p>0&&*p<=65535).context("Invalid control port")? as u16;
     let token=control["token"].as_str().filter(|t|!t.is_empty()&&t.len()<=256).context("Missing local authentication")?;
@@ -76,6 +79,7 @@ pub fn local_control(state:&std::path::Path,method:&str,params:serde_json::Value
  use super::*;use serde_json::json;use std::io::Write;
  #[test]fn local_preferences_use_authenticated_bounded_broker_protocol(){
   let state=crate::test_support::tempdir();let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  crate::storage::private_dir(state.path()).unwrap();
   crate::storage::atomic(&state.path().join("control.json"),&json!({"protocol":1,"port":listener.local_addr().unwrap().port(),"token":"fixture-secret"})).unwrap();
   let worker=thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();let mut n=[0;4];socket.read_exact(&mut n).unwrap();let mut bytes=vec![0;u32::from_be_bytes(n) as usize];socket.read_exact(&mut bytes).unwrap();let request:serde_json::Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(request["token"],"fixture-secret");assert_eq!(request["method"],"session/preferences/update");assert_eq!(request["params"]["knownRevision"],3);let reply=serde_json::to_vec(&json!({"result":{"defaultMode":"desktop","revision":4}})).unwrap();socket.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();socket.write_all(&reply).unwrap();});
   let result=local_control(state.path(),"session/preferences/update",json!({"mode":"desktop","knownRevision":3,"commandId":"fixture-operation"})).unwrap();assert_eq!(result["revision"],4);worker.join().unwrap();

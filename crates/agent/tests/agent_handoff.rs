@@ -121,7 +121,7 @@ fn exact_wire_and_strict_params() {
     );
     assert_eq!(
         caps,
-        json!({"protocol":1,"supported":true,"generation":generation(),"owner":"pocket-agent","methods":METHODS,"checkpoint":"sha256","shutdown":"after_reply_flush","writeFence":true,"preservesIdentity":true})
+        json!({"protocol":1,"supported":true,"generation":generation(),"owner":"pocket-agent","methods":METHODS,"checkpoint":"sha256","shutdown":"after_reply_flush","writeFence":true,"preservesIdentity":true,"unconfirmedWrites":0})
     );
     assert!(h.capabilities(&Value::Null).is_err());
     let value = serde_json::to_value(params(2)).unwrap();
@@ -143,6 +143,36 @@ fn exact_wire_and_strict_params() {
 }
 
 #[test]
+fn capabilities_reports_current_unconfirmed_permits_without_mutating_handoff() {
+    let (dir, h) = setup();
+    let state_path = dir.path().join("handoff/state.json");
+    let initial_state = std::fs::read(&state_path).ok();
+    let initial = h.capabilities(&json!({})).unwrap();
+    assert_eq!(initial["generation"], json!(generation()));
+    assert_eq!(initial["unconfirmedWrites"], 0);
+    assert_eq!(h.unconfirmed_writes(), 0);
+    assert_eq!(h.capabilities(&json!({})).unwrap(), initial);
+    let completed = h.admit_write().unwrap();
+    let abandoned = h.admit_write().unwrap();
+    let token = abandoned.token();
+    assert_eq!(h.capabilities(&json!({})).unwrap()["unconfirmedWrites"], 2);
+    assert_eq!(h.unconfirmed_writes(), 2);
+    completed.confirm().unwrap();
+    drop(abandoned);
+    assert_eq!(h.capabilities(&json!({})).unwrap()["unconfirmedWrites"], 1);
+    assert_eq!(h.unconfirmed_writes(), 1);
+    h.confirm_write(Uuid::from_u128(999)).unwrap();
+    assert_eq!(h.capabilities(&json!({})).unwrap()["unconfirmedWrites"], 1);
+    assert_eq!(std::fs::read(&state_path).ok(), initial_state);
+    assert!(h.accepting_writes() && h.remote_enabled());
+    assert!(!*h.shutdown_receiver().borrow());
+    h.confirm_write(token).unwrap();
+    h.confirm_write(token).unwrap();
+    assert_eq!(h.capabilities(&json!({})).unwrap(), initial);
+    assert_eq!(h.unconfirmed_writes(), 0);
+}
+
+#[test]
 fn quiesce_fences_and_status_finishes_original_write_without_replay() {
     let (_dir, h) = setup();
     let permit = h.admit_write().unwrap();
@@ -154,7 +184,9 @@ fn quiesce_fences_and_status_finishes_original_write_without_replay() {
     assert!(h.admit_write().is_err());
     drop(permit); // Dropping a sent/abandoned write is never a receipt.
     assert_eq!(h.status(&params(2)).unwrap().unconfirmed_writes, 1);
+    assert_eq!(h.capabilities(&json!({})).unwrap()["unconfirmedWrites"], 1);
     h.confirm_write(token).unwrap();
+    assert_eq!(h.capabilities(&json!({})).unwrap()["unconfirmedWrites"], 0);
     let r = h.quiesce(&params(2), snapshot()).unwrap();
     assert_eq!(r.phase, Phase::Ready);
     assert!(r.safe_to_exit);
@@ -243,7 +275,7 @@ fn owner_generation_and_concurrent_operation_conflicts_are_fail_closed() {
 }
 
 #[test]
-fn submitted_and_unknown_ledger_writes_block_until_real_terminal_evidence() {
+fn submitted_blocks_but_durable_unknown_survives_checkpoint_without_replay() {
     for status in [Status::Submitted, Status::Unknown] {
         let (_dir, h) = setup();
         let mut s = snapshot();
@@ -271,6 +303,17 @@ fn submitted_and_unknown_ledger_writes_block_until_real_terminal_evidence() {
         }
         s.ledger = serde_json::from_str(&ledger.snapshot_json()).unwrap();
         let r = h.quiesce(&params(2), s.clone()).unwrap();
+        if status == Status::Unknown {
+            assert!(r.safe_to_exit, "durable deduplication receipt kept broker draining");
+            let saved = CheckpointStore::new(h.state_dir()).verify(r.checkpoint.as_ref().unwrap(), "pc").unwrap();
+            assert_eq!(saved.snapshot.ledger, s.ledger);
+            saved.snapshot.verify_successor(&s).unwrap();
+            let mut missing = s.clone();
+            missing.ledger["entries"] = json!([]);
+            assert!(saved.snapshot.verify_successor(&missing).is_err());
+            assert!(matches!(ledger.begin(key.clone(), b"original body", 1).unwrap(), pocket_core::ledger::Begin::Existing(Status::Unknown)));
+            continue;
+        }
         assert!(!r.safe_to_exit);
         assert!(r.blockers.contains("unconfirmed_writes"));
         ledger

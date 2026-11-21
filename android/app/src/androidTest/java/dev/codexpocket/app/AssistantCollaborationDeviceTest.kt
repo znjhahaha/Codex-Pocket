@@ -217,6 +217,7 @@ class AssistantCollaborationDeviceTest {
         val config = remember(baseConfig, fontScale) { Configuration(baseConfig).apply { this.fontScale = this@AssistantCollaborationDeviceTest.fontScale } }
         val scaledContext = remember(context, config) { context.createConfigurationContext(config) }
         CompositionLocalProvider(LocalContext provides scaledContext, LocalConfiguration provides config,
+            androidx.activity.compose.LocalActivityResultRegistryOwner provides activity,
             LocalDensity provides Density(baseDensity.density, fontScale), LocalPocketGlass provides optics,
             LocalPocketGlassPreferences provides if (reducedMotion) PocketGlassPreferences(false, false, false) else null,
             LocalToolMediaImages provides imageSource, LocalImageConnection provides (1L to false),
@@ -272,26 +273,41 @@ class AssistantCollaborationDeviceTest {
     }
 
     @Test fun collapsedGroupMemberDetailsAndReturnPreserveDraftAndReadingState() = step("progressive_disclosure_and_return") {
+        node(INPUT).performTextReplacement(DRAFT); hideKeyboard()
         scroll(GROUP); node(TASK).assertDoesNotExist(); capture("group-collapsed")
-        node(GROUP).performClick(); waitForNode(TASK); scroll(TASK); node(TASK).performClick()
+        node(GROUP).performClick(); waitForNode(TASK)
+        scroll("assistant-task-expand:task"); node("assistant-task-expand:task").performClick()
+        // A task row discloses steps; only its explicit detail action opens the full task page.
+        node("assistant-task-full-prompt:task").assertDoesNotExist()
+        scroll("assistant-task-detail:task")
+        val chatTop = bounds("assistant-task-detail:task").top
+        node("assistant-task-detail:task").performClick()
         waitForNode("assistant-task-full-prompt:task")
+        node(INPUT).assertDoesNotExist()
         scroll("assistant-task-full-prompt:task"); node("assistant-task-full-prompt:task").assertTextEquals("核查资料并引用可验证来源")
         scroll(MEMBER); node(MEMBER).performClick(); waitForNode("assistant-native-agents:$THREAD")
         scroll("assistant-native-agents:$THREAD"); node("assistant-native-agents:$THREAD").performClick()
         scroll("assistant-native-thread:$CHILD"); node("assistant-native-thread:$CHILD").assertIsDisplayed()
-        node(INPUT).performTextReplacement(DRAFT); hideKeyboard(); scroll("assistant-native-thread:$CHILD")
+        scroll("assistant-native-thread:$CHILD")
         val before = bounds("assistant-native-thread:$CHILD")
         capture("member-and-native-descendants")
+        node("assistant-back").performClick(); assertDraft(DRAFT)
+        assertEquals("Chat reading position survives the task page", chatTop, bounds("assistant-task-detail:task").top, 2f)
         node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
         compose.onNodeWithText("保留阅读位置和草稿").assertIsDisplayed(); capture("memory-details")
         node("assistant-back").performClick(); assertDraft(DRAFT)
+        assertEquals("Chat reading position survives Memory", chatTop, bounds("assistant-task-detail:task").top, 2f)
+        node("assistant-task-detail:task").performClick()
+        waitForNode("assistant-native-thread:$CHILD")
         node("assistant-native-thread:$CHILD").assertIsDisplayed()
         val after = bounds("assistant-native-thread:$CHILD")
         assertEquals("Reading position survives return", before.top, after.top, 2f)
         measurements += buildJsonObject { put("kind", "return_reading_position"); put("beforeTopPx", before.top); put("afterTopPx", after.top) }
         capture("returned-preserved-state")
+        node("assistant-back").performClick(); assertDraft(DRAFT)
         scroll(GROUP); node(GROUP).performClick(); node(TASK).assertDoesNotExist()
-        node(GROUP).performClick(); waitForNode(TASK); scroll("assistant-native-thread:$CHILD"); node("assistant-native-thread:$CHILD").assertIsDisplayed()
+        node(GROUP).performClick(); waitForNode(TASK)
+        node("assistant-task-full-prompt:task").assertDoesNotExist()
         assertTrue(actions.isEmpty()); assertTrue(opened.isEmpty())
     }
 
@@ -306,11 +322,16 @@ class AssistantCollaborationDeviceTest {
             assertChrome(); capture("$mode-official-fallback")
         }
         compose.runOnIdle { optics = true; theme = "light"; fontScale = 1.4f; reducedMotion = true }
-        assertChrome(); scroll(GROUP); node(GROUP).performClick(); waitForNode(TASK); scroll(TASK); node(TASK).performClick()
+        node(INPUT).performTextReplacement(DRAFT); hideKeyboard(); assertChrome(); assertDraft(DRAFT)
+        scroll(GROUP); node(GROUP).performClick(); waitForNode(TASK)
+        scroll("assistant-task-expand:task"); node("assistant-task-expand:task").performClick()
+        scroll("assistant-task-detail:task"); node("assistant-task-detail:task").performClick()
         waitForNode("assistant-task-full-prompt:task")
         scroll(MEMBER); node(MEMBER).performClick()
         compose.onNodeWithText("核对来源，保留成员署名").assertExists()
-        node(INPUT).performTextReplacement(DRAFT); hideKeyboard(); assertDraft(DRAFT); capture("font-1_4-reduced-motion")
+        node(INPUT).assertDoesNotExist()
+        capture("font-1_4-member-details")
+        node("assistant-back").performClick(); assertChrome(); assertDraft(DRAFT); capture("font-1_4-reduced-motion")
         compose.runOnIdle { fontScale = 1f; reducedMotion = false }
         assertChrome(); assertDraft(DRAFT); assertTrue(actions.isEmpty())
     }
@@ -369,6 +390,208 @@ class AssistantCollaborationDeviceTest {
         compose.runOnIdle { fontScale = 1f; reducedMotion = false }; assertTrue(actions.isEmpty())
     }
 
+    /** Captured callbacks and explicit fixture replies only; never dispatches a native task. */
+    @Test fun productDispatchTaskDetailQuestionAndArtifactNavigation() = step("product_task_question_artifact") {
+        compose.runOnIdle {
+            val initial = productState()
+            state = initial.copy(snapshot = initial.snapshot!!.copy(tasks = emptyList(), operations = emptyList(),
+                groups = emptyList(), events = emptyList(), artifacts = emptyList()), messages = emptyList())
+        }
+        node(INPUT).performTextReplacement("整理本周行业动态，输出一份可分享的简报")
+        hideKeyboard(); node("assistant-send").performClick()
+        val dispatched = actions.single()
+        assertEquals("assistant/send", dispatched.method)
+        assertFalse(dispatched.params.containsKey("taskId"))
+        assertNotNull(dispatched.commandId)
+        assertDraft("整理本周行业动态，输出一份可分享的简报")
+        val binding = checkNotNull(dispatched.composerBinding)
+        compose.runOnIdle {
+            state = productState().copy(sendReceipts = listOf(AssistantSendReceipt(checkNotNull(dispatched.commandId),
+                binding.computerId, binding.runtimeId, binding.conversationId, "accepted")))
+        }
+        compose.waitUntil(5_000) { node(INPUT).fetchSemanticsNode().config[SemanticsProperties.EditableText].text.isEmpty() }
+        node(INPUT).performTextReplacement(DRAFT); hideKeyboard()
+        listOf("Tasks", "Pending", "Results").forEach {destination ->
+            node("assistant-shortcut:$destination").assertIsDisplayed()
+        }
+        node("assistant-shortcut:Pending").performClick()
+        node("assistant-center:Pending").assertIsSelected()
+        scroll("assistant-group-expand:product-goal"); node("assistant-group-expand:product-goal").assertIsDisplayed()
+        node("assistant-main-chat").performClick(); assertDraft(DRAFT)
+        node("assistant-shortcut:Tasks").performClick()
+        scroll("assistant-group-expand:product-goal"); node("assistant-group-expand:product-goal").performClick()
+        scroll("assistant-task-primary:product-task"); capture("product-parent-and-task")
+        node("assistant-task-primary:product-task").performClick()
+        scroll("assistant-approve:product-operation"); capture("product-detail-approval")
+        node("assistant-approve:product-operation").performClick()
+        val approval = actions.last()
+        assertEquals("assistant/respond", approval.method)
+        assertEquals(JsonPrimitive("product-operation"), approval.params["operationId"])
+        assertEquals(JsonPrimitive("product-approval"), approval.params["requestId"])
+        assertEquals(JsonPrimitive(true), approval.params["response"]!!.jsonObject["Approval"]!!.jsonObject["approved"])
+        compose.runOnIdle { state = state.copy(pendingActions = setOf("assistant/respond")) }
+        node("assistant-approve:product-operation").assertIsNotEnabled()
+        compose.runOnIdle {
+            state = state.copy(pendingActions = emptySet(), snapshot = state.snapshot!!.copy(operations = state.snapshot!!.operations.map {
+                if (it.id == "product-operation") it.copy(question = AssistantQuestion("product-input", AssistantQuestionKind.Input, "简报需要覆盖哪一周？")) else it
+            }))
+        }
+        node("assistant-approve:product-operation").assertDoesNotExist()
+        scroll("assistant-answer:product-operation")
+        node("assistant-answer:product-operation").performTextReplacement("覆盖本周，保留来源链接")
+        hideKeyboard()
+        compose.runOnIdle { state = state.copy(readError = "隔离夹具：刷新暂时失败", snapshot = state.snapshot!!.copy(fresh = false)) }
+        scroll("assistant-answer:product-operation"); node("assistant-answer:product-operation").assertIsNotEnabled()
+        assertEquals("覆盖本周，保留来源链接", node("assistant-answer:product-operation").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        scroll("assistant-respond:product-operation"); node("assistant-respond:product-operation").assertIsNotEnabled()
+        node("assistant-read-retry").performClick()
+        assertEquals("assistant/read", actions.last().method)
+        node("assistant-respond:product-operation").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(readError = null, snapshot = state.snapshot!!.copy(fresh = true)) }
+        scroll("assistant-answer:product-operation")
+        assertEquals("覆盖本周，保留来源链接", node("assistant-answer:product-operation").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        scroll("assistant-respond:product-operation"); node("assistant-respond:product-operation").performClick()
+        val answer = actions.last()
+        assertEquals("assistant/respond", answer.method)
+        assertEquals(JsonPrimitive("product-input"), answer.params["requestId"])
+        assertEquals(JsonPrimitive("覆盖本周，保留来源链接"), answer.params["response"]!!.jsonObject["Answer"])
+        compose.runOnIdle {
+            val snapshot = state.snapshot!!
+            state = state.copy(snapshot = snapshot.copy(
+                tasks = snapshot.tasks.map {if (it.id == "product-task") it.copy(status = AssistantTaskStatus.Done, detail = "简报与来源清单已完成") else it},
+                operations = snapshot.operations.map {if (it.id == "product-operation") it.copy(phase = AssistantOperationPhase.Completed, question = null, result = "已整理简报与来源。") else it},
+                artifacts = snapshot.artifacts + AssistantArtifact("product-text", "product-task", "product-operation", "本周简报", "text",
+                    "# 本周简报\n\n已核对来源，以下内容仅为隔离测试夹具。", null, "product-v1", NOW, "available", THREAD)))
+        }
+        node("assistant-respond:product-operation").assertDoesNotExist()
+        scroll("assistant-task-section:Artifacts"); node("assistant-task-section:Artifacts").performClick()
+        scroll("assistant-artifact-open:product-text"); node("assistant-artifact-open:product-text").performClick()
+        scroll("assistant-artifact-save"); node("assistant-artifact-share").assertIsDisplayed()
+        capture("product-artifact-preview")
+        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        node("assistant-memory-list").assertExists()
+        node("assistant-back").performClick()
+        node("assistant-artifact-preview:product-text").assertExists()
+        node("assistant-back").performClick()
+        scroll("assistant-task-section:Artifacts"); node("assistant-task-section:Artifacts").assertIsSelected()
+        node("assistant-back").performClick()
+        node("assistant-task-center").assertExists()
+        node("assistant-center:Results").performClick()
+        scroll("assistant-artifact-open:product-text"); node("assistant-artifact-open:product-text").performClick()
+        node("assistant-artifact-preview:product-text").assertExists()
+        node("assistant-back").performClick()
+        node("assistant-center:Results").assertIsSelected()
+        node("assistant-main-chat").performClick(); assertDraft(DRAFT)
+        assertEquals(listOf("assistant/send", "assistant/respond", "assistant/read", "assistant/respond"), actions.map {it.method})
+        assertTrue(opened.isEmpty()); capture("product-returned-main-draft")
+    }
+
+    @Test fun productSchedulesMemoryAndLargeFontReturnToOrigin() = step("product_schedule_memory_large_font") {
+        compose.runOnIdle { state = productState(); fontScale = 1.4f }
+        node("assistant-main-tasks").performClick()
+        listOf("assistant-center:Tasks", "assistant-center:Pending", "assistant-center:Results", "assistant-center-schedules").forEach {tag ->
+            node(tag).assertIsDisplayed()
+            val b = bounds(tag); val screen = bounds("assistant-screen")
+            assertTrue("$tag must fit inside the screen at 1.4x font", b.left >= screen.left && b.right <= screen.right)
+        }
+        assertTrue("Schedule entry has its own row", bounds("assistant-center-schedules").top >= bounds("assistant-center:Results").bottom)
+        capture("product-center-large-font")
+        node("assistant-center-schedules").performClick()
+        node("assistant-back").performClick(); node("assistant-task-center").assertExists()
+        node("assistant-center-schedules").performClick()
+        scroll("assistant-schedule-edit:product-schedule"); node("assistant-schedule-edit:product-schedule").performClick()
+        node("assistant-schedule-prompt").performTextReplacement("每天整理行业动态并保留来源")
+        hideKeyboard()
+        node("assistant-schedule-workspace").assertDoesNotExist() // An edit cannot silently replace its execution scope.
+        node("assistant-schedule-time").performScrollTo()
+        assertEquals("09:30", node("assistant-schedule-time").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        node("assistant-schedule-save").performClick()
+        val edit = actions.last()
+        assertEquals("assistant/schedule/update", edit.method)
+        assertEquals(JsonPrimitive("product-schedule"), edit.params["scheduleId"])
+        assertEquals(JsonPrimitive("Asia/Shanghai"), edit.params["spec"]!!.jsonObject["zone"]!!.jsonObject["name"])
+        assertEquals(JsonPrimitive("skip"), edit.params["missedPolicy"])
+        assertFalse(edit.params.containsKey("threadId"))
+        compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(schedules = state.snapshot!!.schedules.map {it.copy(prompt = "每天整理行业动态并保留来源")})) }
+        scroll("assistant-schedule-toggle:product-schedule"); node("assistant-schedule-toggle:product-schedule").performClick()
+        assertEquals("assistant/schedule/pause", actions.last().method)
+        compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(schedules = state.snapshot!!.schedules.map {it.copy(paused = true, nextMs = null)})) }
+        scroll("assistant-schedule-run:product-schedule"); node("assistant-schedule-run:product-schedule").performClick()
+        assertEquals("assistant/schedule/run", actions.last().method)
+        scroll("assistant-schedule-history:product-schedule"); node("assistant-schedule-history:product-schedule").performClick()
+        scroll("assistant-schedule-task:product-run-done"); capture("product-schedule-history")
+        node("assistant-schedule-task:product-run-done").performClick()
+        node("assistant-task-detail-page:product-done").assertExists()
+        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        scroll("assistant-memory-edit:product-memory"); node("assistant-memory-edit:product-memory").performClick()
+        assertEquals("简报保持精炼并保留来源", node("assistant-memory-text").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        node("assistant-memory-cancel").performClick()
+        scroll("assistant-memory-add"); node("assistant-memory-add").performClick()
+        assertEquals("", node("assistant-memory-text").fetchSemanticsNode().config[SemanticsProperties.EditableText].text) // New memory must not reuse edited text.
+        node("assistant-memory-cancel").performClick()
+        scroll("assistant-memory-undo:product-memory"); capture("product-memory-provenance")
+        node("assistant-memory-undo:product-memory").performClick()
+        assertEquals("assistant/memory/undo", actions.last().method)
+        assertEquals(JsonPrimitive("product-memory"), actions.last().params["memoryId"])
+        compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(memories = emptyList())) }
+        node("assistant-memory-undo:product-memory").assertDoesNotExist()
+        node("assistant-back").performClick(); node("assistant-task-detail-page:product-done").assertExists()
+        node("assistant-back").performClick(); node("assistant-schedules-list").assertExists()
+        node("assistant-back").performClick(); node("assistant-task-center").assertExists()
+        assertEquals(listOf("assistant/schedule/update", "assistant/schedule/pause", "assistant/schedule/run", "assistant/memory/undo"), actions.map {it.method})
+        assertTrue(opened.isEmpty())
+    }
+
+    @Test fun productTaskFollowupKeepsDraftUntilMatchingReceipt() = step("product_followup_receipt") {
+        compose.runOnIdle { state = productState() }
+        node("assistant-shortcut:Tasks").performClick()
+        scroll("assistant-task-primary:product-done"); node("assistant-task-primary:product-done").performClick()
+        scroll("assistant-task-draft:product-done"); node("assistant-task-draft:product-done").performTextReplacement("基于这份成果整理一个简短版本")
+        hideKeyboard(); scroll("assistant-task-send:product-done"); node("assistant-task-send:product-done").performClick()
+        val action = actions.single(); val binding = checkNotNull(action.composerBinding)
+        assertEquals("assistant/send", action.method); assertEquals(JsonPrimitive("product-done"), action.params["taskId"])
+        node("assistant-task-send:product-done").assertIsNotEnabled()
+        scroll("assistant-task-draft:product-done"); node("assistant-task-draft:product-done").performTextReplacement("收到后再增加图表，保留这份新草稿")
+        hideKeyboard()
+        compose.runOnIdle { state = state.copy(sendReceipts = listOf(AssistantSendReceipt(checkNotNull(action.commandId), "another-computer", binding.runtimeId, binding.conversationId, "accepted"))) }
+        scroll("assistant-task-send:product-done"); node("assistant-task-send:product-done").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(sendReceipts = listOf(AssistantSendReceipt(checkNotNull(action.commandId), binding.computerId, binding.runtimeId, binding.conversationId, "accepted"))) }
+        node("assistant-task-send:product-done").assertIsEnabled()
+        scroll("assistant-task-draft:product-done"); assertEquals("收到后再增加图表，保留这份新草稿", node("assistant-task-draft:product-done").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        node("assistant-back").performClick()
+        scroll("assistant-task-draft:product-done"); assertEquals("收到后再增加图表，保留这份新草稿", node("assistant-task-draft:product-done").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(fresh = false)) }
+        scroll("assistant-task-send:product-done"); node("assistant-task-send:product-done").assertIsNotEnabled()
+        assertEquals(1, actions.size); assertTrue(opened.isEmpty()); capture("product-bound-draft-receipt")
+    }
+
+    private fun productState(): AssistantUiState = AssistantUiState(
+        computerId = "product-fixture-computer",
+        snapshot = AssistantSnapshot(enabled = true, ready = true, fresh = true, runtimeId = RUNTIME,
+            assistantId = "product-fixture", paused = false, coordinatorThreadId = "fixture-main",
+            settings = AssistantSettings(personality = "隔离测试助理", tone = "简明", timezone = "Asia/Shanghai"),
+            tasks = listOf(
+                AssistantTask("product-task", "整理本周行业动态，生成一份带来源的简报", AssistantTaskStatus.WaitingUser, "product-operation", false, null,
+                    AssistantAssignment("product-task", groupId = "product-goal", completionCriteria = "保留来源，可预览和分享")),
+                AssistantTask("product-running", "核对行业资料与来源", AssistantTaskStatus.Running, "product-running-operation", false, null,
+                    AssistantAssignment("product-running", groupId = "product-goal")),
+                AssistantTask("product-done", "上一次定时简报", AssistantTaskStatus.Done, "product-done-operation", false, "已交付一份文字简报")),
+            groups = listOf(AssistantGroup("product-goal", "本周行业简报", listOf("product-task", "product-running"), false, true, "waiting_user")),
+            operations = listOf(
+                AssistantOperation("product-operation", "Execution", "product-task", AssistantOperationPhase.Waiting, false, THREAD,
+                    AssistantQuestion("product-approval", AssistantQuestionKind.Approval, "允许把报告写入助理工作区？"), null),
+                AssistantOperation("product-running-operation", "Execution", "product-running", AssistantOperationPhase.Running, false, "fixture-source-thread", null, null),
+                AssistantOperation("product-done-operation", "Execution", "product-done", AssistantOperationPhase.Completed, false, "fixture-done-thread", null, "已整理摘要与来源。")),
+            events = listOf(AssistantEvent(1, "product-queued", "product-operation", "started", "已分派资料整理", NOW - 2000, "product-task", groupId = "product-goal")),
+            artifacts = listOf(AssistantArtifact("product-previous-result", "product-done", "product-done-operation", "上次简报", "text", "上次简报的隔离测试内容。", null, "product-previous-v1", NOW - 86400000, "available")),
+            schedules = listOf(AssistantSchedule("product-schedule", "每天整理行业动态", buildJsonObject {put("Daily", buildJsonObject {put("hour", 9); put("minute", 30)})}, "Asia/Shanghai", NOW + 86400000, false, null)),
+            scheduleRuns = listOf(AssistantScheduleRun("product-run-skipped", "product-schedule", null, NOW - 172800000, "skipped", false),
+                AssistantScheduleRun("product-run-done", "product-schedule", "product-done", NOW - 86400000, "done", false)),
+            memories = listOf(AssistantMemory("product-memory", "简报保持精炼并保留来源", "user:product-preference", "personal", true, NOW - 3000, listOf(NOW - 3000))),
+            memoryUsage = mapOf("product-done-operation" to listOf("product-memory"))),
+        messages = listOf(AssistantChatMessage("user:product-preference", "User", "简报保持精炼并保留来源", NOW - 3000)))
+
     private fun checkpoint(name: String) { stage = name; writeResult("running") }
     private fun step(name: String, block: () -> Unit) {
         checkpoint(name)
@@ -395,17 +618,21 @@ class AssistantCollaborationDeviceTest {
         compose.onAllNodesWithTag(tag, useUnmergedTree = unmerged).fetchSemanticsNodes().size == 1
     }
     private fun scroll(tag: String) {
-        node("assistant-chat-list").performScrollToNode(hasTestTag(tag)); compose.waitForIdle()
+        val inChat = compose.onAllNodesWithTag("assistant-chat-list").fetchSemanticsNodes().isNotEmpty()
+        val listTag = listOf("assistant-chat-list", "assistant-detail-list", "assistant-tasks-list", "assistant-schedules-list", "assistant-memory-list")
+            .first {compose.onAllNodesWithTag(it).fetchSemanticsNodes().isNotEmpty()}
+        node(listTag).performScrollToNode(hasTestTag(tag)); compose.waitForIdle()
         // The product intentionally scrolls behind floating chrome. Compose sees the full-height
         // LazyColumn viewport, so performScrollToNode alone can leave the hit point under the dock.
-        val top = bounds("assistant-top-chrome").bottom + 12f
-        val bottom = bounds("assistant-bottom-dock").top - 12f
+        val viewport = bounds(listTag)
+        val top = maxOf(viewport.top, bounds("assistant-top-chrome").bottom) + 12f
+        val bottom = minOf(viewport.bottom, if (inChat) bounds("assistant-bottom-dock").top else viewport.bottom) - 12f
         check(bottom > top) { "No unobscured chat viewport" }
         val center = bounds(tag).center.y
         // Land inside the visible region, not on a fractional-pixel clipping boundary.
         val delta = if (center !in top..bottom) center - (top + bottom) / 2f else 0f
         if (delta != 0f) {
-            node("assistant-chat-list").performSemanticsAction(SemanticsActions.ScrollBy) { check(it(0f, delta)) }
+            node(listTag).performSemanticsAction(SemanticsActions.ScrollBy) { check(it(0f, delta)) }
             compose.waitForIdle()
         }
         val target = bounds(tag)

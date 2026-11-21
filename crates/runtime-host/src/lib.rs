@@ -6,6 +6,12 @@ pub use protocol::{Descriptor, read_frame, write_frame};
 #[cfg(feature = "server")]
 mod recovery;
 #[cfg(feature = "server")]
+mod queries;
+#[cfg(feature = "server")]
+mod admission;
+#[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
 pub use server::{HostConfig, run};
+#[cfg(all(feature = "server", windows))]
+pub mod legacy_upgrade;

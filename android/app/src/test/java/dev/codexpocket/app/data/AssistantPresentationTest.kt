@@ -6,6 +6,12 @@ import org.junit.Test
 import java.time.*
 
 class AssistantPresentationTest {
+    @Test fun sameNativeIdInDifferentRuntimeOrAccountNeverAliasesProjectSelection() {
+        val choice=AssistantWorkspaceChoice("desktop-a","thread","Project",configStoreId="store-a")
+        assertNotEquals(choice.selectionKey,choice.copy(runtimeId="desktop-b").selectionKey)
+        assertNotEquals(choice.selectionKey,choice.copy(configStoreId="store-b").selectionKey)
+        assertEquals(choice.selectionKey,choice.copy(label="Renamed").selectionKey)
+    }
     private fun obj(text: String) = pocketJson.parseToJsonElement(text).jsonObject
     private val native = NativeModel("directory-id", "actual-model", "电脑模型", "", emptyList(), "", false, true)
 
@@ -34,9 +40,13 @@ class AssistantPresentationTest {
     @Test fun actionsPreserveNativeEnumsAndOnlyAnAuthorizedThreadChoice() {
         val choice = AssistantWorkspaceChoice("runtime-a", "thread-a", "当前项目", true)
         val send = AssistantActions.send("runtime-a", "真实用户消息", choice)
-        assertEquals(obj("""{"message":"真实用户消息","runtimeId":"runtime-a","threadId":"thread-a"}"""), send.params)
+        assertEquals(obj("""{"message":"真实用户消息","runtimeId":"runtime-a","threadId":"thread-a","sourceRuntimeId":"runtime-a"}"""), send.params)
         assertFalse(AssistantActions.send("runtime-a", "你好", null).params.containsKey("threadId"))
-        assertThrows(IllegalArgumentException::class.java) { AssistantActions.send("runtime-b", "你好", choice) }
+        val cross=AssistantActions.send("assistant", "你好", choice.copy(configStoreId="store-a"))
+        assertEquals("assistant",cross.params.string("runtimeId"))
+        assertEquals("runtime-a",cross.params.string("sourceRuntimeId"))
+        assertEquals("store-a",cross.params.string("sourceConfigStoreId"))
+        assertThrows(IllegalArgumentException::class.java) { AssistantActions.send("assistant", "你好", choice.copy(runtimeId="")) }
         assertEquals(obj("""{"Answer":"使用现有配置"}"""), AssistantActions.respond("r", "o", "q", "使用现有配置").params["response"])
         assertEquals(obj("""{"Approval":{"approved":false}}"""), AssistantActions.approve("r", "o", "q", false).params["response"])
         val settings = AssistantSettings("认真", "简洁", "actual-model", "Asia/Shanghai", AssistantNotifications(true, false, true))
@@ -57,11 +67,14 @@ class AssistantPresentationTest {
         }
         assertEquals(Instant.parse("2030-11-03T05:30:00Z").toEpochMilli(), AssistantScheduleTime.once("2030-11-03", "01:30", zone, now))
         val choice = AssistantWorkspaceChoice("r", "authorized", "项目", false)
-        val action = AssistantActions.schedule("r", choice, AssistantScheduleDraft("汇总", "Daily", "2030-01-02", "09:30", 0, "60", zone, false), now)
+        val action = AssistantActions.schedule("assistant", choice.copy(configStoreId="source-store"), AssistantScheduleDraft("汇总", "Daily", "2030-01-02", "09:30", 0, "60", zone, false), now)
         assertEquals("assistant/schedule/create", action.method)
         assertEquals(obj("""{"Daily":{"hour":9,"minute":30}}"""), action.params.obj("spec")["kind"])
         assertFalse(action.params.obj("spec").containsKey("directory"))
         assertEquals("authorized", action.params.string("threadId"))
+        assertEquals("assistant", action.params.string("runtimeId"))
+        assertEquals("r", action.params.string("sourceRuntimeId"))
+        assertEquals("source-store", action.params.string("sourceConfigStoreId"))
         assertThrows(IllegalArgumentException::class.java) { AssistantActions.schedule("r", choice, AssistantScheduleDraft("汇总", "Daily", "2030-01-02", "09:30", 0, "60", zone, true), now) }
     }
 }

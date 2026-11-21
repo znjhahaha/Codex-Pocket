@@ -66,7 +66,7 @@ impl OperationError {
             "deployment_failed"=>"服务器部署步骤未完成，请检查 SSH、域名和端口后重试。",
             "pairing_payload_invalid"=>"配对码未能读取或已经过期，请重新生成配对码。",
             "operation_busy"=>"另一项操作正在进行，请稍后重试。",
-            "upgrade_unverified"=>"尚未取得旧后台的完整进程与安装代次证据，无法自动交接。请保留任务，任务完成后重新登录 Windows，再核验版本。",
+            "upgrade_unverified"=>"尚未取得旧后台的完整进程与安装代次证据，无法自动交接。请运行新版 Pocket 安装包，后台切换后重新核验版本。",
             _=>"此步骤未完成，请查看连接诊断后重试。",
         };
         Self{code:code.into(),stage:stage.into(),message:message.into(),retryable,

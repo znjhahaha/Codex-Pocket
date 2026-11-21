@@ -1,10 +1,18 @@
 //! Deterministic test peer. Never included in Pocket delivery packages.
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
+#[cfg(windows)]
+#[path = "pocket-host-fixture/legacy_upgrade_fixture.rs"]
+mod legacy_upgrade_fixture;
 fn main() {
     // Give lifecycle tests a real Host process identity, independent of the test runner.
     let mut args = std::env::args().skip(1);
     let mode = args.next();
+    #[cfg(windows)]
+    if mode.as_deref()==Some("--legacy-upgrade-fixture") {
+        let root=std::path::PathBuf::from(args.next().unwrap());let generation=args.next().unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(legacy_upgrade_fixture::run(root,generation)).unwrap();return;
+    }
     if mode.as_deref() == Some("--host-test-driver") {
         let root = std::path::PathBuf::from(args.next().expect("fixture root"));
         assert!(args.next().is_none());
@@ -54,7 +62,12 @@ fn main() {
             continue;
         }
         let result = match method {
+            "initialize" if mode.as_deref()==Some("app-server") => json!({"userAgent":"deterministic-pocket-fixture/1.0",
+                "codexHome":std::env::var("CODEX_HOME").unwrap(),"platformFamily":"windows","platformOs":"windows"}),
             "initialize" => json!({"userAgent":"deterministic-pocket-fixture"}),
+            "thread/start" => json!({"thread":{"id":"fixture-thread"},"cwd":value["params"]["cwd"],
+                "approvalPolicy":value["params"]["approvalPolicy"],"approvalsReviewer":value["params"]["approvalsReviewer"],
+                "sandbox":{"type":if value["params"]["sandbox"]=="workspace-write" {"workspaceWrite"} else {"readOnly"}}}),
             "turn/start" => {
                 writes += 1;
                 emit(
@@ -62,7 +75,7 @@ fn main() {
                 );
                 json!({"turn":{"id":"fixture-turn"},"writes":writes})
             }
-            "fixture/finish" => {
+            "fixture/finish" | "turn/interrupt" => {
                 emit(
                     json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
                 );

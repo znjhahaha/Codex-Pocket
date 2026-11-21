@@ -205,7 +205,10 @@ function Get-PocketFileHash([string]$Path) {
 }
 function Write-PocketAtomic([string]$Path, [byte[]]$Bytes) {
     Assert-PocketPlainPath $Path
-    $temporary = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    # A sibling temporary file preserves atomic replacement without extending
+    # an already long destination filename on Windows PowerShell 5.1.
+    $temporary = Join-Path ([IO.Path]::GetDirectoryName($Path)) ('.pocket-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    Assert-PocketPlainPath $temporary
     try {
         [IO.File]::WriteAllBytes($temporary, $Bytes)
         $deadline=[DateTime]::UtcNow.AddSeconds(2)
@@ -233,10 +236,21 @@ function Write-PocketJson([string]$Path, $Value) {
 function Move-PocketStagedDirectory([string]$Source, [string]$Destination) {
     $Source = Get-PocketDirectoryPath $Source
     $Destination = Get-PocketDirectoryPath $Destination
+    $parent = [IO.Path]::GetDirectoryName($Destination)
+    $shortGenerationStage = [IO.Path]::GetFileName($parent) -ceq 'bin' -and
+        [IO.Path]::GetFileName($Destination) -cmatch '^[a-f0-9]{64}$' -and
+        [IO.Path]::GetFileName($Source) -cmatch '^\.staging-[a-f0-9]{32}$'
     if ([IO.Path]::GetDirectoryName($Source) -ne [IO.Path]::GetDirectoryName($Destination) -or
         (-not $Source.StartsWith($Destination + '.staging-',[StringComparison]::OrdinalIgnoreCase) -and
-         -not $Source.StartsWith($Destination + '.migration-',[StringComparison]::OrdinalIgnoreCase))) {
+         -not $Source.StartsWith($Destination + '.migration-',[StringComparison]::OrdinalIgnoreCase) -and
+         -not $shortGenerationStage)) {
         throw 'Invalid staged directory publication paths.'
+    }
+    if ($shortGenerationStage) {
+        Test-PocketWindowsDirectory $Source | Out-Null
+        if ((Get-PocketFileHash (Join-Path $Source 'windows-manifest.json')) -cne [IO.Path]::GetFileName($Destination)) {
+            throw 'Staged generation digest differs from publication destination.'
+        }
     }
     for ($attempt=0; $attempt -le 5; $attempt++) {
         Assert-PocketPlainPath $Source
@@ -257,8 +271,9 @@ function ConvertTo-PocketArgument([string]$Value) {
     # Windows CommandLineToArgvW/CRT quoting, including a trailing backslash.
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
-function Get-PocketWindowsFiles {
-    return @('codex-pocket.ico','cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
+function Get-PocketWindowsFiles([switch]$IncludeUpdateTrust) {
+    if($IncludeUpdateTrust){Write-Output 'windows-update-trust.json'}
+    return @('codex-pocket.ico','cloudflared.exe','cloudflared-LICENSE.txt','pocket-agent.exe','pocket-bridge.exe','pocket-native-proxy.exe','pocket-desktop.exe','pocket-supervisor.exe','pocket-launcher.exe','pocket-upgrade.exe','windows-startup.ps1','windows-common.ps1','windows-install.ps1',
         'windows-launch-desktop.ps1','windows-tray.ps1','windows-verify-release.ps1',
         'cli-install.ps1','cli-wrapper.mjs','windows-user-guide.md','cli-install-implementation.md',
         'resume-windows-report.md','cli-native-probe-result.md','V02-WINDOWS-INSTALL.md',
@@ -308,6 +323,8 @@ function Test-PocketWindowsDirectory([string]$Directory) {
     $present=@($manifest.files | Where-Object {$_.path -in $optional})
     if($present.Count -ne 0 -and $present.Count -ne $optional.Count){throw 'Incomplete runtime/transport delivery inventory.'}
     $expected=if($present.Count){Get-PocketWindowsFiles}else{@(Get-PocketWindowsFiles | Where-Object {$_ -notin $optional})}
+    if(-not @($manifest.files | Where-Object {$_.path -eq 'pocket-native-proxy.exe'}).Count){$expected=@($expected | Where-Object {$_ -ne 'pocket-native-proxy.exe'})}
+    if(@($manifest.files | Where-Object {$_.path -eq 'windows-update-trust.json'}).Count -gt 0){$expected=@($expected)+@('windows-update-trust.json')}
     Test-PocketInventory $Directory $manifest $expected 'windows-manifest.json'
     return $manifest
 }
@@ -318,6 +335,7 @@ function Test-PocketReleaseDirectory([string]$Directory) {
     if ($manifest.version -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') { throw 'Invalid release version.' }
     $windows = Test-PocketWindowsDirectory (Join-Path $Directory 'windows')
     $names = @($windows.files | ForEach-Object { 'windows/' + $_.path }) + @('windows/windows-manifest.json',('codex-pocket-' + $manifest.version + '.apk'),('codex-pocket-' + $manifest.version + '-windows.zip'))
+    if (@($manifest.files | Where-Object {$_.path -eq 'MIGRATION-ROLLBACK.md'}).Count -gt 0) { $names += 'MIGRATION-ROLLBACK.md' }
     Test-PocketInventory $Directory $manifest $names 'release-manifest.json'
     if ($windows.version -ne $manifest.version) { throw 'Release version mismatch.' }
     return $manifest

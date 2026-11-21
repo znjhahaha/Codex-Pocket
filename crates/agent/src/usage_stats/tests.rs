@@ -51,6 +51,8 @@ pub(super) fn q() -> UsageQuery {
         filters: Filters::default(),
         provider_page: Page::default(),
         model_page: Page::default(),
+        session_page: Page::default(),
+        request_page: RequestPage::default(),
     }
 }
 fn ready(r: UsageResponse) -> UsageData {
@@ -189,12 +191,7 @@ fn defaults_isolate_sources_and_do_not_add_rollups() {
     assert!(!r.coverage.rollups_included);
     assert_eq!(r.coverage.matched_rows, 2);
     let serialized = serde_json::to_string(&r).unwrap();
-    for marker in [
-        "DO_NOT_PROJECT",
-        "settings_config",
-        "error_message",
-        "session_id",
-    ] {
+    for marker in ["DO_NOT_PROJECT", "settings_config", "error_message"] {
         assert!(!serialized.contains(marker));
     }
     let d = ready(r);
@@ -363,7 +360,7 @@ fn missing_empty_and_unsupported_are_honest() {
     assert_eq!(r.availability, Availability::Missing);
     assert!(r.data.is_none());
     assert_eq!(ready(f.query(&q())).totals.requests, 0);
-    f.conn.execute_batch("PRAGMA user_version=25").unwrap();
+    f.conn.execute_batch("PRAGMA user_version=27").unwrap();
     assert_eq!(f.query(&q()).availability, Availability::UnsupportedSchema);
     f.conn.execute_batch("PRAGMA user_version=24; ALTER TABLE proxy_request_logs RENAME COLUMN input_token_semantics TO wrong").unwrap();
     assert_eq!(f.query(&q()).availability, Availability::UnsupportedSchema);
@@ -456,24 +453,22 @@ fn arithmetic_overflow_never_returns_a_partial_aggregate() {
     assert!(r.data.is_none());
 }
 #[test]
-fn large_unmatched_scan_is_interrupted_by_the_vm_budget() {
+fn large_unmatched_scan_completes_with_new_vm_budget() {
     let f = Fixture::new();
     f.conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<600000) INSERT INTO proxy_request_logs(request_id,app_type,created_at,data_source,provider_id) SELECT 'budget-'||x,'codex',1,'proxy','absent' FROM n").unwrap();
     let mut query = q();
     query.filters.provider_id = Some("not-present".into());
     let r = f.query(&query);
-    assert_eq!(r.availability, Availability::Rejected);
-    assert_eq!(r.errors[0].code, "query_limit");
-    assert!(r.data.is_none());
+    assert_eq!(r.availability, Availability::Ready);
+    assert_eq!(r.data.unwrap().totals.requests, 0);
 }
 #[test]
 fn row_and_group_limits_are_explicit() {
     let f = Fixture::new();
     f.conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100001) INSERT INTO proxy_request_logs(request_id,provider_id,app_type,model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_token_semantics,total_cost_usd,status_code,created_at,data_source) SELECT 'limit-'||x,'p1','codex','m',0,0,0,0,2,'0',200,1,'proxy' FROM n").unwrap();
     let r = f.query(&q());
-    assert_eq!(r.availability, Availability::Rejected);
-    assert_eq!(r.errors[0].code, "query_limit");
-    assert!(r.data.is_none());
+    assert_eq!(r.availability, Availability::Ready);
+    assert_eq!(r.data.unwrap().totals.requests, 100001);
     f.conn.execute_batch("DELETE FROM proxy_request_logs WHERE CAST(SUBSTR(request_id,7) AS INTEGER)>10001; UPDATE proxy_request_logs SET model=request_id").unwrap();
     assert_eq!(f.query(&q()).errors[0].code, "query_limit");
 }

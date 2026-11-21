@@ -527,3 +527,17 @@ pub fn run(root: &Path, state: &Path, operation_id: &str) -> Result<UpgradeStatu
     );
     c.execute(&mut LocalBackend)
 }
+
+/// Complete a failed, already-cancelled pre-release inventory. Unlike execute,
+/// this narrowly scoped recovery proves the original owner never departed.
+pub(crate) fn recover_cancelled(root: &Path, state: &Path, operation_id: &str) -> Result<UpgradeStatus> {
+    let mut c=Coordinator::open(root,state)?;
+    ensure!(c.status.operation_id == operation_id
+        && matches!(c.status.phase,Phase::Failed|Phase::RolledBack)
+        && c.status.failure == Some(Failure::RollbackFailed), "Handoff is not a cancelled inventory failure");
+    let verification=local::cancelled_source(&c.status)?;
+    ensure!(verification.valid(&c.status,&c.status.from_generation), "Source recovery unverified");
+    c.status.verification=Some(verification);
+    c.save(Phase::RolledBack,Some(Failure::RollbackFailed))?;
+    Ok(c.status.clone())
+}

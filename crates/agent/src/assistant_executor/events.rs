@@ -34,6 +34,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                         .push((mapping.clone(), call.clone()));
                 }
                 self.pending.remove(&key);
+                if !self.state.streaming_stopped.contains(&id) {
                 let status = self
                     .pending_status(&mapping)?
                     .unwrap_or(ExecutionStatus::Running(mapping));
@@ -43,6 +44,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                     status,
                     event_id: format!("host:{generation}:{}", event.sequence),
                 });
+                }
             }
         } else {
             let op = self
@@ -50,23 +52,57 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 .operations
                 .values()
                 .find(|o| {
-                    o.mapping.as_ref().is_some_and(|m| {
+                    o.generation==generation && o.mapping.as_ref().is_some_and(|m| {
                         Some(m.thread_id.as_str()) == thread && Some(m.turn_id.as_str()) == turn
                     })
                 })
                 .cloned();
             if let Some(op) = op {
                 let mapping = op.mapping.clone().unwrap();
-                if method == "item/tool/call" {
-                    ensure!(
-                        self.state.threads[&mapping.thread_id]
+                if method == "item/agentMessage/delta"
+                    || (method == "item/completed" && p["item"]["type"] == "agentMessage")
+                {
+                    if self.state.threads[&mapping.thread_id]
+                        .current_operation
+                        .as_deref()
+                        == Some(&op.operation_id)
+                        && !self.state.streaming_gap
+                        && !self.state.streaming_stopped.contains(&op.operation_id)
+                        && !self.statuses.get(&op.operation_id).is_some_and(|s| {
+                            matches!(
+                                s,
+                                ExecutionStatus::Completed(..)
+                                    | ExecutionStatus::Failed(..)
+                                    | ExecutionStatus::Interrupted(..)
+                            )
+                        })
+                    {
+                        let item = p["itemId"]
+                            .as_str()
+                            .or_else(|| p["item"]["id"].as_str())
+                            .context("Streaming item identity missing")?;
+                        small(item)?;
+                        let text = if method == "item/completed" {
+                            p["item"]["text"].as_str()
+                        } else {
+                            p["delta"].as_str()
+                        }
+                        .context("Streaming text missing")?;
+                        self.store_stream(&op.operation_id, item, text, method != "item/completed");
+                        if let Some(text) = self.stream_text(&op.operation_id) {
+                            projection.streams.push(StreamObservation {
+                                operation_id: op.operation_id.clone(),
+                                text,
+                            });
+                        }
+                    }
+                } else if method == "item/tool/call" {
+                    let current = self.state.threads[&mapping.thread_id]
                             .current_operation
                             .as_deref()
-                            == Some(&op.operation_id),
-                        "Dynamic call targets an old turn"
-                    );
-                    ensure!(
-                        !self
+                            == Some(&op.operation_id);
+                    let stopped = self.state.streaming_stopped.contains(&op.operation_id)
+                        || self
                             .statuses
                             .get(&op.operation_id)
                             .is_some_and(|s| matches!(
@@ -74,9 +110,9 @@ impl<R: RuntimeIo> HostExecutor<R> {
                                 ExecutionStatus::Completed(..)
                                     | ExecutionStatus::Failed(..)
                                     | ExecutionStatus::Interrupted(..)
-                            )),
-                        "Dynamic call targets stopped turn"
-                    );
+                            ));
+                    ensure!((current && !stopped) || event.sequence == 0,
+                        "Dynamic call targets an old or stopped turn");
                     let native_id = v
                         .get("id")
                         .context("Dynamic call native request id missing")?
@@ -98,7 +134,9 @@ impl<R: RuntimeIo> HostExecutor<R> {
                     };
                     self.insert_pending(pending)?;
                     let decoded =
-                        if op.role != Role::Coordinator && p["tool"] != "assistant_read_main" {
+                        if !current || stopped {
+                            Err(anyhow::anyhow!("Retained tool belongs to a stopped turn; use Assistant to reject it"))
+                        } else if op.role != Role::Coordinator && p["tool"] != "assistant_read_main" {
                             Err(anyhow::anyhow!(
                                 "Only current coordinator may use assistant tools"
                             ))
@@ -138,6 +176,10 @@ impl<R: RuntimeIo> HostExecutor<R> {
                         call_id: None,
                     };
                     self.insert_pending(pending)?;
+                    if self.state.streaming_stopped.contains(&op.operation_id) {
+                        ensure!(event.sequence == 0, "Native request targets a stopped turn");
+                        return Ok(projection);
+                    }
                     let text = if method == "item/tool/requestUserInput" {
                         serde_json::to_string(&p["questions"])?
                     } else {
@@ -218,6 +260,12 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 && batch.pending_requests.len() <= 128,
             "Invalid event batch"
         );
+        if batch.snapshot_required || self.state.streaming_gap {
+            self.state.streaming_gap = true;
+            self.event_gap = true;
+            self.save()?;
+            return self.recover_stream_gap(batch, limit);
+        }
         let mut current_pending = std::collections::BTreeSet::new();
         for request in &batch.pending_requests {
             bounded_json(request)?;
@@ -238,6 +286,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
         for event in batch.events {
             let p = self.ingest(&generation, event)?;
             result.observations.extend(p.observations);
+            result.streams.extend(p.streams);
             result.tools.extend(p.tools);
             result.resolved_tools.extend(p.resolved_tools);
         }
@@ -251,6 +300,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 },
             )?;
             result.observations.extend(p.observations);
+            result.streams.extend(p.streams);
             result.tools.extend(p.tools);
         }
         // Replay may omit the resolution event. Only a successful same-generation
@@ -281,6 +331,184 @@ impl<R: RuntimeIo> HostExecutor<R> {
         self.save()?;
         Ok(result)
     }
+    fn recover_stream_gap(
+        &mut self,
+        batch: RuntimeEvents,
+        limit: usize,
+    ) -> Result<EventProjection> {
+        let generation = self.state.generation.clone();
+        let targets = self
+            .state
+            .operations
+            .values()
+            .filter(|op| {
+                op.generation==generation && op.mapping.as_ref().is_some_and(|mapping| {
+                    self.state
+                        .threads
+                        .get(&mapping.thread_id)
+                        .is_some_and(|owner| {
+                            owner.current_operation.as_deref() == Some(&op.operation_id)
+                        })
+                }) && !self.state.streaming_stopped.contains(&op.operation_id)
+                    && !self.statuses.get(&op.operation_id).is_some_and(|status| {
+                        matches!(
+                            status,
+                            ExecutionStatus::Completed(..)
+                                | ExecutionStatus::Failed(..)
+                                | ExecutionStatus::Interrupted(..)
+                        )
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut cursor = batch.next_after;
+        let mut latest = batch;
+        // Native history and Host replay have separate reads. Take full exact
+        // snapshots, then drain replay to a quiet watermark. Any body/turn
+        // event in that interval requires another snapshot: it may already be
+        // included in the first one. Read-RPC replies alone do not change text.
+        for _ in 0..3 {
+            let mut snapshots = vec![];
+            for op in &targets {
+                let mapping = op.mapping.as_ref().unwrap();
+                let turn = self
+                    .read_exact_turn(mapping)?
+                    .context("Native stream snapshot unavailable")?;
+                snapshots.push((op.clone(), turn));
+            }
+            let mut changed = false;
+            let mut quiet = false;
+            for _ in 0..4 {
+                let follow = self.runtime.events(cursor, limit)?;
+                ensure!(
+                    follow.generation == generation
+                        && follow.events.len() <= limit
+                        && follow.pending_requests.len() <= 128
+                        && follow.next_after >= cursor,
+                    "Invalid stream snapshot fence"
+                );
+                for event in &follow.events {
+                    bounded_json(&event.message)?;
+                    ensure!(
+                        event.sequence > cursor && event.sequence <= follow.next_after,
+                        "Invalid stream snapshot event boundary"
+                    );
+                    let p = &event.message["params"];
+                    let turn = p["turnId"].as_str().or_else(|| p["turn"]["id"].as_str());
+                    changed |= matches!(
+                        event.message["method"].as_str(),
+                        Some(
+                            "item/agentMessage/delta"
+                                | "item/completed"
+                                | "turn/started"
+                                | "turn/completed"
+                        )
+                    ) && targets.iter().any(|op| {
+                        op.mapping.as_ref().is_some_and(|m| {
+                            p["threadId"].as_str() == Some(&m.thread_id) && turn == Some(&m.turn_id)
+                        })
+                    });
+                }
+                changed |= follow.snapshot_required
+                    || (follow.events.is_empty() && follow.next_after != cursor);
+                quiet = !follow.snapshot_required
+                    && follow.events.is_empty()
+                    && follow.next_after == cursor;
+                cursor = follow.next_after;
+                latest = follow;
+                if quiet || latest.snapshot_required {
+                    break;
+                }
+            }
+            if changed || !quiet {
+                continue;
+            }
+            let previous = self.state.clone();
+            let previous_pending = self.pending.clone();
+            let previous_statuses = self.statuses.clone();
+            let applied = (|| -> Result<EventProjection> {
+                let mut result = EventProjection::default();
+                for (op, turn) in snapshots {
+                    let mapping = op.mapping.as_ref().unwrap();
+                    let status = self.project_turn(mapping, &turn)?;
+                    ensure!(
+                        !matches!(status, ExecutionStatus::Unknown),
+                        "Unverified native stream snapshot status"
+                    );
+                    if matches!(status, ExecutionStatus::Running(..)) {
+                        self.clear_stream(&op.operation_id);
+                        let items = turn["items"]
+                            .as_array()
+                            .context("Full native stream items missing")?;
+                        for item in items.iter().filter(|item| item["type"] == "agentMessage") {
+                            let id = item["id"]
+                                .as_str()
+                                .context("Native stream snapshot item ID missing")?;
+                            small(id)?;
+                            let text = item["text"]
+                                .as_str()
+                                .context("Native stream snapshot text missing")?;
+                            self.store_stream(&op.operation_id, id, text, false);
+                        }
+                        result.streams.push(StreamObservation {
+                            operation_id: op.operation_id.clone(),
+                            text: self.stream_text(&op.operation_id).unwrap_or_default(),
+                        });
+                    }
+                    self.statuses
+                        .insert(op.operation_id.clone(), status.clone());
+                    result.observations.push(StatusObservation {
+                        operation_id: op.operation_id,
+                        event_id: format!("host:stream-snapshot:{cursor}:{}", hash(&status)?),
+                        status,
+                    });
+                }
+                let pending_ids = latest
+                    .pending_requests
+                    .iter()
+                    .map(|p| native_key(&p["id"]))
+                    .collect::<Result<std::collections::BTreeSet<_>>>()?;
+                for (handle, pending) in &self.pending {
+                    if !pending_ids.contains(handle)
+                        && let Some(call) = &pending.call_id
+                    {
+                        result
+                            .resolved_tools
+                            .push((pending.mapping.clone(), call.clone()));
+                    }
+                }
+                self.pending.clear();
+                for message in latest.pending_requests {
+                    let p = self.ingest(
+                        &generation,
+                        RuntimeEvent {
+                            sequence: 0,
+                            message,
+                        },
+                    )?;
+                    result.observations.extend(p.observations);
+                    result.tools.extend(p.tools);
+                }
+                result.pending_snapshot = true;
+                self.state.cursor = cursor;
+                self.state.streaming_gap = false;
+                self.save()?;
+                self.event_gap = false;
+                Ok(result)
+            })();
+            if applied.is_err() {
+                self.state = previous;
+                self.pending = previous_pending;
+                self.statuses = previous_statuses;
+                self.event_gap = true;
+            }
+            return applied;
+        }
+        anyhow::bail!(
+            "Native stream snapshot is changing; retain replay fence until reconciliation"
+        )
+    }
+
     fn fence_unknown(&mut self, reason: &str) -> EventProjection {
         self.pending.clear();
         self.event_gap = true;
@@ -313,7 +541,17 @@ impl<R: RuntimeIo> HostExecutor<R> {
         );
         let status = match turn["status"].as_str() {
             Some("completed") => {
-                let text = protocol::turn_text(turn)?;
+                // A bounded text projection must never poison completion/control
+                // delivery just because the native answer exceeds the UI budget.
+                let parts = turn["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(100)
+                    .filter(|item| item["type"] == "agentMessage")
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>();
+                let text = clip_stream(&parts.join("\n"), 65536);
                 ExecutionStatus::Completed(
                     mapping.clone(),
                     if text.is_empty() {
@@ -340,7 +578,18 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 | ExecutionStatus::Failed(..)
                 | ExecutionStatus::Interrupted(..)
         ) {
-            self.pending.retain(|_, p| p.mapping != *mapping);
+            // Only a current Host pending snapshot/resolution event retires a
+            // request. A completed turn can still retain an unanswered tool.
+            if let Some(id) = self
+                .state
+                .operations
+                .values()
+                .find(|op| op.mapping.as_ref() == Some(mapping))
+                .map(|op| op.operation_id.clone())
+            {
+                self.clear_stream(&id);
+                self.state.streaming_stopped.insert(id);
+            }
         }
         Ok(status)
     }
@@ -410,12 +659,26 @@ impl<R: RuntimeIo> HostExecutor<R> {
         id: &str,
         mapping: &NativeMapping,
     ) -> Result<ExecutionStatus> {
+        let Some(turn) = self.read_exact_turn(mapping)? else {
+            return Ok(ExecutionStatus::Unknown);
+        };
+        let mut status = self.project_turn(mapping, &turn)?;
+        if matches!(status, ExecutionStatus::Running(..)) {
+            status = self.pending_status(mapping)?.unwrap_or(status);
+        }
+        self.statuses.insert(id.into(), status.clone());
+        if self.state.streaming_stopped.contains(id) {
+            self.save()?;
+        }
+        Ok(status)
+    }
+    fn read_exact_turn(&mut self, mapping: &NativeMapping) -> Result<Option<Value>> {
         let meta = match self.query(
             "thread/read",
             json!({"threadId":mapping.thread_id,"includeTurns":false}),
         ) {
             Ok(v) => v,
-            Err(_) => return Ok(ExecutionStatus::Unknown),
+            Err(_) => return Ok(None),
         };
         ensure!(
             meta["thread"]["id"].as_str() == Some(&mapping.thread_id),
@@ -423,7 +686,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
         );
         let mut cursor: Option<String> = None;
         for _ in 0..4 {
-            let page=match self.query("thread/turns/list",json!({"threadId":mapping.thread_id,"limit":100,"sortDirection":"desc","itemsView":"full","cursor":cursor})){Ok(v)=>v,Err(_)=>return Ok(ExecutionStatus::Unknown)};
+            let page=match self.query("thread/turns/list",json!({"threadId":mapping.thread_id,"limit":100,"sortDirection":"desc","itemsView":"full","cursor":cursor})){Ok(v)=>v,Err(_)=>return Ok(None)};
             let turns = page["data"]
                 .as_array()
                 .context("Invalid native reconciliation page")?;
@@ -432,18 +695,13 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 .iter()
                 .find(|t| t["id"].as_str() == Some(&mapping.turn_id))
             {
-                let mut status = self.project_turn(mapping, turn)?;
-                if matches!(status, ExecutionStatus::Running(..)) {
-                    status = self.pending_status(mapping)?.unwrap_or(status);
-                }
-                self.statuses.insert(id.into(), status.clone());
-                return Ok(status);
+                return Ok(Some(turn.clone()));
             }
             cursor = page["nextCursor"].as_str().map(str::to_owned);
             if cursor.is_none() {
                 break;
             }
         }
-        Ok(ExecutionStatus::Unknown)
+        Ok(None)
     }
 }

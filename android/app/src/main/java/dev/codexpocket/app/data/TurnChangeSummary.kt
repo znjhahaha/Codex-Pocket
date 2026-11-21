@@ -23,7 +23,7 @@ fun changeLineCountsKnown(file: ActivityFile): Boolean = file.diff.lineSequence(
 fun turnChangeSummaries(timeline: NativeTimeline): List<TurnChangeSummary> {
     val terminal = timeline.completedTurns + timeline.turns.values.filter { it.status in setOf("completed", "failed", "interrupted") }.map { it.id }
     return timeline.items.values.groupBy { it.turnId }.mapNotNull { (turn, items) ->
-        if (turn !in terminal || timeline.activeTurn == turn) return@mapNotNull null
+        if (turn !in terminal || timeline.activeTurn == turn || timeline.turns[turn]?.status == "inProgress") return@mapNotNull null
         val cumulative = items.lastOrNull { it.type == "turn/diff/updated" && it.raw.obj("params")["diff"] is JsonPrimitive }
         val records = if (cumulative != null) activityFiles(cumulative) else items
             .filter { it.type == "fileChange" && it.complete && it.status !in setOf("failed", "declined", "interrupted", "inProgress") }

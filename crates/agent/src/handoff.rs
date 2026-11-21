@@ -558,7 +558,7 @@ impl Snapshot {
                 .filter(|e| {
                     matches!(
                         serde_json::from_value::<Status>(e["status"].clone()),
-                        Ok(Status::Submitted | Status::Unknown)
+                        Ok(Status::Submitted)
                     )
                 })
                 .count()
@@ -1270,9 +1270,15 @@ impl Handoff {
         if p.as_object().is_none_or(|o| !o.is_empty()) {
             return Err(error("invalid_params"));
         }
+        let state = self.state.lock().unwrap();
         Ok(
-            json!({"protocol":1,"supported":self.pocket_owned,"generation":self.state.lock().unwrap().durable.generation,"owner":"pocket-agent","methods":METHODS,"checkpoint":"sha256","shutdown":"after_reply_flush","writeFence":true,"preservesIdentity":true}),
+            json!({"protocol":1,"supported":self.pocket_owned,"generation":state.durable.generation,"owner":"pocket-agent","methods":METHODS,"checkpoint":"sha256","shutdown":"after_reply_flush","writeFence":true,"preservesIdentity":true,"unconfirmedWrites":state.writes.len()}),
         )
+    }
+    /// Current unconfirmed WritePermit tokens, including abandoned permits.
+    /// Advisory evidence only; checkpoint/release revalidates under the fence.
+    pub fn unconfirmed_writes(&self) -> usize {
+        self.state.lock().unwrap().writes.len()
     }
     fn check(&self, s: &State, p: &Params) -> Result<()> {
         p.validate()?;

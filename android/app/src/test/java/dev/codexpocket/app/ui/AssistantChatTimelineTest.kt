@@ -196,13 +196,13 @@ class AssistantChatTimelineTest {
             ),
         )
         val state = AssistantUiState(snapshot, listOf(AssistantChatMessage("native", "User", "无时间的消息")),
-            loading = true, error = "离线", pendingActions = setOf("assistant/send"), sendAcknowledgement = 123)
+            loading = true, error = "离线", pendingActions = setOf("assistant/send"))
 
         val timeline = assistantTimeline(state)
 
         assertEquals(listOf("message:native", "message:operation:coordinator:result", "task:unmapped", "task:mapped", "question:execution", "result:execution"), timeline.map { it.key })
         assertTrue("Missing time must remain null rather than becoming an index, sequence, or wall-clock time", timeline.all { it.atMs == null })
-        assertEquals(timeline, assistantTimeline(state.copy(loading = false, error = null, pendingActions = emptySet(), sendAcknowledgement = 124)))
+        assertEquals(timeline, assistantTimeline(state.copy(loading = false, error = null, pendingActions = emptySet(),sendReceipts=listOf(AssistantSendReceipt("once","pc","r",null,"accepted")))))
     }
 
     @Test fun duplicateSummarySuppliesItsActualTimeToAnUntimedNativeReply() {

@@ -97,7 +97,7 @@ internal fun PocketSegmented(options: List<String>, selected: Int, onSelect: (In
                 Box(Modifier.height(34.dp).onSizeChanged { size -> if (widths.getOrNull(index) != size.width) widths = widths.toMutableList().also { it[index] = size.width } }
                     .clip(PocketCapsule).clickable(role = Role.Tab) { onSelect(index) }.semantics { this.selected = active }
                     .padding(horizontal = 16.dp), contentAlignment = Alignment.Center) {
-                    Text(label, style = MaterialTheme.typography.labelLarge, color = color, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal)
+                    PocketTabLabel(label, active, style = MaterialTheme.typography.labelLarge, color = color)
                 }
             }
         }

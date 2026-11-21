@@ -37,9 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -82,12 +80,11 @@ internal fun SettingsPageLayout(
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
     val background = MaterialTheme.colorScheme.background
-    val density = LocalDensity.current
-    var segmentHeight by remember { mutableIntStateOf(with(density) { 82.dp.roundToPx() }) }
-    Box(modifier.fillMaxSize().background(background).testTag("management-settings")) {
+    Column(modifier.fillMaxSize().background(background).testTag("management-settings")) {
+        SettingsPageSegments(page, { page = it }, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
         AnimatedContent(
             targetState = page,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.weight(1f).fillMaxWidth(),
             transitionSpec = {
                 if (motion) fadeIn(tween(180)) togetherWith fadeOut(tween(180))
                 else EnterTransition.None togetherWith ExitTransition.None
@@ -95,8 +92,7 @@ internal fun SettingsPageLayout(
             label = "settings-page",
         ) { selected ->
             pages.SaveableStateProvider(selected.name) {
-                val padding = PaddingValues(start = 16.dp, end = 16.dp,
-                    top = with(density) { segmentHeight.toDp() } + 4.dp, bottom = 24.dp)
+                val padding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp)
                 if (selected == SettingsPage.Extensions && extensionContent != null) {
                     extensionContent(Modifier.fillMaxSize().testTag("settings-page:" + selected.name), padding)
                 } else {
@@ -106,16 +102,13 @@ internal fun SettingsPageLayout(
                         SettingsPage.App -> appScroll
                     }
                     Column(
-                        Modifier.fillMaxSize().testTag("settings-page:" + selected.name).verticalScroll(scroll).padding(padding),
+                        Modifier.fillMaxSize().testTag("settings-page:" + selected.name)
+                            .verticalScroll(scroll).padding(padding),
                         verticalArrangement = Arrangement.spacedBy(20.dp),
                     ) { content(selected) }
                 }
             }
         }
-        // An opaque backing keeps moving page content out of the segmented control.
-        SettingsPageSegments(page, { page = it }, Modifier.align(Alignment.TopCenter)
-            .onSizeChanged { segmentHeight = it.height }
-            .padding(horizontal = 16.dp, vertical = 12.dp))
     }
 }
 
@@ -141,7 +134,7 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
                                 .testTag("settings-tab:" + item.name).selectable(page == item, role = Role.Tab,
                                     interactionSource = interaction, indication = null, onClick = { onSelect(item) })
                                 .padding(horizontal = 6.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
-                                Text(item.label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center,
+                                PocketTabLabel(item.label, page == item, style = MaterialTheme.typography.labelMedium,
                                     color = if (page == item) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
@@ -175,7 +168,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     SettingsPageLayout(if (management) SettingsPage.Connection else SettingsPage.App, modifier,
         extensionContent = { pageModifier, padding ->
             val wired = usageState != null && onUsageRefresh != null && onUsageFilter != null
-            UsageScreen(if (wired) usageState!! else UsageScreenState(), onUsageRefresh ?: {}, onUsageFilter ?: {}, pageModifier, padding)
+            UsageScreen(if (wired) usageState!! else UsageScreenState(), onUsageRefresh ?: {}, onUsageFilter ?: {}, pageModifier, padding,
+                onRequests = if (wired) { cursor -> repo.loadUsageRequests(cursor) } else null)
         }) { page ->
         when (page) {
             SettingsPage.Connection -> {
@@ -284,6 +278,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                 }
                 Text(context.getString(R.string.app_about), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("${dev.codexpocket.app.BuildConfig.VERSION_NAME} · ${dev.codexpocket.app.BuildConfig.POCKET_BUILD_ID}", Modifier.padding(horizontal = 8.dp),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("阅读字体使用 MiSans，版权归小米所有。字体原文件及许可协议随应用提供。", Modifier.padding(horizontal = 8.dp),
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

@@ -17,6 +17,8 @@ pub enum Route {
 
 struct Pending {
     client: Client,
+    post_initialize: bool,
+    initialize_client: Option<String>,
     original_id: Value,
     method: String,
     requested_thread: Option<String>,
@@ -59,6 +61,12 @@ pub struct Router {
     pub initialized: bool,
     initialize_received: bool,
     pub native_version: Option<String>,
+    pub runtime_role: &'static str,
+    // Lost native outcomes must not become an idle-update permit.
+    activity_unknown: bool,
+    maintenance: Option<(String, std::time::Instant)>,
+    startup: Option<crate::startup::StartupBarrier>,
+    pub startup_admission: Option<pocket_core::admission::Registration>,
     settings: crate::settings::SettingsCache,
 }
 
@@ -82,36 +90,101 @@ impl Default for Router {
             initialized: false,
             initialize_received: false,
             native_version: None,
+            runtime_role: "pending",
+            activity_unknown: false,
+            maintenance: None,
+            startup: None,
+            startup_admission: None,
             settings: Default::default(),
         }
     }
 }
 
 impl Router {
+    pub fn with_startup_operation(operation: String, release_file: Option<std::path::PathBuf>) -> anyhow::Result<Self> {
+        let startup=crate::startup::StartupBarrier::new(operation,release_file)?;
+        let mut router=Self { startup:Some(startup), ..Self::default() };
+        router.refresh_startup();
+        Ok(router)
+    }
+    pub fn refresh_startup(&mut self) {
+        if self.startup.as_ref().is_some_and(|gate|gate.released()) { self.startup=None; }
+    }
+    pub fn maintenance_status(&self) -> Value {
+        let operation=self.startup.as_ref().map(|g|g.operation.as_str())
+            .or_else(||self.maintenance.as_ref().map(|(id,_)|id.as_str()));
+        operation.map(|id|json!({"operationId":id,"startupFenced":self.startup.is_some(),
+            "remainingMs":self.maintenance.as_ref().map(|(_,deadline)|deadline.saturating_duration_since(std::time::Instant::now()).as_millis()).unwrap_or(0)})).unwrap_or(Value::Null)
+    }
+    fn effectful(method: &str) -> bool {
+        !matches!(method,
+            "initialize" | "initialized" | "model/list" | "account/read" | "account/rateLimits/read"
+            | "config/read" | "configRequirements/read" | "thread/list" | "thread/read"
+            | "thread/loaded/list" | "thread/turns/list" | "thread/items/list"
+            | "thread/goal/get" | "thread/queue/list" | "project/list" | "project/read" | "skills/list"
+            | "mcpServerStatus/list" | "collaborationMode/list" | "app/installed"
+            | "plugin/installed" | "plugin/list")
+    }
+    fn pending_writes(&self) -> usize {
+        self.pending.values().filter(|p| Self::effectful(&p.method)).count()
+            + self.completed.len()
+    }
     fn management_busy(&self) -> bool {
         !self.active.is_empty()
             || !self.server.is_empty()
-            || self.pending.values().any(|p| {
-                matches!(
-                    p.method.as_str(),
-                    "turn/start" | "turn/steer" | "thread/compact/start" | "mcpServer/tool/call"
-                )
-            })
+            || self.pending_writes() != 0
+            || self.activity_unknown
     }
     pub fn from_client(&mut self, client: Client, mut value: Value) -> Vec<Route> {
+        self.refresh_startup();
+        if self.maintenance.as_ref().is_some_and(|(_, deadline)| *deadline <= std::time::Instant::now()) {
+            self.maintenance = None;
+        }
         if let Some(method) = value
             .get("method")
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            if matches!(client, Client::Remote(_)) && matches!(method.as_str(), "pocket/maintenance/quiesce" | "pocket/maintenance/resume") {
+                let operation = value["params"]["operationId"].as_str().filter(|id| {
+                    uuid::Uuid::parse_str(id).is_ok_and(|v| v.to_string() == *id)
+                });
+                if value["params"].as_object().is_none_or(|p| p.len() != 1) || operation.is_none() {
+                    return Self::reject(client, &value, "Maintenance requires one canonical operationId");
+                }
+                let operation = operation.unwrap();
+                if self.maintenance.as_ref().is_some_and(|(id, _)| id != operation)
+                    || self.startup.as_ref().is_some_and(|gate|gate.operation != operation) {
+                    return Self::reject(client, &value, "Another maintenance operation owns the write barrier");
+                }
+                if method == "pocket/maintenance/quiesce" {
+                    if !self.initialized || self.management_busy() {
+                        return Self::reject(client, &value, "Native work is active or unverified");
+                    }
+                    self.maintenance = Some((operation.to_owned(), std::time::Instant::now() + std::time::Duration::from_secs(30)));
+                } else {
+                    if self.startup.as_ref().is_some_and(|gate|gate.requires_receipt()) {
+                        return Self::reject(client,&value,"Startup release receipt has not been published");
+                    }
+                    if self.startup.is_some() && !self.initialized {
+                        return Self::reject(client,&value,"Startup verification has not completed");
+                    }
+                    self.maintenance=None; self.startup=None;
+                }
+                return vec![Route::Client(client, json!({"id":value["id"],"result":{"protocol":1,"operationId":operation,"quiesced":self.maintenance.is_some()||self.startup.is_some(),"startupFenced":self.startup.is_some(),"leaseMs":if self.maintenance.is_some(){30000}else{0}}}))];
+            }
             if matches!(client, Client::Remote(_)) && method == "pocket/managementStatus" {
                 if value["params"].as_object().is_none_or(|p| !p.is_empty()) {
                     return Self::reject(client, &value, "Management status takes no parameters");
                 }
                 return vec![Route::Client(
                     client,
-                    json!({"id":value["id"],"result":{"protocol":1,"initialized":self.initialized,"busy":self.management_busy()}}),
+                    json!({"id":value["id"],"result":{"protocol":1,"startupBarrierProtocol":1,"startupAdmissionProtocol":if self.startup_admission.is_some(){1}else{0},"startupAdmission":self.startup_admission,"admission":crate::admission::summary(self.startup_admission.as_ref()),"initialized":self.initialized,"busy":self.management_busy(),"activeTurns":self.active.len(),"pendingQuestions":self.server.len(),"pendingWrites":self.pending_writes(),"unknownOperations":u8::from(self.activity_unknown),"maintenance":self.maintenance_status()}}),
                 )];
+            }
+            if (self.maintenance.is_some() || self.startup.is_some()) && Self::effectful(&method)
+                && !matches!(method.as_str(),"pocket/threadSettings"|"pocket/approvals/list") {
+                return if value.get("id").is_some() { Self::reject(client, &value, "Native writes are temporarily paused for update") } else { vec![Route::Drop] };
             }
             if matches!(client, Client::Remote(_)) && method == "pocket/threadSettings" {
                 if !value["params"].as_object().is_some_and(|p| {
@@ -152,6 +225,9 @@ impl Router {
                 )];
             }
             if client != Client::Desktop {
+                if self.runtime_role == "auxiliary" {
+                    return Self::reject(client, &value, "Auxiliary runtime does not accept conversation RPCs");
+                }
                 let restricted = matches!(
                     method.as_str(),
                     "config/value/write" | "skills/config/write" | "config/mcpServer/reload"
@@ -248,6 +324,10 @@ impl Router {
                         | "thread/archive"
                         | "thread/unarchive"
                         | "thread/start"
+                        | "project/list"
+                        | "project/read"
+                        | "project/create"
+                        | "fs/createDirectory"
                         | "thread/turns/list"
                         | "thread/items/list"
                         | "thread/resume"
@@ -364,6 +444,7 @@ impl Router {
                     && !matches!(
                         method.as_str(),
                         "thread/goal/get" | "skills/list" | "plugin/list"
+                            | "project/list" | "project/read" | "project/create" | "fs/createDirectory"
                     );
                 if method.starts_with("turn/")
                     || method == "thread/resume"
@@ -420,6 +501,10 @@ impl Router {
                 self.pending.insert(
                     proxy_id.clone(),
                     Pending {
+                        post_initialize: client == Client::Desktop && self.initialize_received,
+                        initialize_client: (client == Client::Desktop && method == "initialize")
+                            .then(|| value["params"]["clientInfo"]["name"].as_str().map(str::to_owned))
+                            .flatten(),
                         client,
                         original_id: id,
                         settings: self.settings.prepare(&method, &value["params"]),
@@ -436,6 +521,7 @@ impl Router {
             }
             return vec![Route::Runtime(value)];
         }
+        if self.startup.is_some() || self.maintenance.is_some() { return vec![Route::Drop]; }
         if let Some(id) = value.get("id") {
             let key = self
                 .server
@@ -476,6 +562,7 @@ impl Router {
                     });
                     if self.completed.len() > 1024 {
                         self.completed.pop_front();
+                        self.activity_unknown = true;
                     }
                     value["id"] = p.id.clone();
                     let mut routes = vec![Route::Runtime(value)];
@@ -634,13 +721,16 @@ impl Router {
         if let Some(id) = value.get("id").and_then(Value::as_str)
             && let Some(p) = self.pending.remove(id)
         {
+            if Self::effectful(&p.method) && value.get("error").is_none() && value.get("result").is_none() {
+                self.activity_unknown = true;
+            }
             let settings_event = if value.get("error").is_none() && value.get("result").is_some() {
                 p.settings
                     .and_then(|settings| self.settings.accepted(settings, &value["result"]))
             } else {
                 None
             };
-            if value.get("error").is_none() {
+            if value.get("error").is_none() && value.get("result").is_some() {
                 if p.method == "thread/read"
                     && matches!(p.client, Client::Remote(_))
                     && let Some(thread) = p.requested_thread.as_deref()
@@ -731,12 +821,24 @@ impl Router {
                         }
                     }
                 }
-                if p.method == "initialize" {
+                if p.method == "initialize" && p.client == Client::Desktop && value["result"].is_object() {
                     self.initialize_received = true;
                     self.native_version = value["result"]["version"]
                         .as_str()
                         .or_else(|| value["result"]["userAgent"].as_str())
                         .map(str::to_owned);
+                    // The native user agent is negotiated on this exact connection.
+                    // Browser helpers share the bridge executable but do not own chats.
+                    let auxiliary = [p.initialize_client.as_deref(), value["result"]["userAgent"].as_str()]
+                        .into_iter().flatten().any(|name| {
+                            let name = name.to_ascii_lowercase().replace('_', "-");
+                            name == "codex-browser-use" || name.starts_with("codex-browser-use/")
+                        });
+                    self.runtime_role = if auxiliary { "auxiliary" } else { "desktop" };
+                } else if p.post_initialize && p.method != "initialize" && p.method != "initialized" {
+                    // Only a request issued after initialize succeeded can prove that
+                    // the native peer is usable. Earlier requests may reply out of order.
+                    self.initialized = true;
                 }
                 if matches!(
                     p.method.as_str(),
@@ -801,7 +903,9 @@ impl Router {
         self.server.values().filter(|p| p.shareable).count()
     }
     pub fn disconnect(&mut self, client: &Client) {
-        self.pending.retain(|_, p| &p.client != client);
+        // A remote disconnect cancels delivery, not an already-dispatched write.
+        // Keep its native ID until the original runtime confirms the outcome.
+        self.pending.retain(|_, p| &p.client != client || Self::effectful(&p.method));
         self.verified_history.remove(client);
         self.verified_cwds.remove(client);
         self.verified_profiles.remove(client);
@@ -817,6 +921,21 @@ impl Router {
                 completed.winner = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_expiration_tests {
+    use super::*;
+    #[test]
+    fn expired_ordinary_lease_cannot_release_startup_barrier() {
+        let op=uuid::Uuid::new_v4().to_string();
+        let mut router=Router::with_startup_operation(op.clone(),None).unwrap();
+        router.maintenance=Some((op,std::time::Instant::now()-std::time::Duration::from_secs(1)));
+        let denied=router.from_client(Client::Desktop,json!({"id":1,"method":"turn/start","params":{}}));
+        assert!(denied.iter().all(|route|!matches!(route,Route::Runtime(_))));
+        assert_eq!(router.maintenance_status()["startupFenced"],true);
+        assert_eq!(router.maintenance_status()["remainingMs"],0);
     }
 }
 fn known_extension_keys(read: &Value) -> HashMap<String, String> {
@@ -856,6 +975,10 @@ fn safe_advanced(method: &str, params: &Value) -> bool {
         return true;
     }
     let allowed: &[&str] = match method {
+        "project/list" => &["cursor","limit","sortKey","sortDirection"],
+        "project/read" => &["projectId"],
+        "project/create" => &["name","roots","idempotencyKey"],
+        "fs/createDirectory" => &["path","recursive"],
         "thread/revert" => &["threadId", "beforeTurnId"],
         "thread/queue/add" => &["threadId", "clientUserMessageId", "input"],
         "thread/queue/update" => &["threadId", "queuedSubmissionId", "input"],
@@ -882,6 +1005,20 @@ fn safe_advanced(method: &str, params: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_catalog_and_creation_are_not_bound_to_an_existing_thread() {
+        for (method,params) in [
+            ("project/list",json!({"limit":100})),
+            ("project/read",json!({"projectId":"project"})),
+            ("project/create",json!({"name":"project","roots":[{"path":"D:/project"}],"idempotencyKey":"key"})),
+            ("fs/createDirectory",json!({"path":"D:/project","recursive":false})),
+        ] {
+            let mut router=Router::default();
+            router.capabilities.0.insert(method.into(),params.as_object().unwrap().keys().cloned().collect());
+            let routes=router.from_client(Client::Remote("phone".into()),json!({"id":1,"method":method,"params":params}));
+            assert!(routes.iter().any(|route|matches!(route,Route::Runtime(_))),"{method} requires no thread owner");
+        }
+    }
     #[test]
     fn v054_app_inventory_requires_exact_cached_read_and_native_evidence() {
         let mut router = Router::default();

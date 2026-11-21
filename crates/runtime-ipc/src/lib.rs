@@ -9,7 +9,7 @@ pub mod protocol;
 
 pub use client::{Discovery, HostClient, load_descriptor};
 pub use protocol::{
-    Capabilities, Descriptor, Health, PROTOCOL, Receipt, Replay, ReplayEvent, read_frame,
+    Capabilities, Descriptor, Health, MAX_RECOVERY_RECORDS, PROTOCOL, Receipt, Replay, ReplayEvent, read_frame,
     write_frame,
 };
 

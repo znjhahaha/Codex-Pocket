@@ -56,7 +56,7 @@ jobs:
         run: |
           rustup toolchain install 1.93.1 --profile minimal
           rustup override set 1.93.1
-          choco install nsis --no-progress -y
+          python -m pip install cryptography
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test, sign and package
         shell: pwsh
@@ -64,6 +64,9 @@ jobs:
           POCKET_SIGNING_KEY_BASE64: ${{ secrets.POCKET_SIGNING_KEY_BASE64 }}
           POCKET_SIGNING_PASSWORD: ${{ secrets.POCKET_SIGNING_PASSWORD }}
           POCKET_EXPECTED_SIGNER: ${{ vars.POCKET_EXPECTED_SIGNER }}
+          POCKET_UPDATE_PRIVATE_KEY_PEM: ${{ secrets.POCKET_UPDATE_PRIVATE_KEY_PEM }}
+          POCKET_UPDATE_TRUST_JSON: ${{ vars.POCKET_UPDATE_TRUST_JSON }}
+          POCKET_UPDATE_ASSET_BASE: ${{ vars.POCKET_UPDATE_ASSET_BASE }}
         run: ./scripts/ci-release.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'pocket-release')
       - name: Preserve failed host test reports
         if: failure()
@@ -83,6 +86,7 @@ jobs:
             ${{ runner.temp }}/pocket-release/*.apk
             ${{ runner.temp }}/pocket-release/*.zip
             ${{ runner.temp }}/pocket-release/*.exe
+            ${{ runner.temp }}/pocket-release/*.nupkg
             ${{ runner.temp }}/pocket-release/*.json
             ${{ runner.temp }}/pocket-release/*.txt
           if-no-files-found: error

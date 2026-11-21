@@ -54,24 +54,49 @@ async fn msix_restore_dead_original_owners_keep_unknown_recovery_and_use_new_bin
     assert_eq!(read_json(&f.state().join("startup.json"))["nativeBinary"],json!(new.native_binary()));
     assert_eq!(std::fs::read(&account).unwrap(),b"preserve account");
     assert!(descriptor.exists());assert!(journal.exists());
-    assert!(next.shutdown_idle().await.is_err());
+    // Scoped-admission Hosts retain cold Unknown receipts without holding an
+    // idle process alive; older Hosts retain their original refusal contract.
+    if next.health().await.unwrap().scoped_admission > 0 {
+        next.shutdown_idle().await.unwrap();
+        assert_eq!(read_json(&journal)["commands"]["s:unknown-msix"],uncertain);
+    } else { assert!(next.shutdown_idle().await.is_err()); }
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn msix_restore_live_original_owner_never_overwrites_records_or_starts_another_host() {
     let f=Fixture::new();let(old,new,controller)=msix_restore_fixture(&f);
     let first=controller.ensure(&f.profile).await.unwrap();
+    first.request(json!("keep-active"),"turn/start",json!({"threadId":"fixture-thread","input":[]})).await.unwrap();
     let descriptor=f.state().join("descriptor.json");let d=pocket_runtime_ipc::load_descriptor(&descriptor,old.config_home()).unwrap();
     let startup=f.state().join("startup.json");let mut owner=read_json(&startup);
     std::fs::remove_file(old.native_binary()).unwrap();owner["nativeBinary"]=json!(old.native_binary());
     crate::storage::atomic_write(&startup,&serde_json::to_vec(&owner).unwrap()).unwrap();
     let paths=[startup,descriptor,f.state().join("recovery.json")];
     let before:Vec<_>=paths.iter().map(|p|std::fs::read(p).unwrap()).collect();
-    let error=controller.ensure(&new).await.err().unwrap();
-    assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),Some(&crate::managed_runtime::discovery::RestoreFailure::OwnershipUnconfirmed));
+    // A registered package update changes the next launch target, not the
+    // authenticated Host that still owns this profile and native process.
+    let attached=controller.ensure(&new).await.unwrap();
+    assert_eq!(attached.generation(),first.generation());
+    assert_eq!(attached.health().await.unwrap().native_pid,d.native_pid);
     for (path,bytes) in paths.iter().zip(before) {assert_eq!(std::fs::read(path).unwrap(),bytes);}
     assert_eq!(first.health().await.unwrap().native_pid,d.native_pid);
+    first.request(json!("finish-active"),"fixture/finish",json!({})).await.unwrap();
     first.shutdown_idle().await.unwrap();ended(&d).await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn msix_restore_idle_host_switches_removed_package_only_after_native_shutdown() {
+    let f=Fixture::new();let(old,new,controller)=msix_restore_fixture(&f);
+    let first=controller.ensure(&f.profile).await.unwrap();
+    let d=pocket_runtime_ipc::load_descriptor(&f.state().join("descriptor.json"),old.config_home()).unwrap();
+    let startup=f.state().join("startup.json");let mut owner=read_json(&startup);
+    std::fs::remove_file(old.native_binary()).unwrap();owner["nativeBinary"]=json!(old.native_binary());
+    crate::storage::atomic_write(&startup,&serde_json::to_vec(&owner).unwrap()).unwrap();
+    let next=controller.ensure(&new).await.unwrap();
+    assert_ne!(next.generation(),first.generation());
+    assert!(d.host_process.unwrap().terminated());assert!(d.native_process.unwrap().terminated());
+    assert_eq!(read_json(&startup)["nativeBinary"],json!(new.native_binary()));
+    next.shutdown_idle().await.unwrap();
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
@@ -352,6 +377,9 @@ async fn real_events_stable_receipts_human_answer_independent_and_idle_guard() {
         "completed"
     );
     assert!(runtime.shutdown_idle().await.is_err());
+    // A refused answer closes only that call's transport. It must not poison
+    // the independent lane used by the next, genuinely pending question.
+    assert!(runtime.answer(json!(999), json!({"result":{}})).await.is_err());
     let request = runtime.request(json!("human-op"), "fixture/waitForHuman", json!({}));
     let answer = async {
         tokio::time::timeout(Duration::from_secs(4), async {
@@ -446,6 +474,13 @@ async fn cancelled_operation_keeps_same_receipt_and_never_rewrites_native() {
     .unwrap();
     work.abort();
     let _ = work.await;
+    // Account refresh is a new read, not a replay of the cancelled effect.
+    // Keep the same ManagedRuntime to exercise the long-lived assistant actor.
+    let account = runtime.request(
+        json!("account-after-cancel"), "account/read", json!({"refreshToken":false}),
+    ).await.unwrap();
+    assert_eq!(account["result"]["requiresOpenaiAuth"], true);
+    assert_eq!(runtime.receipt(json!("cancelled")).await.unwrap().state, "unknown");
     let reattached = f.controller.ensure(&f.profile).await.unwrap();
     assert_eq!(reattached.generation(), runtime.generation());
     assert!(
@@ -568,8 +603,17 @@ async fn cold_completed_receipts_have_no_invented_result_and_native_read_resolve
             .any(|r| r["turnId"] == "other-turn" && r["state"] == "unknown")
     );
     assert!(next.health().await.unwrap().reconciliation_required);
-    assert!(next.shutdown_idle().await.is_err());
-    // Fixture Drop stops only its fake peer; unresolved evidence stays on disk.
+    let unresolved = read_json(&journal)["runs"][&unmatched].clone();
+    if next.health().await.unwrap().scoped_admission > 0 {
+        let current = pocket_runtime_ipc::load_descriptor(&path, f.profile.config_home()).unwrap();
+        next.shutdown_idle().await.unwrap();
+        ended(&current).await;
+        assert_eq!(read_json(&journal)["runs"][&unmatched], unresolved);
+    } else {
+        assert!(next.shutdown_idle().await.is_err());
+    }
+    // Idle shutdown preserves the unresolved cold run and completed receipt.
+    assert_eq!(read_json(&journal)["commands"]["s:done"]["completed"], true);
 }
 
 #[tokio::test]

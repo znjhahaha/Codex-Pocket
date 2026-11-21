@@ -3,6 +3,7 @@
 use crate::{
     protocol::{Capabilities, Descriptor, PROTOCOL, Receipt, key, read_frame, write_frame},
     recovery::Store,
+    queries::{NATIVE_QUERY_PREFIX, read_only},
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
@@ -99,7 +100,7 @@ async fn actor_loop(
     token: Arc<String>,
     descriptor: &Descriptor,
     initialized: Value,
-    writer: &mut tokio::process::ChildStdin,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     store: &mut Store,
     events: mpsc::Sender<Event>,
     mut incoming: mpsc::Receiver<Event>,
@@ -139,20 +140,39 @@ async fn actor_loop(
                             deliver(&reply,json!({"id":id,"result":{"protocol":PROTOCOL,"runtimeId":descriptor.runtime_id,"generation":descriptor.generation,
                                 "pid":descriptor.pid,"nativePid":descriptor.native_pid,"hostProcess":descriptor.host_process,"nativeProcess":descriptor.native_process,
                                 "initialized":true,"native":initialized,"capabilities":Capabilities::default(),"activeTurns":store.state.active_count(),
-                                "pendingRequests":store.state.pending_count(),"reconciliationRequired":store.state.reconciliation_required}}));
+                                "pendingRequests":store.state.pending_count(),"reconciliationRequired":store.state.reconciliation_required,"scopedAdmission":1}}));
                         },
                         "host/replay" => {
                             let Some(after)=value["params"]["after"].as_u64() else {deliver(&reply,fail(id,"invalid_request"));continue;};
                             let result=store.state.replay(after,value["params"]["generation"].as_str());
                             deliver(&reply,json!({"id":id,"result":result}));
                         },
-                        "host/recovery" => deliver(&reply,json!({"id":id,"result":store.state.snapshot()})),
+                        "host/recovery" => deliver(&reply,json!({"id":id,"result":store.snapshot()})),
                         "host/receipt" => {
                             let Some(key)=key(&value["params"]["requestId"]) else {deliver(&reply,fail(id,"invalid_request"));continue;};
-                            deliver(&reply,json!({"id":id,"result":store.state.receipt(&key,false)}));
+                            deliver(&reply,json!({"id":id,"result":store.receipt(&key)}));
+                        },
+                        "host/answer/receipt" => {
+                            if value["params"]["generation"]!=descriptor.generation {deliver(&reply,fail(id,"generation_mismatch"));continue;}
+                            let request_id=&value["params"]["requestId"];
+                            let Some(key)=key(request_id) else {deliver(&reply,fail(id,"invalid_request"));continue;};
+                            let receipt=store.state.receipt(&key,true);
+                            deliver(&reply,json!({"id":id,"result":{"namespace":"answer","requestId":request_id,
+                                "generation":receipt.generation,"state":receipt.state,"response":receipt.response}}));
+                        },
+                        "host/answer/evidence" => {
+                            let params=&value["params"];
+                            let Some(generation)=params["generation"].as_str() else {deliver(&reply,fail(id,"invalid_request"));continue;};
+                            let Some(digest)=params["snapshotDigest"].as_str() else {deliver(&reply,fail(id,"invalid_request"));continue;};
+                            let Some(offset)=params["offset"].as_u64().and_then(|n|usize::try_from(n).ok()) else {deliver(&reply,fail(id,"invalid_request"));continue;};
+                            if params.as_object().is_none_or(|o|o.len()!=3) {deliver(&reply,fail(id,"invalid_request"));continue;}
+                            match store.state.answer_evidence(generation,offset,digest) {
+                                Ok(page)=>deliver(&reply,json!({"id":id,"result":page})),
+                                Err(_)=>deliver(&reply,fail(id,"answer_evidence_unavailable")),
+                            }
                         },
                         "host/shutdown" => {
-                            if store.state.busy() {deliver(&reply,fail(id,"busy"));continue;}
+                            if store.busy_resources() {deliver(&reply,fail(id,"busy"));continue;}
                             let (ack,wait)=tokio::sync::oneshot::channel();
                             if reply.try_send(Reply{value:json!({"id":id,"result":{"stopping":true}}),flushed:Some(ack)}).is_err() {continue;}
                             let _=tokio::time::timeout(Duration::from_secs(2),wait).await;
@@ -180,7 +200,7 @@ async fn actor_loop(
 }
 
 async fn submit(
-    writer: &mut tokio::process::ChildStdin,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     store: &mut Store,
     value: Value,
     reply: &mpsc::Sender<Reply>,
@@ -193,6 +213,7 @@ async fn submit(
         return Ok(());
     };
     if method.is_empty()
+        || value["id"].as_str().is_some_and(|id| id.starts_with(NATIVE_QUERY_PREFIX))
         || method.starts_with("host/")
         || ["initialize", "initialized"].contains(&method)
         || value.as_object().is_none_or(|o| {
@@ -206,36 +227,31 @@ async fn submit(
     // Cold recovery never authorizes a fresh write to resolve an unknown run.
     // These existing native reads can supply evidence without model inference.
     if store.state.reconciliation_required
-        && ![
-            "model/list",
-            "thread/list",
-            "thread/loaded/list",
-            "thread/read",
-            "thread/turns/list",
-            "thread/items/list",
-        ]
-        .contains(&method)
-        && !(method == "account/read" && value["params"]["refreshToken"] == false)
+        && !read_only(&value)
         && store.state.receipt(&command_key, false).state == "missing"
+        && !store.admits_independent(&value)
     {
-        deliver(reply, fail(id, "reconciliation_required"));
+        let mut denied=fail(id,"reconciliation_required");
+        denied["error"]["notDispatched"]=json!(true);
+        deliver(reply, denied);
         return Ok(());
     }
-    match store.state.reserve(command_key, &value, false) {
+    match store.reserve_request(&value) {
         Err(error) => {
             deliver(
                 reply,
                 fail(
                     id,
-                    if error.to_string() == "conflict" {
-                        "conflict"
-                    } else {
-                        "capacity"
+                    match error.to_string().as_str() {
+                        "conflict" => "conflict",
+                        "read_capacity" => "read_capacity",
+                        _ => "capacity",
                     },
                 ),
             );
         }
-        Ok(Some(receipt)) => {
+        Ok(prepared) if prepared.receipt.is_some() => {
+            let receipt = prepared.receipt.unwrap();
             if outer.is_some() {
                 deliver(reply, json!({"id":id,"result":receipt}));
             } else {
@@ -245,10 +261,12 @@ async fn submit(
                 );
             }
         }
-        Ok(None) => {
-            store.save()?;
+        Ok(prepared) => {
+            if prepared.durable {
+                store.save()?;
+            }
             store.note_read(&value);
-            write_frame(writer, &value).await?;
+            write_frame(writer, &prepared.native).await?;
             if outer.is_some() {
                 deliver(
                     reply,
@@ -261,7 +279,7 @@ async fn submit(
 }
 
 async fn answer(
-    writer: &mut tokio::process::ChildStdin,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     store: &mut Store,
     request_id: Value,
     response: Value,
@@ -316,6 +334,12 @@ async fn answer(
             }
         }
         Ok(None) => {
+            // Scope stays generation-local, like native pending request bodies.
+            store.scope_before_answer(&request_key,&native);
+            let scope=store.state.pending.get(&request_key)
+                .and_then(|p|p.request["params"]["threadId"].as_str())
+                .and_then(|thread|store.threads.get(thread)).cloned();
+            store.state.answers.get_mut(&request_key).unwrap().scope=scope;
             store.save()?; // Keep the question until the response reservation is on disk.
             write_frame(writer, &native).await?;
             store.state.pending.remove(&request_key);
@@ -371,7 +395,7 @@ pub async fn run(config: HostConfig) -> Result<()> {
             Sha256::digest(crate::client::normalized_home(&config.config_home)?.as_bytes())
         )[..24]
     );
-    if config.descriptor.try_exists()? {
+    let previous=if config.descriptor.try_exists()? {
         let bytes = pocket_agent::storage::read_physical(&config.descriptor, 16384)
             .context("Read earlier host descriptor")?;
         let _ = bytes;
@@ -388,7 +412,8 @@ pub async fn run(config: HostConfig) -> Result<()> {
                 "Previous Host/native process has not verifiably exited; inspect original creation identities"
             );
         }
-    }
+        Some(previous)
+    } else {None};
     verify_reservation(&config).await?;
     let parent = config
         .descriptor
@@ -401,6 +426,7 @@ pub async fn run(config: HostConfig) -> Result<()> {
         &generation,
     )
     .context("Open host recovery")?;
+    if let Some(previous)=&previous {store.release_predecessor(previous)?;}
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mut launch = tokio::process::Command::new(&config.binary);
     launch
@@ -572,3 +598,11 @@ async fn verify_reservation(config: &HostConfig) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[cfg(test)]
+mod capacity_tests;
+
+#[cfg(test)]
+mod answer_receipt_tests;
+#[cfg(test)]
+mod admission_tests;

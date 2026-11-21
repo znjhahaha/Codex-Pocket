@@ -4,6 +4,11 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ComposerUiPolicyTest {
+    @Test fun ordinaryConversationKeepsItsLayoutWhileHistoryGeometryChanges() {
+        for (reading in listOf(false,true,false,true)) {
+            assertFalse(composerIsCompact(reading,false,false,false,false,stableLayout=true))
+        }
+    }
     @Test fun historyCompactsOnlyWhenEveryInteractionLockIsReleased() {
         assertTrue(composerIsCompact(true, false, false, false, false))
         assertFalse(composerIsCompact(false, false, false, false, false))

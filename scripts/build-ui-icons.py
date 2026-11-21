@@ -14,6 +14,7 @@ ROOT=Path(__file__).resolve().parent.parent
 OUT=ROOT/'design/icons'
 OUT.mkdir(parents=True,exist_ok=True)
 P={
+'CliOrigin':['M5 7l5 5-5 5M13 17h6'],
 'ChatBubbleOutline':['M7 4.5h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H10l-5.5 3V7.5a3 3 0 0 1 3-3','M8.5 9h7M8.5 13h4.5'],
 'NotificationsNone':['M7 10a5 5 0 0 1 10 0v5l1.5 2H5.5L7 15z','M10 20h4M12 3v2'],
 'Devices':['M12.5 16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2M8 16v4M5.5 20h6','M16 10h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1M17.5 18.5h1'],

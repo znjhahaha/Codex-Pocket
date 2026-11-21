@@ -18,6 +18,8 @@ pub mod media;
 pub mod message_edit;
 pub mod native;
 mod native_history_compat;
+pub mod history_catalog;
+pub mod runtime_catalog;
 #[path = "../../bridge/src/permission_policy.rs"]
 pub mod permission_policy;
 pub mod permissions;

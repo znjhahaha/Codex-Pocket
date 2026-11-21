@@ -10,7 +10,7 @@ pub fn current() -> Value {
             .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
         let executable_sha256=std::env::current_exe().ok().and_then(|p|std::fs::read(p).ok())
             .map(|bytes|format!("{:x}",Sha256::digest(bytes)));
-        json!({"version":env!("CARGO_PKG_VERSION"),"generation":generation,"pid":std::process::id(),
+        json!({"version":env!("CARGO_PKG_VERSION"),"buildId":option_env!("POCKET_BUILD_ID").unwrap_or("development"),"generation":generation,"pid":std::process::id(),
             "processIdentity":pocket_core::native_process::NativeProcess::capture(std::process::id()).ok(),
             "executableSha256":executable_sha256,"controlProtocol":1})
     }).clone()

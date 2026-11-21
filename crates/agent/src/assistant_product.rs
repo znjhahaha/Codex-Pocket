@@ -16,6 +16,63 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+mod command_receipts;
+mod artifacts;
+pub(crate) use command_receipts::read_completed_command;
+
+/// Read retained role identity without starting the Actor, acquiring executor
+/// ownership, or touching its journal. Old/partial Coordinator starts are still
+/// internal even when they are no longer the Service's current coordinator.
+#[cfg(test)]
+pub(crate) fn coordinator_threads(root: &Path) -> Result<BTreeSet<String>> {
+    Ok(coordinator_identity(root)?.threads)
+}
+#[derive(Default)]
+pub(crate) struct CoordinatorIdentity {
+    pub runtime_id: Option<String>,
+    pub threads: BTreeSet<String>,
+}
+pub(crate) fn coordinator_identity(root: &Path) -> Result<CoordinatorIdentity> {
+    #[derive(serde::Deserialize)]
+    struct Owner { role: Role }
+    #[derive(serde::Deserialize)]
+    struct Operation {
+        role: Role,
+        thread_id: Option<String>,
+        mapping: Option<Mapping>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Mapping { thread_id: String }
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        #[serde(default)]
+        runtime_id: Option<String>,
+        operations: BTreeMap<String, Operation>,
+        threads: BTreeMap<String, Owner>,
+    }
+    let path = root.join("executor.db");
+    if !path.try_exists()? { return Ok(CoordinatorIdentity::default()); }
+    let file = std::fs::File::open(&path)?;
+    crate::storage::verify_physical_file(&path, &file)?;
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_millis(50))?;
+    db.execute_batch("PRAGMA query_only=ON")?;
+    let saved: Option<String> = db.query_row(
+        "SELECT data FROM assistant_executor_state WHERE singleton=1", [], |r| r.get(0),
+    ).optional()?;
+    let Some(saved) = saved else { return Ok(CoordinatorIdentity::default()); };
+    let identity: Identity = serde_json::from_str(&saved)?;
+    let mut threads = BTreeSet::new();
+    for (thread, owner) in identity.threads {
+        if owner.role == Role::Coordinator { threads.insert(thread); }
+    }
+    for operation in identity.operations.into_values().filter(|o| o.role == Role::Coordinator) {
+        threads.extend(operation.thread_id);
+        threads.extend(operation.mapping.map(|m| m.thread_id));
+    }
+    Ok(CoordinatorIdentity { runtime_id:identity.runtime_id, threads })
+}
+
 #[derive(Clone)]
 pub struct HostIo {
     pub runtime: Arc<ManagedRuntime>,
@@ -94,6 +151,62 @@ fn checked_answer(id: &Value, generation: &str, receipt: RuntimeReceipt) -> Resu
     );
     Ok(())
 }
+fn assistant_protocol_ready(c: &crate::capabilities::Capabilities) -> bool {
+    let requirements: &[(&str, &[&str])] = &[
+        (
+            "thread/start",
+            &[
+                "model",
+                "cwd",
+                "sandbox",
+                "approvalPolicy",
+                "approvalsReviewer",
+                "baseInstructions",
+                "runtimeWorkspaceRoots",
+                "ephemeral",
+                "allowProviderModelFallback",
+                "dynamicTools",
+            ],
+        ),
+        (
+            "thread/resume",
+            &[
+                "threadId",
+                "model",
+                "cwd",
+                "sandbox",
+                "approvalPolicy",
+                "approvalsReviewer",
+                "baseInstructions",
+                "runtimeWorkspaceRoots",
+            ],
+        ),
+        (
+            "turn/start",
+            &[
+                "threadId",
+                "model",
+                "cwd",
+                "input",
+                "approvalPolicy",
+                "approvalsReviewer",
+                "sandboxPolicy",
+                "runtimeWorkspaceRoots",
+                "clientUserMessageId",
+            ],
+        ),
+        ("turn/interrupt", &["threadId", "turnId"]),
+        ("thread/read", &["threadId", "includeTurns"]),
+        (
+            "thread/turns/list",
+            &["threadId", "limit", "sortDirection", "itemsView"],
+        ),
+    ];
+    requirements.iter().all(|(method, fields)| {
+        c.0.get(*method)
+            .is_some_and(|schema| fields.iter().all(|field| schema.contains(*field)))
+    })
+}
 impl RuntimeIo for HostIo {
     fn supports(&self, method: &str, parameters: &Value) -> bool {
         self.capabilities.supports(method, parameters)
@@ -132,6 +245,20 @@ impl RuntimeIo for HostIo {
                 response: r.response,
             },
         )
+    }
+    fn answer_receipt(&mut self, id: Value) -> Result<RuntimeReceipt> {
+        let r = self.handle.block_on(self.runtime.answer_receipt(id.clone()))?;
+        checked_receipt(&id, self.runtime.generation(), RuntimeReceipt {
+            generation:r.generation, state:r.state, response:r.response,
+        })
+    }
+    fn historical_receipt(&mut self, id:Value, generation:&str)->Result<RuntimeReceipt> {
+        let receipt=self.handle.block_on(self.runtime.receipt(id.clone()))?;
+        checked_receipt(&id,generation,RuntimeReceipt{generation:receipt.generation,state:receipt.state,response:receipt.response})
+    }
+    fn recovery(&mut self)->Result<Value> {self.handle.block_on(self.runtime.recovery())}
+    fn answer_evidence(&mut self,offset:usize,digest:&str)->Result<pocket_runtime_ipc::client::AnswerEvidencePage> {
+        self.handle.block_on(self.runtime.answer_evidence(offset,digest))
     }
     fn answer(&mut self, id: Value, result: Value) -> Result<()> {
         let r = self
@@ -183,12 +310,7 @@ impl RuntimeIo for HostIo {
             h.runtime_id == self.runtime.runtime_id() && h.generation == self.runtime.generation(),
             "Host identity changed"
         );
-        let schema = self
-            .capabilities
-            .0
-            .get("thread/start")
-            .is_some_and(|fields| fields.contains("dynamicTools"))
-            && self.capabilities.0.contains_key("turn/start");
+        let schema = assistant_protocol_ready(&self.capabilities);
         Ok(RuntimeHealth {
             runtime_id: h.runtime_id,
             generation: h.generation,
@@ -196,7 +318,22 @@ impl RuntimeIo for HostIo {
             initialized: h.initialized,
             protocol_verified: schema,
             reconciliation_required: h.reconciliation_required,
+            scoped_admission:h.scoped_admission==1,
         })
+    }
+    fn account(&mut self) -> Result<AccountReadiness> {
+        let id = read_id();
+        let result = self.handle.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.runtime
+                    .request(id.clone(), "account/read", json!({"refreshToken":false})),
+            )
+            .await
+        })??;
+        Ok(AccountReadiness::from_native(&checked_envelope(
+            &id, result,
+        )?))
     }
 }
 
@@ -233,7 +370,12 @@ fn read_id() -> Value {
 fn read_method(method: &str) -> bool {
     matches!(
         method,
-        "model/list" | "thread/read" | "thread/list" | "thread/turns/list" | "thread/items/list"
+        "model/list"
+            | "config/read"
+            | "thread/read"
+            | "thread/list"
+            | "thread/turns/list"
+            | "thread/items/list"
     )
 }
 #[derive(Default)]
@@ -285,6 +427,26 @@ impl<R: RuntimeIo> RuntimeIo for WorkerIo<R> {
     fn receipt(&mut self, id: Value) -> Result<RuntimeReceipt> {
         self.inner.receipt(id)
     }
+    fn answer_receipt(&mut self, id: Value) -> Result<RuntimeReceipt> {
+        self.inner.answer_receipt(id)
+    }
+    fn historical_receipt(&mut self,id:Value,generation:&str)->Result<RuntimeReceipt> {self.inner.historical_receipt(id,generation)}
+    fn recovery(&mut self)->Result<Value> {self.inner.recovery()}
+    fn answer_evidence(&mut self,offset:usize,digest:&str)->Result<pocket_runtime_ipc::client::AnswerEvidencePage> {
+        self.inner.answer_evidence(offset,digest)
+    }
+    fn confirm_answer_receipt(&mut self, generation: &str, id: &Value) -> Result<()> {
+        let mut t = self.tracking.lock().unwrap();
+        ensure!(generation == t.generation, "Answer confirmation generation changed");
+        if t.uncertain_answers.contains_key(&key(id)) {
+            self.ledger.lock().unwrap().execute(
+                "DELETE FROM product_answers WHERE generation=?1 AND native_id=?2",
+                params![generation, key(id)],
+            )?;
+            t.uncertain_answers.remove(&key(id));
+        }
+        Ok(())
+    }
     fn answer(&mut self, id: Value, result: Value) -> Result<()> {
         let (generation, epoch) = {
             let t = self.tracking.lock().unwrap();
@@ -301,19 +463,9 @@ impl<R: RuntimeIo> RuntimeIo for WorkerIo<R> {
             .unwrap()
             .uncertain_answers
             .insert(key(&id), epoch);
-        let response = self.inner.answer(id.clone(), result);
-        if response.is_ok() {
-            self.ledger.lock().unwrap().execute(
-                "DELETE FROM product_answers WHERE generation=?1 AND native_id=?2",
-                params![generation, key(&id)],
-            )?;
-            self.tracking
-                .lock()
-                .unwrap()
-                .uncertain_answers
-                .remove(&key(&id));
-        }
-        response
+        // Executor calls confirm_answer_receipt only after saving its own
+        // confirmation. Keep this product intent if that save fails.
+        self.inner.answer(id, result)
     }
     fn events(&mut self, after: u64, limit: usize) -> Result<RuntimeEvents> {
         let batch = self.inner.events(after, limit)?;
@@ -362,6 +514,9 @@ impl<R: RuntimeIo> RuntimeIo for WorkerIo<R> {
     fn health(&mut self) -> Result<RuntimeHealth> {
         self.inner.health()
     }
+    fn account(&mut self) -> Result<AccountReadiness> {
+        self.inner.account()
+    }
     fn project_permissions(
         &mut self,
         runtime: &str,
@@ -376,6 +531,8 @@ struct Request {
     method: String,
     parameters: Value,
     id: String,
+    // Authenticated Broker metadata; never obtained from phone parameters.
+    caller: Option<String>,
     directory: Option<PathBuf>,
     reply: oneshot::Sender<Result<Value>>,
 }
@@ -417,7 +574,7 @@ impl Actor {
         )
         .await
     }
-    async fn start_with_io<R: RuntimeIo + Clone + Send + 'static>(
+    pub(crate) async fn start_with_io<R: RuntimeIo + Clone + Send + 'static>(
         root: PathBuf,
         computer: String,
         profile: String,
@@ -442,19 +599,76 @@ impl Actor {
                 Ok(value)=>{*out.lock().unwrap()=value;let _=started.send(Ok(()));}
                 Err(error)=>{drop(worker);running.store(false,Ordering::Release);let _=started.send(Err(error));return;}
             }
+            let mut parked=false;
             loop{
                 let request=match receiver.recv_timeout(Duration::from_millis(500)){
                     Ok(request)=>Some(request),Err(mpsc::RecvTimeoutError::Timeout)=>None,Err(mpsc::RecvTimeoutError::Disconnected)=>break,
                 };
+                if let Some(r)=request.as_ref().filter(|r|r.caller.is_none() && r.method.starts_with("local/lifecycle/")) {
+                    let method=r.method.clone();let r=request.unwrap();
+                    match method.as_str() {
+                        "local/lifecycle/park"=>{parked=true;let _=r.reply.send(Ok(json!({"generation":worker.generation})));}
+                        "local/lifecycle/resume"=>{parked=false;let _=r.reply.send(Ok(Value::Null));}
+                        "local/lifecycle/stop" if parked=>{
+                            drop(worker);running.store(false,Ordering::Release);
+                            let _=r.reply.send(Ok(Value::Null));return;
+                        }
+                        _=>{let _=r.reply.send(Err(anyhow::anyhow!("Worker lifecycle transition refused")));}
+                    }
+                    continue;
+                }
+                if parked {
+                    if let Some(r)=request {let _=r.reply.send(Err(anyhow::anyhow!("Assistant runtime transition in progress")));}
+                    continue;
+                }
+                // A timed-out read has already fallen back to the published cache.
+                // Mutations must still finish even if their caller stopped waiting.
+                if request.as_ref().is_some_and(|r| is_read(&r.method) && r.reply.is_closed()) { continue; }
                 // Observe buffered native results before recording a newer
                 // user message. Explicit requests wake this loop immediately.
+                if request.as_ref().is_some_and(|r| is_read(&r.method)) { worker.account_checked_at = i64::MIN; }
                 worker.observe_runtime();
-                let result=request.as_ref().map(|r|worker.apply(r));
+                if request.as_ref().is_some_and(|r| !is_read(&r.method)) {
+                    let mut cache = out.lock().unwrap();
+                    cache["dispatchInFlight"] = json!(true);
+                    cache["ready"] = json!(false);
+                    cache["fresh"] = json!(false);
+                    cache["error"] = Value::Null;
+                }
+                let mut result=request.as_ref().map(|r| {
+                    let receipt=worker.apply(r)?;
+                    if !is_read(&r.method) {
+                        command_receipts::record(&worker.messages,r,&receipt)?;
+                    }
+                    Ok(receipt)
+                });
+                let request = match request {
+                    Some(request) if !is_read(&request.method) => {
+                        let response = result.take().unwrap().map(|receipt| {
+                            let mut response = json!({"accepted":true,"commandId":request.id,"result":receipt});
+                            // Acceptance is durable before dispatch. A later refresh failure
+                            // cannot turn that receipt into an ambiguous mutation result.
+                            if let Ok(mut value) = worker.snapshot(None) {
+                                value["dispatchInFlight"] = json!(true);
+                                value["ready"] = json!(false);
+                                value["fresh"] = json!(false);
+                                value["snapshotSource"] = json!("worker_cache");
+                                *out.lock().unwrap() = value.clone();
+                                response["snapshot"] = value;
+                            }
+                            response
+                        });
+                        let _ = request.reply.send(response);
+                        None
+                    }
+                    request => request,
+                };
                 worker.dispatch_pending();
                 let value=worker.snapshot(None);
                 if let Ok(v)=&value{*out.lock().unwrap()=v.clone();}
                 if let Some(request)=request{
                     let response=(||->Result<Value>{match result.unwrap(){
+                        Ok(receipt) if request.method=="assistant/artifact/read"=>Ok(receipt),
                         Ok(_) if is_read(&request.method)=>{
                             match value{Ok(mut v)=>{
                                 if request.method=="assistant/settings/read"{v=json!({"settings":v["settings"],"fresh":true,"updatedAtMs":v["updatedAtMs"],"snapshotSource":"worker_read"});}
@@ -499,12 +713,38 @@ impl Actor {
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
+    pub(crate) async fn park_for_runtime_transition(&self)->Result<String> {
+        let value=self.request("local/lifecycle/park",json!({}),"lifecycle".into(),None).await?;
+        Ok(text(&value,"generation")?.into())
+    }
+    pub(crate) async fn resume_after_runtime_check(&self)->Result<()> {
+        self.request("local/lifecycle/resume",json!({}),"lifecycle".into(),None).await?;Ok(())
+    }
+    pub(crate) async fn stop_parked_worker(&self)->Result<()> {
+        self.request("local/lifecycle/stop",json!({}),"lifecycle".into(),None).await?;Ok(())
+    }
+    pub(crate) fn same_worker(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.alive, &other.alive)
+    }
     pub async fn request(
         &self,
         method: &str,
         parameters: Value,
         id: String,
         directory: Option<PathBuf>,
+    ) -> Result<Value> {
+        self.request_authorized(method, parameters, id, directory, None).await
+    }
+    pub(crate) async fn request_from_device(
+        &self, method: &str, parameters: Value, id: String,
+        directory: Option<PathBuf>, caller: String,
+    ) -> Result<Value> {
+        ensure!(!caller.is_empty() && caller.len() <= 256, "Invalid authenticated caller");
+        self.request_authorized(method, parameters, id, directory, Some(caller)).await
+    }
+    async fn request_authorized(
+        &self, method: &str, parameters: Value, id: String,
+        directory: Option<PathBuf>, caller: Option<String>,
     ) -> Result<Value> {
         ensure!(
             self.alive.load(Ordering::Acquire),
@@ -516,11 +756,15 @@ impl Actor {
                 method: method.into(),
                 parameters,
                 id,
+                caller,
                 directory,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("Assistant queue busy"))?;
-        tokio::time::timeout(Duration::from_secs(25), response)
+        // Leave time for the Broker to return its explicitly stale cache before
+        // the phone's eight-second quiet read window expires.
+        let budget = if is_read(method) { Duration::from_millis(1500) } else { Duration::from_secs(25) };
+        tokio::time::timeout(budget, response)
             .await
             .context("Assistant result pending")??
     }
@@ -528,7 +772,7 @@ impl Actor {
 fn is_read(method: &str) -> bool {
     matches!(
         method,
-        "assistant/read" | "assistant/settings/read" | "assistant/snapshot"
+        "assistant/read" | "assistant/settings/read" | "assistant/snapshot" | "assistant/artifact/read"
     )
 }
 #[derive(Clone)]
@@ -547,7 +791,9 @@ struct Worker<R: RuntimeIo + Clone> {
     probe: WorkerIo<R>,
     messages: Connection,
     projects: Vec<Project>,
+    workspace: PathBuf,
     deferred: BTreeMap<String, PendingToolCall>,
+    local_receipts_pending: BTreeSet<String>,
     handoff: Option<Arc<crate::handoff::Handoff>>,
     permits: Vec<crate::handoff::WritePermit>,
     recovered_permits: Vec<uuid::Uuid>,
@@ -556,6 +802,10 @@ struct Worker<R: RuntimeIo + Clone> {
     generation: String,
     error: Option<&'static str>,
     runtime_ready: bool,
+    startup_runtime_ready: bool,
+    capabilities_ready: bool,
+    account: AccountReadiness,
+    account_checked_at: i64,
     revision: u64,
 }
 fn messages_db(path: &Path) -> Result<Connection> {
@@ -573,6 +823,8 @@ DELETE FROM product_projects WHERE rowid NOT IN (SELECT max(rowid) FROM product_
 DELETE FROM product_timeline WHERE role='User' AND id IN (SELECT id FROM messages) AND ('user:'||id) IN (SELECT id FROM product_timeline);
 UPDATE product_timeline SET id='user:'||id WHERE role='User' AND id IN (SELECT id FROM messages);
 INSERT OR IGNORE INTO product_timeline(id,role,text,at_ms) SELECT 'user:'||id,'User',text,at_ms FROM messages ORDER BY at_ms,rowid;")?;
+    command_receipts::initialize(&db)?;
+    artifacts::initialize(&db)?;
     let columns = db
         .prepare("PRAGMA table_info(product_projects)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -599,6 +851,11 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         let workspace = root.join("workspace");
         crate::storage::private_directory(&workspace)?;
         let health = io.health()?;
+        let account = if health.online && health.initialized {
+            io.account().unwrap_or(AccountReadiness::Unavailable)
+        } else {
+            AccountReadiness::Unavailable
+        };
         let runtime_id = health.runtime_id.clone();
         let generation = health.generation.clone();
         let messages = messages_db(&root.join("messages.db"))?;
@@ -656,7 +913,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         ensure!(projects.len() <= 64, "Too many persisted projects");
-        let mut grants = vec![];
+        let mut grants = vec![DirectoryGrant {root:workspace.clone(),writable:true}];
         for project in &mut projects {
             if let Ok((actual, writable, proof)) = verify_project(
                 &mut probe,
@@ -688,7 +945,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             &root.join("executor.db"),
             probe.clone(),
             ExecutorPolicy {
-                coordinator_directory: workspace,
+                coordinator_directory: workspace.clone(),
                 grants,
             },
         )?);
@@ -699,25 +956,44 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             &generation,
             executor.clone(),
         )?;
-        let legacy=messages.prepare("SELECT id,role,text,at_ms FROM (SELECT * FROM product_timeline ORDER BY sequence DESC LIMIT 200) ORDER BY sequence")?
+        let legacy=messages.prepare("SELECT id,role,text,at_ms FROM product_timeline ORDER BY sequence")?
             .query_map([],|row|Ok(ConversationEntry{id:row.get(0)?,role:row.get(1)?,text:row.get(2)?,at_ms:row.get(3)?,member_id:None,task_id:None,group_id:None,source_thread_id:None}))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         service.import_legacy_conversation(legacy)?;
+        let answers_confirmed={let tracking=probe.tracking.lock().unwrap();!tracking.old_answers && tracking.uncertain_answers.is_empty()};
+        let scoped_transition=executor.adopt_scoped_generation();
+        let terminal_proof_failed = if matches!(scoped_transition,Ok(true)) {false}
+        else if scoped_transition.is_err() {true}
+        else if recovered_permits.is_empty() && answers_confirmed {
+            // Only a complete cold terminal proof can move executor generation.
+            // A failed proof preserves old histories and all dispatch fences.
+            executor.reconcile_terminal_generation(&service.operations()).is_err()
+        } else { false };
+        let executor_generation_ready=executor.current_generation_ready(&generation)?;
+        if executor_generation_ready {
+            service.release_ended_resources(&executor.released_generations()?)?;
+        }
         let mut worker = Self {
             service,
             executor,
             probe,
             messages,
             projects,
+            workspace,
             deferred: BTreeMap::new(),
+            local_receipts_pending: BTreeSet::new(),
             handoff,
             permits: vec![],
             recovered_permits,
-            clock,
+            clock: clock.clone(),
             runtime_id,
             generation,
-            error: None,
+            error: if terminal_proof_failed || !executor_generation_ready {Some("terminal_generation_requires_reconciliation")}else{None},
             runtime_ready: health.online && health.initialized && health.protocol_verified,
+            startup_runtime_ready: health.online && health.initialized,
+            capabilities_ready: health.protocol_verified,
+            account,
+            account_checked_at: (clock)(),
             revision: 0,
         };
         worker.sync_timeline()?;
@@ -754,6 +1030,11 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         }
     }
     fn uncertain(&self) -> bool {
+        self.native_uncertain() || !self.local_receipts_pending.is_empty()
+    }
+    fn native_uncertain(&self) -> bool {
+        // Read before taking tracking: executor I/O may take the tracking lock.
+        let generation_ready=self.executor.current_generation_ready(&self.generation).unwrap_or(false);
         let t = self.probe.tracking.lock().unwrap();
         self.service
             .operations()
@@ -762,6 +1043,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             || self.service.uncertain_deliveries()
             || t.old_answers
             || !t.uncertain_answers.is_empty()
+            || !generation_ready
     }
     fn confirm_known(&mut self) {
         if !self.uncertain() {
@@ -789,6 +1071,21 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         }
     }
     fn sync_timeline(&mut self) -> Result<()> {
+        // The executor durably saves text together with its replay cursor. If
+        // the worker crashed before projection, reconstruct without native RPC.
+        for stream in self.executor.streaming_text()? {
+            if self.service.operations().iter().any(|o| {
+                o.id == stream.operation_id
+                    && matches!(
+                        o.phase,
+                        OperationPhase::Unknown | OperationPhase::Running | OperationPhase::Waiting
+                    )
+                    && (o.role == Role::Coordinator || self.service.direct_result(o))
+            }) {
+                self.messages.execute("INSERT INTO product_timeline(id,role,text,at_ms,operation_id) VALUES(?1,'Assistant',?2,?3,?4) ON CONFLICT(id) DO UPDATE SET text=excluded.text",
+                    params![format!("assistant-operation:{}",stream.operation_id),stream.text,(self.clock)(),stream.operation_id])?;
+            }
+        }
         let mut after = self
             .messages
             .query_row(
@@ -813,7 +1110,23 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                         })
                     })
                 {
-                    tx.execute("INSERT OR IGNORE INTO product_timeline(id,role,text,at_ms,operation_id,source_sequence) VALUES(?1,'Assistant',?2,?3,?4,?5)",params![format!("assistant:{}",event.id),event.detail,event.at_ms,event.operation_id,event.sequence])?;
+                    let stream_id = format!(
+                        "assistant-operation:{}",
+                        event.operation_id.as_deref().unwrap()
+                    );
+                    let streaming: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM product_timeline WHERE id=?1)",
+                        [&stream_id],
+                        |r| r.get(0),
+                    )?;
+                    if streaming {
+                        tx.execute(
+                            "UPDATE product_timeline SET text=?2,source_sequence=?3 WHERE id=?1",
+                            params![stream_id, event.detail, event.sequence],
+                        )?;
+                    } else {
+                        tx.execute("INSERT OR IGNORE INTO product_timeline(id,role,text,at_ms,operation_id,source_sequence) VALUES(?1,'Assistant',?2,?3,?4,?5)",params![format!("assistant:{}",event.id),event.detail,event.at_ms,event.operation_id,event.sequence])?;
+                    }
                 }
                 after = event.sequence;
             }
@@ -884,6 +1197,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     root: p.root.clone(),
                     writable: p.writable,
                 })
+                .chain(std::iter::once(DirectoryGrant {root:self.workspace.clone(),writable:true}))
                 .collect(),
         )
     }
@@ -909,6 +1223,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 .filter(|d| matches!(d.status.as_str(), "queued" | "sending" | "unknown"))
                 .map(|d| d.directory),
         );
+        self.revalidate_project_paths(&pending)
+    }
+    fn revalidate_project_paths(&mut self, pending: &[PathBuf]) -> Result<()> {
         for project in &mut self.projects {
             if !pending
                 .iter()
@@ -950,6 +1267,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .into_iter()
             .filter(|t| t.status == TaskStatus::Queued)
         {
+            if physical(&task.directory).is_ok_and(|d|d==self.workspace) {continue;}
             if !self.projects.iter().any(|p| {
                 p.verified
                     && (!task.writes || p.writable)
@@ -965,6 +1283,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         Ok(())
     }
     fn apply(&mut self, r: &Request) -> Result<Value> {
+        if r.method=="assistant/artifact/read" {
+            ensure!(r.parameters.as_object().is_some_and(|o|o.keys().all(|k|["artifactId","offset"].contains(&k.as_str()))) && r.parameters.get("offset").is_none_or(|v|v.as_u64().is_some()),"Invalid artifact read");
+            return self.artifact_read(&r.parameters);
+        }
         if is_read(&r.method) {
             ensure!(
                 r.parameters.as_object().is_some_and(|p| p
@@ -1006,6 +1328,27 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         match r.method.as_str() {
             "assistant/send" => {
                 let message = text(p, "message")?;
+                let mut inputs:Vec<crate::assistant::AssistantInput>=p.get("retainedAttachments").map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+                crate::assistant::inputs::validate_inputs(&inputs)?;
+                let expanded=if let Some(artifact)=p["artifactId"].as_str() {
+                    let context=self.artifact_context(artifact,text(p,"artifactVersion")?,text(p,"taskId")?)?;
+                    if let Some(image)=self.artifact_image_input(artifact)? {inputs.push(image);}
+                    Some(format!("{}\n\n{}",message,context))
+                } else {None};
+                let submitted=expanded.as_deref().unwrap_or(message);
+                ensure!(submitted.len()<=65536,"Result context and follow-up exceed input limit");
+                self.account = self
+                    .probe
+                    .account()
+                    .unwrap_or(AccountReadiness::Unavailable);
+                self.account_checked_at = at;
+                ensure!(
+                    self.account == AccountReadiness::Ready,
+                    "{}",
+                    self.account
+                        .error()
+                        .unwrap_or("assistant_account_unavailable")
+                );
                 let h = self.probe.health()?;
                 ensure!(
                     h.online
@@ -1016,26 +1359,29 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     "Assistant native runtime unavailable/unsupported"
                 );
                 if let Some(root) = &r.directory {
-                    let source = p["runtimeId"]
+                    let source = p["sourceRuntimeId"]
                         .as_str()
+                        .or_else(|| p["runtimeId"].as_str())
                         .unwrap_or(&self.runtime_id)
                         .to_owned();
                     self.authorize(&source, None, text(p, "threadId")?, root, true)?;
                 }
                 if p["memberId"].is_string() || p["taskId"].is_string() {
-                    self.service.submit_targeted(
+                    self.service.submit_targeted_with_inputs(
                         &r.id,
-                        message,
+                        submitted,
                         p["memberId"].as_str(),
                         p["taskId"].as_str(),
                         false,
+                        inputs,
                         at,
                     )?;
                 } else {
-                    self.service.submit(
+                    self.service.submit_with_inputs(
                         &r.id,
                         message,
-                        r.directory.iter().cloned().collect(),
+                        vec![r.directory.clone().unwrap_or_else(||self.workspace.clone())],
+                        inputs,
                         at,
                     )?;
                 }
@@ -1065,7 +1411,14 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     "Assistant paused; native stop must be confirmed before manual write"
                 );
             }
-            "assistant/resume" => self.service.release_takeover(&r.id, at)?,
+            "assistant/resume" => {
+                if let Some(operation)=p["operationId"].as_str() {
+                    let selected=self.service.coordinator_handoff_recovery_directories(operation)?;
+                    self.revalidate_project_paths(&selected)?;
+                    self.service.resume_coordinator_handoff(&r.id,operation,at)?;
+                } else {self.service.release_takeover(&r.id,at)?;}
+            }
+            "assistant/task/memory" => self.service.set_task_memories(&r.id,text(p,"taskId")?,p["enabled"].as_bool().context("Missing memory choice")?)?,
             "assistant/task/pause" => {
                 self.service.apply(
                     &r.id,
@@ -1075,7 +1428,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     at,
                 )?;
             }
-            "assistant/task/resume" => {
+            "assistant/task/resume" | "assistant/v2/task/retry" => {
                 let task_id = text(p, "taskId")?;
                 let task = self
                     .service
@@ -1085,6 +1438,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     .context("Task not found")?;
                 // Explicit resume cannot reuse permission evidence captured
                 // before a native project policy change.
+                if !physical(&task.directory).is_ok_and(|d|d==self.workspace) {
                 let project = self
                     .projects
                     .iter()
@@ -1105,23 +1459,19 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                             .is_ok_and(|root| within(&root, &project.root))),
                     "Reauthorize project before resuming task"
                 );
+                }
                 self.service.apply(
                     &r.id,
-                    Command::ResumeTask {
-                        task_id: task_id.into(),
-                    },
+                    if r.method=="assistant/v2/task/retry" {Command::RetryTask {task_id:task_id.into()}}
+                    else {Command::ResumeTask {task_id:task_id.into()}},
                     at,
                 )?;
             }
             "assistant/memory/add" => {
-                self.service.apply(
-                    &r.id,
-                    Command::Remember {
-                        text: text(p, "text")?.into(),
-                    },
-                    at,
-                )?;
+                self.service.remember_with_source(&r.id,text(p,"text")?,&format!("command:{}",r.id),p["scope"].as_str().unwrap_or("personal"),false,at)?;
             }
+            "assistant/memory/undo" => self.service.undo_memory(&r.id,text(p,"memoryId")?,at)?,
+            "assistant/v2/task/seen" => self.service.mark_task_seen("local",text(p,"taskId")?,p["throughSequence"].as_u64().context("Missing activity cursor")?)?,
             "assistant/memory/update" => {
                 self.service.apply(
                     &r.id,
@@ -1154,6 +1504,24 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 let operation = text(p, "operationId")?;
                 let request = text(p, "requestId")?;
                 let response: HumanResponse = serde_json::from_value(p["response"].clone())?;
+                if response == (HumanResponse::Approval { approved:false }) {
+                    if self.service.tool_rejection_receipt(&r.id, operation, request, None)? {
+                        return Ok(json!({"accepted":true,"commandId":r.id}));
+                    }
+                    let op = self.service.operations().into_iter().find(|o| o.id == operation)
+                        .context("Unowned operation")?;
+                    let scope = op.mapping.context("Missing native mapping")?;
+                    let pending = self.executor.pending_requests()?.into_iter()
+                        .find(|q| q.operation_id == operation && q.handle == request);
+                    if pending.as_ref().is_some_and(|q| q.method == "item/tool/call")
+                        || (op.role == Role::Coordinator && matches!(op.phase, OperationPhase::Completed | OperationPhase::Failed))
+                    {
+                        self.service.tool_rejection_receipt(&r.id, operation, request, Some(false))?;
+                        self.executor.reject_retained_tool(scope, request)?;
+                        self.service.tool_rejection_receipt(&r.id, operation, request, Some(true))?;
+                        return Ok(json!({"accepted":true,"commandId":r.id}));
+                    }
+                }
                 let pending = self
                     .executor
                     .pending_requests()?
@@ -1187,37 +1555,33 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             "assistant/schedule/delete" => self
                 .service
                 .remove_schedule(&r.id, text(p, "scheduleId")?)?,
-            "assistant/schedule/create" => {
-                let root = r
-                    .directory
-                    .as_ref()
-                    .context("Select an authorized project")?;
-                let spec = &p["spec"];
-                let writes = spec["writes"].as_bool().context("Missing writes choice")?;
-                let source = p["runtimeId"]
-                    .as_str()
-                    .unwrap_or(&self.runtime_id)
-                    .to_owned();
-                self.authorize(&source, None, text(p, "threadId")?, root, writes)?;
-                ensure!(
-                    !writes
-                        || self.projects.iter().any(|project| project.verified
-                            && project.writable
-                            && physical(root).is_ok_and(|actual| within(&actual, &project.root))),
-                    "Selected project does not authorize scheduled writes"
-                );
-                let zone = zone_rules(text(&spec["zone"], "name")?, at)?;
-                self.service.add_schedule(
-                    &r.id,
-                    ScheduleSpec {
-                        kind: serde_json::from_value(spec["kind"].clone())?,
-                        zone,
-                        prompt: text(spec, "prompt")?.into(),
-                        directory: root.clone(),
-                        writes,
-                    },
-                    at,
-                )?;
+            "assistant/schedule/pause" | "assistant/schedule/resume" => self.service.set_schedule_paused(&r.id,text(p,"scheduleId")?,r.method.ends_with("/pause"),at)?,
+            "assistant/schedule/run" => {
+                let schedule=self.service.schedules().into_iter().find(|s|Some(s.id.as_str())==p["scheduleId"].as_str()).context("Schedule not found")?;
+                self.revalidate_project_paths(std::slice::from_ref(&schedule.spec.directory))?;
+                self.executor.clone().validate_directory(&schedule.spec.directory,schedule.spec.writes)?;
+                self.service.run_schedule(&r.id,&schedule.id,at)?;
+            }
+            "assistant/schedule/create" | "assistant/schedule/update" => {
+                let spec=&p["spec"];
+                let existing=if r.method.ends_with("/update") {Some(self.service.schedules().into_iter().find(|s|Some(s.id.as_str())==p["scheduleId"].as_str()).context("Schedule not found")?)} else {None};
+                let root=existing.as_ref().map(|s|s.spec.directory.clone()).or_else(||r.directory.clone()).unwrap_or_else(||self.workspace.clone());
+                let requested_writes=spec["writes"].as_bool().context("Missing writes choice")?;
+                let writes=root==self.workspace || requested_writes;
+                if let Some(selected)=&r.directory {
+                    let source=p["sourceRuntimeId"].as_str().or_else(||p["runtimeId"].as_str()).unwrap_or(&self.runtime_id).to_owned();
+                    self.authorize(&source,None,text(p,"threadId")?,selected,writes)?;
+                } else if root!=self.workspace {
+                    self.revalidate_project_paths(std::slice::from_ref(&root))?;
+                }
+                self.executor.clone().validate_directory(&root,writes)?;
+                let zone=zone_rules(spec["zone"]["name"].as_str().unwrap_or("Asia/Shanghai"),at)?;
+                let updated=ScheduleSpec {kind:serde_json::from_value(spec["kind"].clone())?,zone,prompt:text(spec,"prompt")?.into(),directory:root,writes};
+                if let Some(existing)=existing {
+                    self.service.update_schedule(&r.id,&existing.id,updated,p["missedPolicy"].as_str().unwrap_or(&existing.missed_policy),at)?;
+                } else {
+                    self.service.add_schedule(&r.id,updated,at)?;
+                }
             }
             _ => anyhow::bail!("Unsupported assistant action"),
         }
@@ -1250,7 +1614,15 @@ impl<R: RuntimeIo + Clone> Worker<R> {
     }
     fn observe_runtime(&mut self) {
         self.error = None;
-        self.runtime_ready = self.probe.health().is_ok_and(|h| {
+        let health = self.probe.health();
+        self.startup_runtime_ready = health.as_ref().is_ok_and(|h| {
+            h.online
+                && h.initialized
+                && h.runtime_id == self.runtime_id
+                && h.generation == self.generation
+        });
+        self.capabilities_ready = health.as_ref().is_ok_and(|h| h.protocol_verified);
+        self.runtime_ready = health.is_ok_and(|h| {
             h.online
                 && h.initialized
                 && h.protocol_verified
@@ -1260,8 +1632,27 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         if !self.runtime_ready {
             self.error = Some("runtime_unavailable_or_unsupported");
         }
+        let at = (self.clock)();
+        if self.startup_runtime_ready && at.saturating_sub(self.account_checked_at) >= 5000 {
+            self.account = self
+                .probe
+                .account()
+                .unwrap_or(AccountReadiness::Unavailable);
+            self.account_checked_at = at;
+        }
         match self.executor.poll_events(256) {
             Ok(projection) => {
+                for stream in projection.streams {
+                    if self.service.operations().iter().any(|o| {
+                        o.id == stream.operation_id
+                            && (o.role == Role::Coordinator || self.service.direct_result(o))
+                    }) {
+                        if self.messages.execute("INSERT INTO product_timeline(id,role,text,at_ms,operation_id) VALUES(?1,'Assistant',?2,?3,?4) ON CONFLICT(id) DO UPDATE SET text=excluded.text",
+                            params![format!("assistant-operation:{}",stream.operation_id),stream.text,(self.clock)(),stream.operation_id]).is_err() {
+                            self.error = Some("timeline_unavailable");
+                        }
+                    }
+                }
                 if projection.pending_snapshot {
                     match self.executor.pending_requests() {
                         Ok(pending) => {
@@ -1274,6 +1665,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                             for op in self.service.operations() {
                                 if let (Some(scope), Some(call)) = (op.mapping, op.input_tool_call)
                                 {
+                                    if scope.host_generation!=self.generation {continue;}
                                     if !pending.iter().any(|p| {
                                         p.mapping == scope
                                             && p.call_id.as_deref() == Some(call.as_str())
@@ -1324,6 +1716,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             Err(_) => self.error = Some("runtime_reconnecting"),
         }
         self.reconcile_only();
+        if self.executor.reconcile_answer_receipts().is_err() {
+            self.error = Some("native_tool_answer_requires_reconciliation");
+        }
+        self.confirm_known();
         if self.service.reconcile_deliveries().is_err() {
             self.error = Some("delivery_requires_reconciliation");
         }
@@ -1332,14 +1728,19 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         }
     }
     fn dispatch_pending(&mut self) {
-        if self.allowed() && self.runtime_ready && !self.uncertain() {
+        if self.allowed() && self.runtime_ready {
             for (id, tool) in self.deferred.clone() {
+                if self.service.operations().iter().any(|o| o.id == tool.operation_id
+                    && matches!(o.phase, OperationPhase::Completed | OperationPhase::Failed | OperationPhase::Paused)) {
+                    self.error = Some("retained_native_request_requires_response");
+                    continue;
+                }
                 if self.service.operations().iter().any(|o| {
                     o.id == tool.operation_id && o.input_tool_call.as_deref() == Some(&tool.call_id)
                 }) {
                     continue;
                 }
-                if !self.allowed() || self.uncertain() {
+                if !self.allowed() {
                     break;
                 }
                 let Ok(permit) = self.admit() else {
@@ -1347,8 +1748,24 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 };
                 let result = match tool.call.clone() {
                     Some(call) => {
-                        self.service
-                            .tool(tool.scope.clone(), &tool.call_id, call, (self.clock)())
+                        let validation =
+                            if let ToolCall::Housekeeping(HousekeepingTool::ScheduleCreate {
+                                directory,
+                                ..
+                            }) = &call
+                            {
+                                self.revalidate_project_paths(std::slice::from_ref(directory))
+                            } else {
+                                Ok(())
+                            };
+                        validation.and_then(|_| {
+                            self.service.tool(
+                                tool.scope.clone(),
+                                &tool.call_id,
+                                call,
+                                (self.clock)(),
+                            )
+                        })
                     }
                     None => Err(anyhow::anyhow!(
                         tool.error.clone().unwrap_or("Invalid native tool".into())
@@ -1357,9 +1774,18 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 match result {
                     Ok(_) => {
                         self.deferred.remove(&id);
+                        self.local_receipts_pending.remove(&id);
                     }
                     Err(error) => {
-                        if self
+                        let committed = tool.call.as_ref().is_some_and(|call| {
+                            self.service
+                                .tool_effect_committed(&tool.scope, &tool.call_id, call)
+                                .unwrap_or(true)
+                        });
+                        if committed {
+                            self.local_receipts_pending.insert(id.clone());
+                            self.error = Some("local_tool_receipt_pending");
+                        } else if self
                             .executor
                             .has_tool_answer_attempt(&tool.scope, &tool.call_id)
                             .unwrap_or(true)
@@ -1376,7 +1802,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 }
                 self.finish_permit(permit);
             }
-            if self.allowed() && !self.uncertain() {
+            if self.allowed()
+                && self.account == AccountReadiness::Ready
+                && self.runtime_ready
+            {
                 if let Ok(permit) = self.admit() {
                     if self
                         .revalidate_pending_projects()
@@ -1416,6 +1845,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 .iter()
                 .any(|p| p.mapping == t.scope && p.call_id.as_deref() == Some(&t.call_id))
         });
+        self.local_receipts_pending
+            .retain(|id| self.deferred.contains_key(id));
+        self.confirm_known();
         if self.sync_timeline().is_err() {
             self.error = Some("timeline_unavailable");
         }
@@ -1423,6 +1855,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
     }
     fn snapshot(&mut self, override_error: Option<&str>) -> Result<Value> {
         self.sync_timeline()?;
+        self.capture_artifacts()?;
         let value = snapshot_value(
             &self.service,
             &self.executor,
@@ -1431,18 +1864,58 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             override_error.or(self.error),
         )?;
         let mut value = value;
+        artifacts::project(&self.messages,&mut value)?;
+        self.service.record_artifact_versions(value["artifacts"].as_array().map(Vec::as_slice).unwrap_or(&[]))?;
+        value["domain"]=self.service.domain_snapshot("local")?;
         value["fresh"] = json!(true);
         value["snapshotSource"] = json!("worker_read");
         value["updatedAtMs"] = json!((self.clock)());
         value["revision"] = json!(self.revision);
+        value["runtimeEventCursor"] = json!(self.executor.cursor()?);
         value["runtimeReady"] = json!(self.runtime_ready);
+        value["executorGenerationReady"] = json!(self.executor.current_generation_ready(&self.generation)?);
         value["reconciliationRequired"] = json!(self.uncertain());
         value["unconfirmedWrites"] = json!(self.permits.len() + self.recovered_permits.len());
         value["ready"] = json!(
-            self.runtime_ready && !self.uncertain() && override_error.or(self.error).is_none()
+            self.runtime_ready
+                && self.account == AccountReadiness::Ready
+                && self.executor.current_generation_ready(&self.generation)?
+                && override_error.is_none()
         );
+        value["accountReady"] = json!(self.account == AccountReadiness::Ready);
+        value["acceptingMessages"]=json!(self.allowed() && self.account==AccountReadiness::Ready);
+        value["protocolVersion"]=json!(2);
+        if value["ready"]==true && value["error"]=="service_reconciliation_required" {value["error"]=Value::Null;}
+        if self.startup_runtime_ready && self.account.error().is_some() {
+            value["error"] = json!(self.account.error());
+        }
+        value["startupStages"] = json!([
+            {"id":"runtime","status":if self.startup_runtime_ready {"ready"}else{"blocked"},"recoveryAction":if self.startup_runtime_ready {Value::Null}else{json!("inspect_runtime_host_startup")}},
+            {"id":"account","status":if !self.startup_runtime_ready {"waiting"}else if self.account == AccountReadiness::Ready {"ready"}else{"blocked"},"recoveryAction":self.account.error().map(|e|if e == "assistant_needs_login" {"login_with_codex_cli"}else{"check_cli_account_status"})},
+            {"id":"capabilities","status":if !self.startup_runtime_ready {"waiting"}else if self.capabilities_ready {"ready"}else{"blocked"},"recoveryAction":if self.capabilities_ready {Value::Null}else{json!("update_native_codex_protocol")}},
+            {"id":"coordinator","status":if !self.runtime_ready || self.account != AccountReadiness::Ready {"waiting"}else if self.uncertain() {"reconciling"}else if self.service.is_paused() {"paused"}else if self.error.is_some() {"blocked"}else{"ready"},"sessionCreated":self.service.coordinator_thread_id().is_some(),"recoveryAction":if self.uncertain() {json!("reconcile_retained_native_receipts")}else if self.service.is_paused() {json!("resume_assistant")}else if self.error.is_some() {json!("inspect_runtime_host_and_retry")}else{Value::Null}}
+        ]);
         value["unsupportedOperation"] = json!(self.probe.tracking.lock().unwrap().unsupported);
+        if self.runtime_ready && self.account==AccountReadiness::Ready && !self.uncertain() {
+            for record in self.executor.operation_records()? {
+                if record.rejected && !record.thread_submitted && !record.turn_submitted && record.mapping.is_none()
+                    && self.service.coordinator_handoff_recovery_directories(&record.operation_id).is_ok() {
+                    if let Some(op)=value["operations"].as_array_mut().and_then(|ops|ops.iter_mut().find(|op|op["id"]==record.operation_id)) {
+                        op["handoffRecovery"]=json!({"action":"resume_original_handoff","operationId":record.operation_id,
+                            "messageIds":op["user_message_ids"],"generation":record.generation});
+                    }
+                }
+            }
+        }
         value["projectAuthorization"]=json!(self.projects.iter().map(|p|json!({"threadId":p.thread,"directory":p.root,"writable":p.writable,"verified":p.verified,"sourceRuntimeId":p.source_runtime,"sourceGeneration":p.source_generation,"permissionRevision":p.permission_revision})).collect::<Vec<_>>());
+        for p in self.executor.pending_requests()? {
+            if self.executor.rejection_recovery_available(&p)? {
+                if let Some(v) = value["pendingRequests"].as_array_mut().and_then(|items| items.iter_mut()
+                    .find(|v| v["operationId"] == p.operation_id && v["requestId"] == p.handle)) {
+                    v["recoveryAction"] = json!("reject_original_tool_answer");
+                }
+            }
+        }
         Ok(value)
     }
 }
@@ -1463,6 +1936,7 @@ fn verify_project<R: RuntimeIo>(
         before.online && before.initialized && before.protocol_verified,
         "Assistant Host permission boundary unavailable"
     );
+    let actual = if runtime == before.runtime_id {
     let result = io.request(
         read_id(),
         "thread/read",
@@ -1475,7 +1949,14 @@ fn verify_project<R: RuntimeIo>(
     let cwd = result["thread"]["cwd"]
         .as_str()
         .context("Native project cwd unavailable")?;
-    let actual = physical(Path::new(cwd))?;
+    physical(Path::new(cwd))?
+    } else {
+        // The controller supplied this root from the selected source runtime's
+        // native thread/read. Its registered permission reader rechecks that
+        // source's owner, cwd, policy and generation below; the assistant Host
+        // must not be asked to resolve another runtime's thread namespace.
+        expected.clone()
+    };
     ensure!(
         within(&actual, &expected) && within(&expected, &actual),
         "Native project cwd changed; reauthorize"
@@ -1508,13 +1989,16 @@ fn verify_project<R: RuntimeIo>(
             && after.generation == before.generation,
         "Assistant Host changed while reading project permissions"
     );
-    let policy = crate::settings::canonical(&proof.settings);
-    let writable = policy["activePermissionProfile"]["id"].is_null()
+    let writable = project_writable(&proof.settings);
+    Ok((actual, writable, proof))
+}
+pub(crate) fn project_writable(settings: &Value) -> bool {
+    let policy = crate::settings::canonical(settings);
+    policy["activePermissionProfile"]["id"].is_null()
         && matches!(
             policy["sandboxPolicy"]["type"].as_str(),
             Some("workspaceWrite" | "dangerFullAccess")
-        );
-    Ok((actual, writable, proof))
+        )
 }
 fn text<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
     v[field]
@@ -1674,7 +2158,7 @@ fn snapshot_value<R: RuntimeIo>(
         .map(|s| serde_json::from_str::<Value>(&s))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(
-        json!({"enabled":true,"ready":error.is_none(),"runtimeId":runtime,"coordinatorThreadId":service.coordinator_thread_id(),"assistantId":service.assistant_id(),"paused":service.is_paused(),"settings":service.settings(),"tasks":service.tasks()?,"members":members,"groups":service.groups()?,"assignments":assignments,"deliveries":service.deliveries(),"questionHistory":question_history,"operations":operations,"events":events,"eventCursor":events.last().map(|e|e.sequence),"memories":service.memories()?,"schedules":service.schedules(),"messages":chat,"nextBefore":next_before,"pendingRequests":pending,"error":error}),
+        json!({"enabled":true,"ready":error.is_none(),"runtimeId":runtime,"coordinatorThreadId":service.coordinator_thread_id(),"assistantId":service.assistant_id(),"paused":service.is_paused(),"settings":service.settings(),"tasks":service.tasks()?,"members":members,"groups":service.groups()?,"assignments":assignments,"deliveries":service.deliveries(),"questionHistory":question_history,"operations":operations,"events":events,"eventCursor":events.last().map(|e|e.sequence),"memories":service.memories()?,"memoryMetadata":service.memory_metadata(),"memoryUsage":service.memory_usage(),"memoryDisabledTasks":service.memory_disabled_tasks(),"schedules":service.schedules(),"scheduleRuns":service.schedule_runs()?,"artifacts":service.artifacts(),"messages":chat,"nextBefore":next_before,"pendingRequests":pending,"error":error}),
     )
 }
 /// Timezone data is produced locally; clients supply a validated zone name only.
@@ -1732,3 +2216,5 @@ pub fn zone_rules(name: &str, now: i64) -> Result<ZoneRules> {
 #[cfg(test)]
 #[path = "assistant_product/tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::Fake as AssistantTestIo;

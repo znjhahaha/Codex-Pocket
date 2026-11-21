@@ -32,7 +32,7 @@ impl Default for Settings {
             personality: "Helpful personal assistant".into(),
             tone: "Clear and concise".into(),
             model: None,
-            timezone: "UTC".into(),
+            timezone: "Asia/Shanghai".into(),
             notifications: NotificationSettings::default(),
         }
     }

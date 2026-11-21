@@ -6,7 +6,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
@@ -77,6 +79,94 @@ class TranscriptScrollingDeviceTest {
     private var timeline by mutableStateOf(NativeTimeline())
     private var headerHeight by mutableIntStateOf(48)
 
+    @Test fun floatingComposerCompactsWithoutMovingTheReadingAnchor() {
+        content(savedDraft=DraftEntity(key,text="保留中文草稿\n第二行",followEnd=true))
+        val transcript=compose.onNodeWithTag("chat-transcript")
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        transcript.performTouchInput {swipeDown()}
+        compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==false}
+        compose.onNodeWithTag("composer-history-preview").assertIsDisplayed()
+        screenshot("rc39-floating-composer-compact")
+        repeat(4) {transcript.performTouchInput {swipeDown()}}
+        compose.waitForIdle()
+        val position=scrollPosition()
+        SystemClock.sleep(800)
+        assertEquals(position,scrollPosition(),.1f)
+        compose.onNodeWithTag("composer-history-preview").performClick()
+        compose.onNodeWithTag("composer-input").assertTextEquals("保留中文草稿\n第二行")
+        screenshot("rc39-floating-composer-editing")
+    }
+
+    @Test fun fastFlingToTailExpandsTheComposerWithoutAnotherGesture() {
+        content(savedDraft=DraftEntity(key,text="快速滑动后保留草稿",followEnd=true))
+        val transcript=compose.onNodeWithTag("chat-transcript")
+        transcript.performTouchInput { swipeDown() }
+        compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==false}
+        transcript.performScrollToIndex(18)
+        compose.waitForIdle()
+        compose.onNodeWithTag("composer-history-preview").assertIsDisplayed()
+        transcript.performTouchInput { swipeUp(durationMillis=60) }
+        compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==true}
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        compose.onNodeWithTag("composer-input").assertTextEquals("快速滑动后保留草稿")
+        screenshot("rc43-fast-fling-expanded")
+    }
+
+    @Test fun scriptDisplayAndJumpDotsRetainTheOriginalCommandAndMoveWithoutResizing() {
+        content()
+        val script="Get-Content README.md\nWrite-Output '完成'"
+        val invocation="\"C:\\Program Files\\WindowsApps\\CodexRuntime\\powershell\\pwsh.exe\" -Command '$script'"
+        val item=TimelineItem.from("fixture",buildJsonObject {
+            put("id","script");put("type","commandExecution");put("command",invocation)
+            put("status","completed");put("exitCode",0)
+            put("commandActions",buildJsonArray {add(buildJsonObject {put("type","unknown");put("command",script)})})
+        })
+        var running by mutableStateOf(true)
+        // The Compose test policy cancels infinite animations started while
+        // autoAdvance is enabled. Own the clock before composing the glyph.
+        compose.mainClock.autoAdvance=false
+        fun play(ms:Int) {repeat((ms+15)/16) {compose.mainClock.advanceTimeByFrame();SystemClock.sleep(16)};compose.waitForIdle()}
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {compose.activity.setContent {
+            PocketTheme("dark") {Surface {Column(Modifier.fillMaxSize().padding(20.dp)) {
+                NativeActivityTrace(TranscriptRow("script",TranscriptKind.Activity,listOf(item)),"fixture",true,{}, {})
+                Box(Modifier.size(44.dp).testTag("jump-fixture"),contentAlignment=androidx.compose.ui.Alignment.Center) {
+                    JumpToLatestGlyph(running)
+                }
+            }}}
+        }}
+        play(480)
+        compose.waitUntil(5_000) {compose.onAllNodesWithText("Get-Content README.md").fetchSemanticsNodes().isNotEmpty()}
+        compose.onNodeWithTag("activity-toggle:${item.key}").performClick()
+        play(400)
+        compose.onNodeWithText("$ $script").assertExists()
+        compose.onNodeWithText("WindowsApps",substring=true).assertDoesNotExist()
+        assertTrue(nativeActivityDetailText(item).contains(invocation))
+        play(160)
+        val node=compose.onNodeWithTag("jump-fixture")
+        val bounds=node.fetchSemanticsNode().boundsInRoot
+        fun pixels():IntArray {
+            val bitmap=node.captureToImage().asAndroidBitmap()
+            return IntArray(bitmap.width*bitmap.height).also {bitmap.getPixels(it,0,bitmap.width,0,0,bitmap.width,bitmap.height)}
+        }
+        val first=pixels()
+        screenshot("rc44-command-and-dots-a")
+        // Observe a complete cycle: two arbitrary samples can both land in the
+        // intentional resting interval after the third dot settles.
+        var moved=false
+        repeat(12) {
+            play(112)
+            if (!first.contentEquals(pixels())) moved=true
+        }
+        assertTrue("Dots must change position during one complete cycle",moved)
+        assertEquals(bounds,node.fetchSemanticsNode().boundsInRoot)
+        screenshot("rc44-command-and-dots-b")
+        compose.runOnIdle {running=false}
+        compose.mainClock.advanceTimeByFrame();compose.waitForIdle()
+        compose.onNodeWithTag("jump-latest-running").assertDoesNotExist()
+        compose.onNodeWithTag("jump-latest-idle").assertExists()
+        compose.mainClock.autoAdvance=true
+    }
+
     private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null, online: Boolean = false) = runBlocking {
         withTimeout(5_000) { repo.state.first { it.initialized } }
         val chat = ChatEntity(key, "runtime", "desktop", "Fixture", "", "", 0, "idle", false)
@@ -104,6 +194,87 @@ class TranscriptScrollingDeviceTest {
             compose.waitForIdle()
         }
         loaded
+    }
+
+    @Test fun imageDeckFansAndReversesWithoutMovingSurroundingContent() {
+        content()
+        val files=(0 until 12).map { index ->
+            val file=java.io.File(compose.activity.cacheDir,"rc45-deck-$index.png")
+            val bitmap=android.graphics.Bitmap.createBitmap(360,360,android.graphics.Bitmap.Config.ARGB_8888)
+            val canvas=android.graphics.Canvas(bitmap)
+            canvas.drawColor(intArrayOf(0xff8ba6ad.toInt(),0xffcbb194.toInt(),0xffa6b59b.toInt(),0xffa29cb8.toInt())[index%4])
+            val paint=android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {color=android.graphics.Color.WHITE;textSize=136f}
+            canvas.drawText("${index+1}",40f,220f,paint)
+            file.outputStream().use {bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)}
+            bitmap.recycle()
+            MentionedFile("验收图片 ${index+1}",file.absolutePath,true)
+        }
+        var count by mutableIntStateOf(4)
+        val reads=java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.atomic.AtomicInteger>()
+        val source=DesktopImageSource {path ->
+            reads.computeIfAbsent(path) {java.util.concurrent.atomic.AtomicInteger()}.incrementAndGet()
+            java.io.File(path)
+        }
+        compose.mainClock.autoAdvance=false
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {compose.activity.setContent {
+            PocketTheme("dark") {CompositionLocalProvider(LocalDesktopImages provides source,
+                LocalPocketGlassPreferences provides PocketGlassPreferences(false,false,true)) {
+                Surface {Column(Modifier.fillMaxSize().padding(20.dp)) {
+                    androidx.compose.material3.Text("多图片",Modifier.testTag("deck-before"))
+                    ImageGrid(files.take(count),alignEnd=true,Modifier.width(340.dp))
+                    androidx.compose.material3.Text("正文位置保持不变",Modifier.testTag("deck-after"))
+                }}
+            }}
+        }}
+        fun play(ms:Int) {repeat((ms+15)/16) {compose.mainClock.advanceTimeByFrame();SystemClock.sleep(16)};compose.waitForIdle()}
+        fun bounds(tag:String)=compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+        fun card(index:Int)=compose.onNodeWithTag("image-card:$index",useUnmergedTree=true)
+        play(480)
+        compose.waitUntil(5_000) {reads.size==3}
+        for (size in listOf(4,2,12)) {
+            compose.runOnIdle {count=size};play(80)
+            val frame=bounds("image-transition-frame");val after=bounds("deck-after")
+            val identity=card(1).fetchSemanticsNode().id
+            val closed=card(1).fetchSemanticsNode().boundsInRoot
+            screenshot("rc46-deck-$size-closed")
+            compose.onNodeWithTag("image-deck-toggle").performClick();play(96)
+            val moving=card(1).fetchSemanticsNode().boundsInRoot
+            assertNotEquals(closed,moving)
+            screenshot("rc46-deck-$size-opening")
+            assertEquals(identity,card(1).fetchSemanticsNode().id)
+            assertEquals(frame,bounds("image-transition-frame"));assertEquals(after,bounds("deck-after"))
+            val reversalClock=compose.mainClock.currentTime
+            // Check continuity at the same instant, independently of touch injection duration.
+            compose.onNodeWithTag("image-deck-toggle").performSemanticsAction(SemanticsActions.OnClick) {assertTrue(it())}
+            assertEquals(reversalClock,compose.mainClock.currentTime)
+            assertEquals("Changing direction must not reset the card position",moving,card(1).fetchSemanticsNode().boundsInRoot)
+            play(32)
+            screenshot("rc46-deck-$size-reversing");play(480)
+            assertEquals(closed,card(1).fetchSemanticsNode().boundsInRoot)
+            // Real touch reversal still exercises hit testing and the full pointer gesture.
+            compose.onNodeWithTag("image-deck-toggle").performClick();play(96)
+            val beforeTap=compose.mainClock.currentTime
+            compose.onNodeWithTag("image-deck-toggle").performClick()
+            println("deck real reversal count=$size touchClockDelta=${compose.mainClock.currentTime-beforeTap}ms")
+            play(480)
+            assertEquals(closed,card(1).fetchSemanticsNode().boundsInRoot)
+            assertEquals(identity,card(1).fetchSemanticsNode().id)
+            compose.onNodeWithTag("image-deck-toggle").performClick();play(256)
+            val settled=card(1).fetchSemanticsNode().boundsInRoot
+            play(160)
+            assertEquals("Expansion must already be settled by 256 ms",settled,card(1).fetchSemanticsNode().boundsInRoot)
+            screenshot("rc46-deck-$size-open")
+            assertEquals(frame,bounds("image-transition-frame"));assertEquals(after,bounds("deck-after"))
+            if(size==12) {
+                compose.onNodeWithText("+3").assertIsDisplayed()
+                compose.onNodeWithContentDescription("验收图片 9").performClick();play(480)
+                compose.onNodeWithText("9 / 12").assertIsDisplayed()
+                compose.onNodeWithContentDescription("关闭",useUnmergedTree=true).performClick();play(80)
+            }
+            compose.onNodeWithTag("image-deck-toggle").performClick();play(480)
+            assertEquals(frame,bounds("image-transition-frame"));assertEquals(after,bounds("deck-after"))
+        }
+        compose.mainClock.autoAdvance=true
     }
 
     @After fun close() = runBlocking<Unit> {

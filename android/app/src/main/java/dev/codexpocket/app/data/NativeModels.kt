@@ -24,12 +24,14 @@ data class ThreadKey(val computerId: String, val configStoreId: String, val nati
 
 data class RuntimeInfo(val id: String, val source: String, val version: String, val configStoreId: String, val online: Boolean, val loadedThreadIds: Set<String>, val capabilities: Set<String>?,
     val capabilityFields: Map<String, Set<String>> = emptyMap(), val bridgeVersion: String? = null,
-    val helperVersion: String? = null, val bridgeUpdatePending: Boolean = false, val role: String = "ordinary") {
+    val helperVersion: String? = null, val bridgeUpdatePending: Boolean = false, val role: String = "ordinary",
+    val readinessStage: String? = null, val readinessTimedOut: Boolean = false) {
     val supportsServiceTier get() = "serviceTier" in capabilityFields["thread/settings/update"].orEmpty()
     companion object {
         fun from(o: JsonObject) = RuntimeInfo(o.string("id"), o.string("source"), o.string("version"), o.string("configStoreId"), o.flag("online"), o.array("loadedThreadIds").mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.toSet(), (o["capabilities"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet(),
             o.obj("capabilityFields").mapValues { (_, value) -> (value as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.toSet().orEmpty() },
-            o.string("bridgeVersion").takeIf(String::isNotBlank), o.string("helperVersion").takeIf(String::isNotBlank), o.flag("bridgeUpdatePending"), o.obj("role").string("kind", "ordinary"))
+            o.string("bridgeVersion").takeIf(String::isNotBlank), o.string("helperVersion").takeIf(String::isNotBlank), o.flag("bridgeUpdatePending"), o.obj("role").string("kind", "ordinary"),
+            o.obj("readiness").string("stage").takeIf(String::isNotBlank), o.obj("readiness").flag("timedOut"))
     }
 }
 
@@ -160,18 +162,29 @@ object NativeReducer {
         // Deprecated but still present in the native schema: ContextCompactedNotification.
         if (method == "thread/compacted") {
             if (turn.isBlank()) return old
-            return old.copy(items = old.items.mapValues { (_, item) ->
-                if (item.turnId == turn && item.type == "contextCompaction") item.copy(complete = true, liveStarted = false) else item
-            })
+            val items = LinkedHashMap(old.items)
+            val existing = items.values.lastOrNull { it.turnId == turn && it.type == "contextCompaction" }
+            val completed = existing?.copy(complete = true, liveStarted = false) ?: TimelineItem.from(turn,
+                buildJsonObject { put("id", "compacted:$turn"); put("type", "contextCompaction") }, complete = true)
+            items[completed.key] = completed
+            return old.copy(items = items)
         }
         val next: TimelineItem = when (method) {
             "item/started", "item/completed" -> {
                 val native = TimelineItem.from(turn, p.obj("item"), method == "item/completed").copy(liveStarted = method == "item/started")
+                if (method == "item/started" && native.type == "reasoning" &&
+                    (turn in old.completedTurns || old.turns[turn]?.status in setOf("completed", "failed", "interrupted"))) return old
                 // Replayed starts must not revive compaction in a terminal native turn.
                 if (method == "item/started" && native.type == "contextCompaction" &&
                     (turn in old.completedTurns || old.turns[turn]?.status in setOf("completed", "failed", "interrupted"))) return old
                 val existing = old.items[native.key]
-                if (method == "item/completed" || existing == null) native
+                if (method == "item/completed" && native.type == "reasoning" && existing != null && "summary" !in native.raw && existing.summaryParts.isNotEmpty()) {
+                    // Some completion envelopes carry only identity/content. Preserve already
+                    // received summary prose; an explicit summary (including []) still replaces it.
+                    val parts = existing.summaryParts
+                    native.copy(text = parts.filter(String::isNotBlank).joinToString("\n\n"),
+                        raw = JsonObject(native.raw + ("summary" to JsonArray(parts.map(::JsonPrimitive)))))
+                } else if (method == "item/completed" || existing == null) native
                 else {
                     if (existing.complete) return old
                     // Starts add lifecycle metadata; only completion/snapshots replace accumulated text.
@@ -181,6 +194,7 @@ object NativeReducer {
                 }
             }
             "item/reasoning/summaryPartAdded", "item/reasoning/summaryTextDelta" -> {
+                if (turn in old.completedTurns || old.turns[turn]?.status in setOf("completed", "failed", "interrupted")) return old
                 val seed = TimelineItem(turn, p.string("itemId"), "reasoning")
                 val existing = old.items[seed.key] ?: seed
                 if (existing.complete) return old
@@ -238,8 +252,16 @@ object NativeReducer {
             for (item in turn.array("items")) {
                 val nativeItem = item.asObject()
                 val itemCompleted = (nativeItem["completedAtMs"] as? JsonPrimitive)?.longOrNull?.takeIf { it >= 0 } != null
-                // Turn completion alone never establishes compaction success, including in history.
-                val complete = itemCompleted || (nativeItem.string("type") != "contextCompaction" && turn.string("status") != "inProgress")
+                // Native legacy ContextCompactedEvent history is an already
+                // completed marker with no timing fields. A timed start remains
+                // unfinished until item completion; turn outcome is independent.
+                val legacyCompacted = nativeItem.string("type") == "contextCompaction" &&
+                    nativeItem["startedAtMs"].let { it == null || it == JsonNull } &&
+                    nativeItem["completedAtMs"].let { it == null || it == JsonNull } &&
+                    nativeItem.string("status").isBlank()
+                val complete = itemCompleted || legacyCompacted ||
+                    (nativeItem.string("type") == "reasoning" && nativeItem.string("status") in setOf("completed", "failed", "interrupted")) ||
+                    (nativeItem.string("type") != "contextCompaction" && turn.string("status") != "inProgress")
                 val value = TimelineItem.from(turn.string("id"), nativeItem, complete)
                 if (ConversationPresentation.visible(value)) items[value.key] = value
             }

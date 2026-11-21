@@ -34,6 +34,25 @@ class V05ComposerModelUiTest {
         compose.waitForIdle()
     }
 
+    @Test fun delayedDraftEchoCannotEraseNewerKeystrokesOrChineseComposition() {
+        var persisted by mutableStateOf("")
+        val sent=mutableListOf<String>()
+        content {PocketComposer(persisted,"Model","",false,ComposerAvailability(true,false,true,false),
+            {sent+=it},{},{},{},{},{},{},true)}
+        val input=compose.onNodeWithTag("composer-input")
+        input.performClick().performTextInput("中")
+        input.performTextInput("文🙂")
+        assertEquals(listOf("中","中文🙂"),sent)
+        compose.runOnIdle {persisted="中"}
+        input.assertTextEquals("中文🙂")
+        input.performTextInput("快速输入")
+        assertEquals("中文🙂快速输入",sent.last())
+        compose.runOnIdle {persisted=sent.last()}
+        input.assertTextEquals("中文🙂快速输入")
+        compose.runOnIdle {persisted=""}
+        assertEquals("",input.fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+    }
+
     @Test fun historyPreviewIsNotAnEditorAndRepeatedExitKeepsMultilineDraft() {
         var reading by mutableStateOf(false)
         var mounted by mutableStateOf(true)

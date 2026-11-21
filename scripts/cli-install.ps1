@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 5.1
 <#
 .SYNOPSIS
 Dry-run by default. Install or restore reversible wrappers around known npm
@@ -9,7 +9,7 @@ Codex entrypoints. Native configuration, credentials and package code are untouc
 .\cli-install.ps1 -Uninstall -Apply
 #>
 [CmdletBinding()]
-param([string]$LauncherDirectory, [switch]$Apply, [switch]$Uninstall)
+param([string]$LauncherDirectory, [switch]$Apply, [switch]$Uninstall, [switch]$Upgrade)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -34,11 +34,23 @@ function Assert-PlainPath([string]$Path) {
 }
 function Write-Atomic([string]$Path, [byte[]]$Bytes) {
     Assert-PlainPath $Path
+    if(-not ('PocketCliAtomic' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PocketCliAtomic {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+ static extern bool MoveFileEx(string source,string target,uint flags);
+ public static void Replace(string source,string target) {
+  if(!MoveFileEx(source,target,9)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+ }
+}
+'@
+    }
     $temporary = $Path + '.codex2-' + [guid]::NewGuid().ToString('N') + '.tmp'
     try {
         [IO.File]::WriteAllBytes($temporary, $Bytes)
-        if ([IO.File]::Exists($Path)) { [IO.File]::Move($temporary, $Path, $true) }
-        else { [IO.File]::Move($temporary, $Path) }
+        [PocketCliAtomic]::Replace($temporary,$Path)
     } finally {
         if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
     }
@@ -71,6 +83,7 @@ Assert-PlainPath $stateDir
 $manifestPath = Join-Path $stateDir 'manifest.json'
 $runtimePath = Join-Path $stateDir 'runtime.json'
 $wrapperPath = Join-Path $stateDir 'cli-wrapper.mjs'
+$updatePath = Join-Path $stateDir 'update.json'
 $sourceWrapper = Join-Path $PSScriptRoot 'cli-wrapper.mjs'
 Assert-PlainPath $sourceWrapper
 if (-not [IO.File]::Exists($sourceWrapper)) { throw 'The sibling CLI wrapper helper is missing.' }
@@ -88,6 +101,23 @@ try {
         try { $locked = $lock.WaitOne(0) }
         catch [Threading.AbandonedMutexException] { $locked = $true }
         if (-not $locked) { throw 'Another installer owns this npm entry directory.' }
+    }
+    if ([IO.File]::Exists($updatePath)) {
+        if (-not $Apply) { throw 'CLI helper update recovery pending; use -Apply to recover.' }
+        Assert-PlainPath $updatePath
+        $pending=Get-Content -LiteralPath $updatePath -Raw | ConvertFrom-Json
+        if($pending.schema -ne 1 -or $pending.directory -ne $stateDir){throw 'CLI helper update identity differs.'}
+        $complete=(Get-BytesHash ([IO.File]::ReadAllBytes($manifestPath))) -eq $pending.manifestHash
+        foreach($entry in $pending.files){
+            if($entry.name -notin @('cli-wrapper.mjs','runtime.json','manifest.json')){throw 'Invalid CLI helper recovery file.'}
+            $target=Join-Path $stateDir $entry.name;Assert-PlainPath $target
+            $currentHash=Get-BytesHash ([IO.File]::ReadAllBytes($target))
+            $old=[Convert]::FromBase64String($entry.before)
+            if($currentHash -notin @((Get-BytesHash $old),$entry.afterHash)){throw 'CLI helper changed during recovery.'}
+            if($currentHash -ne $entry.afterHash){$complete=$false}
+        }
+        if(-not $complete){foreach($entry in $pending.files){Write-Atomic (Join-Path $stateDir $entry.name) ([Convert]::FromBase64String($entry.before))}}
+        [IO.File]::Delete($updatePath)
     }
     foreach ($name in $names) {
         $target = Join-Path $LauncherDirectory $name
@@ -146,7 +176,7 @@ try {
             Assert-PlainPath $check.Path
             if ((Get-BytesHash ([IO.File]::ReadAllBytes($check.Path))) -ne $check.Hash) { throw 'Installed helper integrity check failed.' }
         }
-        if (-not $Uninstall -and ((Get-BytesHash $wrapperBytes) -ne $manifest.wrapperHash -or (Get-BytesHash $runtimeBytes) -ne $manifest.runtimeHash)) {
+        if (-not $Uninstall -and -not $Upgrade -and ((Get-BytesHash $wrapperBytes) -ne $manifest.wrapperHash -or (Get-BytesHash $runtimeBytes) -ne $manifest.runtimeHash)) {
             throw 'Wrapper source changed; uninstall with the existing manifest before installing the new source.'
         }
     }
@@ -163,6 +193,28 @@ try {
         daemonLifecycleAtInstall = 'none'
     }
     if (-not $Apply) { $plan | ConvertTo-Json -Depth 5; return }
+    if($null -ne $manifest -and $Upgrade -and -not $Uninstall -and
+        ((Get-BytesHash $wrapperBytes) -ne $manifest.wrapperHash -or (Get-BytesHash $runtimeBytes) -ne $manifest.runtimeHash)) {
+        $oldManifest=[IO.File]::ReadAllBytes($manifestPath)
+        $manifest.wrapperHash=Get-BytesHash $wrapperBytes;$manifest.runtimeHash=Get-BytesHash $runtimeBytes
+        $nextManifest=$utf8.GetBytes(($manifest | ConvertTo-Json -Depth 6))
+        $updates=@(
+            @{name='cli-wrapper.mjs';before=[Convert]::ToBase64String([IO.File]::ReadAllBytes($wrapperPath));afterHash=(Get-BytesHash $wrapperBytes)},
+            @{name='runtime.json';before=[Convert]::ToBase64String([IO.File]::ReadAllBytes($runtimePath));afterHash=(Get-BytesHash $runtimeBytes)},
+            @{name='manifest.json';before=[Convert]::ToBase64String($oldManifest);afterHash=(Get-BytesHash $nextManifest)}
+        )
+        Write-Atomic $updatePath $utf8.GetBytes((@{schema=1;directory=$stateDir;manifestHash=(Get-BytesHash $nextManifest);files=$updates}|ConvertTo-Json -Depth 6))
+        try {
+            Write-Atomic $wrapperPath $wrapperBytes
+            Write-Atomic $runtimePath $runtimeBytes
+            Write-Atomic $manifestPath $nextManifest
+            [IO.File]::Delete($updatePath)
+        } catch {
+            foreach($entry in $updates){Write-Atomic (Join-Path $stateDir $entry.name) ([Convert]::FromBase64String($entry.before))}
+            [IO.File]::Delete($updatePath)
+            throw
+        }
+    }
     if ($null -eq $manifest) {
         [void][IO.Directory]::CreateDirectory($stateDir)
         $createdState = $true

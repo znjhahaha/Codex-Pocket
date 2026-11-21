@@ -247,6 +247,7 @@ impl Broker {
         handoff: &Handoff,
         writable: bool,
     ) -> std::result::Result<Snapshot, HandoffError> {
+        self.restore_desktop_followers().await;
         let probes = {
             let state = self.state.lock().await;
             state

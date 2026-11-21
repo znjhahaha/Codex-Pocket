@@ -20,6 +20,10 @@ mod permissions;
 mod protocol;
 #[path = "assistant_executor/shared.rs"]
 mod shared;
+#[path = "assistant_executor/answer_recovery.rs"]
+mod answer_recovery;
+#[path = "assistant_executor/generation.rs"]
+mod generation;
 pub(crate) use permissions::project_permission_reader;
 pub use permissions::{
     ProjectPermissionProof, ProjectPermissionReader, register_project_permission_reader,
@@ -27,6 +31,7 @@ pub use permissions::{
 pub use protocol::dynamic_tools;
 pub(crate) use protocol::normalize_input_answers;
 pub use shared::SharedHostExecutor;
+const TOOL_REVISION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeHealth {
@@ -36,6 +41,8 @@ pub struct RuntimeHealth {
     pub initialized: bool,
     pub protocol_verified: bool,
     pub reconciliation_required: bool,
+    #[serde(default)]
+    pub scoped_admission:bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeReceipt {
@@ -56,15 +63,70 @@ pub struct RuntimeEvents {
     pub events: Vec<RuntimeEvent>,
     pub pending_requests: Vec<Value>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountReadiness {
+    Ready,
+    NeedsLogin,
+    Unavailable,
+}
+impl AccountReadiness {
+    pub fn from_native(value: &Value) -> Self {
+        match value["requiresOpenaiAuth"].as_bool() {
+            Some(false) => Self::Ready,
+            Some(true) if value.get("account") == Some(&Value::Null) => Self::NeedsLogin,
+            Some(true)
+                if matches!(
+                    value["account"]["type"].as_str(),
+                    Some("apiKey" | "chatgpt")
+                ) =>
+            {
+                Self::Ready
+            }
+            _ => Self::Unavailable,
+        }
+    }
+    pub fn error(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::NeedsLogin => Some("assistant_needs_login"),
+            Self::Unavailable => Some("assistant_account_unavailable"),
+        }
+    }
+}
 pub trait RuntimeIo {
     fn supports(&self, _method: &str, _parameters: &Value) -> bool {
         false
     }
     fn request(&mut self, stable_id: Value, method: &str, params: Value) -> Result<Value>;
     fn receipt(&mut self, stable_id: Value) -> Result<RuntimeReceipt>;
+    /// Read retained evidence from its original generation; never dispatch an effect.
+    fn historical_receipt(&mut self, _id: Value, _generation: &str) -> Result<RuntimeReceipt> {
+        anyhow::bail!("Historical command receipt unavailable")
+    }
+    fn recovery(&mut self) -> Result<Value> {
+        anyhow::bail!("Authoritative runtime recovery unavailable")
+    }
+    fn answer_evidence(&mut self, _offset: usize, _snapshot_digest: &str)
+        -> Result<pocket_runtime_ipc::client::AnswerEvidencePage> {
+        anyhow::bail!("Authoritative historical answer evidence unavailable")
+    }
+    /// Must use the native answer namespace. Legacy capability gaps are unknown,
+    /// never command-missing evidence and never authorization to resend.
+    fn answer_receipt(&mut self, _native_id: Value) -> Result<RuntimeReceipt> {
+        anyhow::bail!("Authoritative answer receipt unavailable")
+    }
     fn answer(&mut self, native_id: Value, result: Value) -> Result<()>;
+    /// Called only after the exact Host write receipt and executor confirmation
+    /// are durable. Adapters may then release their retained answer intent.
+    fn confirm_answer_receipt(&mut self, _generation: &str, _native_id: &Value) -> Result<()> {
+        Ok(())
+    }
     fn events(&mut self, after: u64, limit: usize) -> Result<RuntimeEvents>;
     fn health(&mut self) -> Result<RuntimeHealth>;
+    /// Fixed local account evidence; never expose credentials or infer auth from files.
+    fn account(&mut self) -> Result<AccountReadiness> {
+        Ok(AccountReadiness::Unavailable)
+    }
     fn project_permissions(
         &mut self,
         _: &str,
@@ -133,7 +195,26 @@ struct Effect {
     #[serde(default)]
     rejected: bool,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct CleanGeneration {
+    previous_generation: String,
+    generation: String,
+    previous_cursor: u64,
+}
+/// Positive evidence for a legacy service intent which never entered the
+/// executor's write-ahead journal. This is a tombstone, never a retry permit.
+#[derive(Clone, Serialize, Deserialize)]
+struct MissingDispatchReceipts {
+    previous_generation: String,
+    /// Host generation that supplied the exact missing receipts.
+    generation: String,
+    /// Original Service intent; older proofs used `generation` for both.
+    #[serde(default)]
+    expected_generation: Option<String>,
+    thread_rpc_id: Value,
+    turn_rpc_id: Value,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Durable {
     runtime_id: String,
     generation: String,
@@ -142,6 +223,33 @@ struct Durable {
     threads: BTreeMap<String, ThreadOwner>,
     effects: BTreeMap<String, Effect>,
     answers: BTreeMap<String, Effect>,
+    #[serde(default)]
+    streaming: BTreeMap<String, String>,
+    #[serde(default)]
+    streaming_order: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    streaming_stopped: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    streaming_gap: bool,
+    #[serde(default)]
+    clean_generation: Option<CleanGeneration>,
+    #[serde(default)]
+    not_dispatched: BTreeMap<String, MissingDispatchReceipts>,
+    #[serde(default)]
+    terminal_generations: Vec<Value>,
+    #[serde(default)]
+    scoped_generations: Vec<Value>,
+}
+impl Durable {
+    fn empty_native_history(&self) -> bool {
+        self.operations.is_empty()
+            && self.threads.is_empty()
+            && self.effects.is_empty()
+            && self.answers.is_empty()
+            && self.streaming.is_empty()
+            && self.streaming_order.is_empty()
+            && self.streaming_stopped.is_empty()
+    }
 }
 #[derive(Clone, Debug)]
 pub struct PendingRequest {
@@ -175,6 +283,12 @@ pub struct EventProjection {
     /// Calls absent from a successfully read authoritative pending snapshot.
     pub resolved_tools: Vec<(NativeMapping, String)>,
     pub pending_snapshot: bool,
+    pub streams: Vec<StreamObservation>,
+}
+#[derive(Clone, Debug)]
+pub struct StreamObservation {
+    pub operation_id: String,
+    pub text: String,
 }
 
 pub struct HostExecutor<R: RuntimeIo> {
@@ -224,6 +338,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
         let health = runtime.health()?;
         valid_health(&health)?;
         if state.runtime_id.is_empty() {
+            ensure!(state.empty_native_history() && state.not_dispatched.is_empty(), "Unidentified executor history");
             state.runtime_id = health.runtime_id.clone();
             state.generation = health.generation.clone();
         }
@@ -232,6 +347,29 @@ impl<R: RuntimeIo> HostExecutor<R> {
             state.runtime_id == health.runtime_id,
             "Runtime profile identity mismatch"
         );
+        if state.generation != health.generation
+            && state.empty_native_history()
+            && health.online && health.initialized && health.protocol_verified
+            && !health.reconciliation_required
+        {
+            small(&state.generation)?;
+            // Non-dispatch tombstones contain no native work. Retain them
+            // across clean restarts so old IDs remain permanently fenced.
+            state.clean_generation = Some(CleanGeneration {
+                previous_generation: state.generation.clone(),
+                generation: health.generation.clone(),
+                previous_cursor: state.cursor,
+            });
+            state.generation = health.generation.clone();
+            state.cursor = 0;
+            state.streaming_gap = false;
+        }
+        // Legacy text caches did not retain native item order. Rebuild them
+        // from a fenced native snapshot instead of inventing an order.
+        if !state.streaming.is_empty() && state.streaming_order.is_empty() {
+            state.streaming_gap = true;
+        }
+        let event_gap = state.streaming_gap;
         let instance = Self {
             runtime,
             policy,
@@ -239,7 +377,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             state,
             pending: BTreeMap::new(),
             statuses: BTreeMap::new(),
-            event_gap: false,
+            event_gap,
             _owner: owner,
         };
         instance.save()?;
@@ -247,6 +385,79 @@ impl<R: RuntimeIo> HostExecutor<R> {
     }
     pub fn operation_records(&self) -> Vec<OperationRecord> {
         self.state.operations.values().cloned().collect()
+    }
+    pub fn streaming_text(&self) -> Vec<StreamObservation> {
+        if self.state.streaming_gap {
+            return vec![];
+        }
+        self.state
+            .operations
+            .values()
+            .filter_map(|op| {
+                self.stream_text(&op.operation_id)
+                    .map(|text| StreamObservation {
+                        operation_id: op.operation_id.clone(),
+                        text,
+                    })
+            })
+            .collect()
+    }
+    fn stream_text(&self, operation: &str) -> Option<String> {
+        let order = self.state.streaming_order.get(operation)?;
+        let parts = order
+            .iter()
+            .filter_map(|item| {
+                self.state
+                    .streaming
+                    .get(&format!("{operation}:{item}"))
+                    .map(String::as_str)
+            })
+            .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| clip_stream(&parts.join("\n\n"), 65536))
+    }
+    fn store_stream(&mut self, operation: &str, item: &str, text: &str, append: bool) {
+        let key = format!("{operation}:{item}");
+        let old = self.state.streaming.get(&key);
+        if append && old.is_some_and(|text| text.ends_with(STREAM_TRUNCATED)) {
+            return;
+        }
+        if old.is_none() && self.state.streaming.len() >= 512 {
+            return;
+        }
+        let budget = (1024 * 1024usize)
+            .saturating_sub(
+                self.state
+                    .streaming
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>()
+                    - old.map_or(0, String::len),
+            )
+            .min(65536);
+        if budget < STREAM_TRUNCATED.len() {
+            return;
+        }
+        let next = if append {
+            format!("{}{text}", old.map(String::as_str).unwrap_or(""))
+        } else {
+            text.to_owned()
+        };
+        let order = self
+            .state
+            .streaming_order
+            .entry(operation.into())
+            .or_default();
+        if !order.iter().any(|id| id == item) {
+            order.push(item.into());
+        }
+        self.state.streaming.insert(key, clip_stream(&next, budget));
+    }
+    fn clear_stream(&mut self, operation: &str) {
+        let prefix = format!("{operation}:");
+        self.state
+            .streaming
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.state.streaming_order.remove(operation);
     }
     pub fn pending_requests(&self) -> Vec<PendingRequest> {
         self.pending.values().cloned().collect()
@@ -332,7 +543,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
         );
         if writing {
             ensure!(
-                !h.reconciliation_required && !self.event_gap,
+                (!h.reconciliation_required || h.scoped_admission) && !self.event_gap,
                 "Host/event stream requires reconciliation before new effects"
             );
         }
@@ -362,7 +573,8 @@ impl<R: RuntimeIo> HostExecutor<R> {
         let result = match self.runtime.request(id.clone(), method, params) {
             Ok(value) => value,
             Err(error) => {
-                if error.downcast_ref::<RuntimeUnsupported>().is_some() {
+                if error.downcast_ref::<RuntimeUnsupported>().is_some()
+                    || error.downcast_ref::<pocket_runtime_ipc::client::AdmissionRejected>().is_some() {
                     self.state.effects.get_mut(&key).unwrap().rejected = true;
                     for op in self.state.operations.values_mut().filter(|op| {
                         op.mapping.is_none() && (op.thread_rpc_id == id || op.turn_rpc_id == id)
@@ -430,7 +642,9 @@ impl<R: RuntimeIo> HostExecutor<R> {
     fn dispatch(&mut self, req: StartRequest, resume: bool) -> Result<NativeMapping> {
         small(&req.operation_id)?;
         small(&req.host_generation)?;
+        ensure!(!self.state.not_dispatched.contains_key(&req.operation_id), "Original operation proven not dispatched; explicit new intent required");
         bounded_text(&req.prompt, 65536)?;
+        crate::assistant::inputs::validate_inputs(&req.inputs)?;
         bounded_text(&req.instructions, 131072)?;
         req.settings.validate()?;
         self.healthy(&req.host_generation, true)?;
@@ -470,6 +684,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 saved.fingerprint == fingerprint,
                 "Service operation ID reused with different input"
             );
+            ensure!(!saved.rejected, "Original preflight rejected; explicit new intent required");
             if let Some(mapping) = &saved.mapping {
                 return Ok(mapping.clone());
             }
@@ -508,13 +723,19 @@ impl<R: RuntimeIo> HostExecutor<R> {
             }
             self.require_idle_thread(thread)?;
         }
-        let model = self.select_model(req.settings.model.as_deref())?;
+        // None deliberately inherits the native profile's model/provider. The
+        // public directory may omit custom provider models and is not a default.
+        let model = req
+            .settings
+            .model
+            .as_deref()
+            .map(|m| self.select_model(Some(m)))
+            .transpose()?;
         let thread_rpc_id = rpc_id(&req.operation_id, "thread");
         let turn_rpc_id = rpc_id(&req.operation_id, "turn");
-        let tool_revision = req
-            .thread_id
-            .as_ref()
-            .map_or(1, |thread| self.state.threads[thread].tool_revision);
+        let tool_revision = req.thread_id.as_ref().map_or(TOOL_REVISION, |thread| {
+            self.state.threads[thread].tool_revision
+        });
         let op = OperationRecord {
             operation_id: req.operation_id.clone(),
             generation: req.host_generation.clone(),
@@ -539,7 +760,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             .unwrap()
             .thread_submitted = true;
         self.save()?;
-        let thread_params = protocol::thread_params(&req, &directory, &model, resume);
+        let thread_params = protocol::thread_params(&req, &directory, model.as_deref(), resume);
         let result = self.effect(
             thread_rpc_id,
             if resume {
@@ -550,7 +771,9 @@ impl<R: RuntimeIo> HostExecutor<R> {
             thread_params,
         )?;
         ensure!(
-            result["model"].as_str() == Some(model.as_str()),
+            model
+                .as_ref()
+                .is_none_or(|model| result["model"].as_str() == Some(model.as_str())),
             "Native changed the verified model"
         );
         ensure!(
@@ -623,7 +846,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
         let result = self.effect(
             turn_rpc_id,
             "turn/start",
-            protocol::turn_params(&req, &thread, &directory, &model),
+            protocol::turn_params(&req, &thread, &directory, model.as_deref()),
         )?;
         let turn = result["turn"]["id"]
             .as_str()
@@ -715,6 +938,19 @@ impl<R: RuntimeIo> HostExecutor<R> {
         Ok(None)
     }
     fn select_model(&mut self, requested: Option<&str>) -> Result<String> {
+        // Catalogs need not enumerate private provider models. A fixed local
+        // read of this Host's effective config is authoritative for its current
+        // model, without reading or rewriting credentials/provider files.
+        if let Some(requested) = requested {
+            if self
+                .query("config/read", json!({"includeLayers":false}))
+                .ok()
+                .is_some_and(|config| config["config"]["model"].as_str() == Some(requested))
+            {
+                small(requested)?;
+                return Ok(requested.into());
+            }
+        }
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::BTreeSet::new();
         let mut default = None;
@@ -777,7 +1013,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
                 "Native answer reused with different content"
             );
             ensure!(old.accepted, "Native answer unresolved; never resend");
-            return Ok(());
+            return self.runtime.confirm_answer_receipt(&pending.mapping.host_generation, &pending.native_id);
         }
         self.state.answers.insert(
             key.clone(),
@@ -788,9 +1024,9 @@ impl<R: RuntimeIo> HostExecutor<R> {
             },
         );
         self.save()?;
-        self.runtime.answer(pending.native_id, result)?;
-        self.state.answers.get_mut(&key).unwrap().accepted = true;
-        self.save()
+        self.runtime.answer(pending.native_id.clone(), result)?;
+        self.mark_answer_accepted(&key)?;
+        self.runtime.confirm_answer_receipt(&pending.mapping.host_generation, &pending.native_id)
     }
     fn attempt(&mut self, req: StartRequest, resume: bool) -> Result<NativeMapping> {
         let result = self.dispatch(req.clone(), resume);
@@ -798,8 +1034,16 @@ impl<R: RuntimeIo> HostExecutor<R> {
         // evidence of non-dispatch, rather than leaking an unreconcilable lease.
         if result.is_err()
             && !self.state.operations.contains_key(&req.operation_id)
+            && !self.state.not_dispatched.contains_key(&req.operation_id)
             && small(&req.operation_id).is_ok()
-            && self.healthy(&req.host_generation, false).is_ok()
+            && small(&req.host_generation).is_ok()
+            && ["thread", "turn"].iter().all(|phase| {
+                native_key(&rpc_id(&req.operation_id, phase))
+                    .is_ok_and(|id| !self.state.effects.contains_key(&id))
+            })
+            && !self.state.threads.values().any(|owner| {
+                owner.current_operation.as_deref() == Some(req.operation_id.as_str())
+            })
         {
             self.state.operations.insert(
                 req.operation_id.clone(),
@@ -820,23 +1064,115 @@ impl<R: RuntimeIo> HostExecutor<R> {
                     thread_id: None,
                     mapping: None,
                     rejected: true,
-                    tool_revision: 1,
+                    tool_revision: TOOL_REVISION,
                 },
             );
-            self.save()?;
+            if let Err(error) = self.save() {
+                self.state.operations.remove(&req.operation_id);
+                return Err(error);
+            }
         }
         result
     }
+
+    fn legacy_non_dispatch(&mut self, req: &StatusRequest) -> Result<ExecutionStatus> {
+        small(&req.operation_id)?;
+        small(&req.host_generation)?;
+        if req.mapping.is_some() {
+            return Ok(ExecutionStatus::Unknown);
+        }
+        let thread_rpc_id = rpc_id(&req.operation_id, "thread");
+        let turn_rpc_id = rpc_id(&req.operation_id, "turn");
+        if let Some(proof) = self.state.not_dispatched.get(&req.operation_id) {
+            // A saved proof remains valid after later clean transitions or
+            // new work. Its intent identity must never follow the live Host.
+            return Ok(if proof.expected_generation.as_deref().unwrap_or(&proof.generation) == req.host_generation
+                && proof.previous_generation != proof.generation
+                && proof.thread_rpc_id == thread_rpc_id && proof.turn_rpc_id == turn_rpc_id
+            { ExecutionStatus::NotDispatched } else { ExecutionStatus::Unknown });
+        }
+        let Some(transition) = self.state.clean_generation.clone() else {
+            return Ok(ExecutionStatus::Unknown);
+        };
+        if transition.generation != self.state.generation
+            || transition.previous_generation == transition.generation
+        {
+            return Ok(ExecutionStatus::Unknown);
+        }
+        // Missing receipts alone never prove non-dispatch. The persisted clean
+        // transition and still-empty write-ahead journal are both required:
+        // every native write reserves durable history first, and that history
+        // is never pruned. Thus an intent from an intervening, now absent Host
+        // may be checked against the current Host without rewriting its ID.
+        // Service calls status only for its already durable operation intents.
+        if !self.state.empty_native_history() || self.state.not_dispatched.len() >= 256
+            || self.healthy(&transition.generation, true).is_err()
+        {
+            return Ok(ExecutionStatus::Unknown);
+        }
+        for id in [&thread_rpc_id, &turn_rpc_id] {
+            let receipt = self.runtime.receipt(id.clone())?;
+            if receipt.generation != transition.generation
+                || receipt.state != "missing" || receipt.response.is_some()
+            {
+                return Ok(ExecutionStatus::Unknown);
+            }
+        }
+        self.healthy(&transition.generation, true)?;
+        self.state.not_dispatched.insert(req.operation_id.clone(), MissingDispatchReceipts {
+            previous_generation: transition.previous_generation,
+            generation: transition.generation,
+            expected_generation: Some(req.host_generation.clone()),
+            thread_rpc_id,
+            turn_rpc_id,
+        });
+        if let Err(error) = self.save() {
+            self.state.not_dispatched.remove(&req.operation_id);
+            return Err(error);
+        }
+        Ok(ExecutionStatus::NotDispatched)
+    }
 }
 impl<R: RuntimeIo> Executor for HostExecutor<R> {
+    fn validate_directory(&mut self, directory: &Path, writes: bool) -> Result<()> {
+        self.healthy(&self.state.generation.clone(), true)?;
+        let directory = canonical(directory)?;
+        ensure!(
+            self.policy.grants.iter().any(|grant| {
+                (!writes || grant.writable)
+                    && within(&directory, &grant.root)
+                    && canonical(&grant.root).is_ok_and(|actual| actual == grant.root)
+            }),
+            "Project directory/write not authorized"
+        );
+        Ok(())
+    }
+    fn reconcile_tool_answer(&mut self, scope: &NativeMapping, call_id: &str) -> Result<bool> {
+        self.healthy(&scope.host_generation, false)?;
+        let Some(pending) = self
+            .pending
+            .values()
+            .find(|p| p.mapping == *scope && p.call_id.as_deref() == Some(call_id))
+        else {
+            return Ok(true); // authoritative pending snapshot has retired it
+        };
+        let Some(answer) = self
+            .state
+            .answers
+            .get(&hash(&(&pending.mapping, &pending.native_id))?)
+        else {
+            return Ok(false);
+        };
+        ensure!(answer.accepted, "Native answer unresolved; never resend");
+        Ok(true)
+    }
     fn needs_tool_upgrade(&self, thread: &str) -> Result<bool> {
-        Ok(self
+        let owner = self
             .state
             .threads
             .get(thread)
-            .context("Unmanaged thread")?
-            .tool_revision
-            < 1)
+            .context("Unmanaged thread")?;
+        Ok(owner.generation != self.state.generation || owner.tool_revision < TOOL_REVISION)
     }
     fn append_status(
         &mut self,
@@ -844,12 +1180,15 @@ impl<R: RuntimeIo> Executor for HostExecutor<R> {
         mapping: &NativeMapping,
         message: &str,
     ) -> Result<AppendOutcome> {
+        self.append_inputs_status(id,mapping,message,&[])
+    }
+    fn append_inputs_status(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[AssistantInput])->Result<AppendOutcome> {
         self.healthy(&mapping.host_generation, false)?;
         let native_id = rpc_id(id, "append");
         let Some(effect) = self.state.effects.get(&native_key(&native_id)?) else {
             return Ok(AppendOutcome::Rejected);
         };
-        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":[{"type":"text","text":message,"text_elements":[]}]});
+        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":crate::assistant::inputs::native_input(message,inputs)});
         ensure!(
             effect.fingerprint == hash(&("turn/steer", &params))?,
             "Append identity reused with different content"
@@ -875,15 +1214,19 @@ impl<R: RuntimeIo> Executor for HostExecutor<R> {
         mapping: &NativeMapping,
         message: &str,
     ) -> Result<AppendOutcome> {
+        self.append_inputs(id,mapping,message,&[])
+    }
+    fn append_inputs(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[AssistantInput])->Result<AppendOutcome> {
         bounded_text(id, 512)?;
         bounded_text(message, 65536)?;
         self.healthy(&mapping.host_generation, true)?;
-        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":[{"type":"text","text":message,"text_elements":[]}]});
+        let params = json!({"threadId":mapping.thread_id,"expectedTurnId":mapping.turn_id,"input":crate::assistant::inputs::native_input(message,inputs)});
         let native_id = rpc_id(id, "append");
         let key = native_key(&native_id)?;
         if self.state.effects.contains_key(&key) {
-            return self.append_status(id, mapping, message);
+            return self.append_inputs_status(id, mapping, message,inputs);
         }
+        crate::assistant::inputs::validate_inputs(inputs)?;
         if !self.runtime.supports("turn/steer", &params) {
             return Ok(AppendOutcome::Unsupported);
         }
@@ -945,7 +1288,7 @@ impl<R: RuntimeIo> Executor for HostExecutor<R> {
             || owner.role != role
             || owner.directory != canonical(directory)?
             || owner.writes != writes
-            || owner.tool_revision < 1
+            || (role == Role::Coordinator && owner.tool_revision < TOOL_REVISION)
         {
             return Ok(false);
         }
@@ -1011,22 +1354,25 @@ impl<R: RuntimeIo> Executor for HostExecutor<R> {
     }
     fn status(&mut self, req: StatusRequest) -> Result<ExecutionStatus> {
         let Some(op) = self.state.operations.get(&req.operation_id).cloned() else {
+            return self.legacy_non_dispatch(&req);
+        };
+        if op.generation != req.host_generation {
             return Ok(ExecutionStatus::Unknown);
         };
-        if op.generation != req.host_generation || self.healthy(&op.generation, false).is_err() {
-            return Ok(ExecutionStatus::Unknown);
-        };
-        if self.event_gap {
-            return Ok(ExecutionStatus::Unknown);
-        }
-        if op.rejected {
-            return Ok(ExecutionStatus::NotDispatched);
-        }
         if let Some(supplied) = &req.mapping {
             ensure!(
                 op.mapping.as_ref() == Some(supplied),
                 "Supplied mapping not verified by executor"
             );
+        }
+        if op.rejected && op.mapping.is_none() {
+            // This local proof does not need a reachable Host. A failed save
+            // must never let optimistic rejection state clear Service Unknown.
+            self.save()?;
+            return Ok(ExecutionStatus::NotDispatched);
+        }
+        if self.healthy(&op.generation, false).is_err() || self.event_gap {
+            return Ok(ExecutionStatus::Unknown);
         }
         let recovered = self.recover_mapping(&req.operation_id);
         let mapping = match recovered {
@@ -1140,6 +1486,17 @@ impl<R: RuntimeIo> Executor for HostExecutor<R> {
 fn small(s: &str) -> Result<()> {
     bounded_text(s, 256)
 }
+const STREAM_TRUNCATED: &str = "\n[stream truncated]";
+fn clip_stream(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max.saturating_sub(STREAM_TRUNCATED.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], STREAM_TRUNCATED)
+}
 fn bounded_text(s: &str, max: usize) -> Result<()> {
     ensure!(
         !s.is_empty() && s.len() <= max && !s.contains('\0'),
@@ -1158,7 +1515,7 @@ fn hash<T: Serialize>(v: &T) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(v)?)))
 }
 fn request_hash(req: &StartRequest) -> Result<String> {
-    hash(&(
+    let legacy=hash(&(
         &req.operation_id,
         &req.host_generation,
         req.role,
@@ -1168,7 +1525,8 @@ fn request_hash(req: &StartRequest) -> Result<String> {
         req.writes,
         &req.settings,
         &req.instructions,
-    ))
+    ))?;
+    if req.inputs.is_empty() {Ok(legacy)} else {hash(&(legacy,&req.inputs))}
 }
 fn rpc_id(op: &str, phase: &str) -> Value {
     json!(format!(

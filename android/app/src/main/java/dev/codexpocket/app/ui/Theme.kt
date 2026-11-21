@@ -1,14 +1,22 @@
 package dev.codexpocket.app.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalInspectionMode
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 
 /** Codex-neutral surfaces; violet is reserved for selected controls. */
 private val Light = lightColorScheme(
@@ -38,6 +46,17 @@ private val Dark = darkColorScheme(
 fun PocketTheme(theme: String, content: @Composable () -> Unit) {
     val dark = theme == "dark" || (theme == "system" && isSystemInDarkTheme())
     val colors = if (dark) Dark else Light
+    val view = LocalView.current
+    if (!LocalInspectionMode.current) {
+        SideEffect {
+            view.context.findActivity()?.window?.let { window ->
+                WindowCompat.getInsetsController(window, view).apply {
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
+                }
+            }
+        }
+    }
     MaterialTheme(colorScheme = colors, typography = Typography(
         headlineLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 30.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.6).sp),
         headlineMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 26.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.4).sp),
@@ -51,4 +70,17 @@ fun PocketTheme(theme: String, content: @Composable () -> Unit) {
         labelMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
         labelSmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Normal),
     )) { CompositionLocalProvider(LocalContentColor provides colors.onSurface, content = content) }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> if (baseContext !== this) baseContext.findActivity() else null
+    else -> null
+}
+
+/** A single low-contrast accent for the sparse native backdrop. */
+@Composable
+internal fun pocketAmbientInk(): Color {
+    val colors = MaterialTheme.colorScheme
+    return colors.secondary.copy(alpha = if (colors.background.luminance() < .5f) .22f else .18f)
 }

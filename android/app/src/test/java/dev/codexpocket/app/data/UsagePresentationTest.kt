@@ -86,7 +86,7 @@ class UsagePresentationTest {
 
     @Test fun malformedCountsDecimalsUnknownKeysAndMissingFieldsNeverBecomeZero() {
         val original = usageFixtureJson()
-        assertThrows(IllegalArgumentException::class.java) { UsageResponse.fromJson(JsonObject(original + ("path" to JsonPrimitive("unexpected")))) }
+        assertEquals(5uL, UsageResponse.fromJson(JsonObject(original + ("future_field" to JsonPrimitive("unexpected")))).data!!.totals.requests)
         assertThrows(IllegalArgumentException::class.java) { UsageResponse.fromJson(JsonObject(original - "coverage")) }
         val data = original["data"]!!.jsonObject
         val totals = data["totals"]!!.jsonObject

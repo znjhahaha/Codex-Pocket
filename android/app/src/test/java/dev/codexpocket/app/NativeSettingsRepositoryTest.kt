@@ -239,6 +239,24 @@ class NativeSettingsRepositoryTest {
         assertEquals(55L, ContextUsage.from(repo.state.value.advanced.usage).used)
     }
 
+    @Test fun backgroundPermissionReadKeepsConfirmedStateVisibleUntilNewReadback() = runBlocking<Unit> {
+        fun permission(revision: String, preset: String) = json("""{"runtimeId":"r","threadId":"t","status":"ready","revision":"$revision","currentPresetId":"$preset","currentLabel":"$preset","presets":[]}""")
+        server.permissionRead = { permission("first", "full") }
+        repo.refreshPermissions().join()
+        assertEquals(JsonPrimitive("first"), repo.state.value.permissions.revision)
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        server.permissionRead = { entered.complete(Unit); release.await(); permission("second", "request") }
+        try {
+            server.event("t", json("""{"approvalPolicy":"on-request"}"""))
+            withTimeout(5_000) { entered.await() }
+            assertEquals(JsonPrimitive("first"), repo.state.value.permissions.revision)
+            assertFalse("Background sync must not replace confirmed permissions with a spinner", repo.state.value.permissions.loading)
+        } finally { release.complete(Unit) }
+        await { it.permissions.revision == JsonPrimitive("second") }
+        assertEquals("request", repo.state.value.permissions.currentPresetId)
+        assertFalse(repo.state.value.permissions.loading)
+    }
+
     @Test fun childReaderKeepsParentDraftAndRemovesProvenChildFromHome() = runBlocking<Unit> {
         val childKey = key.copy(nativeId = "child")
         db.dao().putChat(ChatEntity(childKey, "r", "desktop", "Child", "", "", 0, "idle", false))
@@ -267,6 +285,7 @@ class NativeSettingsRepositoryTest {
         var read: suspend (String) -> JsonObject = { unknown(it) }
         var history: suspend (String) -> JsonObject = { snapshot(it) }
         var contextRead: suspend (String) -> JsonObject = { id -> buildJsonObject { put("runtimeId", "r"); put("threadId", id); put("status", "empty") } }
+        var permissionRead: suspend (String) -> JsonObject = { id -> buildJsonObject { put("runtimeId", "r"); put("threadId", id); put("status", "unsupported") } }
         fun unknown(id: String) = buildJsonObject { put("runtimeId", "r"); put("threadId", id); put("settings", buildJsonObject {}); put("known", false) }
         fun settings(id: String, value: JsonObject) = JsonObject(unknown(id) + mapOf("settings" to value, "known" to JsonPrimitive(true)))
         fun cursor() = buildJsonObject { put("epoch", "settings-epoch"); put("sequence", sequence.get()) }
@@ -317,6 +336,7 @@ class NativeSettingsRepositoryTest {
                     "sync" -> buildJsonObject { put("events", buildJsonArray {}); put("cursors", buildJsonObject { put("r", cursor()) }); put("pendingRequests", buildJsonArray {}) }
                     "thread/settings/read" -> read(params.string("threadId"))
                     "thread/context/read" -> contextRead(params.string("threadId"))
+                    "thread/permissions/read" -> permissionRead(params.string("threadId"))
                     "codex/request" -> when (params.string("method")) {
                         "thread/read" -> history(params.obj("params").string("threadId"))
                         "model/list" -> buildJsonObject { put("data", buildJsonArray { add(buildJsonObject {

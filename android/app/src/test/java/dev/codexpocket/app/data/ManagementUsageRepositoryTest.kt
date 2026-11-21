@@ -40,7 +40,7 @@ class ManagementUsageRepositoryTest {
     @After fun release()=runBlocking<Unit> {
         val scope=PocketRepository::class.java.getDeclaredField("scope").apply {isAccessible=true}.get(repo) as CoroutineScope
         scope.coroutineContext[Job]!!.cancelAndJoin();db.close()
-        assertTrue("Only read-only usage RPC is allowed",transport.calls.all {it.first=="usage/read"})
+        assertTrue("Only read-only usage RPC is allowed",transport.calls.all {it.first in setOf("usage/read", "usage/dashboard/read", "usage/requests/read")})
     }
 
     @Test fun managementReadUsesFixedSourceExplicitUtcQueryAndPreservesPerformanceAndCosts()=runBlocking<Unit> {
@@ -48,7 +48,7 @@ class ManagementUsageRepositoryTest {
         val params=transport.calls.single().second
         assertEquals(setOf("source_id","query"),params.keys)
         assertEquals("cc_switch",params.string("source_id"))
-        assertEquals(filter.toJson(),params.obj("query"))
+        assertEquals(filter.legacyJson(),params.obj("query"))
         assertEquals("proxy",params.obj("query").obj("filters").string("data_source"))
         val screen=repo.state.value.usage
         assertEquals(UsagePhase.Ready,screen.phase)
@@ -61,6 +61,13 @@ class ManagementUsageRepositoryTest {
         assertNull(response.coverage.confirmedFreeRows)
         assertEquals("stored_zero_free_status_unknown",response.coverage.zeroCostInterpretation)
         assertFalse(screen.refreshing)
+    }
+
+    @Test fun dashboardCapabilitySelectsNewReadContract()=runBlocking<Unit> {
+        state().update { it.copy(capabilities=setOf("usage/read", "usage/dashboard/read", "usage/requests/read")) }
+        repo.loadUsage(filter).join()
+        assertEquals("usage/dashboard/read", transport.calls.single().first)
+        assertNotNull(repo.state.value.usage.visibleSnapshot!!.response.data!!.recentRequests)
     }
 
     @Test fun sourceAndFilterChangesNeverReuseAnotherSourcesSnapshot()=runBlocking<Unit> {
@@ -108,7 +115,46 @@ class ManagementUsageRepositoryTest {
         repo.loadUsage(newFilter).join()
         release.complete(Unit);old.join()
         assertEquals(newFilter,repo.state.value.usage.visibleSnapshot!!.filter)
-        assertEquals(newFilter.toJson(),repo.state.value.usage.visibleSnapshot!!.response.query)
+        assertEquals(newFilter.legacyJson(),repo.state.value.usage.visibleSnapshot!!.response.query)
+    }
+
+    private fun enableDashboard() { state().update { it.copy(capabilities=setOf("usage/read", "usage/dashboard/read", "usage/requests/read")) } }
+    @Test fun boundedRequestPageAppendsWithoutReplacingDashboardTotals()=runBlocking<Unit> {
+        enableDashboard(); repo.loadUsage(filter).join()
+        val totals = repo.state.value.usage.visibleSnapshot!!.response.data!!.totals
+        val cursor = repo.state.value.usage.visibleRequests!!.nextCursor!!
+        repo.loadUsageRequests(cursor).join()
+        assertEquals("usage/requests/read", transport.calls.last().first)
+        assertEquals(cursor.toJson(), transport.calls.last().second.obj("query").obj("request_page")["cursor"])
+        assertEquals(listOf("request-1", "request-2"), repo.state.value.usage.visibleRequests!!.items.map { it.requestId })
+        assertEquals(totals, repo.state.value.usage.visibleSnapshot!!.response.data!!.totals)
+        assertFalse(repo.state.value.usage.visibleRequests!!.hasMore)
+    }
+    @Test fun staleRequestPageAndOfflineCallsPreserveExistingRows()=runBlocking<Unit> {
+        enableDashboard(); repo.loadUsage(filter).join()
+        val page = repo.state.value.usage.visibleRequests!!
+        transport.locked = true
+        repo.loadUsageRequests(page.nextCursor!!).join()
+        assertEquals(page, repo.state.value.usage.visibleRequests)
+        assertNotNull(repo.state.value.usage.requestError)
+        val count = transport.calls.size
+        state().update { it.copy(online=false) }
+        repo.loadUsageRequests(page.nextCursor!!).join()
+        assertEquals(count, transport.calls.size)
+    }
+    @Test fun lateRequestPageCannotCrossFilterRevision()=runBlocking<Unit> {
+        enableDashboard(); repo.loadUsage(filter).join()
+        val arrived = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        transport.beforeReply = { arrived.complete(Unit); withContext(NonCancellable) { release.await() } }
+        val page = repo.loadUsageRequests(repo.state.value.usage.visibleRequests!!.nextCursor!!)
+        withTimeout(5_000) { arrived.await() }
+        transport.beforeReply = null
+        val next = filter.withModel("other-model")
+        repo.loadUsage(next).join()
+        release.complete(Unit); page.join()
+        assertEquals(next, repo.state.value.usage.filter)
+        assertNull(repo.state.value.usage.requestFeed)
+        assertEquals(listOf("request-1"), repo.state.value.usage.visibleRequests!!.items.map { it.requestId })
     }
 
     private class UsageConnection:PocketConnection {
@@ -119,13 +165,20 @@ class ManagementUsageRepositoryTest {
         var beforeReply:(suspend ()->Unit)?=null
         override suspend fun connect(config:ConnectionConfig):Unit=error("Fixture must never connect")
         override suspend fun request(method:String,params:JsonObject,commandId:String?,timeoutMillis:Long):JsonElement {
-            require(method=="usage/read" && commandId==null)
+            require(method in setOf("usage/read", "usage/dashboard/read", "usage/requests/read") && commandId==null)
             calls+=method to params
             beforeReply?.invoke()
             val query=params.obj("query")
-            val base=usageFixtureJson()
+            val base=if (method=="usage/read") usageFixtureJson() else usageV070Fixture()
             val source=JsonObject(base.obj("source")+mapOf("app_type" to query.obj("filters")["app_type"]!!,"data_source" to query.obj("filters")["data_source"]!!))
-            val result=JsonObject(base+mapOf("availability" to JsonPrimitive(if(locked) "locked" else "ready"),"source" to source))
+            var result=JsonObject(base+mapOf("availability" to JsonPrimitive(if(locked) "locked" else "ready"),"source" to source))
+            if (method=="usage/requests/read") {
+                val first = base.obj("data").obj("recent_requests")["items"]!!.jsonArray.single().jsonObject
+                val row = JsonObject(first + mapOf("request_id" to JsonPrimitive("request-2"), "created_at" to JsonPrimitive(1794268799)))
+                result = JsonObject(result + ("data" to buildJsonObject { put("requests", buildJsonObject {
+                    put("items", JsonArray(listOf(row))); put("limit", 50); put("has_more", false); put("next_cursor", JsonNull)
+                }) }))
+            }
             return buildJsonObject {
                 put("schema",1);put("query",query);put("result",result)
                 put("cache",buildJsonObject {put("state",if(locked) "stale" else "fresh");put("sampled_at",1794268800);put("age_seconds",if(locked) 90 else 0);put("ttl_seconds",60);put("stale_reason",if(locked) JsonPrimitive("locked") else JsonNull)})

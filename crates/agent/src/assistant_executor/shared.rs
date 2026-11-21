@@ -33,8 +33,27 @@ impl<R: RuntimeIo> SharedHostExecutor<R> {
     pub fn pending_requests(&self) -> Result<Vec<PendingRequest>> {
         Ok(self.lock()?.pending_requests())
     }
+    pub fn reconcile_answer_receipts(&self) -> Result<()> {
+        self.lock()?.reconcile_answer_receipts()
+    }
+    pub fn rejection_recovery_available(&self, p: &PendingRequest) -> Result<bool> {
+        Ok(self.lock()?.rejection_recovery_available(p))
+    }
+    pub fn reject_retained_tool(&self, scope: NativeMapping, handle: &str) -> Result<()> {
+        self.lock()?.reject_retained_tool(scope, handle)
+    }
     pub fn operation_records(&self) -> Result<Vec<OperationRecord>> {
         Ok(self.lock()?.operation_records())
+    }
+    pub fn streaming_text(&self) -> Result<Vec<StreamObservation>> { Ok(self.lock()?.streaming_text()) }
+    pub fn cursor(&self) -> Result<u64> { Ok(self.lock()?.cursor()) }
+    pub fn reconcile_terminal_generation(&self,operations:&[crate::assistant::Operation])->Result<bool> {
+        self.lock()?.reconcile_terminal_generation(operations)
+    }
+    pub fn adopt_scoped_generation(&self)->Result<bool> {self.lock()?.adopt_scoped_generation()}
+    pub fn released_generations(&self)->Result<std::collections::BTreeSet<String>> {self.lock()?.released_generations()}
+    pub fn current_generation_ready(&self,generation:&str)->Result<bool> {
+        Ok(self.lock()?.current_generation_ready(generation))
     }
     pub fn reject_tool(&self, scope: NativeMapping, call_id: &str, reason: &str) -> Result<()> {
         self.lock()?.reject_tool(scope, call_id, reason)
@@ -50,6 +69,18 @@ impl<R: RuntimeIo> SharedHostExecutor<R> {
     }
 }
 impl<R: RuntimeIo> Executor for SharedHostExecutor<R> {
+    fn append_inputs(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[AssistantInput])->Result<AppendOutcome> {
+        self.lock()?.append_inputs(id,mapping,message,inputs)
+    }
+    fn append_inputs_status(&mut self,id:&str,mapping:&NativeMapping,message:&str,inputs:&[AssistantInput])->Result<AppendOutcome> {
+        self.lock()?.append_inputs_status(id,mapping,message,inputs)
+    }
+    fn validate_directory(&mut self, directory: &Path, writes: bool) -> Result<()> {
+        self.lock()?.validate_directory(directory, writes)
+    }
+    fn reconcile_tool_answer(&mut self, scope: &NativeMapping, call_id: &str) -> Result<bool> {
+        self.lock()?.reconcile_tool_answer(scope, call_id)
+    }
     fn needs_tool_upgrade(&self,thread:&str)->Result<bool> {self.lock()?.needs_tool_upgrade(thread)}
     fn append(
         &mut self,

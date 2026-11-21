@@ -2,6 +2,10 @@
 fn main(){if run().is_err(){std::process::exit(1)}}
 fn run()->anyhow::Result<()>{
     let args:Vec<_>=std::env::args_os().skip(1).collect();
+    if args.len()==1 && args[0]=="--build-info" {
+        println!("{}",serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"buildId":option_env!("POCKET_BUILD_ID").unwrap_or("development")}));
+        return Ok(())
+    }
     let option=|key:&str|args.iter().position(|a|a==key).and_then(|i|args.get(i+1)).map(std::path::PathBuf::from);
     let state=option("--state").ok_or_else(||anyhow::anyhow!("--state required"))?;
     let agent=option("--agent").unwrap_or(std::env::current_exe()?.with_file_name("pocket-agent.exe"));

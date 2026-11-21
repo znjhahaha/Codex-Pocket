@@ -5,7 +5,7 @@ use serde_json::json;
 #[test]
 fn remote_read_defaults_and_path_rejection_are_explicit() {
     let query = prepare_read(&json!({}), 1_800_000_031).unwrap();
-    assert_eq!(query.end_at, 1_800_000_000);
+    assert_eq!((query.end_at + 8 * 3600).rem_euclid(86400), 0);
     assert_eq!(query.start_at, query.end_at - 7 * 86400);
     assert_eq!(query.bucket_edges.len(), 8);
     assert_eq!(query.filters.app_type, "codex");
@@ -35,7 +35,7 @@ async fn sources_probe_schema_even_if_selected_filter_is_empty() {
     let read = service.read(q()).await;
     assert_eq!(read["result"]["coverage"]["matched_rows"], 0);
     assert_eq!(read["result"]["availability"], "ready");
-    f.conn.execute_batch("PRAGMA user_version=25").unwrap();
+    f.conn.execute_batch("PRAGMA user_version=27").unwrap();
     let service = UsageService::with_path(Some(f.path.clone()));
     assert_eq!(
         service.sources().await["sources"][0]["availability"],
@@ -66,7 +66,7 @@ async fn exact_query_cache_uses_stale_only_for_missing_or_locked() {
     other.filters.model = Some("unrelated".into());
     assert!(service.read(other).await["result"]["data"].is_null());
     f.conn
-        .execute_batch("ROLLBACK; PRAGMA user_version=25")
+        .execute_batch("ROLLBACK; PRAGMA user_version=27")
         .unwrap();
     let bad = service.read(q()).await;
     assert_eq!(bad["result"]["availability"], "unsupported_schema");

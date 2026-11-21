@@ -569,6 +569,17 @@ impl MediaStore {
                     }
                 }
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+                if kind == "imageView" {
+                    owner.item_id = value.get("id").and_then(Value::as_str).unwrap_or("").into();
+                    let mut item = object.clone();
+                    // The bridge cannot open paths. The agent imports this native
+                    // item only after checking its history proof and image roots.
+                    let block = value.get("toolOutputBlocks").and_then(Value::as_array)
+                        .and_then(|parts| parts.first()).map(|part| self.project_user_image(&owner, 0, part))
+                        .unwrap_or_else(|| self.project_user_image(&owner, 0, &json!({"type":"localImage"})));
+                    item.insert("toolOutputBlocks".into(), json!([block]));
+                    return Value::Object(item);
+                }
                 if image_kind(kind) {
                     return self.image(&owner, slot, value);
                 }

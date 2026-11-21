@@ -29,7 +29,7 @@ sealed interface ThreadLinkResolution {
 
 /** Never pick a native ID from another computer or fall back to another configuration profile. */
 fun resolveThreadDeepLink(nativeId: String, computerId: String, origin: ThreadKey?, chats: List<ChatEntity>,
-    runtimes: List<RuntimeInfo>): ThreadLinkResolution {
+    runtimes: List<RuntimeInfo>, persistedReadable: Boolean = false): ThreadLinkResolution {
     fun reject(message: String, missing: Boolean = false) = ThreadLinkResolution.Rejected(message, missing)
     if (computerId.isBlank() || origin?.computerId?.let { it != computerId } == true)
         return reject("此链接的来源电脑与当前配对不一致，请切回原电脑")
@@ -42,6 +42,8 @@ fun resolveThreadDeepLink(nativeId: String, computerId: String, origin: ThreadKe
         return reject("此会话属于其他配置档案，请从原会话打开")
     val candidates = known.filter { it.key.configStoreId == store }.distinctBy { it.key to it.runtimeId }
     val owners = loaded.filter { it.configStoreId == store }
+    if (persistedReadable && candidates.map { it.key }.distinct().size == 1)
+        return ThreadLinkResolution.Open(candidates.first())
     if (candidates.size > 1 || owners.size > 1 || candidates.any { it.conflict })
         return reject("此会话的运行入口归属冲突，请在电脑端确认后重试")
     val chat = candidates.singleOrNull()

@@ -78,7 +78,11 @@ pub fn validate(method: &str, params: &Value) -> Result<bool, AccessError> {
         ),
         "model/list" => (&["cursor", "limit", "includeHidden"], false),
         "collaborationMode/list" => (&[], false),
-        "thread/start" => (&["cwd", "model"], true),
+        "thread/start" => (&["cwd", "model", "projectId"], true),
+        "project/list" => (&["cursor", "limit", "sortKey", "sortDirection"], false),
+        "project/read" => (&["projectId"], false),
+        "project/create" => (&["name", "roots", "idempotencyKey"], true),
+        "fs/createDirectory" => (&["path", "recursive"], true),
         "thread/resume" => (&["threadId", "excludeTurns"], true),
         "thread/name/set" => (&["threadId", "name"], true),
         "thread/archive" | "thread/unarchive" => (&["threadId"], true),
@@ -120,6 +124,21 @@ pub fn validate(method: &str, params: &Value) -> Result<bool, AccessError> {
         required_string(params, "threadId")?;
     }
     match method {
+        "project/create" => {
+            required_string(params,"name")?;required_string(params,"idempotencyKey")?;
+            let roots=params["roots"].as_array().ok_or("Missing project roots")?;
+            if roots.is_empty() || roots.len()>32 || roots.iter().any(|r|
+                r.as_object().is_none_or(|o|o.len()!=1) || r["path"].as_str().is_none_or(|p|!absolute_directory(p))) {
+                return Err("Invalid project roots".into());
+            }
+        }
+        "project/read" => required_string(params,"projectId")?,
+        "fs/createDirectory" => {
+            if params["path"].as_str().is_none_or(|p|!absolute_directory(p)) || params["recursive"]!=false {
+                return Err("Choose one absolute new directory under an existing parent".into());
+            }
+        }
+        "thread/start" if !params["projectId"].is_null() => required_string(params,"projectId")?,
         "thread/queue/add" => {
             required_string(params, "clientUserMessageId")?;
             if !params["input"].is_array() {
@@ -272,11 +291,26 @@ fn required_string(value: &Value, key: &str) -> Result<(), AccessError> {
     }
     Ok(())
 }
+fn absolute_directory(path: &str) -> bool {
+    !path.is_empty() && path.len()<=4096 && !path.chars().any(char::is_control) &&
+        std::path::Path::new(path).is_absolute() &&
+        !std::path::Path::new(path).components().any(|c|matches!(c,std::path::Component::ParentDir))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn project_creation_preserves_native_identity_and_rejects_extra_authority() {
+        assert_eq!(validate("project/list",&json!({"limit":50})),Ok(false));
+        assert_eq!(validate("project/create",&json!({"name":"Notes","roots":[{"path":"D:/Notes"}],"idempotencyKey":"unique"})),Ok(true));
+        assert_eq!(validate("thread/start",&json!({"cwd":"D:/Notes","projectId":"native-project"})),Ok(true));
+        assert_eq!(validate("fs/createDirectory",&json!({"path":"D:/Notes","recursive":false})),Ok(true));
+        assert!(validate("project/create",&json!({"name":"Notes","roots":[],"idempotencyKey":"unique"})).is_err());
+        assert!(validate("fs/createDirectory",&json!({"path":"../Notes","recursive":true})).is_err());
+        assert!(validate("project/create",&json!({"name":"Notes","roots":[{"path":"D:/Notes","command":"bad"}],"idempotencyKey":"unique"})).is_err());
+    }
     #[test]
     fn v054_prepared_input_is_opaque_and_never_accepts_native_write_paths() {
         assert!(validate("turn/start", &json!({"threadId":"t","preparedInput":"opaque","input":[{"type":"text","text":"edit"}]})).is_err());

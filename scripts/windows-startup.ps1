@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 [CmdletBinding()]
-param([ValidateSet('Status','Enable','Disable','Start')][string]$Action='Status',[string]$InstallRoot)
+param([ValidateSet('Status','Enable','Disable','Start','MigrateManager')][string]$Action='Status',[string]$InstallRoot)
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 
 function Get-PocketTaskName { return 'CodexPocket-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
@@ -59,9 +59,15 @@ function Assert-PocketTaskOwned([AllowNull()]$Xml,[string]$Launcher) {
     $task=$document.SelectSingleNode('/t:Task',$ns)
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     if ($null -eq $task) { throw 'Invalid scheduled task; refusing drift.' }
+    $entry=$task.SelectSingleNode('t:Actions/t:Exec/t:Command',$ns)
+    $expectedCommand=$Launcher
+    if($entry -and $entry.InnerText -ne $Launcher){
+        Assert-PocketVersionedLauncher $entry.InnerText $Launcher
+        $expectedCommand=$entry.InnerText
+    }
     $expected=@{
         't:RegistrationInfo/t:Description'='Codex Pocket current-user supervisor v3'
-        't:Actions/t:Exec/t:Command'=$Launcher; 't:Actions/t:Exec/t:Arguments'='--pocket-supervise'
+        't:Actions/t:Exec/t:Command'=$expectedCommand; 't:Actions/t:Exec/t:Arguments'='--pocket-supervise'
         't:Principals/t:Principal/t:UserId'=$user; 't:Principals/t:Principal/t:LogonType'='InteractiveToken'
         't:Principals/t:Principal/t:RunLevel'='LeastPrivilege'
         't:Settings/t:MultipleInstancesPolicy'='IgnoreNew'; 't:Settings/t:Enabled'='true'
@@ -86,6 +92,25 @@ function Assert-PocketTaskOwned([AllowNull()]$Xml,[string]$Launcher) {
         if($trigger.LocalName -ne 'LogonTrigger' -or -not $sameUser -or
             ($null -ne $enabled -and $enabled.InnerText -ne 'true')) { throw 'Scheduled task logon trigger drift.' }
     }
+}
+function Assert-PocketVersionedLauncher([string]$Entry,[string]$Launcher) {
+    $bins=Join-Path (Split-Path -Parent $Launcher) 'bin'
+    if($Entry -notmatch ('^'+[regex]::Escape($bins)+'\\([a-f0-9]{64})\\pocket-launcher\.exe$')){throw 'Scheduled task executable drift'}
+    $generation=$Matches[1];$manifest=Join-Path (Split-Path -Parent $Entry) 'windows-manifest.json'
+    Assert-PocketUnredirectedPath $Entry;Assert-PocketUnredirectedPath $manifest
+    if((Get-PocketFileHash $manifest) -ne $generation){throw 'Startup generation changed'}
+    $record=Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    $files=@($record.files|Where-Object {$_.path -ceq 'pocket-launcher.exe'})
+    if($files.Count -ne 1 -or (Get-PocketFileHash $Entry) -ne $files[0].sha256){throw 'Startup launcher changed'}
+}
+function ConvertTo-PocketManagerTask([string]$Xml,[string]$Launcher,[string]$Entry) {
+    Assert-PocketTaskOwned $Xml $Launcher
+    Assert-PocketVersionedLauncher $Entry $Launcher
+    $document=[xml]$Xml
+    $node=$document.SelectSingleNode('//*[local-name()="Actions"]/*[local-name()="Exec"]/*[local-name()="Command"]')
+    if($node.InnerText -eq $Entry){return $Xml}
+    $node.InnerText=$Entry
+    return $document.OuterXml
 }
 function Test-PocketTaskLogon([AllowNull()]$Xml) {
     if ($null -eq $Xml) { return $false }
@@ -116,7 +141,7 @@ function Start-PocketTask {
     try { $service.Connect(); [void]$service.GetFolder('\').GetTask((Get-PocketTaskName)).Run($null) }
     finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($service) }
 }
-function Invoke-PocketStartup([ValidateSet('Status','Enable','Disable','Start')][string]$Action,[string]$InstallRoot) {
+function Invoke-PocketStartup([ValidateSet('Status','Enable','Disable','Start','MigrateManager')][string]$Action,[string]$InstallRoot) {
     $root = if($InstallRoot){Get-PocketDirectoryPath $InstallRoot}else{Join-Path (Get-PocketLocalAppData) 'CodexPocket'}
     Assert-PocketLocalPath $root
     Assert-PocketUnredirectedPath $root
@@ -127,7 +152,17 @@ function Invoke-PocketStartup([ValidateSet('Status','Enable','Disable','Start')]
     if ($record.version -ne 3 -or $record.installRoot -ne $root -or $record.bridge -ne $launcher -or (Get-PocketFileHash $launcher) -ne $record.launcherHash) { throw 'Stable launcher integrity failed.' }
     $xml = Get-PocketTaskXml
     Assert-PocketTaskOwned $xml $launcher
-    if ($Action -in @('Enable','Disable')) { Set-PocketTaskXml (New-PocketTaskXml $launcher ($Action -eq 'Enable')); $xml = Get-PocketTaskXml }
+    if ($Action -eq 'MigrateManager' -and $null -ne $xml) {
+        $entry=Join-Path $PSScriptRoot 'pocket-launcher.exe'
+        $next=ConvertTo-PocketManagerTask $xml $launcher $entry
+        if($next -cne $xml){Set-PocketTaskXml $next; $xml=Get-PocketTaskXml}
+        if($null -eq $xml -or (ConvertTo-PocketManagerTask $xml $launcher $entry) -cne $xml){throw 'Background login migration not confirmed'}
+    }
+    if ($Action -in @('Enable','Disable')) {
+        $target=$launcher
+        if($null -ne $xml){$target=([xml]$xml).SelectSingleNode('//*[local-name()="Exec"]/*[local-name()="Command"]').InnerText}
+        Set-PocketTaskXml (New-PocketTaskXml $target ($Action -eq 'Enable')); $xml = Get-PocketTaskXml
+    }
     if ($Action -eq 'Start') {
         if ($null -eq $xml) { Set-PocketTaskXml (New-PocketTaskXml $launcher $false); $xml = Get-PocketTaskXml }
         Start-PocketTask

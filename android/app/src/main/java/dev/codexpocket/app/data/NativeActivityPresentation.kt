@@ -166,7 +166,8 @@ object NativeActivityPresentation {
             "reasoning" -> PresentedActivity(item.key, ActivityKind.Reasoning, state, output = bounded(sequenceOf(item.summaryParts.filter(String::isNotBlank).joinToString("\n\n"))))
             "agentMessage" -> PresentedActivity(item.key, ActivityKind.Commentary, state, output = bounded(sequenceOf(item.text)))
             "imageView", "imageGeneration" -> PresentedActivity(item.key, ActivityKind.Image, state,
-                subtitle = raw.string("path", raw.string("savedPath")), output = bounded(sequenceOf(raw.string("revisedPrompt"), raw.obj("failure").string("message"))))
+                subtitle = raw.string("path", raw.string("savedPath")), output = bounded(sequenceOf(raw.string("revisedPrompt"), raw.obj("failure").string("message"))),
+                outputBlocks = toolOutputBlocks(item))
             else -> PresentedActivity(item.key, ActivityKind.Unknown, state)
         }
     }

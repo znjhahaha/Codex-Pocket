@@ -3,6 +3,157 @@ use super::*;
 use crate::native::test_peer;
 
 #[tokio::test]
+async fn joining_running_cli_collects_effective_permissions_without_changing_them() {
+    let (_dir,b)=fixture().await;let mut cli=peer(&b,"cli","cli").await;
+    b.watch_cli("cli","t").await;
+    let refresh=tokio::spawn({let b=b.clone();async move {b.refresh_loaded().await}});
+    loaded(&mut cli,&["t"]).await;
+    let request=cli.recv().await;
+    assert_eq!(request["params"],json!({"threadId":"t","excludeTurns":true}));
+    cli.reply(&request,json!({"thread":{"id":"t"},"model":"original","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{"type":"dangerFullAccess"}})).await;
+    refresh.await.unwrap().unwrap();
+    let state=b.state.lock().await;
+    let settings=state.runtimes["cli"].settings.read("t");
+    assert_eq!(settings["settings"]["approvalPolicy"],"never");
+    assert_eq!(settings["settings"]["sandboxPolicy"]["type"],"dangerFullAccess");
+    drop(state);cli.assert_idle().await;
+}
+
+#[tokio::test]
+async fn confirmed_owner_remains_controllable_after_a_previous_source_preference() {
+    let (dir,b)=fixture().await;
+    let mut desktop=peer(&b,"desktop","desktop").await;
+    let refresh=tokio::spawn({let b=b.clone();async move {b.refresh_loaded().await}});
+    loaded(&mut desktop,&["t"]).await;refresh.await.unwrap().unwrap();
+    let store=storage::config_store(dir.path()).unwrap();
+    b.access.lock().await.select_cli(&store,"t",&b.state_dir).unwrap();
+    let snapshot=b.access_snapshot(&json!({"runtimeId":"desktop","threadId":"t"})).await.unwrap();
+    assert_eq!(snapshot["ownerRuntimeId"],"desktop");
+    assert_eq!(snapshot["canSend"],true,"execution owner, not remembered creation preference, grants control");
+    assert_eq!(snapshot["mode"],"desktop");
+    desktop.assert_idle().await;
+}
+
+#[tokio::test]
+async fn desktop_creation_reports_adapter_upgrade_instead_of_endless_startup() {
+    let (_dir,b)=fixture().await;
+    let mut follower=peer(&b,"follower","desktop").await;
+    b.state.lock().await.runtimes.get_mut("follower").unwrap().role=native::NativeRole::DesktopFollower;
+    let result=b.ensure_runtime(&json!({"source":"desktop"})).await.unwrap();
+    assert_eq!(result["phase"],"integration_required");
+    assert_eq!(result["reason"],"adapter_incomplete");
+    assert_eq!(result["recoveryAction"],"restart_desktop");
+    follower.assert_idle().await;
+}
+
+#[tokio::test]
+async fn readiness_backend_unloaded_history_allows_explicit_prepare_without_granting_send() {
+    let (_dir, b) = fixture().await;
+    let mut native = peer(&b, "desktop", "desktop").await;
+    let refresh = tokio::spawn({ let b = b.clone(); async move { b.refresh_loaded().await } });
+    loaded(&mut native, &[]).await;
+    refresh.await.unwrap().unwrap();
+    let p = json!({"runtimeId":"desktop","threadId":"old-history"});
+    let snapshot = b.access_snapshot(&p).await.unwrap();
+    assert_eq!(snapshot["phase"], "ready", "an unloaded history row is not an offline runtime");
+    assert_eq!(snapshot["canSend"], false);
+    assert!(snapshot["ownerRuntimeId"].is_null());
+    assert_eq!(snapshot["reason"], "thread_unloaded");
+    // A read must not acquire the session or persist a handoff.
+    native.assert_idle().await;
+    assert!(!b.state_dir.join("session-access.json").exists());
+    for not_ready in ["inventory", "handshake", "auxiliary"] {
+        {
+            let mut state = b.state.lock().await;
+            let r = state.runtimes.get_mut("desktop").unwrap();
+            r.inventory_ready = not_ready != "inventory";
+            r.desktop_initialized = Some(not_ready != "handshake");
+            r.role = if not_ready == "auxiliary" { crate::native::NativeRole::DesktopAuxiliary } else { crate::native::NativeRole::Desktop };
+        }
+        let snapshot = b.access_snapshot(&p).await.unwrap();
+        assert_ne!(snapshot["phase"], "ready", "{not_ready} cannot prepare a session");
+        assert_eq!(snapshot["canSend"], false);
+    }
+    native.assert_idle().await;
+}
+
+#[tokio::test]
+async fn readiness_backend_unloaded_history_waits_for_other_ordinary_inventory() {
+    let (_dir, b) = fixture().await;
+    let mut desktop = peer(&b, "desktop", "desktop").await;
+    let mut other = peer(&b, "other", "desktop").await;
+    let p = json!({"runtimeId":"desktop","threadId":"old-history"});
+    {
+        let mut state = b.state.lock().await;
+        state.runtimes.get_mut("desktop").unwrap().inventory_ready = true;
+        state.runtimes.get_mut("other").unwrap().inventory_ready = false;
+    }
+    assert_eq!(b.access_snapshot(&p).await.unwrap()["phase"], "failed");
+    b.state.lock().await.runtimes.get_mut("other").unwrap().inventory_ready = true;
+    assert_eq!(b.access_snapshot(&p).await.unwrap()["phase"], "ready");
+    {
+        let mut state = b.state.lock().await;
+        let r = state.runtimes.get_mut("other").unwrap();
+        r.loaded.insert("old-history".into());
+        r.inventory_ready = false;
+        b.save_ownership(&mut state).unwrap();
+    }
+    let uncertain = b.access_snapshot(&p).await.unwrap();
+    assert_eq!(uncertain["phase"], "blocked");
+    assert_eq!(uncertain["ownershipReason"], "owner_uncertain");
+    assert_eq!(uncertain["canSend"], false);
+    desktop.assert_idle().await;
+    other.assert_idle().await;
+}
+
+#[tokio::test]
+async fn readiness_backend_catalogue_excludes_auxiliary_before_store_dedup() {
+    for source in ["desktop", "cli"] {
+        let (_dir, b) = fixture().await;
+        let mut browser = peer(&b, "a-browser", "desktop").await;
+        let mut primary = peer(&b, "z-primary", source).await;
+        b.state.lock().await.runtimes.get_mut("a-browser").unwrap().role =
+            crate::native::NativeRole::DesktopAuxiliary;
+        let task = tokio::spawn({
+            let b = b.clone();
+            async move { b.request("phone", "threads/list", json!({"limit":1})).await }
+        });
+        loaded(&mut primary, &[]).await;
+        let request = tokio::select! {
+            request = primary.recv() => request,
+            request = browser.recv() => panic!("auxiliary catalogue dispatch: {}", request["method"]),
+        };
+        assert_eq!(request["method"], "thread/list");
+        primary.reply(&request, json!({"data":[{"id":"inactive","updatedAt":1}],"nextCursor":null})).await;
+        let result = finish(task).await.unwrap();
+        assert_eq!(result["data"].as_array().unwrap().len(), 1);
+        assert_eq!(result["data"][0]["runtimeId"], "z-primary");
+        assert_eq!(result["data"][0]["source"], source);
+        browser.assert_idle().await;
+        primary.assert_idle().await;
+    }
+}
+
+#[tokio::test]
+async fn readiness_backend_catalogue_with_only_auxiliary_is_empty() {
+    let (_dir, b) = fixture().await;
+    let mut browser = peer(&b, "browser", "desktop").await;
+    b.state.lock().await.runtimes.get_mut("browser").unwrap().role =
+        crate::native::NativeRole::DesktopAuxiliary;
+    let mut task = tokio::spawn({
+        let b = b.clone();
+        async move { b.request("phone", "threads/list", json!({})).await }
+    });
+    let result = tokio::select! {
+        result = &mut task => result.unwrap().unwrap(),
+        request = browser.recv() => panic!("auxiliary-only catalogue dispatch: {}", request["method"]),
+    };
+    assert_eq!(result["data"], json!([]));
+    assert!(result["nextCursor"].is_null());
+    browser.assert_idle().await;
+}
+
+#[tokio::test]
 async fn owner_conflict_projection_distinguishes_uncertain_multiple_and_recovered() {
     for (competitor, expected) in [(false, "owner_uncertain"), (true, "multiple_owners")] {
         let (dir, b) = fixture().await;
@@ -55,6 +206,80 @@ async fn owner_conflict_projection_distinguishes_uncertain_multiple_and_recovere
 
 fn ready(caps: &crate::capabilities::Capabilities) -> Value {
     json!({"runtimeId":"a","initialized":true,"schemaPending":false,"schemaState":"ready","nativeCapabilities":caps})
+}
+
+#[tokio::test]
+async fn completed_inventory_pushes_ready_once_and_schema_failure_is_visible() {
+    let (_dir, b) = fixture().await;
+    let mut native = peer(&b, "a", "desktop").await;
+    let mut events = b.subscribe();
+    {
+        let mut state = b.state.lock().await;
+        let runtime = state.runtimes.get_mut("a").unwrap();
+        runtime.desktop_initialized = Some(true);
+        runtime.inventory_ready = false;
+    }
+    for changed in [true, false] {
+        let refresh = tokio::spawn({ let b=b.clone(); async move {b.refresh_loaded().await} });
+        loaded(&mut native, &["t"]).await;
+        refresh.await.unwrap().unwrap();
+        if changed {
+            let event = events.try_recv().unwrap();
+            assert_eq!(event["method"], "runtimes/changed");
+            assert_eq!(event["params"]["data"][0]["readiness"]["stage"], "ready");
+        } else { assert!(events.try_recv().is_err()); }
+    }
+    let mut state = b.state.lock().await;
+    let r = state.runtimes.get_mut("a").unwrap();
+    r.capabilities = Default::default(); r.schema_state = "initializing".into();
+    let connection = r.connection_id.clone();
+    assert!(Broker::apply_desktop_status(&mut state,"a",&connection,&json!({"runtimeId":"a","initialized":true,"schemaState":"error"})));
+}
+
+#[tokio::test]
+async fn overlapping_inventory_reads_do_not_invalidate_each_others_owner() {
+    let (_dir,b)=fixture().await;
+    let mut native=peer(&b,"a","desktop").await;
+    let first=tokio::spawn({let b=b.clone();async move{b.refresh_loaded().await}});
+    let request=native.recv().await;
+    assert_eq!(request["method"],"thread/loaded/list");
+    let second=tokio::spawn({let b=b.clone();async move{b.refresh_loaded().await}});
+    // The second caller must wait, while native ownership notifications remain unfenced.
+    native.assert_idle().await;
+    native.reply(&request,json!({"data":["t"],"nextCursor":null})).await;
+    loaded(&mut native,&["t"]).await;
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert!(b.state.lock().await.runtimes["a"].loaded.contains("t"));
+}
+
+#[tokio::test]
+async fn v070_auxiliary_runtime_never_competes_with_primary_owner() {
+    for explicit_role in [false, true] {
+        let (dir, b) = fixture().await;
+        let mut primary = peer(&b, "primary", "desktop").await;
+        let mut browser = peer(&b, "browser", "desktop").await;
+        {
+            let mut state = b.state.lock().await;
+            for r in state.runtimes.values_mut() { r.loaded.insert("t".into()); r.inventory_ready = true; }
+            b.save_ownership(&mut state).unwrap();
+            let r = &state.runtimes["browser"];
+            let connection = r.connection_id.clone();
+            let mut status = json!({"runtimeId":"browser","initialized":true,"schemaState":"ready","nativeCapabilities":r.capabilities});
+            if explicit_role { status["runtimeRole"] = json!("auxiliary"); }
+            else { status["nativeVersion"] = json!("codex-browser-use/0.167.0"); }
+            assert!(Broker::apply_desktop_status(&mut state, "browser", &connection, &status));
+            b.save_ownership(&mut state).unwrap();
+            assert!(b.ownership_values(&state)["browser"].auxiliary);
+            assert!(Broker::runtime_values(&state).iter().all(|r| r["id"] != "browser"));
+            let key = ThreadKey { computer_id:b.config.computer_id.clone(), config_store_id:storage::config_store(dir.path()).unwrap(), native_thread_id:"t".into() };
+            assert!(b.directory(&state).unwrap().resolve_write(&key).is_ok());
+        }
+        let refresh = tokio::spawn({let b = b.clone(); async move { b.refresh_loaded().await }});
+        loaded(&mut primary, &["t"]).await;
+        refresh.await.unwrap().unwrap();
+        browser.assert_idle().await;
+    }
 }
 
 async fn p2_pending_desktop(b: &Broker, id: &str) -> test_peer::Peer {

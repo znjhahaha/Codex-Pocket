@@ -51,4 +51,47 @@ class ReplyChunksTest {
         val wrongId = frames("r", buildJsonObject { put("id", "another"); put("result", "value") }).single()
         rejects { ReplyChunks().accept(wrongId, setOf("r")) }
     }
+    @Test fun utf8IsStrictIncludingChunkBoundariesAndFinalTruncation() {
+        val prefix = "{\"id\":\"r\",\"result\":\"".toByteArray()
+        val suffix = "\"}".toByteArray()
+        for (bad in listOf(byteArrayOf(0x80.toByte()), byteArrayOf(0xc0.toByte(), 0xaf.toByte()),
+            byteArrayOf(0xed.toByte(), 0xa0.toByte(), 0x80.toByte()),
+            byteArrayOf(0xf4.toByte(), 0x90.toByte(), 0x80.toByte(), 0x80.toByte()),
+            byteArrayOf(0xe2.toByte(), 0x82.toByte()))) {
+            val bytes = prefix + ByteArray(ReplyChunks.BLOCK - prefix.size - 1) { 'x'.code.toByte() } + bad + suffix
+            rejects { feed(ReplyChunks(), bytes) }
+        }
+        val unfinished = prefix + byteArrayOf(0xe2.toByte(), 0x82.toByte())
+        rejects { feed(ReplyChunks(), unfinished) }
+        val unicode = prefix + ByteArray(ReplyChunks.BLOCK - prefix.size - 1) { 'x'.code.toByte() } + "🚀\"}".toByteArray()
+        assertTrue(feed(ReplyChunks(), unicode)!!["result"]!!.jsonPrimitive.content.endsWith("🚀"))
+    }
+    @Test fun malformedOrNonReplyJsonCannotEscape() {
+        for (text in listOf("[]", "{\"id\":\"r\",\"result\":1} {}", "{\"id\":\"r\",\"result\":1,\"error\":{}}",
+            "{\"id\":\"r\",\"result\":1,\"method\":\"event\"}", "{\"id\":1,\"result\":1}", "{\"id\":\"r\"}")) {
+            rejects { feed(ReplyChunks(), text.toByteArray()) }
+        }
+        val error = feed(ReplyChunks(), "{\"id\":\"r\",\"error\":{\"code\":\"unknown\"}}".toByteArray())
+        assertEquals("unknown", error!!["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+    }
+    @Test fun cancelledLargeReservationsReleaseCapacityWithoutLateResurrection() {
+        val receiver = ReplyChunks()
+        for (id in listOf("a", "b")) receiver.accept(frame(id, 0, ReplyChunks.MAX_REPLY, ByteArray(ReplyChunks.BLOCK)), setOf(id))
+        receiver.discard("a")
+        assertNull(receiver.accept(frame("a", 1, ReplyChunks.MAX_REPLY, ByteArray(ReplyChunks.BLOCK)), setOf("b")))
+        receiver.accept(frame("c", 0, ReplyChunks.MAX_REPLY, ByteArray(ReplyChunks.BLOCK)), setOf("b", "c"))
+        receiver.clear()
+        assertEquals(JsonPrimitive("complete"), feed(receiver, "{\"id\":\"r\",\"result\":\"complete\"}".toByteArray())!!["result"])
+    }
+    private fun feed(receiver: ReplyChunks, bytes: ByteArray): JsonObject? {
+        var reply: JsonObject? = null
+        var offset = 0
+        var sequence = 0
+        while (offset < bytes.size) {
+            val end = minOf(bytes.size, offset + ReplyChunks.BLOCK)
+            reply = receiver.accept(frame("r", sequence++, bytes.size, bytes.copyOfRange(offset, end)), setOf("r"))
+            offset = end
+        }
+        return reply
+    }
 }

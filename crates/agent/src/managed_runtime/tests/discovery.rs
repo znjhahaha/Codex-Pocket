@@ -127,6 +127,18 @@ fn npm_and_pocket_module_wrappers_resolve_behind_native_executable() {
     );
 }
 
+#[test]
+fn npm_current_bin_layout_is_found_without_executing_wrapper() {
+    let (dir, home) = fixture();
+    let bin = dir.path().join("npm");
+    let package = bin.join("node_modules/@openai/codex");
+    let legacy = vendor(&package);
+    let binary = legacy.parent().unwrap().parent().unwrap().join("bin").join(legacy.file_name().unwrap());
+    native(&binary);
+    write(&bin.join("codex.cmd"), b"echo MUST NOT EXECUTE");
+    assert_eq!(select(&home, &[], &[bin]).unwrap().native_binary(), dunce::canonicalize(binary).unwrap());
+}
+
 #[cfg(windows)]
 #[test]
 fn volta_pe_shim_resolves_installed_package_native_instead_of_running_shim() {
@@ -161,7 +173,12 @@ fn environment_fixture() {
         let profile = from_environment().unwrap();
         assert_eq!(
             profile.config_home(),
-            dunce::canonicalize(root.join("home")).unwrap()
+            dunce::canonicalize(
+                std::env::var_os("PREPARATION_EXPECT_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| root.join("home")),
+            )
+            .unwrap()
         );
         assert_eq!(
             profile.native_binary(),
@@ -210,6 +227,170 @@ fn native_environment_discovery_honors_explicit_home_and_never_falls_back_on_inv
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+fn check_environment(root: &Path, home: Option<&std::ffi::OsStr>, expected: Option<&Path>) {
+    let binary = root.join("bin/codex.exe");
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "managed_runtime::discovery::tests::environment_fixture",
+        ])
+        .env("PREPARATION_FIXTURE_ROOT", root)
+        .env_remove("PREPARATION_EXPECT_INVALID_HOME")
+        .env_remove("PREPARATION_EXPECT_HOME")
+        .env_remove("CODEX_HOME")
+        .env("USERPROFILE", root)
+        .env("HOME", root)
+        .env("CODEX_CLI_PATH", &binary)
+        .env("PATH", binary.parent().unwrap());
+    if let Some(home) = home {
+        command.env("CODEX_HOME", home);
+    }
+    if let Some(expected) = expected {
+        command.env("PREPARATION_EXPECT_HOME", expected);
+    } else {
+        command.env("PREPARATION_EXPECT_INVALID_HOME", "1");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn long_config_home_discovery_does_not_require_cli_attachment_socket() {
+    let (dir, _) = fixture();
+    native(&dir.path().join("bin/codex.exe"));
+    for name in ["isolated-native-home-".repeat(4), "隔离配置目录".repeat(8)] {
+        let home = dir.path().join(name);
+        write(&home.join("config.toml"), b"model = 'fixture-never-run'\n");
+        write(&home.join("auth.json"), b"fixture account bytes");
+        let socket = home.join("app-server-control/app-server-control.sock");
+        assert!(socket.to_str().unwrap().len() >= 108);
+        assert!(!socket.exists());
+        #[cfg(windows)]
+        assert!(codex_cli_adapter::Discovery::for_home(&home).is_err());
+        check_environment(dir.path(), Some(home.as_os_str()), Some(&home));
+        assert!(!socket.exists(), "Host discovery must not create CLI state");
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), b"fixture account bytes");
+    }
+}
+
+#[test]
+fn long_saved_config_home_restores_and_migrates_without_cli_socket_validation() {
+    let (dir, _) = fixture();
+    let home = dir.path().join("isolated-native-home-".repeat(4));
+    std::fs::create_dir(&home).unwrap();
+    let binary = dir.path().join("custom/codex.exe");
+    native(&binary);
+    let selected = restore_saved_profile_with(&home, &binary, || panic!("Existing native must not query packages")).unwrap();
+    assert_eq!(selected.config_home(), dunce::canonicalize(&home).unwrap());
+    assert_eq!(selected.native_binary(), dunce::canonicalize(&binary).unwrap());
+    let (old, package, new) = msix_fixture(dir.path());
+    let selected = restore_saved_profile_with(&home, &old, || Ok(vec![package])).unwrap();
+    assert_eq!(selected.config_home(), dunce::canonicalize(&home).unwrap());
+    assert_eq!(selected.native_binary(), dunce::canonicalize(new).unwrap());
+}
+
+#[test]
+fn long_discovered_profile_survives_assistant_prepare_revalidation() {
+    let (dir, _) = fixture();
+    let home = dir.path().join("isolated-native-home-".repeat(4));
+    std::fs::create_dir(&home).unwrap();
+    let binary = dir.path().join("bin/codex.exe");
+    native(&binary);
+    let discovered = select(&home, &[binary], &[]).unwrap();
+    // Broker::ensure_assistant_with reconstructs SelectedProfile from its saved
+    // paths before starting Host. Discovery success must survive this boundary.
+    let selected =
+        SelectedProfile::new(discovered.config_home(), discovered.native_binary()).unwrap();
+    assert_eq!(selected.config_home(), discovered.config_home());
+    assert_eq!(selected.native_binary(), discovered.native_binary());
+}
+
+#[test]
+fn host_profile_retains_physical_path_and_file_type_validation() {
+    let (dir, home) = fixture();
+    let binary = dir.path().join("bin/codex.exe");
+    native(&binary);
+    for invalid_home in [dir.path().join("missing"), binary.clone(), PathBuf::from(".")] {
+        assert!(SelectedProfile::new(invalid_home, &binary).is_err());
+    }
+    for invalid_binary in [dir.path().join("missing.exe"), home.clone(), PathBuf::from("codex.exe")] {
+        assert!(SelectedProfile::new(&home, invalid_binary).is_err());
+    }
+}
+
+#[test]
+fn host_discovery_ignores_unrelated_invalid_cli_socket() {
+    let (dir, home) = fixture();
+    native(&dir.path().join("bin/codex.exe"));
+    let socket = home.join("app-server-control/app-server-control.sock");
+    write(&socket, b"not a CLI socket");
+    assert!(codex_cli_adapter::Discovery::for_home(&home).is_err());
+    check_environment(dir.path(), Some(home.as_os_str()), Some(&home));
+    assert_eq!(std::fs::read(socket).unwrap(), b"not a CLI socket");
+}
+
+#[test]
+fn invalid_explicit_config_home_never_selects_valid_default_account() {
+    let (dir, _) = fixture();
+    native(&dir.path().join("bin/codex.exe"));
+    let default = dir.path().join(".codex");
+    std::fs::create_dir(&default).unwrap();
+    for explicit in [None, Some(std::ffi::OsString::new())] {
+        assert_eq!(
+            configuration_home(explicit, || Ok(Some(dir.path().to_owned()))).unwrap(),
+            dunce::canonicalize(&default).unwrap()
+        );
+    }
+    let file = dir.path().join("file");
+    write(&file, b"not a directory");
+    for home in [dir.path().join("missing"), file, PathBuf::from(".codex")] {
+        check_environment(dir.path(), Some(home.as_os_str()), None);
+        assert!(configuration_home(Some(home.into_os_string()), || panic!("Invalid explicit home must not consult another account")).is_err());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut invalid = dir.path().join("invalid-unicode-").into_os_string();
+        invalid.push(std::ffi::OsString::from_wide(&[0xd800]));
+        // NTFS can hold this existing physical directory, but native's Unicode
+        // CODEX_HOME parser cannot select it. It must not become a profile.
+        std::fs::create_dir(&invalid).unwrap();
+        check_environment(dir.path(), Some(&invalid), None);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn environment_config_home_rejects_reparse_points_and_package_redirection() {
+    let (dir, home) = fixture();
+    native(&dir.path().join("bin/codex.exe"));
+    std::fs::create_dir(dir.path().join(".codex")).unwrap();
+    let linked = dir.path().join("home-link");
+    junction(&linked, &home);
+    check_environment(dir.path(), Some(linked.as_os_str()), None);
+    assert!(SelectedProfile::new(&linked, dir.path().join("bin/codex.exe")).is_err());
+    std::fs::create_dir(home.join("nested")).unwrap();
+    check_environment(dir.path(), Some(linked.join("nested").as_os_str()), None);
+    assert!(SelectedProfile::new(linked.join("nested"), dir.path().join("bin/codex.exe")).is_err());
+    native(&home.join("codex.exe"));
+    assert!(SelectedProfile::new(&home, linked.join("codex.exe")).is_err());
+    let redirected = dir.path().join("Packages/Fixture/LocalCache/home");
+    std::fs::create_dir_all(&redirected).unwrap();
+    check_environment(dir.path(), Some(redirected.as_os_str()), None);
 }
 
 fn msix_fixture(dir:&Path)->(PathBuf,MsixPackage,PathBuf) {

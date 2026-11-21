@@ -2,6 +2,37 @@ package dev.codexpocket.app.data
 
 import android.database.sqlite.SQLiteBlobTooBigException
 
+/** Caller holds the event lock and a Room transaction. The previous timeline is already retained
+ * by the reader/cache; never load a second copy of every text/raw payload just to save a change. */
+internal suspend fun PocketDao.persistTimelineItems(
+    key: ThreadKey, timeline: NativeTimeline, previous: NativeTimeline?, replace: Boolean,
+) {
+    val positions = itemPositions(key).associate { it.itemKey to it.ordinal }
+    val pending = ArrayList<ItemEntity>(32)
+    for ((index, entry) in timeline.items.entries.withIndex()) {
+        val (id, item) = entry
+        val ordinal = index.toLong()
+        val old = previous?.items?.get(id)
+        val turn = timeline.turns[item.turnId]
+        val oldTurn = previous?.turns?.get(item.turnId)
+        var row: ItemEntity? = null
+        val same = id in positions && old != null &&
+            ((old == item && oldTurn == turn) || run {
+                row = ItemEntity.from(key, item.withTurnCache(turn), ordinal)
+                row == ItemEntity.from(key, old.withTurnCache(oldTurn), ordinal)
+            })
+        if (same) {
+            // Prepending an older page changes positions, not the retained payloads.
+            if (positions[id] != ordinal) moveItem(key, id, ordinal)
+        } else {
+            pending.add(row ?: ItemEntity.from(key, item.withTurnCache(turn), ordinal))
+            if (pending.size == 32) { putItems(pending); pending.clear() }
+        }
+    }
+    if (pending.isNotEmpty()) putItems(pending)
+    if (replace) positions.keys.filter { it !in timeline.items }.chunked(400).forEach { removeItems(key, it) }
+}
+
 /** CursorWindow limits individual result rows, even when the stored SQLite TEXT is valid. */
 suspend fun PocketDao.cachedItems(key: ThreadKey): List<ItemEntity> = try { items(key) }
 catch (_: SQLiteBlobTooBigException) { chunkedItems(key) }

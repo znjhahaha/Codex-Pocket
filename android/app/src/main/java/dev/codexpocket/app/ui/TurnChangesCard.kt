@@ -21,7 +21,11 @@ internal fun rememberTurnChangeCards(timeline: NativeTimeline, rows: List<Transc
     val cards by produceState(emptyMap<String, List<TurnChangeSummary>>(), timeline, rows) {
         value = withContext(Dispatchers.Default) { changeSummaryRows(timeline, rows) }
     }
-    return cards
+    // produceState retains the previous value while recomputing. Never leave a
+    // terminal card visible for a turn the fresh snapshot now reports running.
+    return cards.mapValues { (_, summaries) -> summaries.filter { summary ->
+        summary.turnId != timeline.activeTurn && timeline.turns[summary.turnId]?.status != "inProgress"
+    } }.filterValues { it.isNotEmpty() }
 }
 
 @Composable

@@ -46,6 +46,8 @@ pub struct Status {
     pub tray_startup_failure: Option<startup_failure::LaunchFailure>,
     #[serde(default)]
     pub helper_spawn_failure: Option<startup_failure::LaunchFailure>,
+    #[serde(default)]
+    pub native_entry_ready: Option<bool>,
 }
 /// Desired is phone ingress only; stopped may intentionally retain childPid.
 /// Only a fresh, authenticated helper response can confirm the remote gate.
@@ -72,8 +74,9 @@ pub fn remote_phase(
     }
 }
 
-/// Read the same authenticated framed control socket as the agent CLI, without
-/// spawning helper/model processes or depending on a stale status file.
+/// Read authenticated owner identity and remote gates without sampling native
+/// idle. A full status scan would compete with the empty native coordinator
+/// for installation admission; this heartbeat never consumes that idle proof.
 fn helper_status(state: &Path) -> Result<serde_json::Value> {
     use std::io::{Read, Write};
     let path = state.join("control.json");
@@ -99,7 +102,7 @@ fn helper_status(state: &Path) -> Result<serde_json::Value> {
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     socket.set_write_timeout(Some(Duration::from_millis(500)))?;
     let request =
-        serde_json::to_vec(&serde_json::json!({"token":token,"method":"status","params":{}}))?;
+        serde_json::to_vec(&serde_json::json!({"token":token,"method":"helper/health","params":{}}))?;
     socket.write_all(&(request.len() as u32).to_be_bytes())?;
     socket.write_all(&request)?;
     let mut size = [0; 4];
@@ -233,6 +236,11 @@ fn spawn_agent(
         }
     }
 }
+fn cold_start_unconfirmed(state: &Path, generation: Option<&str>) -> bool {
+    crate::updates::read_status(state).is_ok_and(|s|s.phase == "cold_starting"
+        && s.generation.as_deref() == generation)
+}
+
 pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Result<()> {
     storage::plain(state)?;
     storage::plain(agent)?;
@@ -256,6 +264,19 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
     storage::private_dir(&owner)?;
     let _user = Lock::acquire(&owner.join("supervisor.lock"))?;
     let _state = Lock::acquire(&control.join("supervisor.lock"))?;
+    // During an explicit cold start, launch only the selected generation.
+    // Live handoff has its own checkpoint and rollback ownership protocol.
+    let cold_candidate = if crate::updates::read_status(state).ok().is_some_and(|s|
+        s.phase == "cold_starting") {
+        let root = owner.parent().context("Installation root missing")?;
+        let (selected, selected_state) = crate::launcher::resolve_release(root)?;
+        anyhow::ensure!(Some(selected.as_path()) == agent.parent() && selected_state == state,
+            "Supervisor installation changed before cold startup");
+        true
+    } else { false };
+    // Automatic updates survive quitting the optional management window.
+    // Invalid/unconfigured installations retain a functional supervisor.
+    let updates = crate::update_worker::Worker::start(agent,state).ok();
     // The supervisor owns optional tray startup, including for stable launchers
     // from earlier installations. It cannot gate local control or ownership.
     let mut tray = installed_owner.then(|| TrayStartup::new(Instant::now()));
@@ -287,7 +308,17 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
         .and_then(|p| crate::installation::generation(p).ok());
     let handoff_environment = upgrade::local::StartupEnvironment::from_env()?;
     let mut startup_context_failed = false;
+    let mut native_entry_retry = Instant::now();
     loop {
+        if Instant::now() >= native_entry_retry {
+            if let Some(root)=agent.parent().and_then(Path::parent).and_then(Path::parent) {
+                if storage::local_app_data().is_ok_and(|local|root==local.join("CodexPocket"))
+                    && crate::launcher::resolve_release(root).is_ok_and(|(bin,s)|Some(bin.as_path())==agent.parent()&&s==state) {
+                    status.native_entry_ready=Some(crate::native_entry::reconcile(root).is_ok());
+                }
+            }
+            native_entry_retry=Instant::now()+Duration::from_secs(30);
+        }
         let enabled = storage::desired(state);
         if let Some(failure) = startup_attempt.as_ref().and_then(|a| a.read(state)) {
             status.startup_failure = Some(failure);
@@ -296,6 +327,11 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
             if let Some(exit) = c.try_wait()? {
                 status.last_exit = exit.code();
                 child = None;
+                if cold_candidate && cold_start_unconfirmed(state, agent_generation.as_deref()) {
+                    // Exit naturally; the installer can restore the previous
+                    // program only once all three owner locks are free.
+                    return Ok(());
+                }
                 if started.elapsed() > Duration::from_secs(60) {
                     status.failures = 0
                 };
@@ -312,6 +348,10 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
             status.runtime.generation.as_deref(),
             child.as_ref().map(Child::id),
         );
+        if let Some(worker)=updates.as_ref(){
+            worker.permit(child.is_some() && !maintenance.blocks_respawn()
+                && !startup_context_failed && upgrade::local::routes_may_reconcile(state));
+        }
         // The released journal is already fsynced and the exact child is Gone.
         // Return naturally so Drop releases both locks; never kill descendants.
         if child.is_none() && maintenance.release_ready() {
@@ -339,6 +379,7 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
                             status.phase = if enabled { "starting" } else { "stopping" }.into();
                         }
                         Err(_) => {
+                            if cold_candidate && cold_start_unconfirmed(state, agent_generation.as_deref()) { return Ok(()) }
                             retry = Instant::now()
                                 + Duration::from_secs(policy::restart_delay(status.failures));
                             status.failures = status.failures.saturating_add(1);
@@ -594,6 +635,54 @@ mod tests {
         assert!(agent_startup_command(&agent, dir.path(), Some(&request)).is_err());
     }
     #[test]
+    fn supervisor_heartbeat_leaves_empty_native_admission_available() {
+        use std::io::{Read, Write};
+        use pocket_core::admission::Installation;
+        let state = crate::test_support::tempdir();
+        let root = state.path().join("installation");
+        storage::private_dir(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let token = "b".repeat(64);
+        storage::atomic(&state.path().join("control.json"),
+            &json!({"protocol":1,"port":listener.local_addr().unwrap().port(),"token":token})).unwrap();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let held_root = root.clone();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut size = [0; 4];
+            socket.read_exact(&mut size).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["token"], token);
+            assert_eq!(request["params"], json!({}));
+            if request["method"] == "status" {
+                // A full empty lifecycle scan retains this exact installation
+                // lock while its OS inventory is in flight, even after the
+                // heartbeat's short socket deadline expires.
+                let _scan = Installation::open(&held_root).unwrap().update().unwrap();
+                wait_release.recv_timeout(Duration::from_secs(3)).unwrap();
+            } else {
+                assert_eq!(request["method"], "helper/health");
+                let bytes = serde_json::to_vec(&json!({"result":{
+                    "helperRuntime":{"pid":42},"updatedAt":100,
+                    "remoteControlProtocol":1,"remoteEnabled":false
+                }})).unwrap();
+                socket.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
+        });
+        let status = helper_status(state.path());
+        let admission_available = Installation::open(&root).unwrap().update().is_ok();
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert!(status.is_ok(), "heartbeat waited for native scan: {status:?}; admission available={admission_available}");
+        let status = status.unwrap();
+        assert!(admission_available, "supervisor heartbeat blocked the empty native coordinator");
+        assert!(status.get("lifecycle").is_none(), "owner heartbeat must not claim native idle");
+        assert_eq!(remote_phase(false, Some(&status), 42, 100), "stopped");
+    }
+    #[test]
     fn remote_status_uses_authenticated_control_and_does_not_dispatch_model_rpc() {
         use std::io::{Read, Write};
         let state = crate::test_support::tempdir();
@@ -612,7 +701,7 @@ mod tests {
             socket.read_exact(&mut bytes).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(request["token"], token);
-            assert_eq!(request["method"], "status");
+            assert_eq!(request["method"], "helper/health");
             let result = json!({"result":{"helperRuntime":{"pid":42},"updatedAt":100,"remoteControlProtocol":1,"remoteEnabled":false}});
             let bytes = serde_json::to_vec(&result).unwrap();
             socket

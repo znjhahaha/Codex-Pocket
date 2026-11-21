@@ -49,6 +49,10 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
     val context = LocalContext.current
     val chat = s.selected ?: return
     ObserveThreadHandoff(s, repo)
+    DisposableEffect(repo, chat.key) {
+        val observation = repo.observeConversation(chat.key)
+        onDispose { observation.cancel() }
+    }
     key(chat.key.encoded) {
         var composerFocusRequest by remember { mutableIntStateOf(0) }
         val proposedPlan = remember(s.timeline, s.resolvedPlans) { PlanPresentation.latest(s.timeline)?.takeUnless { it.revision in s.resolvedPlans } }
@@ -98,7 +102,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         }
         var restoredAnchor by remember { mutableStateOf(false) }
         val reportReading by rememberUpdatedState(onReadingHistory)
-        var readingHistory by remember { mutableStateOf(false) }
+        val readingHistory = !following
         LaunchedEffect(readingHistory) { reportReading(readingHistory) }
         DisposableEffect(Unit) { onDispose { reportReading(false) } }
         val scope = rememberCoroutineScope()
@@ -140,23 +144,10 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val density = LocalDensity.current
         var composerHeight by remember { mutableIntStateOf(0) }
         var headerHeight by remember { mutableIntStateOf(0) }
+        var statusHeight by remember { mutableIntStateOf(0) }
         val bottomInset = with(density) { composerHeight.toDp() }
         val topInset = with(density) { headerHeight.toDp() }
-        LaunchedEffect(list, density) {
-            val enterDistance = with(density) { 240.dp.toPx() }
-            val leaveDistance = with(density) { 32.dp.toPx() }
-            snapshotFlow {
-                val info = list.layoutInfo
-                val last = info.visibleItemsInfo.lastOrNull()
-                val remainingItems = if (last == null) 0 else info.totalItemsCount - 1 - last.index
-                val remainingPixels = if (last == null) 0 else last.offset + last.size + info.afterContentPadding - info.viewportEndOffset
-                Triple(following, remainingItems, remainingPixels)
-            }.distinctUntilChanged().collect { (follow, items, pixels) ->
-                // Two thresholds keep changing chrome height from bouncing the UI near the end.
-                if (follow || (items == 0 && pixels <= leaveDistance)) readingHistory = false
-                else if (items > 1 || pixels >= enterDistance) readingHistory = true
-            }
-        }
+        val statusInset = if (statusHeight > 0 && (chat.runtimeId.startsWith("history:") || read.failed || s.error != null)) topInset else 0.dp
         ObserveTranscriptDrag(list, transcriptGesture) {
             if (it) { following = true; repo.scroll(list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, true,
                 list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String) }
@@ -220,12 +211,12 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
                 val transcriptInset = maxOf(16.dp, (maxWidth - gutter - 720.dp) / 2)
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
-                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter).testTag("chat-transcript")
+                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter, top = statusInset).testTag("chat-transcript")
                     .transcriptUserGesture(list, transcriptGesture, pauseFollowing, { transcriptContact = it; if (it) jumpJob?.cancel() })
-                    .layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    .layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset - statusInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item(key = "history-control") {
                         ConversationReadStatus(read.copy(failed = false, refreshing = false), null, onRetry = {})
-                        if (rows.isNotEmpty() && s.online && s.supports("thread/turns/list") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        if (rows.isNotEmpty() && s.online && (s.supports("thread/turns/list") || s.conversationReadSource == "persisted") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                             PocketTextButton(onClick = { transcriptGesture.cancelResume(); pauseFollowing(); repo.older() }, enabled = !s.historyLoading) {
                                 Text(stringResource(if (s.historyLoading) R.string.delivery_history_loading else R.string.earlier_messages), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
@@ -269,19 +260,33 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
                 CompositionLocalProvider(LocalPocketClearGlass provides true) {
-                header()
+                val syncLabel = when {
+                    s.automaticConnectionLabel()!=null -> s.automaticConnectionLabel()
+                    !s.online || read.failed -> null
+                    read.refreshing -> stringResource(R.string.v04_transcript_refreshing)
+                    s.busy && s.conversationLoadState != ConversationLoadState.Loading ->
+                        if (s.historyLoading) "加载历史中" else "同步中"
+                    else -> null
+                }
+                CompositionLocalProvider(LocalConversationSyncLabel provides syncLabel) { header() }
                 AgentRosterChip(agents, s.online, s.busy, onAgent,
                     Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp, vertical = 2.dp),
                     names = agentNames, onShow = repo::showAgentReader)
                 }
-                Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth().padding(horizontal = 16.dp)) {
+                // Each notice is a floating card; do not paint a full-width edge mask.
+                Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth()
+                    .onSizeChanged { statusHeight = it.height }.testTag("conversation-status")) {
+                Column {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                     ConversationReadStatus(read.copy(skeleton = false), s.conversationLoadError, onRetry = { repo.reloadConversation() })
                 }
-                if (s.busy && s.conversationLoadState != ConversationLoadState.Loading) PocketProgressStatus(if (s.historyLoading) "正在加载历史" else "正在同步", Modifier.align(Alignment.CenterHorizontally).padding(vertical = 6.dp))
                 Column(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 752.dp).fillMaxWidth().padding(horizontal = 16.dp)) {
-                s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
+                s.error?.takeUnless(::automaticConnectionMessage)?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 if (!s.online) Notice(stringResource(R.string.offline_history), action = stringResource(R.string.reconnect), onAction = repo::reconnect)
-                ThreadOwnershipNotice(s, repo)
+                // The visible-conversation observer restores control automatically. Connection
+                // progress belongs in the existing header, never a second blocking banner.
+                }
+                }
                 }
             }
             Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().testTag("chat-bottom-dock").onSizeChanged { composerHeight = it.height }) {
@@ -296,7 +301,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 PocketGlassSurface(onClick = { transcriptGesture.cancelResume(); jumpJob?.cancel(); jumpJob = scope.launch { following = true; if (keys.lastIndex - list.firstVisibleItemIndex > 30 || !android.animation.ValueAnimator.areAnimatorsEnabled()) list.scrollToItem(keys.lastIndex) else list.animateScrollToItem(keys.lastIndex) } },
                     modifier = Modifier.padding(bottom = 6.dp).semantics { contentDescription = jumpLabel }, backdrop = transcriptBackdrop, shape = CircleShape, dense = true) {
                     Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-                        Icon(PocketIcons.ArrowDownward, null, Modifier.size(18.dp))
+                        JumpToLatestGlyph(running = nativeLive && live != null)
                     }
                 }
             }
@@ -336,6 +341,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 { attachmentSheet = true }, onReferences,
                 { repo.send() }, { repo.send(steer = true) }, { repo.stop() }, s.online && s.supports("references/list"),
                 attachmentCount = s.attachments.size,
+                stableLayout = s.attachments.isNotEmpty(),
                 onPermissions = { permissionPanel = true; repo.refreshPermissions() }, permissionsExpanded = permissionPanel,
                 permissionLabel = s.permissions.label,
                 onPermissionAnchor = { permissionAnchor = it },
@@ -383,7 +389,6 @@ internal fun ConversationReadStatus(read: ConversationReadPresentation, error: S
             listOf(.92f, .84f, .58f).forEach { fraction -> SkeletonBar(fraction, 12.dp) }
             SkeletonBar(.34f, 10.dp)
         }
-        if (read.refreshing) Text(stringResource(R.string.v04_transcript_refreshing), Modifier.padding(vertical = 8.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         androidx.compose.animation.AnimatedVisibility(read.failed,
             enter = androidx.compose.animation.fadeIn(tween(pocketMotionMillis(180))),
             exit = androidx.compose.animation.fadeOut(tween(pocketMotionMillis(180)))) {

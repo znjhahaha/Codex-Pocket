@@ -49,7 +49,7 @@ internal fun liveStatusLabel(status: LiveStatus): String =
 
 /** Missing or mismatched native timing keeps prose readable but supplies no live-motion proof. */
 internal fun nativeSummaryActive(turnId: String, reasoning: TimelineItem?, timing: NativeTurnInfo?): Boolean =
-    reasoning?.type == "reasoning" && reasoning.turnId == turnId &&
+    reasoning?.type == "reasoning" && reasoning.turnId == turnId && !reasoning.complete &&
         timing?.id == turnId && timing.status == "inProgress"
 
 /** The owner supplies an accepted active identity; optional metadata can veto a stale pointer. */
@@ -83,7 +83,7 @@ internal fun LiveTurnStatus(turnId: String, status: LiveStatus, modifier: Modifi
     }
     var expanded by rememberSaveable(turnId) { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
-    val active = online && nativeSummaryActive(turnId, reasoning, timing)
+    val active = online && status == LiveStatus.Thinking && nativeSummaryActive(turnId, reasoning, timing)
     Column(modifier.fillMaxWidth().testTag("live-turn-status")) {
         // Tapping replaces the compact prose with its separate paragraphs, in the same location.
         Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("live-reasoning-toggle")

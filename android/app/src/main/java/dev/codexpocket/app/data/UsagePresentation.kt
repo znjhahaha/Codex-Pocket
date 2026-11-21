@@ -33,13 +33,15 @@ data class UsageFilter(
     val model: String? = null,
     val providerPage: UsagePage = UsagePage(),
     val modelPage: UsagePage = UsagePage(),
+    val sessionId: String? = null,
+    val sessionPage: UsagePage = UsagePage(),
 ) {
     init {
         require(ChronoUnit.DAYS.between(startDate, endDate) in 0..30) { "Choose 1 to 31 days" }
         ZoneId.of(zoneId)
         require(appType in apps) { "Unsupported usage app" }
         require(dataSource != UsageDataSource.CodexSession || appType == "codex") { "Session source requires Codex" }
-        listOf(providerId, model).forEach { require(it == null || (it.toByteArray(Charsets.UTF_8).size in 1..256 && '\u0000' !in it)) { "Invalid usage identity" } }
+        listOf(providerId, model, sessionId).forEach { require(it == null || (it.toByteArray(Charsets.UTF_8).size in 1..256 && '\u0000' !in it)) { "Invalid usage identity" } }
     }
     fun toQuery(): UsageQuery {
         val zone = ZoneId.of(zoneId)
@@ -48,40 +50,43 @@ data class UsageFilter(
         require(edges.first() >= 0 && edges.last() <= 253402300799L)
         require(edges.zipWithNext().all { (a, b) -> b > a && b - a <= 27 * 3600 })
         require(edges.last() - edges.first() <= 32 * 86400)
-        return UsageQuery(edges.first(), edges.last(), edges, UsageQueryFilters(appType, dataSource, providerId, model, status), providerPage, modelPage)
+        return UsageQuery(edges.first(), edges.last(), edges, UsageQueryFilters(appType, dataSource, providerId, model, status, sessionId), providerPage, modelPage, sessionPage)
     }
     fun toJson() = toQuery().toJson()
-    private fun reset() = copy(providerPage = providerPage.copy(offset = 0), modelPage = modelPage.copy(offset = 0))
+    private fun reset() = copy(providerPage = providerPage.copy(offset = 0), modelPage = modelPage.copy(offset = 0), sessionPage = sessionPage.copy(offset = 0))
     fun withDates(start: LocalDate, end: LocalDate) = copy(startDate = start, endDate = end).reset()
     fun withZone(zone: String) = copy(zoneId = zone).reset()
     fun withAppType(app: String) = copy(appType = app,
-        dataSource = if (app == "codex") dataSource else UsageDataSource.Proxy, providerId = null, model = null).reset()
-    fun withDataSource(source: UsageDataSource) = copy(dataSource = source, providerId = null, model = null).reset()
+        dataSource = if (app == "codex") dataSource else UsageDataSource.Proxy, providerId = null, model = null, sessionId = null).reset()
+    fun withDataSource(source: UsageDataSource) = copy(dataSource = source, providerId = null, model = null, sessionId = null).reset()
     fun withStatus(value: UsageStatusFilter) = copy(status = value).reset()
     fun withProvider(value: String?) = copy(providerId = value).reset()
     fun withModel(value: String?) = copy(model = value).reset()
+    fun withSession(value: String?) = copy(sessionId = value).reset()
     companion object {
         val apps = listOf("codex", "claude", "gemini", "grokbuild")
-        fun lastDays(days: Int = 7, zoneId: String = ZoneId.systemDefault().id,
+        fun lastDays(days: Int = 7, zoneId: String = "Asia/Shanghai",
             today: LocalDate = LocalDate.now(ZoneId.of(zoneId))): UsageFilter {
             require(days in 1..31)
             return UsageFilter(today.minusDays(days - 1L), today, zoneId)
         }
     }
 }
-data class UsageQueryFilters(val appType: String, val dataSource: UsageDataSource, val providerId: String?, val model: String?, val status: UsageStatusFilter) {
+data class UsageQueryFilters(val appType: String, val dataSource: UsageDataSource, val providerId: String?, val model: String?, val status: UsageStatusFilter, val sessionId: String? = null) {
     fun toJson() = buildJsonObject {
         put("app_type", appType); put("data_source", dataSource.wire)
         put("provider_id", providerId?.let(::JsonPrimitive) ?: JsonNull)
         put("model", model?.let(::JsonPrimitive) ?: JsonNull); put("status", status.wire)
+        put("session_id", sessionId?.let(::JsonPrimitive) ?: JsonNull)
     }
 }
 data class UsageQuery(val startAt: Long, val endAt: Long, val bucketEdges: List<Long>, val filters: UsageQueryFilters,
-    val providerPage: UsagePage, val modelPage: UsagePage) {
+    val providerPage: UsagePage, val modelPage: UsagePage, val sessionPage: UsagePage = UsagePage()) {
     fun toJson() = buildJsonObject {
         put("start_at", startAt); put("end_at", endAt)
         put("bucket_edges", JsonArray(bucketEdges.map(::JsonPrimitive)))
-        put("filters", filters.toJson()); put("provider_page", providerPage.toJson()); put("model_page", modelPage.toJson())
+        put("filters", filters.toJson()); put("provider_page", providerPage.toJson()); put("model_page", modelPage.toJson()); put("session_page", sessionPage.toJson())
+        put("request_page", UsageRequestPage().toJson())
     }
 }
 
@@ -96,10 +101,17 @@ data class UsageScreenState(
     val refreshing: Boolean = false,
     val canQuery: Boolean = false,
     val cached: Boolean = false,
+    val canPageRequests: Boolean = false,
+    val requestFeed: UsageRequestFeed? = null,
+    val requestLoading: Boolean = false,
+    val requestError: String? = null,
 ) {
     val visibleSnapshot: UsageSnapshot? get() = snapshot?.takeIf {
         it.filter == filter && it.response.source.appType == filter.appType && it.response.source.dataSource == filter.dataSource &&
-            (it.response.query == null || it.response.query == filter.toJson())
+            (it.response.query == null || usageQueryMatches(it.response.query, filter.toJson()))
+    }
+    val visibleRequests: UsageRequestDetailsPage? get() = visibleSnapshot?.response?.data?.recentRequests?.let { first ->
+        requestFeed?.takeIf { it.filter == filter }?.page ?: first
     }
 }
 
@@ -131,7 +143,8 @@ data class UsageTrendBucket(val startAt: Long, val endAt: Long, val totals: Usag
 data class UsageGroupPage<T>(val items: List<T>, val offset: Int, val limit: Int, val totalGroups: Int, val hasMore: Boolean)
 data class UsageProviderGroup(val providerId: String, val appType: String, val name: String?, val totals: UsageTotals)
 data class UsageModelGroup(val model: String, val totals: UsageTotals)
-data class UsageData(val totals: UsageTotals, val trend: List<UsageTrendBucket>, val providerGroups: UsageGroupPage<UsageProviderGroup>, val modelGroups: UsageGroupPage<UsageModelGroup>)
+data class UsageData(val totals: UsageTotals, val trend: List<UsageTrendBucket>, val providerGroups: UsageGroupPage<UsageProviderGroup>, val modelGroups: UsageGroupPage<UsageModelGroup>,
+    val sessionGroups: UsageGroupPage<UsageSessionGroup>? = null, val recentRequests: UsageRequestDetailsPage? = null)
 
 data class UsageResponse(val availability: String, val coverage: UsageCoverage, val source: UsageSource, val errors: List<UsageError>,
     val data: UsageData?, val cache: UsageCache? = null, val query: JsonObject? = null) {
@@ -144,7 +157,7 @@ data class UsageResponse(val availability: String, val coverage: UsageCoverage, 
         /** Accepts the statistics result or the finalized schema=1 RPC envelope. No lossy defaults. */
         fun fromJson(json: JsonObject): UsageResponse {
             if ("result" in json) {
-                json.keysExactly("schema query result cache")
+                json.keysRequired("schema query result cache")
                 require(json.long("schema") == 1L) { "Unsupported usage RPC schema" }
                 val q = json.usageObject("query").also(::validateQuery)
                 return parseResponse(json.usageObject("result")).copy(cache = parseCache(json.usageObject("cache")), query = q)
@@ -160,7 +173,7 @@ fun usageTime(seconds: Long, zone: String): String = DateTimeFormatter.ofPattern
 private fun performanceCoverage(sample: ULong, missing: ULong, invalid: ULong, excluded: ULong) =
     "样本 ${usageCount(sample)} · 缺失 ${usageCount(missing)} · 无效 ${usageCount(invalid)} · 排除 ${usageCount(excluded)}"
 
-private fun JsonObject.keysExactly(keys: String) { require(this.keys == keys.split(' ').toSet()) { "Unexpected usage fields" } }
+private fun JsonObject.keysRequired(keys: String) { require(this.keys.containsAll(keys.split(' ').toSet())) { "Unexpected usage fields" } }
 private fun JsonObject.field(key: String): JsonElement = requireNotNull(this[key]) { "Missing usage field: $key" }
 private fun JsonObject.usageObject(key: String): JsonObject = field(key) as? JsonObject ?: throw IllegalArgumentException("Expected usage object: $key")
 private fun JsonObject.usageArray(key: String): JsonArray = field(key) as? JsonArray ?: throw IllegalArgumentException("Expected usage array: $key")
@@ -196,55 +209,55 @@ private fun decimal(text: String): BigDecimal {
 }
 private fun source(text: String): UsageDataSource = UsageDataSource.entries.singleOrNull { it.wire == text } ?: throw IllegalArgumentException("Unsupported usage source")
 private fun parseResponse(j: JsonObject): UsageResponse {
-    j.keysExactly("availability coverage source errors data")
+    j.keysRequired("availability coverage source errors data")
     val availability = j.string("availability")
     require(availability in setOf("ready", "missing", "locked", "unsupported_schema", "invalid_path", "rejected", "unavailable"))
     val c = j.usageObject("coverage")
-    c.keysExactly("scope complete matched_rows first_observed_at last_observed_at rollups_present rollups_included cost_known_rows cost_missing_rows cost_invalid_rows zero_cost_rows token_invalid_rows confirmed_free_rows zero_cost_interpretation")
+    c.keysRequired("scope complete matched_rows first_observed_at last_observed_at rollups_present rollups_included cost_known_rows cost_missing_rows cost_invalid_rows zero_cost_rows token_invalid_rows confirmed_free_rows zero_cost_interpretation")
     require(c.string("scope") == "retained_detail_only" && !c.bool("complete") && !c.bool("rollups_included"))
     require(c.string("zero_cost_interpretation") == "stored_zero_free_status_unknown" && c.field("confirmed_free_rows") == JsonNull)
     val coverage = UsageCoverage(c.string("scope"), c.bool("complete"), c.unsigned("matched_rows"), c.nullLong("first_observed_at"), c.nullLong("last_observed_at"),
         c.bool("rollups_present"), c.bool("rollups_included"), c.unsigned("cost_known_rows"), c.unsigned("cost_missing_rows"), c.unsigned("cost_invalid_rows"),
         c.unsigned("zero_cost_rows"), c.unsigned("token_invalid_rows"), c.nullUnsigned("confirmed_free_rows"), c.string("zero_cost_interpretation"))
     val s = j.usageObject("source")
-    s.keysExactly("kind table app_type data_source schema_version")
+    s.keysRequired("kind table app_type data_source schema_version")
     require(s.string("kind") == "cc_switch" && s.string("table") == "proxy_request_logs" && s.string("app_type") in UsageFilter.apps)
     val info = UsageSource(s.string("kind"), s.string("table"), s.string("app_type"), source(s.string("data_source")), s.nullLong("schema_version"))
     require(info.dataSource != UsageDataSource.CodexSession || info.appType == "codex")
-    val errors = j.usageArray("errors").map { e -> e.asUsageObject().let { it.keysExactly("code message"); UsageError(it.string("code"), it.string("message")) } }
+    val errors = j.usageArray("errors").map { e -> e.asUsageObject().let { it.keysRequired("code message"); UsageError(it.string("code"), it.string("message")) } }
     val data = if (j.field("data") == JsonNull) null else parseData(j.usageObject("data"))
     require(availability != "ready" || data != null) { "Ready usage lacks data" }
     return UsageResponse(availability, coverage, info, errors, data)
 }
 private fun parseCache(j: JsonObject): UsageCache {
-    j.keysExactly("state sampled_at age_seconds ttl_seconds stale_reason")
+    j.keysRequired("state sampled_at age_seconds ttl_seconds stale_reason")
     val state = j.string("state").also { require(it in setOf("fresh", "stale", "unavailable")) }
     return UsageCache(state, j.nullLong("sampled_at"), j.nullUnsigned("age_seconds"), j.unsigned("ttl_seconds"), j.nullString("stale_reason"))
 }
 private fun parseCost(j: JsonObject): UsageCostAmount {
-    j.keysExactly("known_usd known_rows missing_rows invalid_rows zero_rows")
+    j.keysRequired("known_usd known_rows missing_rows invalid_rows zero_rows")
     val text = j.string("known_usd").also { decimal(it) }
     return UsageCostAmount(text, j.unsigned("known_rows"), j.unsigned("missing_rows"), j.unsigned("invalid_rows"), j.unsigned("zero_rows")).also { require(it.zeroRows <= it.knownRows) }
 }
 private fun parseTiming(j: JsonObject): UsageTimingMetric {
-    j.keysExactly("average_ms sum_ms sample_rows missing_rows invalid_rows excluded_rows")
+    j.keysRequired("average_ms sum_ms sample_rows missing_rows invalid_rows excluded_rows")
     return UsageTimingMetric(j.nullDouble("average_ms"), j.unsigned("sum_ms"), j.unsigned("sample_rows"), j.unsigned("missing_rows"), j.unsigned("invalid_rows"), j.unsigned("excluded_rows")).also {
         require((it.sampleRows == 0uL) == (it.averageMs == null))
     }
 }
 private fun parseSpeed(j: JsonObject): UsageSpeedMetric {
-    j.keysExactly("tokens_per_second sum_output_tokens sum_generation_ms sample_rows missing_rows invalid_rows excluded_rows")
+    j.keysRequired("tokens_per_second sum_output_tokens sum_generation_ms sample_rows missing_rows invalid_rows excluded_rows")
     return UsageSpeedMetric(j.nullDouble("tokens_per_second"), j.unsigned("sum_output_tokens"), j.unsigned("sum_generation_ms"), j.unsigned("sample_rows"), j.unsigned("missing_rows"), j.unsigned("invalid_rows"), j.unsigned("excluded_rows")).also {
         require((it.sampleRows == 0uL) == (it.tokensPerSecond == null))
     }
 }
 private fun parseTotals(j: JsonObject): UsageTotals {
-    j.keysExactly("requests success errors tokens costs performance")
-    val t = j.usageObject("tokens"); t.keysExactly("fresh_input cache_read cache_write output total invalid_rows")
+    j.keysRequired("requests success errors tokens costs performance")
+    val t = j.usageObject("tokens"); t.keysRequired("fresh_input cache_read cache_write output total invalid_rows")
     val tokens = UsageTokens(t.unsigned("fresh_input"), t.unsigned("cache_read"), t.unsigned("cache_write"), t.unsigned("output"), t.unsigned("total"), t.unsigned("invalid_rows"))
-    val c = j.usageObject("costs"); c.keysExactly("input output cache_read cache_write total")
+    val c = j.usageObject("costs"); c.keysRequired("input output cache_read cache_write total")
     val costs = UsageCosts(parseCost(c.usageObject("input")), parseCost(c.usageObject("output")), parseCost(c.usageObject("cache_read")), parseCost(c.usageObject("cache_write")), parseCost(c.usageObject("total")))
-    val p = j.usageObject("performance"); p.keysExactly("scope success_rows ttft duration output_speed")
+    val p = j.usageObject("performance"); p.keysRequired("scope success_rows ttft duration output_speed")
     require(p.string("scope") == "successful_proxy_observations")
     val performance = UsagePerformance(p.string("scope"), p.unsigned("success_rows"), parseTiming(p.usageObject("ttft")), parseTiming(p.usageObject("duration")), parseSpeed(p.usageObject("output_speed")))
     val metrics = listOf(performance.ttft.let { listOf(it.sampleRows, it.missingRows, it.invalidRows, it.excludedRows) },
@@ -254,34 +267,88 @@ private fun parseTotals(j: JsonObject): UsageTotals {
     return UsageTotals(j.unsigned("requests"), j.unsigned("success"), j.unsigned("errors"), tokens, costs, performance)
 }
 private fun <T> parsePage(j: JsonObject, item: (JsonObject) -> T): UsageGroupPage<T> {
-    j.keysExactly("items offset limit total_groups has_more")
+    j.keysRequired("items offset limit total_groups has_more")
     val offset = j.int("offset"); val limit = j.int("limit"); UsagePage(offset, limit)
     val items = j.usageArray("items").map { item(it.asUsageObject()) }
     require(items.size <= limit && j.int("total_groups") <= 10000)
     return UsageGroupPage(items, offset, limit, j.int("total_groups"), j.bool("has_more"))
 }
 private fun parseData(j: JsonObject): UsageData {
-    j.keysExactly("totals trend provider_groups model_groups")
+    j.keysRequired("totals trend provider_groups model_groups")
     val trend = j.usageArray("trend").map { e -> e.asUsageObject().let {
-        it.keysExactly("start_at end_at totals")
+        it.keysRequired("start_at end_at totals")
         UsageTrendBucket(it.long("start_at"), it.long("end_at"), parseTotals(it.usageObject("totals"))).also { b -> require(b.endAt > b.startAt) }
     } }
     require(trend.size <= 744 && trend.zipWithNext().all { (a, b) -> a.endAt == b.startAt })
     return UsageData(parseTotals(j.usageObject("totals")), trend,
-        parsePage(j.usageObject("provider_groups")) { it.keysExactly("provider_id app_type name totals"); UsageProviderGroup(it.string("provider_id"), it.string("app_type"), it.nullString("name"), parseTotals(it.usageObject("totals"))) },
-        parsePage(j.usageObject("model_groups")) { it.keysExactly("model totals"); UsageModelGroup(it.string("model"), parseTotals(it.usageObject("totals"))) })
+        parsePage(j.usageObject("provider_groups")) { it.keysRequired("provider_id app_type name totals"); UsageProviderGroup(it.string("provider_id"), it.string("app_type"), it.nullString("name"), parseTotals(it.usageObject("totals"))) },
+        parsePage(j.usageObject("model_groups")) { it.keysRequired("model totals"); UsageModelGroup(it.string("model"), parseTotals(it.usageObject("totals"))) },
+        j["session_groups"]?.takeUnless { it == JsonNull }?.let { parsePage(it.asUsageObject()) { g ->
+            g.keysRequired("session_id title totals"); UsageSessionGroup(g.string("session_id"), g.nullString("title"), parseTotals(g.usageObject("totals"))) } },
+        j["recent_requests"]?.takeUnless { it == JsonNull }?.let { parseRequests(it.asUsageObject()) })
 }
 private fun validateQuery(j: JsonObject) {
-    j.keysExactly("start_at end_at bucket_edges filters provider_page model_page")
+    j.keysRequired("start_at end_at bucket_edges filters provider_page model_page")
     val start = j.long("start_at"); val end = j.long("end_at")
     val edges = j.usageArray("bucket_edges").map { buildJsonObject { put("edge", it) }.long("edge") }
     require(end > start && end <= 253402300799L && end - start <= 32 * 86400 && edges.size in 2..745 && edges.first() == start && edges.last() == end)
     require(edges.zipWithNext().all { (a, b) -> b > a && b - a <= 27 * 3600 })
     require(edges.zipWithNext().all { (a, b) -> b - a <= 3600 } || edges.size <= 32)
-    val f = j.usageObject("filters"); f.keysExactly("app_type data_source provider_id model status")
+    val f = j.usageObject("filters"); f.keysRequired("app_type data_source provider_id model status")
     require(f.string("app_type") in UsageFilter.apps)
     require(source(f.string("data_source")) != UsageDataSource.CodexSession || f.string("app_type") == "codex")
     require(UsageStatusFilter.entries.any { it.wire == f.string("status") })
-    listOf("provider_id", "model").forEach { k -> f.nullString(k)?.let { require(it.toByteArray(Charsets.UTF_8).size in 1..256 && '\u0000' !in it) } }
-    listOf("provider_page", "model_page").forEach { k -> j.usageObject(k).let { it.keysExactly("offset limit"); UsagePage(it.int("offset"), it.int("limit")) } }
+    listOf("provider_id", "model", "session_id").filter { it in f }.forEach { k -> f.nullString(k)?.let { require(it.toByteArray(Charsets.UTF_8).size in 1..256 && '\u0000' !in it) } }
+    listOf("provider_page", "model_page", "session_page").filter { it in j }.forEach { k -> j.usageObject(k).let { it.keysRequired("offset limit"); UsagePage(it.int("offset"), it.int("limit")) } }
+}
+
+/** Compare declared query fields, accepting legacy omitted defaults and future additive metadata. */
+fun usageQueryMatches(actual: JsonObject, expected: JsonObject): Boolean {
+    fun subset(a: JsonObject, e: JsonObject): Boolean = e.all { (key, value) ->
+        when {
+            a[key] is JsonObject && value is JsonObject -> subset(a[key]!!.jsonObject, value)
+            key !in a && (key == "session_id" && value == JsonNull || key == "session_page" && value == UsagePage().toJson() || key == "request_page" && value == UsageRequestPage().toJson()) -> true
+            else -> a[key] == value
+        }
+    }
+    return subset(actual, expected)
+}
+fun UsageFilter.legacyJson(): JsonObject {
+    val query = toJson()
+    return JsonObject(query - "session_page" - "request_page" + ("filters" to JsonObject(query.getValue("filters").jsonObject - "session_id")))
+}
+private fun parseRequestTokens(j: JsonObject): UsageTokens {
+    j.keysRequired("fresh_input cache_read cache_write output total invalid_rows")
+    return UsageTokens(j.unsigned("fresh_input"), j.unsigned("cache_read"), j.unsigned("cache_write"), j.unsigned("output"), j.unsigned("total"), j.unsigned("invalid_rows"))
+}
+private fun parseRequests(j: JsonObject): UsageRequestDetailsPage {
+    j.keysRequired("items limit has_more next_cursor")
+    val limit = j.int("limit"); require(limit in 1..200)
+    val items = j.usageArray("items").map { e -> e.asUsageObject().let { r ->
+        r.keysRequired("request_id created_at provider_id provider_name model session_id session_title status_code tokens cost_usd ttft_ms latency_ms tokens_per_second")
+        UsageRequestDetail(r.string("request_id"), r.long("created_at"), r.string("provider_id"), r.nullString("provider_name"), r.string("model"),
+            r.nullString("session_id"), r.nullString("session_title"), r.int("status_code"),
+            r["tokens"]?.takeUnless { it == JsonNull }?.let { parseRequestTokens(it.asUsageObject()) },
+            r.nullString("cost_usd")?.also { decimal(it) }, r.nullUnsigned("ttft_ms"), r.nullUnsigned("latency_ms"), r.nullDouble("tokens_per_second"))
+    } }
+    require(items.size <= limit)
+    val cursor = j["next_cursor"]?.takeUnless { it == JsonNull }?.asUsageObject()?.let {
+        it.keysRequired("created_at request_id"); UsageRequestCursor(it.long("created_at"), it.string("request_id"))
+    }
+    val hasMore = j.bool("has_more")
+    require(hasMore == (cursor != null) && (!hasMore || items.isNotEmpty()))
+    if (cursor != null) require(items.last().let { it.createdAt == cursor.createdAt && it.requestId == cursor.requestId })
+    return UsageRequestDetailsPage(items, limit, hasMore, cursor)
+}
+fun parseUsageRequests(json: JsonObject): UsageRequestsResponse {
+    json.keysRequired("schema query result cache"); require(json.long("schema") == 1L)
+    val q = json.usageObject("query").also(::validateQuery)
+    val result = json.usageObject("result"); result.keysRequired("availability source errors data")
+    val infoJson = result.usageObject("source")
+    require(infoJson.string("kind") == "cc_switch" && infoJson.string("table") == "proxy_request_logs")
+    val info = UsageSource(infoJson.string("kind"), infoJson.string("table"), infoJson.string("app_type"), source(infoJson.string("data_source")), infoJson.nullLong("schema_version"))
+    val data = result["data"]?.takeUnless { it == JsonNull }?.asUsageObject()?.let { parseRequests(it.usageObject("requests")) }
+    val availability = result.string("availability")
+    require(availability != "ready" || data != null)
+    return UsageRequestsResponse(q, info, availability, data, parseCache(json.usageObject("cache")))
 }

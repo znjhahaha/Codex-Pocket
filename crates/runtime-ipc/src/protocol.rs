@@ -4,6 +4,9 @@ use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL: u32 = 2;
+/// Combined persistent command + answer history budget. Completed receipts
+/// remain evidence; their count alone is never an unconfirmed-effects count.
+pub const MAX_RECOVERY_RECORDS: usize = 8192;
 #[doc(hidden)]
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ pub struct Health {
     pub active_turns: usize,
     pub pending_requests: usize,
     pub reconciliation_required: bool,
+    /// Optional contract; old Hosts keep the global effect fence.
+    #[serde(default)]
+    pub scoped_admission:u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

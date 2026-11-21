@@ -22,8 +22,13 @@ test('ordinary and resume/fork are ensured, with native display and cwd options'
     assert.equal(classifyLaunch(args,{}).ensure,true,JSON.stringify(args));
 });
 test('explicit and potentially incompatible choices are not changed or ensured',()=>{
-  for(const args of [['--no-daemon'],['-c','key=value'],['-cfoo=bar'],['--config=foo=bar'],['--profile','x'],['-px'],['--sandbox','read-only'],['--enable','feature'],['--search'],['--remote','unix://'],['--strict-config'],['--dangerously-bypass-approvals-and-sandbox'],['--new-unknown-option']])
+  for(const args of [['--no-daemon'],['-c','key=value'],['-cfoo=bar'],['--config=foo=bar'],['--profile','x'],['-px'],['--enable','feature'],['--search'],['--remote','unix://'],['--strict-config'],['--new-unknown-option']])
     assert.equal(classifyLaunch(args,{}).ensure,false,JSON.stringify(args));
+});
+test('per-thread model permission and workspace options retain shared execution',()=>{
+  for(const args of [['--model','custom/model'],['-mcustom/model'],['--sandbox','read-only'],['-sworkspace-write'],
+    ['--ask-for-approval','never'],['-anever'],['--dangerously-bypass-approvals-and-sandbox'],['--approve-for-me'],['--worktree']])
+    assert.equal(classifyLaunch(args,{}).ensure,true,JSON.stringify(args));
 });
 test('management commands bypass preflight and positional prompts are not scanned as command flags',()=>{
   for(const args of [['exec','--no-alt-screen'],['app-server'],['login'],['remote-control'],['--help'],['resume','--help'],['--version']])
@@ -101,6 +106,21 @@ test('installer refuses updated launchers and damaged backups without overwritin
   writeFileSync(path.join(damaged.dir,'.codex2-cli','codex.cmd.original'),'invalid backup');
   assert.notEqual(install(damaged,['-Uninstall','-Apply']).status,0);
   knownEntries.forEach((n,i)=>assert.deepEqual(readFileSync(path.join(damaged.dir,n)),installedBefore[i]));
+});
+
+test('verified wrapper upgrade and npm shim replacement recover without losing originals',()=>{
+  const f=fixture('wrapper-upgrade');assertExit(install(f,['-Apply']));
+  const wrapper=path.join(f.dir,'.codex2-cli','cli-wrapper.mjs');
+  const manifestPath=path.join(f.dir,'.codex2-cli','manifest.json');
+  const manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  const older=readFileSync(wrapper,'utf8')+'\n// earlier verified generation\n';
+  writeFileSync(wrapper,older);manifest.wrapperHash=createHash('sha256').update(older).digest('hex').toUpperCase();
+  writeFileSync(manifestPath,JSON.stringify(manifest));
+  for(const n of knownEntries)writeFileSync(path.join(f.dir,n),f.originals[n]);
+  assertExit(install(f,['-Apply','-Upgrade']));
+  assert.equal(readFileSync(wrapper,'utf8'),readFileSync(path.join(root,'scripts','cli-wrapper.mjs'),'utf8'));
+  assertExit(install(f,['-Uninstall','-Apply']));
+  for(const n of knownEntries)assert.deepEqual(readFileSync(path.join(f.dir,n)),f.originals[n]);
 });
 test('partial install restores prior entries and keeps a usable recovery manifest',()=>{
   const f=fixture('locked-entry');

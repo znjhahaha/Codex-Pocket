@@ -204,8 +204,9 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
                 }
                 PocketMenuItem("在电脑上继续", PocketIcons.Computer, { repo.resume(); onDismiss() }, enabled = actionUnavailableReason(s, "thread/resume") == null)
                 val archived = s.selected?.archived == true
-                PocketMenuItem(if (archived) "恢复会话" else "归档会话", PocketIcons.Inventory2, { s.selected?.let(repo::archive); onDismiss() },
-                    enabled = s.online && s.selected?.conflict == false && !s.uncertainSend && !s.busy && s.supports(if (archived) "thread/unarchive" else "thread/archive"))
+                val archiveReason = s.archiveUnavailableReason()
+                PocketMenuItem(if (archived) "取消归档" else "归档会话", PocketIcons.Inventory2, { s.selected?.let(repo::archive); onDismiss() },
+                    enabled = archiveReason == null, hint = archiveReason)
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
                 QuotaPanel(s, repo)
             }

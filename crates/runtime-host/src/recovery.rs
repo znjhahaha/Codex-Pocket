@@ -1,5 +1,6 @@
 //! Bounded, atomic recovery evidence. Records are reserved before any native write.
 use crate::protocol::{MAX_FRAME, Receipt, key};
+use crate::queries::{PreparedRequest, Queries, read_only};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +14,10 @@ const MAX_STATE: u64 = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 2048;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
-const MAX_RECORDS: usize = 4096;
+// Keep all 4096 legacy receipts, including ones whose original method is no
+// longer knowable, and leave a bounded 4096-record budget for new effects.
+// Queries use a separate volatile cache and cannot consume this budget.
+const MAX_RECORDS: usize = pocket_runtime_ipc::MAX_RECOVERY_RECORDS;
 const MAX_RUNS: usize = 256;
 const MAX_PENDING: usize = 128;
 const PAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -27,6 +31,10 @@ pub(crate) struct CommandRecord {
     pub reply: Option<Value>,
     #[serde(default)]
     pub completed: bool,
+    #[serde(default)]
+    pub scope: Option<crate::admission::Scope>,
+    #[serde(default)]
+    pub method: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -65,6 +73,9 @@ pub(crate) struct Store {
     path: PathBuf,
     // Trusted correlation lives only in this Host generation, never on disk.
     reads: BTreeMap<String, ReadEvidence>,
+    queries: Queries,
+    pub(crate) threads: BTreeMap<String, crate::admission::Scope>,
+    pub(crate) ended_generations: std::collections::BTreeSet<String>,
 }
 
 struct ReadEvidence {
@@ -153,6 +164,8 @@ impl Evidence {
                             digest: None,
                             reply: None,
                             completed: r.completed,
+                            scope: None,
+                            method: None,
                         },
                     )
                 })
@@ -248,6 +261,9 @@ impl Store {
             state,
             path: path.into(),
             reads: BTreeMap::new(),
+            queries: Queries::default(),
+            threads: BTreeMap::new(),
+            ended_generations: Default::default(),
         };
         // Replace legacy plaintext before any new native child can be launched.
         // Never back up the private bodies or reset their uncertain reservations.
@@ -258,6 +274,9 @@ impl Store {
     }
     pub fn begin_generation(&mut self, generation: &str) -> Result<()> {
         if self.state.generation != generation {
+            self.queries = Queries::default();
+            self.reads.clear();
+            self.threads.clear();
             for run in self.state.runs.values_mut().filter(|r| r.state == "active") {
                 run.state = "unknown".into();
             }
@@ -275,16 +294,107 @@ impl Store {
             {
                 record.digest = None;
                 record.reply = None;
+                record.scope = None;
+                record.method = None;
             }
             self.state.generation = generation.into();
         }
         self.save()
+    }
+    /// Called only after the original descriptor's two creation identities end.
+    /// This releases concurrency resources, never the original result receipt.
+    pub(crate) fn release_predecessor(
+        &mut self,
+        previous: &crate::protocol::Descriptor,
+    ) -> Result<()> {
+        ensure!(
+            previous.runtime_id == self.state.runtime_id
+                && previous.generation == self.state.generation,
+            "Predecessor recovery identity mismatch"
+        );
+        for (pid, process) in [
+            (previous.pid, &previous.host_process),
+            (previous.native_pid, &previous.native_process),
+        ] {
+            ensure!(
+                process
+                    .as_ref()
+                    .is_some_and(|p| p.pid == pid && p.created_at != 0 && p.terminated()),
+                "Predecessor process lifetime is not ended"
+            );
+        }
+        self.ended_generations.insert(previous.generation.clone());
+        self.ended_generations.extend(
+            self.state
+                .commands
+                .values()
+                .chain(self.state.answers.values())
+                .map(|r| r.generation.clone()),
+        );
+        self.ended_generations
+            .extend(self.state.runs.values().map(|r| r.generation.clone()));
+        self.ended_generations
+            .extend(self.state.pending.values().map(|r| r.generation.clone()));
+        Ok(())
+    }
+    pub(crate) fn snapshot(&self) -> Value {
+        let mut value = self.state.snapshot();
+        value["releasedGenerations"] = json!(self.ended_generations);
+        value
+    }
+    pub(crate) fn busy_resources(&self) -> bool {
+        let live = |generation: &str| {
+            generation == self.state.generation || !self.ended_generations.contains(generation)
+        };
+        // A reconciliation flag without a verified predecessor still fences.
+        (self.state.reconciliation_required && self.ended_generations.is_empty())
+            || self
+                .state
+                .runs
+                .values()
+                .any(|r| live(&r.generation) && r.state != "completed")
+            || self.state.pending.values().any(|p| live(&p.generation))
+            || self
+                .state
+                .commands
+                .values()
+                .chain(self.state.answers.values())
+                .any(|r| live(&r.generation) && !r.completed)
     }
     pub fn save(&self) -> Result<()> {
         self.state.validate()?;
         let data = serde_json::to_vec(&Evidence::capture(&self.state))?;
         ensure!(data.len() as u64 <= MAX_STATE, "Recovery capacity exceeded");
         pocket_agent::storage::atomic_write(&self.path, &data)
+    }
+    pub fn receipt(&self, id: &str) -> Receipt {
+        // A legacy effect/unknown ID always takes precedence over read caching.
+        if self.state.commands.contains_key(id) {
+            self.state.receipt(id, false)
+        } else {
+            self.queries
+                .receipt(id)
+                .unwrap_or_else(|| self.state.receipt(id, false))
+        }
+    }
+    pub fn reserve_request(&mut self, value: &Value) -> Result<PreparedRequest> {
+        let id = key(&value["id"]).expect("validated request ID");
+        if !self.state.commands.contains_key(&id) && read_only(value) {
+            return self.queries.reserve(value, &self.state.generation);
+        }
+        ensure!(self.queries.receipt(&id).is_none(), "conflict");
+        let scope = self.request_scope(value);
+        let receipt = self.state.reserve(id.clone(), value, false)?;
+        if receipt.is_none() {
+            let r = self.state.commands.get_mut(&id).unwrap();
+            r.scope = scope;
+            r.method = value["method"].as_str().map(str::to_owned);
+        }
+        Ok(PreparedRequest {
+            receipt,
+            native: value.clone(),
+            durable: true,
+        })
     }
     pub fn note_read(&mut self, value: &Value) {
         if value["method"] != "thread/read"
@@ -315,6 +425,8 @@ impl Store {
         );
     }
     pub fn observe_native(&mut self, value: Value) -> Result<Value> {
+        let value = self.queries.observe(value);
+        self.observe_scope(&value)?;
         let read = if value.get("method").is_none() {
             key(&value["id"]).and_then(|id| self.reads.remove(&id))
         } else {
@@ -374,6 +486,71 @@ impl Store {
 }
 
 impl Recovery {
+    /// Digest the persisted allowlist, including identities, even when event
+    /// sequence does not advance for a command/answer completion.
+    pub fn evidence_digest(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(&Evidence::capture(self))?;
+        Ok(Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
+
+    pub fn answer_evidence(
+        &self,
+        generation: &str,
+        offset: usize,
+        snapshot_digest: &str,
+    ) -> Result<pocket_runtime_ipc::client::AnswerEvidencePage> {
+        use pocket_runtime_ipc::client::{
+            ANSWER_EVIDENCE_PAGE_SIZE, AnswerEvidence, AnswerEvidencePage,
+        };
+        ensure!(
+            generation == self.generation && snapshot_digest == self.evidence_digest()?,
+            "Answer evidence snapshot changed"
+        );
+        ensure!(
+            offset <= self.answers.len() && self.answers.len() <= MAX_RECORDS,
+            "Answer evidence offset invalid"
+        );
+        let records = self
+            .answers
+            .iter()
+            .skip(offset)
+            .take(ANSWER_EVIDENCE_PAGE_SIZE)
+            .map(|(id, record)| {
+                let request_id = if let Some(text) = id.strip_prefix("s:") {
+                    json!(text)
+                } else if let Some(number) = id.strip_prefix("n:") {
+                    serde_json::from_str(number)?
+                } else {
+                    anyhow::bail!("Invalid historical answer identity")
+                };
+                ensure!(
+                    key(&request_id).as_ref() == Some(id),
+                    "Historical answer identity is not canonical"
+                );
+                Ok(AnswerEvidence {
+                    generation: record.generation.clone(),
+                    request_id,
+                    completed: record.completed,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let end = offset + records.len();
+        Ok(AnswerEvidencePage {
+            schema: 1,
+            namespace: "answer".into(),
+            runtime_id: self.runtime_id.clone(),
+            generation: self.generation.clone(),
+            snapshot_digest: snapshot_digest.into(),
+            offset,
+            total: self.answers.len(),
+            next_offset: (end < self.answers.len()).then_some(end),
+            records,
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.schema == 1
@@ -508,6 +685,8 @@ impl Recovery {
                 digest: Some(digest),
                 reply: None,
                 completed: false,
+                scope: None,
+                method: None,
             },
         );
         Ok(None)
@@ -576,21 +755,7 @@ impl Recovery {
                 turn_id.len() <= 256 && thread_id.len() <= 256,
                 "Native run identity exceeds budget"
             );
-            let id = format!("{}:{thread_id}:{turn_id}", self.generation);
-            if !self.runs.contains_key(&id) && self.runs.len() >= MAX_RUNS {
-                if let Some(old) = self
-                    .runs
-                    .iter()
-                    .find(|(_, r)| r.state == "completed")
-                    .map(|(id, _)| id.clone())
-                {
-                    self.runs.remove(&old);
-                } else {
-                    ensure!(false, "Run recovery capacity exceeded");
-                }
-            }
-            self.runs.insert(
-                id,
+            self.observe_run(
                 RunRecord {
                     generation: self.generation.clone(),
                     thread_id: thread_id.into(),
@@ -602,7 +767,8 @@ impl Recovery {
                     }
                     .into(),
                 },
-            );
+                true,
+            )?;
         }
         if method == "serverRequest/resolved"
             && let Some(id) = key(&value["params"]["requestId"])
@@ -645,6 +811,27 @@ impl Recovery {
         )
     }
 
+    pub(crate) fn observe_run(&mut self, run: RunRecord, notification: bool) -> Result<()> {
+        let id = format!("{}:{}:{}", run.generation, run.thread_id, run.turn_id);
+        if self.runs.contains_key(&id) && !notification {
+            return Ok(());
+        }
+        if !self.runs.contains_key(&id) && self.runs.len() >= MAX_RUNS {
+            let old = self
+                .runs
+                .iter()
+                .find(|(_, r)| r.state == "completed")
+                .map(|(id, _)| id.clone());
+            if let Some(old) = old {
+                self.runs.remove(&old);
+            } else {
+                anyhow::bail!("Run recovery capacity exceeded");
+            }
+        }
+        self.runs.insert(id, run);
+        Ok(())
+    }
+
     pub fn replay(&self, after: u64, generation: Option<&str>) -> Value {
         let gap = after > self.sequence
             || generation.is_some_and(|g| g != self.generation)
@@ -675,15 +862,253 @@ impl Recovery {
             "reconciliationRequired":self.reconciliation_required})
     }
     pub fn snapshot(&self) -> Value {
+        let unconfirmed_writes = self
+            .commands
+            .values()
+            .chain(self.answers.values())
+            .filter(|record| !record.completed)
+            .count();
+        // receipt() calls every incomplete reservation unknown, even in the
+        // current generation. Completed cold tombstones still count zero.
+        // Runs and pending native requests are separate snapshot evidence.
         json!({"generation":self.generation,"sequence":self.sequence,"reconciliationRequired":self.reconciliation_required,
+            "evidenceDigest":self.evidence_digest().ok(),
             "runs":self.runs.values().collect::<Vec<_>>(),"pendingRequests":self.pending.values().map(|p| if p.request.get("method").is_some() {json!({"generation":p.generation,"request":p.request})} else {json!({"generation":p.generation,"requestId":p.request["id"],"state":"unknown"})}).collect::<Vec<_>>(),
-            "commandCount":self.commands.len(),"answerCount":self.answers.len()})
+            "commandCount":self.commands.len(),"answerCount":self.answers.len(),
+            "unconfirmedWrites":unconfirmed_writes,"unknownOperations":unconfirmed_writes})
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn answer_evidence_pagination_binds_completion_without_event_sequence_or_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let mut store = Store::open(
+            &root.path().join("recovery.json"),
+            "evidence-fixture",
+            &generation,
+        )
+        .unwrap();
+        for id in 0..65 {
+            let key = key(&json!(id)).unwrap();
+            store
+                .state
+                .reserve(
+                    key.clone(),
+                    &json!({"id":id,"result":"private-answer-sentinel"}),
+                    true,
+                )
+                .unwrap();
+            store
+                .state
+                .complete(&key, json!({"id":id,"result":{"written":true}}), true);
+        }
+        let digest = store.state.evidence_digest().unwrap();
+        let first = store
+            .state
+            .answer_evidence(&generation, 0, &digest)
+            .unwrap();
+        assert_eq!(first.records.len(), 64);
+        assert_eq!(first.next_offset, Some(64));
+        let second = store
+            .state
+            .answer_evidence(&generation, 64, &digest)
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert!(second.next_offset.is_none());
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("private-answer-sentinel")
+        );
+        let sequence = store.state.sequence;
+        store
+            .state
+            .reserve("s:new".into(), &json!({"id":"new","result":{}}), true)
+            .unwrap();
+        assert_eq!(store.state.sequence, sequence);
+        assert!(
+            store
+                .state
+                .answer_evidence(&generation, 64, &digest)
+                .is_err()
+        );
+        assert_ne!(store.state.evidence_digest().unwrap(), digest);
+        assert!(
+            store
+                .state
+                .answer_evidence("foreign", 0, &store.state.evidence_digest().unwrap())
+                .is_err()
+        );
+    }
+
     use super::*;
+
+    fn assert_lifecycle_counts(store: &Store, commands: usize, answers: usize, incomplete: usize) {
+        let snapshot = store.state.snapshot();
+        assert_eq!(snapshot["generation"], store.state.generation);
+        assert_eq!(snapshot["sequence"], store.state.sequence);
+        assert_eq!(snapshot["commandCount"], commands);
+        assert_eq!(snapshot["answerCount"], answers);
+        assert_eq!(snapshot["unconfirmedWrites"], incomplete);
+        assert_eq!(snapshot["unknownOperations"], incomplete);
+    }
+
+    #[test]
+    fn lifecycle_snapshot_completed_receipts_count_zero_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        let mut store = Store::open(&path, "fixture", &old).unwrap();
+        assert_lifecycle_counts(&store, 0, 0, 0);
+        for (id, response) in [
+            ("success", json!({"id":"success","result":{}})),
+            ("failure", json!({"id":"failure","error":{"code":"failed"}})),
+            (
+                "evicted",
+                json!({"id":"evicted","result":"x".repeat(MAX_FRAME)}),
+            ),
+        ] {
+            let key = format!("s:{id}");
+            store
+                .state
+                .reserve(key.clone(), &json!({"id":id}), false)
+                .unwrap();
+            store.state.push(response).unwrap();
+            assert_eq!(store.state.receipt(&key, false).state, "completed");
+        }
+        assert_eq!(
+            store.state.receipt("s:evicted", false).response.unwrap()["error"]["code"],
+            "result_evicted"
+        );
+        // A command ID and an answer ID occupy independent receipt maps.
+        store
+            .state
+            .reserve(
+                "s:success".into(),
+                &json!({"id":"success","result":{}}),
+                true,
+            )
+            .unwrap();
+        store.state.complete(
+            "s:success",
+            json!({"id":"success","result":{"written":true}}),
+            true,
+        );
+        assert_lifecycle_counts(&store, 3, 1, 0);
+        assert!(!store.state.busy());
+        store.save().unwrap();
+        let mut cold = Store::open(&path, "fixture", &new).unwrap();
+        cold.begin_generation(&new).unwrap();
+        assert!(
+            cold.state
+                .commands
+                .values()
+                .chain(cold.state.answers.values())
+                .all(|r| r.completed && r.reply.is_none() && r.digest.is_none())
+        );
+        assert_lifecycle_counts(&cold, 3, 1, 0);
+        assert!(!cold.state.busy());
+    }
+
+    #[test]
+    fn lifecycle_snapshot_retains_unknown_receipts_across_generations_and_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        let mut store = Store::open(&path, "fixture", &old).unwrap();
+        for answer in [false, true] {
+            store
+                .state
+                .reserve("s:shared".into(), &json!({"id":"shared"}), answer)
+                .unwrap();
+            store
+                .state
+                .reserve("s:done".into(), &json!({"id":"done"}), answer)
+                .unwrap();
+            store
+                .state
+                .complete("s:done", json!({"id":"done","result":{}}), answer);
+        }
+        assert_lifecycle_counts(&store, 2, 2, 2);
+        store.save().unwrap();
+        let mut cold = Store::open(&path, "fixture", &new).unwrap();
+        cold.begin_generation(&new).unwrap();
+        assert_lifecycle_counts(&cold, 2, 2, 2);
+        for answer in [false, true] {
+            let receipt = cold.state.receipt("s:shared", answer);
+            assert_eq!(receipt.state, "unknown");
+            assert_eq!(receipt.generation, old);
+            cold.state
+                .complete("s:shared", json!({"id":"shared","result":{}}), answer);
+        }
+        let read = json!({"id":"read","method":"thread/read","params":{"threadId":"thread","includeTurns":true}});
+        cold.state.reserve("s:read".into(), &read, false).unwrap();
+        cold.note_read(&read);
+        cold.state
+            .reserve("n:77".into(), &json!({"id":77,"result":{}}), true)
+            .unwrap();
+        assert_lifecycle_counts(&cold, 3, 3, 4);
+        cold.observe_native(json!({"id":"read","result":{"thread":{"id":"thread","turns":[]}}}))
+            .unwrap();
+        assert_lifecycle_counts(&cold, 3, 3, 3);
+        cold.state
+            .complete("n:77", json!({"id":77,"result":{"written":true}}), true);
+        assert_lifecycle_counts(&cold, 3, 3, 2);
+        assert!(cold.state.reconciliation_required && cold.state.busy());
+        cold.save().unwrap();
+        assert_lifecycle_counts(&Store::open(&path, "fixture", &new).unwrap(), 3, 3, 2);
+    }
+
+    #[test]
+    fn lifecycle_snapshot_keeps_runs_and_questions_separate_from_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        let mut store = Store::open(&path, "fixture", &old).unwrap();
+        store.state.push(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"turn"}}})).unwrap();
+        store
+            .state
+            .push(json!({"id":77,"method":"item/tool/requestUserInput","params":{}}))
+            .unwrap();
+        assert_lifecycle_counts(&store, 0, 0, 0);
+        assert!(store.state.busy());
+        store.save().unwrap();
+        let mut cold = Store::open(&path, "fixture", &new).unwrap();
+        cold.begin_generation(&new).unwrap();
+        let snapshot = cold.state.snapshot();
+        assert_eq!(snapshot["runs"][0]["state"], "unknown");
+        assert_eq!(snapshot["pendingRequests"][0]["state"], "unknown");
+        assert_lifecycle_counts(&cold, 0, 0, 0);
+        assert!(cold.state.reconciliation_required && cold.state.busy());
+    }
+
+    #[test]
+    fn lifecycle_snapshot_legacy_migration_preserves_completion_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        let records = json!({
+            "s:done":{"generation":old,"digest":null,"reply":{"id":"done","result":{}}},
+            "s:unknown":{"generation":old,"digest":null,"reply":null}
+        });
+        let legacy = json!({"schema":1,"runtime_id":"fixture","generation":old,"sequence":0,
+            "events":[],"commands":records,"answers":records,"runs":{},"pending":{},"reconciliation_required":false});
+        pocket_agent::storage::atomic_write(&path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut store = Store::open(&path, "fixture", &new).unwrap();
+        store.begin_generation(&new).unwrap();
+        assert_lifecycle_counts(&store, 2, 2, 2);
+        assert_eq!(store.state.receipt("s:done", false).state, "completed");
+        assert_eq!(store.state.receipt("s:done", true).state, "completed");
+        assert_lifecycle_counts(&Store::open(&path, "fixture", &new).unwrap(), 2, 2, 2);
+    }
+
     #[test]
     fn cold_run_requires_correlated_native_identity_and_keeps_unknown_commands_answers() {
         for variant in [

@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.view.PixelCopy
@@ -72,7 +73,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Run this class alone in a fresh instrumentation process with assistantChatDevice=true.
+ * Run each test method alone in a fresh instrumentation process with assistantChatDevice=true.
  * Only AssistantScreen and immutable fixture data are used: no repository, transport, DB or model.
  * PixelCopy targets the Activity window on its actual MuMu display, never UiAutomation's display.
  * The parent run owns all build/install/device commands.
@@ -152,12 +153,43 @@ class AssistantChatDeviceTest {
     }).around(compose)
 
     private class FixtureActivity(private val render: @Composable () -> Unit) : ComponentActivity() {
+        private var contentMounted by mutableStateOf(false)
+        fun mountContent() { contentMounted = true }
         override fun onCreate(savedInstanceState: Bundle?) {
             super.onCreate(savedInstanceState)
             enableEdgeToEdge()
             window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-            setContent(content = render)
+            setContent { if (contentMounted) render() }
         }
+    }
+
+    private fun mountOnDefaultDisplay(scenario: ActivityScenario<ComponentActivity>) {
+        var before = -1
+        var task = -1
+        scenario.onActivity { activity = it; before = it.window.decorView.display?.displayId ?: -1; task = it.taskId }
+        // MuMu can ignore setLaunchDisplayId. Move only the blank, intercepted fixture task,
+        // as AssistantCollaborationDeviceTest does, before Compose and its input connection exist.
+        if (before != android.view.Display.DEFAULT_DISPLAY) {
+            val output = ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(
+                "am display move-stack $task ${android.view.Display.DEFAULT_DISPLAY}"))
+                .bufferedReader().use { it.readText() }
+            measurements += buildJsonObject {
+                put("kind", "fixture_task_display_move"); put("taskId", task)
+                put("beforeDisplayId", before); put("requestedDisplayId", 0); put("result", output)
+            }
+            compose.waitUntil(5_000) {
+                var ready = false
+                scenario.onActivity { activity = it; ready = it.window.decorView.display?.displayId == android.view.Display.DEFAULT_DISPLAY }
+                ready
+            }
+        }
+        scenario.onActivity {
+            activity = it
+            assertEquals("Fixture input and IME must use the verified default display", android.view.Display.DEFAULT_DISPLAY,
+                it.window.decorView.display?.displayId ?: -1)
+            (it as FixtureActivity).mountContent()
+        }
+        compose.waitForIdle()
     }
 
     @Composable private fun FixtureContent() {
@@ -202,7 +234,7 @@ class AssistantChatDeviceTest {
         // Request the default display; report the actual display because emulators may override it.
         val displayOptions=ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle()
         ActivityScenario.launch<ComponentActivity>(Intent(instrumentation.targetContext, MainActivity::class.java),displayOptions).use { activityScenario ->
-            activityScenario.onActivity { activity = it }
+            mountOnDefaultDisplay(activityScenario)
             try {
                 scenario("light_populated_chat") {
                     waitForTail()
@@ -227,7 +259,7 @@ class AssistantChatDeviceTest {
     @Test(timeout = 60_000) fun realKeyboardDoesNotCoverComposer() {
         val options=ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle()
         ActivityScenario.launch<ComponentActivity>(Intent(instrumentation.targetContext,MainActivity::class.java),options).use { scenario ->
-            scenario.onActivity {activity=it}
+            mountOnDefaultDisplay(scenario)
             stage="real_keyboard_geometry"
             try {appearance();verifyRealKeyboard();checks+="real_keyboard_geometry"}
             catch(failure:Throwable) {runCatching {capture("failure")};throw failure}
@@ -350,7 +382,7 @@ class AssistantChatDeviceTest {
     }
 
     private fun history() {
-        compose.runOnIdle { state = populatedState().copy(sendAcknowledgement = state.sendAcknowledgement) }
+        compose.runOnIdle { state = populatedState().copy(sendReceipts = state.sendReceipts) }
         node("assistant-chat-list").performScrollToNode(hasTestTag("assistant-message:history-12"))
         // A real drag establishes reading intent; a programmatic scroll can miss that contract.
         node("assistant-chat-list").performTouchInput {
@@ -451,7 +483,9 @@ class AssistantChatDeviceTest {
 
     private fun acknowledgeSend() {
         compose.runOnIdle {
-            state = state.copy(pendingActions = emptySet(), sendAcknowledgement = state.sendAcknowledgement + 1)
+            val action=actions.last {it.method=="assistant/send"}
+            state = state.copy(pendingActions = emptySet(), sendReceipts=listOf(AssistantSendReceipt(requireNotNull(action.commandId),
+                state.computerId,action.params.string("runtimeId"),state.snapshot?.coordinatorThreadId,"accepted")))
         }
         compose.waitForIdle()
     }
@@ -477,15 +511,23 @@ class AssistantChatDeviceTest {
         val tools = bounds("assistant-tools")
         assertTrue("Tools must not overlap the editor", tools.right <= input.left + 1)
         assertTrue("Editor must not overlap Send", input.right <= send.left + 1)
-        assertTrue("History must stay above the composer", bounds("assistant-chat-list").bottom <= input.top + 2)
+        // The list fills the screen behind glass overlays; content must clear their measured bounds.
+        val transcript = visibleTranscript()
+        assertTrue("Measured chrome must leave room for history", transcript.height > 0)
         measurements += buildJsonObject {
             put("stage", stage); put("screenWidthPx", screen.width)
             put("input", rectangle(input)); put("send", rectangle(send)); put("tools", rectangle(tools))
         }
     }
 
+    private fun visibleTranscript(): Rect {
+        val list = bounds("assistant-chat-list")
+        return Rect(list.left, maxOf(list.top, bounds("assistant-top-chrome").bottom),
+            list.right, minOf(list.bottom, bounds("assistant-bottom-dock").top))
+    }
+
     private fun assertBubbleGeometry() {
-        val viewport = bounds("assistant-chat-list")
+        val viewport = visibleTranscript()
         assertInside("assistant-message:user-todo", viewport)
         assertInside("assistant-message:assistant-result", viewport)
         assertInside("assistant-task:todo", viewport)
@@ -500,9 +542,10 @@ class AssistantChatDeviceTest {
         node(INPUT).fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
 
     private fun waitForTail() {
+        assertTrue("The populated chat fixture must explicitly be prepared", state.snapshot!!.prepared)
         compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-task:todo").fetchSemanticsNodes().isNotEmpty() }
         compose.waitForIdle()
-        node("assistant-task:todo").assertIsDisplayed()
+        assertInside("assistant-task:todo", visibleTranscript())
     }
 
     private fun waitForMarkdown(text: String) = compose.waitUntil(10_000) {
@@ -604,7 +647,7 @@ class AssistantChatDeviceTest {
 
     private fun populatedState(): AssistantUiState = AssistantUiState(
         snapshot = AssistantSnapshot(
-            enabled = true, runtimeId = RUNTIME, coordinatorThreadId = THREAD, paused = false,
+            enabled = true, ready = true, runtimeId = RUNTIME, coordinatorThreadId = THREAD, paused = false,
             settings = AssistantSettings("先给结论，再说明步骤", "直接、清楚", null, "Asia/Shanghai"),
             tasks = listOf(AssistantTask("todo", "核对 Codex Pocket 的设备验收待办", AssistantTaskStatus.Running,
                 "running", false, "正在整理聊天、键盘和历史阅读的检查项。")),

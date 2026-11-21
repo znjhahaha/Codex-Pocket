@@ -29,7 +29,7 @@ import dev.codexpocket.app.data.*
 internal fun actionUnavailableReason(s: PocketState, method: String, idle: Boolean = false): String? = when {
     !s.online -> "连接电脑后可用"
     s.activeRuntime?.online != true -> "等待 Codex 就绪"
-    !s.supports(method) -> "当前 Codex 版本未提供此能力"
+    !s.supports(method) -> missingCapabilityReason(s)
     !s.accessAllowsSending() -> "请先确认会话归属"
     s.selected?.conflict == true -> "先在设备页解决会话归属冲突"
     s.selected?.archived == true -> "恢复此会话后可用"
@@ -37,6 +37,12 @@ internal fun actionUnavailableReason(s: PocketState, method: String, idle: Boole
     s.busy || s.sendBusy -> "当前操作完成后可用"
     idle && s.timeline.activeTurn != null -> "本轮回复结束后可用"
     else -> null
+}
+private fun missingCapabilityReason(s: PocketState): String = when {
+    s.activeRuntime?.role == "desktopFollower" -> "此桌面连接尚未完整接入，请在电脑空闲后重启 Codex"
+    s.activeRuntime?.readinessStage?.let { it != "ready" } == true -> "正在读取 Codex 操作能力"
+    s.activeRuntime?.bridgeUpdatePending == true -> "此会话仍使用旧接入组件，结束当前任务后重启 Codex"
+    else -> "原生运行时尚未提供此操作"
 }
 
 private data class ConversationAction(val title: String, val icon: ImageVector, val reason: String?, val run: () -> Unit)
@@ -87,16 +93,8 @@ internal fun ConversationActionsList(s: PocketState, onDismiss: () -> Unit, onFi
         // The tiles already separate themselves; a divider only belongs under real rows.
         if (ready.isNotEmpty() || fastReason == null) MenuDivider()
         val archived = s.selected?.archived == true
-        val archiveMethod = if (archived) "thread/unarchive" else "thread/archive"
-        val archiveReason = when {
-            !s.online -> "连接电脑后可用"
-            !s.supports(archiveMethod) -> "当前 Codex 版本未提供此能力"
-            s.selected?.conflict != false -> "先在设备页解决会话归属冲突"
-            s.uncertainSend -> "先确认上一条消息的发送结果"
-            s.busy || s.sendBusy -> "当前操作完成后可用"
-            else -> null
-        }
-        PocketMenuItem(if (archived) "恢复会话" else "归档会话", PocketIcons.Inventory2, done(onArchive), enabled = archiveReason == null, hint = archiveReason)
+        val archiveReason = s.archiveUnavailableReason()
+        PocketMenuItem(if (archived) "取消归档" else "归档会话", PocketIcons.Inventory2, done(onArchive), enabled = archiveReason == null, hint = archiveReason)
         if (unavailable.isNotEmpty()) {
             MenuDivider()
             PocketMenuItem("暂不可用 · ${unavailable.size}", null, { showUnavailable = !showUnavailable }, trailing = {

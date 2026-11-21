@@ -105,26 +105,26 @@ function Legacy-Group {
     Add-Process 10 'pocket-supervisor.exe'
     Add-Process 20 'pocket-agent.exe' 10
     Add-Process 30 'cloudflared.exe' 20
-    $script:health=@{protocol=1;computerId='fixture-computer';helperRuntime=@{pid=20;generation=$generation};remoteControlProtocol=1;acceptingWrites=$true;remoteEnabled=$false}
+    $script:health=@{protocol=1;computerId='fixture-computer';helperRuntime=@{pid=20;generation=$generation};remoteControlProtocol=1;acceptingWrites=$true;remoteEnabled=$false;updatedAt=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds();lifecycle=@{observedAt=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds();idle=$true;nativeTasksPreserved=$true;activeTurns=0;pendingQuestions=0;pendingWrites=0;unknownOperations=0}}
 }
 function Remove-TestLifecycle {
     $path=Join-Path $context.InstallRoot 'installer-lifecycle.json'
     if([IO.File]::Exists($path)){[IO.File]::Delete($path)} # test-only disposable journal
 }
-Test 'legacy 0.6.3 stops supervisor before exact children and retains write ledger' {
+Test 'unknown operations defer shutdown and retain the original write ledger' {
     Legacy-Group
     Put (Join-Path $state 'commands.json') '{"unconfirmedWrites":6,"result":"unknown"}'
-    $ledgerHash=Get-PocketFileHash (Join-Path $state 'commands.json')
+    $ledgerHash=Get-PocketFileHash (Join-Path $state 'commands.json');$script:health.lifecycle.unknownOperations=6
     $r=Enter-PocketInstallLifecycle $context.InstallRoot $state $null
-    Assert (($script:stops -join ',') -eq '10,20,30' -and $script:locks -eq 1) 'Legacy group exit order or natural lock proof missing'
-    Assert ($r.mode -eq 'full_process_restart' -and $r.nativeTasksPreserved -eq $false -and $r.phase -eq 'stopped') 'Termination misrepresented as safe handoff'
+    Assert ($script:stops.Count -eq 0 -and $script:locks -eq 0) 'Unknown work caused shutdown'
+    Assert ($r.nativeTasksPreserved -eq $true -and $r.phase -eq 'waiting_idle') 'Unknown work was not deferred'
     Assert ((Get-PocketFileHash (Join-Path $state 'commands.json')) -eq $ledgerHash) 'Unknown write ledger changed'
 }
-Test 'stock 0.6.3 status without runtime stamp uses exact control socket owner' {
+Test 'legacy status without idle evidence defers even with an authenticated socket owner' {
     Remove-TestLifecycle;Legacy-Group
-    $script:health.Remove('helperRuntime')
+    $script:health.Remove('helperRuntime');$script:health.Remove('lifecycle')
     $result=Enter-PocketInstallLifecycle $context.InstallRoot $state $null
-    Assert ($result.phase -eq 'stopped' -and ($script:stops -join ',') -eq '10,20,30') 'Stock legacy status without stamp was rejected'
+    Assert ($result.phase -eq 'waiting_idle' -and $script:stops.Count -eq 0) 'Legacy helper was shut down without idle evidence'
     Remove-TestLifecycle
 }
 Test 'optional discovery warnings cannot replace the required authenticated bridge' {
@@ -212,7 +212,7 @@ Test 'completion restores UI only when requested and requires it in readiness' {
     Remove-TestLifecycle
 }
 Test 'legacy socket owned by another PID cannot authorize a group stop' {
-    Legacy-Group;$script:health.Remove('helperRuntime')
+    Legacy-Group;$script:health.Remove('helperRuntime');$script:health.Remove('lifecycle')
     function Get-PocketInstallControlOwner {return 999}
     Fails {Enter-PocketInstallLifecycle $context.InstallRoot $state $null} 'identity does not match'
     Assert ($script:stops.Count -eq 0) 'Foreign listener caused termination'
@@ -232,6 +232,16 @@ Test 'supervisor-owned tunnel joins full restart while global tunnel stays outsi
     $group=Get-PocketInstallGroup $context.InstallRoot $state
     Assert (@($group|Where-Object {$_.pid -eq 15 -and $_.parentPid -eq 10}).Count -eq 1) 'Supervisor-owned tunnel was omitted'
     Assert (@($group|Where-Object {$_.pid -eq 45}).Count -eq 0) 'Unrelated global tunnel entered restart group'
+}
+Test 'launching the Pocket supervisor from official Codex does not own that desktop' {
+    Legacy-Group
+    Put (Join-Path $testRoot 'native\app\Codex.exe') 'official desktop fixture'
+    Add-Process 5 'Codex.exe' 0 (Join-Path $testRoot 'native\app')
+    Add-Process 8 'pocket-launcher.exe' 5 $context.InstallRoot
+    $script:rows[-1].CommandLine='"'+$script:rows[-1].ExecutablePath+'" --pocket-supervise'
+    $group=Get-PocketInstallGroup $context.InstallRoot $state
+    Assert (@($group | Where-Object {$_.pid -eq 8}).Count -eq 1) 'Owned launcher missing'
+    Assert (@($group | Where-Object {$_.pid -eq 5}).Count -eq 0) 'Background launcher incorrectly claimed the official desktop'
 }
 Test 'only bridge-associated native and desktop ancestry enter the restart group' {
     Legacy-Group
@@ -257,7 +267,7 @@ Test 'authenticated status from another helper is rejected' {
     Fails {Enter-PocketInstallLifecycle $context.InstallRoot $state $null} 'identity does not match'
     Assert ($script:stops.Count -eq 0) 'Wrong authenticated owner was terminated'
 }
-Test 'modern draining handoff is cancelled by exact operation and run before full restart' {
+Test 'draining handoff and unknown writes defer installation without cancelling work' {
     Legacy-Group
     $script:health.handoffCapabilities=@{supported=$true;generation='11111111-1111-4111-8111-111111111111'}
     $script:health.acceptingWrites=$false
@@ -277,8 +287,8 @@ Test 'modern draining handoff is cancelled by exact operation and run before ful
         return $script:health
     }
     $r=Enter-PocketInstallLifecycle $context.InstallRoot $state $null
-    Assert ($r.phase -eq 'stopped' -and $r.cancellations.Count -eq 1 -and $r.cancellations[0].unconfirmedWrites -eq 6) 'Modern cancellation/restart absent'
-    Assert ((Read-PocketRepairJson $path).operations.$op.receipt.phase -eq 'cancelled') 'Cancelled receipt was deleted'
+    Assert ($r.phase -eq 'waiting_idle' -and $script:stops.Count -eq 0) 'Draining handoff caused shutdown'
+    Assert ((Read-PocketRepairJson $path).operations.$op.receipt.phase -eq 'draining') 'Installer cancelled draining work'
     Remove-TestLifecycle;[IO.File]::Delete($path)
 }
 Test 'failed upgrade is archived byte-identically only after exact owner exit' {

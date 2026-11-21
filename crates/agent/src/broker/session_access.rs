@@ -86,6 +86,8 @@ impl AccessOperation {
 #[serde(rename_all = "camelCase")]
 pub(super) struct AccessStore {
     #[serde(default)]
+    pub(super) migrations:BTreeMap<String,super::history_takeover::Migration>,
+    #[serde(default)]
     computer_id: String,
     #[serde(default)]
     pub default_mode: AccessMode,
@@ -103,6 +105,10 @@ pub(super) struct AccessStore {
     released: BTreeSet<(String, String)>,
 }
 impl AccessStore {
+    pub(super) fn select_cli(&mut self,store:&str,thread:&str,state:&std::path::Path)->Result<()> {
+        self.modes.insert(Self::key(store,thread),AccessMode::Cli);
+        self.save(state)
+    }
     pub fn open(state: &std::path::Path, computer: &str) -> Result<Self> {
         let path = state.join("session-access.json");
         let mut value: Self = match std::fs::read(&path) {
@@ -122,7 +128,7 @@ impl AccessStore {
     fn key(store: &str, thread: &str) -> String {
         format!("{store}\0{thread}")
     }
-    fn save(&self, state: &std::path::Path) -> Result<()> {
+    pub(super) fn save(&self, state: &std::path::Path) -> Result<()> {
         storage::atomic_write(
             &state.join("session-access.json"),
             &serde_json::to_vec(self)?,
@@ -237,7 +243,7 @@ impl Broker {
                 None
             }
         };
-        let (store, source, owner, owner_source, online) = {
+        let (store, source, owner, owner_source, online, unloaded_ready) = {
             let state = self.state.lock().await;
             let r = state.runtimes.get(runtime);
             let store = r.map(|r| r.store.clone()).or(fallback).ok_or_else(|| {
@@ -257,24 +263,38 @@ impl Broker {
                 .and_then(|o| state.runtimes.get(&o.runtime_id));
             let owner_source = current.map(|r| r.source.clone());
             let online = current.is_some_and(|r| r.rpc.online() && r.inventory_ready);
+            // History survives a native restart without remaining loaded. A
+            // complete directory with no owner permits an explicit prepare,
+            // never a native write. update_access still proves thread identity
+            // and resolves ownership again before attaching it.
+            let unloaded_ready = matches!(&owner, Err(ResolveError::NoOnlineOwner))
+                && r.is_some_and(|r| !r.role.is_auxiliary() && r.rpc.online()
+                    && r.inventory_ready && r.desktop_initialized != Some(false))
+                && state.runtimes.values().filter(|r| r.store == store
+                    && !r.role.is_auxiliary() && r.rpc.online())
+                    .all(|r| r.inventory_ready && r.desktop_initialized != Some(false));
             (
                 store,
                 r.map(|r| r.source.clone()).unwrap_or_default(),
                 owner,
                 owner_source,
                 online,
+                unloaded_ready,
             )
         };
         let access = self.access.lock().await;
         let key = AccessStore::key(&store, thread);
-        let mode = access.modes.get(&key).copied().unwrap_or_else(|| {
-            if owner_source.as_deref() == Some("cli") {
-                AccessMode::Cli
-            } else {
-                access.default_mode
-            }
-        });
         let operation = access.operations.get(&key);
+        // A failed preparation that never dispatched a resume is not a lease.
+        // Preserve its receipt, while accepting the independently verified owner.
+        let migration = access.migrations.get(&key).filter(|m|m.phase!="ready" && (!online || m.blocks_write()));
+        // Once connected, authority follows the actual native execution owner.
+        // A remembered creation choice must not prohibit another controller.
+        let mode = match owner_source.as_deref() {
+            Some("cli") => AccessMode::Cli,
+            Some("desktop") => AccessMode::Desktop,
+            _ => access.modes.get(&key).copied().unwrap_or(access.default_mode),
+        };
         let owner_id = owner.as_ref().ok().map(|o| o.runtime_id.as_str());
         let conflict = matches!(
             &owner,
@@ -282,20 +302,20 @@ impl Broker {
         );
         let mut phase = operation.map(|o| o.phase.as_str()).unwrap_or(if conflict {
             "blocked"
-        } else if !online {
+        } else if !online && !unloaded_ready {
             "failed"
         } else {
             "ready"
         });
-        if phase == "ready" && !online {
+        if phase == "ready" && !online && !unloaded_ready {
             phase = if conflict { "blocked" } else { "failed" };
         }
-        let ready = phase == "ready"
-            && !conflict
-            && online
-            && owner_source.as_deref() == Some(mode.source());
+        if let Some(m)=migration {phase=match m.phase.as_str(){"queued"=>"waiting_release","attaching"=>"waiting_release",other=>other};}
+        let ready = phase == "ready" && !conflict && online;
         let ownership_reason = ownership_reason(&owner);
-        let reason = ownership_reason.or(operation.and_then(|o| o.reason.as_deref())).or(if !online {
+        let reason = migration.and_then(|m|m.reason.as_deref()).or(ownership_reason).or(operation.and_then(|o| o.reason.as_deref())).or(if unloaded_ready {
+            Some("thread_unloaded")
+        } else if !online {
             Some("runtime_offline")
         } else {
             None
@@ -312,7 +332,8 @@ impl Broker {
             .runtimes
             .iter()
             .filter(|(_, r)| {
-                r.source == "desktop" && r.rpc.online() && store.is_none_or(|s| r.store == s)
+                r.source == "desktop" && !r.role.is_auxiliary() && !matches!(r.role,native::NativeRole::DesktopFollower)
+                    && r.rpc.online() && store.is_none_or(|s| r.store == s)
             })
             .min_by_key(|(_, r)| {
                 (
@@ -325,29 +346,61 @@ impl Broker {
 
     pub(super) async fn ensure_runtime(&self, p: &Value) -> Result<Value> {
         let source = p["source"].as_str().unwrap_or("desktop");
-        let existing = {
-            let state = self.state.lock().await;
-            if source == "desktop" {
-                Self::preferred_desktop(&state, None)
-            } else {
-                state
-                    .runtimes
-                    .iter()
-                    .find(|(_, r)| r.source == "cli" && r.rpc.online() && !matches!(r.role,crate::native::NativeRole::ManagedHost{..}))
-                    .map(|(id, _)| id.clone())
-            }
-        };
+        if source == "cli" {
+            return self.ensure_cli_runtime().await;
+        }
+        let existing = Self::preferred_desktop(&*self.state.lock().await, None);
         if let Some(id) = existing {
             return Ok(json!({"phase":"ready","runtimeId":id,"source":source}));
         }
-        if source != "desktop" {
-            return Err(classify(
-                anyhow::anyhow!("Start the selected native CLI before attaching"),
-                Code::RuntimeOffline,
-            ));
+        if self.state.lock().await.runtimes.values().any(|r|r.rpc.online() && matches!(r.role,native::NativeRole::DesktopFollower)) {
+            return Ok(json!({"phase":"integration_required","runtimeId":null,"source":"desktop",
+                "reason":"adapter_incomplete","recoveryAction":"restart_desktop"}));
         }
         self.launch_desktop_once().await?;
         Ok(json!({"phase":"starting_desktop","runtimeId":null,"source":"desktop"}))
+    }
+
+    async fn ensure_cli_runtime(&self) -> Result<Value> {
+        let _launch = self.cli_launch.try_lock().map_err(|_| classify(
+            anyhow::anyhow!("Codex CLI is already starting"), Code::OperationInProgress,
+        ))?;
+        // A request without a runtime id uses the configured default profile,
+        // never whichever other account happens to finish discovery first.
+        let home = self.config.codex_homes.first().cloned().ok_or_else(|| classify(
+            anyhow::anyhow!("No Codex configuration profile"), Code::RuntimeUnavailable,
+        ))?;
+        let store = storage::config_store(&home).map_err(|err| classify(err, Code::RuntimeUnavailable))?;
+        let existing = self.state.lock().await.runtimes.iter().find_map(|(id, r)| {
+            (matches!(r.role, native::NativeRole::CliDaemon) && r.store == store && r.rpc.online()).then(|| id.clone())
+        });
+        if let Some(id) = existing {
+            return Ok(json!({"phase":"ready","runtimeId":id,"configStoreId":store,"source":"cli"}));
+        }
+        #[cfg(not(windows))]
+        return Err(classify(anyhow::anyhow!("No connected Codex CLI"), Code::RuntimeOffline));
+        #[cfg(windows)]
+        {
+            let profile = tokio::task::spawn_blocking(move || {
+                crate::managed_runtime::discovery::for_cli_home(&home)
+            }).await.map_err(|err| classify(err.into(), Code::RuntimeUnavailable))?
+                .map_err(|err| classify(err, Code::RuntimeUnavailable))?;
+            let status = tokio::time::timeout(Duration::from_secs(18),
+                tokio::process::Command::new(profile.native_binary())
+                    .args(["app-server", "daemon", "start"])
+                    .env("CODEX_HOME", profile.config_home()).env_remove("CODEX_CLI_PATH")
+                    .creation_flags(0x08000000).kill_on_drop(true)
+                    .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()).status()
+            ).await.map_err(|_| classify(anyhow::anyhow!("Codex CLI startup timed out"), Code::RuntimeUnavailable))?
+                .map_err(|err| classify(err.into(), Code::RuntimeUnavailable))?;
+            if !status.success() {
+                return Err(classify(anyhow::anyhow!("Codex CLI startup failed: {status}"), Code::RuntimeUnavailable));
+            }
+            // The normal discovery loop still verifies the peer, schema and
+            // store before publishing a usable runtime. Do not claim readiness here.
+            Ok(json!({"phase":"starting_cli","runtimeId":null,"configStoreId":store,"source":"cli"}))
+        }
     }
 
     async fn launch_desktop_once(&self) -> Result<()> {
@@ -1131,6 +1184,69 @@ mod tests {
     use super::*;
     use crate::broker::tests::{fixture, loaded, peer};
     use crate::native::test_peer::Peer;
+
+    #[tokio::test]
+    async fn rediscovered_owner_is_not_blocked_by_an_undispatched_recovery_failure() {
+        let (_dir, b) = fixture().await;
+        let mut desktop = peer(&b, "new-desktop", "desktop").await;
+        let store = {
+            let mut state = b.state.lock().await;
+            let runtime = state.runtimes.get_mut("new-desktop").unwrap();
+            runtime.loaded.insert("t".into());
+            runtime.inventory_ready = true;
+            runtime.store.clone()
+        };
+        let migration = super::super::history_takeover::Migration {
+            operation_id: "old-recovery".into(), device: "phone".into(), store: store.clone(),
+            thread: "t".into(), phase: "blocked".into(), reason: Some("unknown".into()),
+            runtime: None, native: None,
+        };
+        b.access.lock().await.migrations.insert(AccessStore::key(&store, "t"), migration);
+        let access = b.access_snapshot(&json!({"runtimeId":"new-desktop","threadId":"t"})).await.unwrap();
+        assert_eq!(access["canSend"], true);
+        assert_eq!(access["ownerRuntimeId"], "new-desktop");
+        assert_eq!(access["reason"], Value::Null);
+        assert_eq!(b.access.lock().await.migrations.len(), 1, "retain the original receipt");
+        {
+            let mut access=b.access.lock().await;
+            let old=access.migrations.values_mut().next().unwrap();
+            old.native=Some(NativeProcess{pid:77,created_at:44});
+            old.reason=Some("resume_result_unknown".into());
+        }
+        assert_eq!(b.access_snapshot(&json!({"runtimeId":"new-desktop","threadId":"t"})).await.unwrap()["canSend"],false,
+            "a dispatched resume with unknown result still needs reconciliation");
+        desktop.assert_idle().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_backend_desktop_candidate_never_uses_auxiliary() {
+        let (_dir, b) = fixture().await;
+        let mut browser = peer(&b, "a-browser", "desktop").await;
+        let store = {
+            let mut state = b.state.lock().await;
+            let runtime = state.runtimes.get_mut("a-browser").unwrap();
+            runtime.role = crate::native::NativeRole::DesktopAuxiliary;
+            runtime.store.clone()
+        };
+        {
+            let state = b.state.lock().await;
+            assert_eq!(Broker::preferred_desktop(&state, None), None);
+            assert_eq!(Broker::preferred_desktop(&state, Some(&store)), None);
+        }
+        let mut primary = peer(&b, "z-primary", "desktop").await;
+        let ensured = b.ensure_runtime(&json!({"source":"desktop"})).await.unwrap();
+        assert_eq!(ensured["runtimeId"], "z-primary");
+        assert_eq!(ensured["phase"], "ready");
+        {
+            let state = b.state.lock().await;
+            assert_eq!(Broker::preferred_desktop(&state, Some(&store)), Some("z-primary".into()));
+            assert_eq!(Broker::preferred_desktop(&state, Some("other-store")), None);
+        }
+        primary.offline();
+        assert_eq!(Broker::preferred_desktop(&*b.state.lock().await, Some(&store)), None);
+        browser.assert_idle().await;
+        primary.assert_idle().await;
+    }
 
     async fn handoff_fixture(owned: bool) -> (tempfile::TempDir, Arc<Broker>, Peer, Peer, String) {
         let (dir, b) = fixture().await;

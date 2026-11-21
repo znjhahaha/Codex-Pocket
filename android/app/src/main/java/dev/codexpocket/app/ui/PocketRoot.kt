@@ -36,6 +36,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
@@ -48,6 +49,12 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun PocketRoot(s: PocketState, repo: PocketRepository) { CompositionLocalProvider(LocalPocketGlass provides s.glassEffects,
+    LocalAssistantArtifacts provides remember(repo, s.computerId, s.mediaConnectionEpoch, s.online) {
+        if (!s.online) null else object : AssistantArtifactSource {
+            override val ownerKey = "${s.computerId}:${s.mediaConnectionEpoch}"
+            override suspend fun file(artifact: AssistantArtifact) = repo.assistantArtifactFile(artifact)
+        }
+    },
     LocalImageConnection provides (s.mediaConnectionEpoch to s.online),
     LocalDesktopImages provides remember(repo, s.selected?.key, s.selected?.runtimeId) { s.selected?.let { owner -> object : DesktopImageSource {
         override val ownerKey = "${owner.key.encoded}:${owner.runtimeId}"
@@ -171,14 +178,12 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 AssistantScreen(s.assistant, s.assistantModels,
                     s.runtimes.filter { it.role != "managedHost" || it.id == assistantRuntime }.map { AssistantRuntimeChoice(it.id, "${if (it.role == "managedHost") "助理 CLI" else it.source} · ${it.version}", it.online && s.online) },
-                    (s.chats + s.agentChats).filter { store==null || it.key.configStoreId==store }.map {
-                        AssistantWorkspaceChoice(assistantRuntime ?: it.runtimeId, it.key.nativeId, it.title,
-                            canWrite = s.online && !it.isSubagent, parentThreadId = it.parentThreadId, isSubagent = it.isSubagent)
-                    }.distinctBy { it.threadId }, repo::assistantAction,
+                    s.assistantWorkspaces(), repo::assistantAction,
                     onOpenThread = { runtime, thread -> assistantScope.launch {
                         repo.openAssistantThread(runtime, thread).join()
                         if (repo.state.value.selected?.key?.nativeId == thread) { assistantReturn=true;assistantOpen=false;home=false }
-                    } }, onBack = {assistantOpen=false}, connected=s.online)
+                    } }, onBack = {assistantOpen=false}, connected=s.online,
+                    onProjectSelected = {repo.readAssistantProject(it)})
                 }
                 }
             }
@@ -197,6 +202,8 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 { settings = true; if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }, onAssistant = { assistantOpen=true }) {
                 val insets = LocalHomeContentPadding.current
                 val hasNotice = s.error != null
+                Box(Modifier.fillMaxSize()) {
+                PocketLightPoints(Modifier.matchParentSize(), edgeOnly = true, active = !newChat && !hostSheet)
                 Column(Modifier.fillMaxSize()) {
                     if (hasNotice) Column(Modifier.padding(top = insets.calculateTopPadding())) {
                         s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
@@ -216,6 +223,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                             }
                         }
                     }
+                }
                 }
             } }
             else -> Scaffold(containerColor = Color.Transparent, topBar = {
@@ -291,7 +299,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 onOpen = onOpen, onDraftComment = draftComment, canRead = canRead)
         }
     }
-    if (newChat) NewChatDialog(s, { newChat = false }) { mode, cwd, runtimeId -> createOrigin = s.selected?.key; repo.create(mode, cwd, runtimeId) }
+    if (newChat) NewChatDialog(s, { newChat = false }) { mode, cwd, runtimeId, createDirectory -> createOrigin = s.selected?.key; repo.create(mode, cwd, runtimeId, linkProject = true, createDirectory = createDirectory) }
     LaunchedEffect(s.selected?.key, s.actionStatus["create"]?.loading) {
         if (newChat && s.actionStatus["create"]?.loading != true && s.selected != null && s.selected.key != createOrigin) { newChat = false; home = false }
     }
@@ -341,16 +349,28 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
 
 @Composable
 internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -> Unit, onModels: () -> Unit, compact: Boolean = false, actions: @Composable () -> Unit = {}) {
+    val syncLabel = LocalConversationSyncLabel.current
     val inset by animateDpAsState(if (compact) 6.dp else 14.dp, tween(pocketMotionMillis(220)), label = "header-inset")
     Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 14.dp, vertical = inset).testTag("conversation-header"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         CircleAction(PocketIcons.ArrowBack, stringResource(R.string.open_chats), onBack)
         PocketGlassSurface(onClick = onHost, shape = PocketOval, modifier = Modifier.weight(1f), dense = true) {
             Column(Modifier.heightIn(min = 48.dp).padding(horizontal = 13.dp, vertical = 7.dp), verticalArrangement = Arrangement.Center) {
-                Text(s.selected?.title ?: "Codex", modifier = Modifier.testTag("conversation-title"), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(s.selected?.title ?: "Codex", modifier = Modifier.weight(1f).testTag("conversation-title"), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (compact && syncLabel != null) ConversationSyncStatus(syncLabel, compact = true)
+                }
                 AnimatedVisibility(!compact) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Box(Modifier.size(5.dp).background(if (s.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
-                    Text(s.computerName, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    // Fixed subtitle slot: refresh events never change the transcript's top padding.
+                    val lineHeight = with(LocalDensity.current) { MaterialTheme.typography.labelMedium.lineHeight.toDp() }
+                    androidx.compose.animation.Crossfade(targetState = syncLabel, modifier = Modifier.weight(1f).height(lineHeight),
+                        animationSpec = tween(pocketMotionMillis(140)), label = "header-sync-status") { label ->
+                        if (label != null) ConversationSyncStatus(label)
+                        else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Box(Modifier.size(5.dp).background(if (s.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
+                            Text(s.computerName, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
                     TaskElapsedLabel(s.timeline.activeTurn?.let { s.timeline.turns[it] })
                 }
                 }
@@ -396,46 +416,6 @@ internal fun Notice(text: String, error: Boolean = false, action: String? = null
     }
 }
 @Composable
-private fun NewChatDialog(s: PocketState, onDismiss: () -> Unit, onCreate: (SessionMode, String, String?) -> Unit) {
-    val context = LocalContext.current
-    var mode by rememberSaveable { mutableStateOf(s.sessionPreferences.defaultMode) }
-    val available = sessionRuntimes(s.runtimes, mode).filter { s.supports("thread/start", it) }
-    val preferences = remember { context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE) }
-    var runtimeId by rememberSaveable { mutableStateOf(available.firstOrNull { it.id == preferences.getString("newRuntime", null) }?.id ?: available.firstOrNull()?.id) }
-    LaunchedEffect(mode, available.map { it.id }) { if (available.none { it.id == runtimeId }) runtimeId = available.firstOrNull()?.id }
-    val creating = s.actionStatus["create"]?.loading == true
-    var cwd by rememberSaveable { mutableStateOf(preferences.getString("newCwd", "").orEmpty()) }
-    val projects = remember(s.chats, runtimeId) { s.chats.filter { it.runtimeId == runtimeId }.map { it.cwd }.filter(String::isNotBlank).distinct().take(6) }
-    PocketScreen(context.getString(R.string.start_chat), onDismiss, "选择工作位置，然后开始对话") {
-        Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            SessionModeChoices(mode, !creating) { mode = it }
-            Text(if (mode == SessionMode.Desktop) "在桌面创建并跟随此会话" else "新建由 CLI 独立运行的会话", style = MaterialTheme.typography.bodySmall)
-            Text(context.getString(R.string.choose_runtime), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (available.isEmpty()) Text(if (mode == SessionMode.Desktop && s.supports(BrokerCapability.EnsureRuntime)) "开始时将准备桌面运行环境" else context.getString(R.string.no_runtime))
-            available.forEach { runtime ->
-                PocketActionRow(context.sourceLabel(runtime.source), if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer,
-                    { runtimeId = runtime.id }, subtitle = runtimeVersionLabel(runtime.version), selected = runtime.id == runtimeId, enabled = !creating)
-            }
-            if (projects.isNotEmpty()) {
-                Text(stringResource(R.string.v02_recent_projects), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                projects.forEach { path ->
-                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { cwd = path }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Icon(PocketIcons.FolderOpen, null, Modifier.size(20.dp))
-                        Column(Modifier.weight(1f)) { Text(path.substringAfterLast('\\').substringAfterLast('/')); Text(path, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        if (cwd == path) Icon(PocketIcons.Check, null, Modifier.size(18.dp))
-                    }
-                }
-            }
-            PocketTextField(cwd, { cwd = it }, Modifier.fillMaxWidth(), label = context.getString(R.string.project_folder), placeholder = context.getString(R.string.use_native_default), singleLine = true)
-            Text(stringResource(R.string.v02_existing_worktree), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            s.actionStatus["create"]?.phase?.let { PocketProgressStatus(it) }
-            s.actionStatus["create"]?.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            PocketButton(context.getString(R.string.create), enabled = !creating && s.online &&
-                (available.any { it.id == runtimeId } || (mode == SessionMode.Desktop && s.supports(BrokerCapability.EnsureRuntime))), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), onClick = {
-                preferences.edit().putString("newCwd", cwd).apply()
-                runtimeId?.let { preferences.edit().putString("newRuntime", it).apply() }
-                onCreate(mode, cwd, runtimeId)
-            })
-        }
-    }
+internal fun NewChatDialog(s: PocketState, onDismiss: () -> Unit, onCreate: (SessionMode, String, String?, Boolean) -> Unit) {
+    ProjectCreationForm(s, onDismiss, onCreate)
 }

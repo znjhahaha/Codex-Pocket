@@ -38,7 +38,7 @@ class TranscriptScrollingUiTest {
     private var timeline by mutableStateOf(NativeTimeline())
     private var headerHeight by mutableIntStateOf(48)
 
-    private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null) = runBlocking {
+    private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null, historyNotice: Boolean = false) = runBlocking {
         db = Room.inMemoryDatabaseBuilder(compose.activity, PocketDatabase::class.java).build()
         val storage = object : PairingStorage {
             override fun load(): PairedComputer? = null
@@ -60,7 +60,9 @@ class TranscriptScrollingUiTest {
                     LocalPocketGlassPreferences provides PocketGlassPreferences(false, false, false)) {
                     Surface { ProvideMarkdownRendering {
                         val current by repo.state.collectAsState()
-                        ChatScreen(current.copy(timeline = timeline, conversationCached = true), repo, {}, {}, {},
+                        val displayed=if(historyNotice) current.copy(selected=current.selected?.copy(runtimeId="history:store"),
+                            online=true,error="所选运行环境尚未就绪，请稍后重试",conversationReadSource="persisted",conversationLoadState=ConversationLoadState.Ready) else current
+                        ChatScreen(displayed.copy(timeline = timeline, conversationCached = true), repo, {}, {}, {},
                             header = { Spacer(Modifier.height(headerHeight.dp)) })
                     } }
                 }
@@ -90,6 +92,36 @@ class TranscriptScrollingUiTest {
 
     private fun scrollPosition(): Float = compose.onNodeWithTag("chat-transcript").fetchSemanticsNode()
         .config[SemanticsProperties.VerticalScrollAxisRange].value()
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun historyConnectionKeepsTranscriptAndFloatingComposerAvailable() {
+        content(historyNotice=true)
+        compose.onNodeWithTag("conversation-recovery").assertDoesNotExist()
+        compose.onNodeWithTag("chat-transcript").assertIsDisplayed()
+        compose.onNodeWithTag("composer-surface").assertIsDisplayed()
+        compose.runOnIdle {
+            val view=compose.activity.window.decorView
+            val bitmap=android.graphics.Bitmap.createBitmap(view.width,view.height,android.graphics.Bitmap.Config.ARGB_8888)
+            view.draw(android.graphics.Canvas(bitmap))
+            val file=java.io.File("build/reports/history-status/history-status.png")
+            file.parentFile!!.mkdirs()
+            file.outputStream().use {assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,it))}
+        }
+    }
+
+    @Test fun readingHistoryShrinksTheActualChatComposerAndKeepsItsDraft() {
+        content(savedDraft=DraftEntity(key,text="中文草稿\n第二行",followEnd=true))
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        compose.onNodeWithTag("chat-transcript").performTouchInput {swipeDown()}
+        compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==false}
+        compose.onNodeWithTag("composer-history-preview").assertIsDisplayed()
+        assertEquals("中文草稿\n第二行",repo.state.value.draft?.text)
+        val position=scrollPosition()
+        compose.mainClock.advanceTimeBy(1_000)
+        compose.waitForIdle()
+        assertEquals(position,scrollPosition(),.1f)
+    }
 
     @Test fun firstHistoryProjectionWaitsForContactBeforeRestoringAndPersistingAnchor() {
         val anchor = TimelineItem("turn-12", "message", "agentMessage").key
@@ -242,5 +274,30 @@ class TranscriptScrollingUiTest {
         assertFalse(repo.state.value.draft!!.followEnd)
         compose.onNodeWithContentDescription(compose.activity.getString(dev.codexpocket.app.R.string.jump_latest)).performClick()
         compose.waitUntil(2_000) { repo.state.value.draft?.followEnd == true }
+    }
+
+    @Test fun fastFlingToTailExpandsTheComposerWithoutAnotherGesture() {
+        content(savedDraft=DraftEntity(key,text="快速滑动后保留草稿",followEnd=true))
+        val transcript=compose.onNodeWithTag("chat-transcript")
+        transcript.performTouchInput { swipeDown() }
+        compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==false}
+        // Robolectric's text layout can fit the last ten rows in one viewport.
+        // Start above the boundary so the fling consumes real transcript movement.
+        transcript.performScrollToIndex(8)
+        compose.waitForIdle()
+        compose.onNodeWithTag("composer-history-preview").assertIsDisplayed()
+        val before=transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        val beforePosition=before.value()
+        assertTrue("The fling must start above the tail",beforePosition < before.maxValue())
+        transcript.performTouchInput { swipeUp(durationMillis=60) }
+        try { compose.waitUntil(5_000) {repo.state.value.draft?.followEnd==true} }
+        catch(failure:Throwable) {
+            throw AssertionError("Fast fling stopped at ${scrollPosition()}; draft=${repo.state.value.draft}; " +
+                "transcript=${transcript.fetchSemanticsNode().boundsInRoot}; composer=${compose.onNodeWithTag("composer-surface").fetchSemanticsNode().boundsInRoot}; " +
+                transcript.printToString().take(1800),failure)
+        }
+        assertTrue("The fling must advance the transcript",scrollPosition() > beforePosition)
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        compose.onNodeWithTag("composer-input").assertTextEquals("快速滑动后保留草稿")
     }
 }

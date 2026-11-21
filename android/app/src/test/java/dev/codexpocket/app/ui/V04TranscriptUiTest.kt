@@ -120,7 +120,8 @@ class V04TranscriptUiTest {
         compose.runOnIdle { assertTrue(retried) }
         compose.onNodeWithTag("conversation-skeleton").assertDoesNotExist()
         compose.onNodeWithText("Cached conversation stays readable").assertIsDisplayed()
-        compose.onNodeWithText(compose.activity.getString(R.string.v04_transcript_refreshing)).assertExists()
+        // Refresh feedback lives in the existing header, never in a full-width transcript banner.
+        compose.onNodeWithText(compose.activity.getString(R.string.v04_transcript_refreshing)).assertDoesNotExist()
         compose.onNodeWithText(compose.activity.getString(R.string.offline_history)).assertDoesNotExist()
     }
 

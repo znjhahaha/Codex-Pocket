@@ -35,10 +35,14 @@ class PocketRepositoryTest {
     private val network = MutableSharedFlow<Unit>(extraBufferCapacity = 8)
     private val key = ThreadKey("computer", "store", "t")
     private val otherKey = ThreadKey("computer", "store", "other")
+    private var traceCacheQueries = false
+    private val cacheQueries = CopyOnWriteArrayList<String>()
 
     @Before fun prepare() = runBlocking<Unit> {
         app = ApplicationProvider.getApplicationContext()
-        db = Room.inMemoryDatabaseBuilder(app, PocketDatabase::class.java).build()
+        db = Room.inMemoryDatabaseBuilder(app, PocketDatabase::class.java)
+            .setQueryCallback({ sql, _ -> if (traceCacheQueries && sql.contains("items", ignoreCase = true)) cacheQueries.add(sql) },
+                java.util.concurrent.Executor { it.run() }).build()
         server = BrokerFixture()
         val saved = PairedComputer(ConnectionConfig("wss://fixture.invalid", "room", "fixture-token", "00".repeat(32)), "phone", "fixture-secret", "computer", "Fixture")
         storage = object : PairingStorage {
@@ -70,7 +74,468 @@ class PocketRepositoryTest {
     }
 
     private suspend fun await(predicate: (PocketState) -> Boolean) = withTimeout(5_000) { repo.state.first(predicate) }
+
+    @Test fun persistedHistoryIsBrowsableWithoutAnOnlineNativeRuntime() = runBlocking<Unit> {
+        val diskKey=ThreadKey("computer","store","disk-cli")
+        update { it.copy(capabilities=it.capabilities+"threads/history/read",runtimes=emptyList()) }
+        server.intercept={method,_,_->when(method){
+            "threads/list"->buildJsonObject { put("data",buildJsonArray { add(buildJsonObject {
+                put("id","disk-cli");put("runtimeId","history:store");put("configStoreId","store");put("source","cli");put("name","Saved CLI");put("readable",true)
+            }) });put("nextCursor",JsonNull) }
+            "threads/history/read"->buildJsonObject {
+                put("thread",buildJsonObject {put("id","disk-cli");put("status",buildJsonObject {put("type","notLoaded")})})
+                put("data",buildJsonArray {add(buildJsonObject {put("id","disk-turn");put("status","completed");put("items",buildJsonArray {add(buildJsonObject {put("id","disk-item");put("type","agentMessage");put("text","Saved answer")})})})})
+                put("historyState","ready");put("nextCursor",JsonNull)
+            }
+            else->null
+        }}
+        repo.refresh().join()
+        await { it.chats.any { c->c.key==diskKey } }
+        val before=server.calls.size
+        repo.select(repo.state.value.chats.first {it.key==diskKey}).join()
+        await { it.conversationLoadState==ConversationLoadState.Ready&&it.timeline.items.values.any {i->i.text=="Saved answer"} }
+        assertEquals("persisted",repo.state.value.conversationReadSource)
+        assertFalse(repo.state.value.ownershipVerifiedFor())
+        assertTrue(server.calls.drop(before).none {it.nativeMethod in setOf("thread/start","thread/resume","turn/start")})
+    }
     private suspend fun until(predicate: () -> Boolean) = withTimeout(5_000) { while (!predicate()) delay(10) }
+
+    @Test fun persistedHistoryRebuildsPagingAfterReaderRestartWithoutLosingDraftOrAnchor() = runBlocking<Unit> {
+        val chat=repo.state.value.selected!!.copy(runtimeId="history:store")
+        var epoch="first"
+        update {it.copy(capabilities=it.capabilities+"threads/history/read")}
+        server.intercept={method,params,_->if(method=="threads/history/read") {
+            val cursor=params.string("cursor")
+            if(cursor.isNotBlank()) check(cursor.startsWith("$epoch:")) {"Stale reader cursor"}
+            val end=cursor.substringAfter(':',"12").toInt();val start=(end-params.number("limit").toInt()+1).coerceAtLeast(0)
+            buildJsonObject {
+                put("thread",server.thread("t"));put("historyEpoch",epoch)
+                put("data",buildJsonArray {for(n in end downTo start) add(buildJsonObject {
+                    put("id","turn-$n");put("status","completed");put("items",buildJsonArray {add(buildJsonObject {
+                        put("id","i-$n");put("type","agentMessage");put("text","$epoch-$n")
+                    })})
+                })})
+                put("nextCursor",if(start==0) JsonNull else JsonPrimitive("$epoch:${start-1}"))
+            }
+        }else null}
+        repo.select(chat,true).join();repo.editDraft("保留草稿");repo.scroll(3,24,false,"turn-6:i-6")
+        val draft=repo.state.value.draft
+        epoch="second"
+        val follow=repo.observeConversation(chat.key)
+        try {
+            await {it.timeline.items.values.lastOrNull()?.text=="second-12"}
+            assertEquals(draft,repo.state.value.draft)
+            assertTrue(repo.state.value.nextTurns!!.jsonPrimitive.content.startsWith("second:"))
+            repo.older().join();assertTrue(repo.state.value.historyExhausted)
+            assertEquals(13,repo.state.value.timeline.turns.size)
+            assertNull(repo.state.value.conversationLoadError)
+        }finally {follow.cancelAndJoin()}
+    }
+
+    @Test fun historyRecoveryDeduplicatesAndKeepsUnknownOperationForStatusCheck() = runBlocking<Unit> {
+        update {it.copy(capabilities=it.capabilities+setOf("threads/history/read","threads/takeover","threads/takeover/status"))}
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
+        val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>()
+        server.intercept={method,_,_->when(method){
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            "threads/takeover/status"->buildJsonObject {put("phase",if(release.isCompleted) "blocked" else "absent");if(release.isCompleted) put("reason","resume_result_unknown")}
+            "threads/takeover"->{entered.complete(Unit);release.await();buildJsonObject {put("phase","blocked");put("reason","resume_result_unknown");put("operationId","original")}}
+            else->null
+        }}
+        repo.select(disk,true).join();repo.editDraft("保留原草稿")
+        val first=repo.takeoverHistory();withTimeout(5000) {entered.await()}
+        val second=repo.takeoverHistory();delay(100);release.complete(Unit);first.join();second.join()
+        repo.takeoverHistory().join()
+        assertEquals(1,server.calls.count {it.method=="threads/takeover"})
+        assertEquals("保留原草稿",repo.state.value.draft!!.text)
+        assertFalse(repo.state.value.actionStatus["access:${key.encoded}"]?.loading==true)
+        assertTrue(server.calls.none {it.nativeMethod=="thread/resume"})
+    }
+
+    @Test fun retiredNativeHistoryReadsRetainedRecoveryWithoutStartingAnotherOperation() = runBlocking<Unit> {
+        update {it.copy(capabilities=it.capabilities+setOf("threads/history/read","threads/takeover","threads/takeover/status"))}
+        val disk=repo.state.value.selected!!.copy(runtimeId="retired-native")
+        server.intercept={method,_,_->when(method){
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            "threads/takeover/status"->buildJsonObject {put("phase","waiting_release");put("reason","native_start_unconfirmed");put("operationId","retained")}
+            else->null
+        }}
+        repo.select(disk,true).join()
+        val observer=repo.observeConversation(key)
+        try {
+            await {it.conversationRecovery[key]?.operationId=="retained"}
+            assertTrue(server.calls.none {it.method=="threads/takeover"})
+        } finally {observer.cancelAndJoin()}
+    }
+
+    @Test fun disconnectedRecoveryCanRequeueButUnknownAndTransientErrorsNeverReplay() = runBlocking<Unit> {
+        update {it.copy(capabilities=it.capabilities+setOf("threads/history/read","threads/takeover","threads/takeover/status"))}
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
+        var queued=false
+        var failRead=false
+        server.intercept={method,_,_->when(method){
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            "threads/takeover/status"->{if(failRead) throw WireException("runtime_unavailable","Unavailable")
+                buildJsonObject {put("phase",if(queued) "queued" else "disconnected");put("reason","runtime_restarted")}}
+            "threads/takeover"->{queued=true;buildJsonObject {put("phase","queued");put("operationId","new")}}
+            else->null
+        }}
+        repo.select(disk,true).join();repo.editDraft("保留草稿")
+        repo.takeoverHistory().join();repo.takeoverHistory().join()
+        assertEquals(1,server.calls.count {it.method=="threads/takeover"})
+        failRead=true;repo.takeoverHistory().join()
+        assertNull(repo.state.value.error)
+        assertNotNull(repo.state.value.actionStatus["access:${key.encoded}"]?.error)
+        assertEquals("保留草稿",repo.state.value.draft?.text)
+        assertEquals(1,server.calls.count {it.method=="threads/takeover"})
+    }
+
+    @Test fun existingDesktopHistoryAttachesToOriginalOwnerAndLoadsNativeControlsWithoutResume() = runBlocking<Unit> {
+        update { it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read")) }
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
+        server.intercept={method,params,_->when(method){
+            "threads/control/read"->buildJsonObject {
+                assertEquals("t",params.string("threadId"));put("runtimeId",server.owner)
+                put("runtimes",JsonArray(server.runtimes().map {JsonObject(it.asObject()+ ("role" to buildJsonObject {put("kind","desktopFollower")}))}))
+            }
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            else->null
+        }}
+        val before=server.calls.size
+        repo.select(disk,true).join()
+        await { it.selected?.runtimeId==server.owner && it.nativeSettings.model.known && it.settingsFresh &&
+            it.modelCatalogState==ModelCatalogState.Ready && it.conversationLoadState==ConversationLoadState.Ready }
+        assertTrue(repo.state.value.settingsFresh)
+        assertEquals("persisted",repo.state.value.conversationReadSource)
+        assertTrue(server.calls.drop(before).none {it.nativeMethod in setOf("thread/resume","thread/start","turn/start") || it.commandId!=null})
+    }
+
+    @Test fun openHistoryAutomaticallyAttachesWhenOriginalRuntimeStartsLater() = runBlocking<Unit> {
+        update {it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read"))}
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store",source="cli")
+        val started=java.util.concurrent.atomic.AtomicBoolean(false)
+        server.intercept={method,_,_->when(method){
+            "threads/control/read"->buildJsonObject {
+                put("runtimeId",if(started.get()) JsonPrimitive(server.owner) else JsonNull)
+                put("runtimes",server.runtimes())
+            }
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            else->null
+        }}
+        repo.select(disk,true).join()
+        await {it.selected?.runtimeId=="history:store"&&it.conversationLoadState==ConversationLoadState.Ready}
+        val before=server.calls.size
+        val observe=repo.observeConversation(disk.key)
+        started.set(true)
+        try {
+            await {it.selected?.runtimeId==server.owner&&it.settingsFresh}
+            assertTrue(server.calls.drop(before).none {it.nativeMethod in setOf("thread/start","thread/resume","turn/start")||it.commandId!=null})
+        } finally {observe.cancelAndJoin()}
+    }
+
+    @Test fun nativeRestartReconnectsWhileOldHistoryReadIsLoadingAndPreservesDraft() = runBlocking<Unit> {
+        val previous = repo.state.value.selected!!.copy(runtimeId="retired-desktop")
+        update { it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read"),
+            selected=previous, conversationLoadState=ConversationLoadState.Loading, settingsFresh=false) }
+        repo.editDraft("重连时保留中文草稿")
+        repo.scroll(3, 24, false, "kept-anchor")
+        val draft=repo.state.value.draft
+        server.intercept={method,_,_->when(method) {
+            "threads/control/read"->buildJsonObject {put("runtimeId",server.owner);put("runtimes",server.runtimes())}
+            else->null
+        }}
+        val before=server.calls.size
+        val observer=repo.observeConversation(key)
+        try {
+            await {it.selected?.runtimeId==server.owner && it.settingsFresh && it.conversationLoadState==ConversationLoadState.Ready}
+            assertEquals(draft,repo.state.value.draft)
+            assertTrue(server.calls.drop(before).none {it.commandId!=null || it.nativeMethod in setOf("thread/resume","thread/start","turn/start")})
+        } finally {observer.cancelAndJoin()}
+    }
+
+    @Test fun helperUpgradeReconnectAttachesTheAlreadyOpenHistoryWithoutResume() = runBlocking<Unit> {
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
+        var upgraded=false
+        var attached=false
+        fun runtimes()=JsonArray(server.runtimes().map {JsonObject(it.asObject()+ ("role" to buildJsonObject {put("kind","desktopFollower")}))})
+        update {it.copy(capabilities=it.capabilities+"threads/history/read")}
+        server.intercept={method,_,_->when(method) {
+            "hello"->if(upgraded) buildJsonObject {
+                put("protocol",1);put("computerId","computer");put("computerName","Fixture");put("runtimes",runtimes())
+                put("capabilities",JsonArray((repo.state.value.capabilities+setOf("threads/history/read","threads/control/read")).map(::JsonPrimitive)))
+            }else null
+            "threads/list"->if(!attached) buildJsonObject {put("data",buildJsonArray {add(JsonObject(server.row("t")+mapOf("runtimeId" to JsonPrimitive("history:store"),"source" to JsonPrimitive("desktop"),"configStoreId" to JsonPrimitive("store"))))});put("nextCursor",JsonNull)}else null
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            "threads/control/read"->{attached=true;buildJsonObject {put("runtimeId",server.owner);put("runtimes",runtimes())}}
+            else->null
+        }}
+        repo.select(disk,true).join()
+        await {it.selected?.runtimeId=="history:store"&&it.conversationLoadState==ConversationLoadState.Ready}
+        val before=server.calls.size
+        upgraded=true
+        server.links.last().close()
+        network.emit(Unit)
+        try { await {it.online&&it.selected?.runtimeId==server.owner&&it.settingsFresh&&it.nativeSettings.model.known} }
+        catch(failure:TimeoutCancellationException) {throw AssertionError("Upgrade control: attached=$attached selected=${repo.state.value.selected?.runtimeId} online=${repo.state.value.online} fresh=${repo.state.value.settingsFresh} phase=${repo.state.value.connectionPhase} calls=${server.calls.drop(before).map {it.method+':'+it.nativeMethod}} diagnostics=${repo.connectionDiagnostics()}",failure)}
+        assertTrue(attached)
+        assertTrue(server.calls.drop(before).none {it.nativeMethod in setOf("thread/resume","thread/start","turn/start") || it.commandId!=null})
+    }
+
+    @Test fun helperRestartReattachesSelectedControlBeforeReadingPermissionsAndKeepsDraft() = runBlocking<Unit> {
+        val capabilities = repo.state.value.capabilities + "threads/control/read"
+        var attached = true
+        var generation = "first"
+        server.intercept = { method, params, _ -> when (method) {
+            "hello" -> buildJsonObject {
+                put("protocol", 1); put("computerId", "computer"); put("computerName", "Fixture")
+                put("runtimes", server.runtimes()); put("capabilities", JsonArray(capabilities.map(::JsonPrimitive)))
+            }
+            "threads/control/read" -> {
+                assertEquals(key.nativeId, params.string("threadId"))
+                attached = true
+                buildJsonObject { put("runtimeId", server.owner); put("runtimes", server.runtimes()) }
+            }
+            "thread/permissions/read" -> {
+                if (!attached) throw WireException("offline", "Follower subscription lost after helper restart")
+                buildJsonObject {
+                    put("runtimeId", server.owner); put("threadId", key.nativeId); put("status", "ready")
+                    put("revision", generation); put("currentPresetId", "full"); put("currentLabel", "完全访问权限")
+                    put("presets", buildJsonArray {})
+                }
+            }
+            else -> null
+        } }
+        repo.refreshPermissions().join()
+        assertEquals(JsonPrimitive("first"), repo.state.value.permissions.revision)
+        repo.editDraft("保留草稿🙂")
+        repo.scroll(3, 42, false, "kept-anchor")
+        val draft = repo.state.value.draft
+        val selected = repo.state.value.selected!!.key
+        val before = server.calls.size
+        attached = false; generation = "restarted"
+        server.links.last().close(); network.emit(Unit)
+        await { it.online && it.permissions.revision == JsonPrimitive("restarted") }
+        assertTrue(attached)
+        assertEquals(selected, repo.state.value.selected!!.key)
+        assertEquals(draft, repo.state.value.draft)
+        assertNull(repo.state.value.permissions.error)
+        assertTrue(server.calls.drop(before).none { it.nativeMethod in setOf("thread/resume", "thread/start", "turn/start") || it.commandId != null })
+    }
+
+    @Test fun persistedLargeHistoryRefreshUsesTailPagesAndIncrementalCacheWithoutLosingOldItems() = runBlocking<Unit> {
+        val chat = ChatEntity(ThreadKey("computer", "store", "large-external"), "history:store", "desktop", "Large history", "", "", 1, "", false)
+        val revision = AtomicInteger(0)
+        val latest = AtomicInteger(37)
+        val pageLimits = CopyOnWriteArrayList<Int>()
+        fun count(turn: Int) = when (turn) { 37 -> 316; 36 -> 84; in 0..35 -> 100; else -> 1 }
+        fun nativeTurn(turn: Int) = buildJsonObject {
+            put("id", "turn-$turn"); put("status", if (turn == latest.get()) "inProgress" else "completed")
+            put("items", buildJsonArray { repeat(count(turn)) { item -> add(buildJsonObject {
+                put("id", "item-$item"); put("type", if (item % 2 == 0) "commandExecution" else "agentMessage")
+                if (item % 2 == 0) put("command", "echo recorded")
+                put(if (item % 2 == 0) "aggregatedOutput" else "text", "turn-$turn/item-$item:" + "recorded output ".repeat(256) +
+                    if (turn == latest.get() && item == count(turn) - 1) " revision-${revision.get()}" else "")
+            }) } })
+        }
+        update { it.copy(capabilities = it.capabilities + "threads/history/read") }
+        server.intercept = { method, params, _ -> if (method == "threads/history/read") {
+            val limit = params.number("limit").toInt(); pageLimits.add(limit)
+            val end = params.string("cursor").toIntOrNull() ?: latest.get()
+            val start = (end - limit + 1).coerceAtLeast(0)
+            // Exercise the serialization boundary, not shared in-memory fixture trees.
+            pocketJson.parseToJsonElement(buildJsonObject {
+                put("thread", buildJsonObject { put("id", chat.key.nativeId) })
+                put("data", JsonArray((end downTo start).map(::nativeTurn)))
+                put("nextCursor", if (start == 0) JsonNull else JsonPrimitive((start - 1).toString()))
+            }.toString())
+        } else null }
+        repo.select(chat).join()
+        withTimeout(60_000) { while (!repo.state.value.historyExhausted) repo.older().join() }
+        assertEquals(4_000, repo.state.value.timeline.items.size)
+        repo.editDraft("Keep my draft")
+        repo.scroll(21, 42, false, "turn-0:item-20")
+        val draft = repo.state.value.draft
+        val oldest = repo.state.value.timeline.items.values.first()
+        val unchangedTail = repo.state.value.timeline.items.values.first { it.turnId == "turn-37" }
+        val before = server.calls.size
+        pageLimits.clear(); cacheQueries.clear(); traceCacheQueries = true
+        val follow = repo.observeConversation(chat.key)
+        try {
+            for (version in 1..3) {
+                revision.set(version)
+                withTimeout(30_000) { repo.state.first { it.timeline.items.values.last().text.endsWith("revision-$version") } }
+            }
+            assertTrue("Refresh must read the latest turn, not reparse the full first page: $pageLimits", pageLimits.all { it == 1 })
+            assertTrue("Saving history must not materialize all cached text/raw again: $cacheQueries",
+                cacheQueries.none { it.startsWith("SELECT * FROM items", ignoreCase = true) })
+            assertTrue("Only changed rows should be written", cacheQueries.count { it.startsWith("INSERT", true) || it.startsWith("UPDATE", true) } <= 6)
+            assertSame("Old pages remain shared, not reconstructed", oldest, repo.state.value.timeline.items.values.first())
+            assertSame("Unchanged items in the refreshed turn must retain their text and raw trees", unchangedTail,
+                repo.state.value.timeline.items[unchangedTail.key])
+            assertEquals(draft, repo.state.value.draft)
+            // Two turns arrive between polls. Read through to turn 37 so its final state is updated.
+            latest.set(39); revision.set(4)
+            withTimeout(30_000) { repo.state.first { it.timeline.turns["turn-39"] != null } }
+            assertEquals(4_002, repo.state.value.timeline.items.size)
+            assertEquals("completed", repo.state.value.timeline.turns.getValue("turn-37").status)
+            assertEquals("completed", repo.state.value.timeline.turns.getValue("turn-38").status)
+            assertEquals("inProgress", repo.state.value.timeline.turns.getValue("turn-39").status)
+            assertEquals(draft, repo.state.value.draft)
+            assertTrue(repo.state.value.historyExhausted)
+            assertTrue(server.calls.drop(before).none { it.method == "codex/request" || it.commandId != null })
+            // An authoritative revert removes the newer branch while retaining the older pages.
+            latest.set(37); revision.set(5)
+            withTimeout(30_000) { repo.state.first { it.timeline.items.size == 4_000 && it.timeline.items.values.last().text.endsWith("revision-5") } }
+            assertEquals("inProgress", repo.state.value.timeline.turns.getValue("turn-37").status)
+            assertFalse("Reverted turns must not survive in the reader", repo.state.value.timeline.turns.containsKey("turn-39"))
+            assertEquals(draft, repo.state.value.draft)
+            println("large-history: items=4000 latestTurnItems=316 refreshes=5 heapLimitMiB=${Runtime.getRuntime().maxMemory() / 1024 / 1024} textChars=${repo.state.value.timeline.items.values.sumOf { it.text.length.toLong() }}")
+        } finally { follow.cancelAndJoin(); traceCacheQueries = false }
+        val headers = db.dao().itemHeaders(chat.key)
+        assertEquals(4_000, headers.size)
+        assertEquals(4_000, headers.map { it.itemKey }.distinct().size)
+        assertEquals((0L..3999L).toList(), headers.map { it.ordinal })
+    }
+
+    @Test fun persistedReaderDoesNotRequestRuntimeAccessOnReconnectOrMetadataRefresh() = runBlocking<Unit> {
+        val chat=ChatEntity(ThreadKey("computer","store","external"),"history:store","desktop","External","","",1,"",false)
+        update { it.copy(capabilities=it.capabilities+setOf("threads/history/read","thread/access/read")) }
+        server.intercept={method,params,_->
+            if(params.string("runtimeId").startsWith("history:")) throw WireException("runtime_offline","Runtime not available")
+            if(method=="threads/history/read") buildJsonObject {
+                put("thread",buildJsonObject {put("id","external")});put("data",JsonArray(emptyList()));put("nextCursor",JsonNull)
+            } else null
+        }
+        repo.select(chat).join()
+        val before=server.calls.size
+        // The reconnect and foreground refresh paths invoke these independently of select().
+        repo.refreshThreadAccess().join()
+        repo.refreshPermissions().join()
+        repo.refreshContext().join()
+        repo.refreshModels().join()
+        repo.refreshAgentNames().join()
+        assertNull("A readable history thread has no native access endpoint",repo.state.value.error)
+        assertTrue(server.calls.drop(before).none {it.params.string("runtimeId").startsWith("history:")})
+        assertEquals(ConversationLoadState.Ready,repo.state.value.conversationLoadState)
+        assertFalse(repo.state.value.ownershipVerifiedFor())
+    }
+
+    @Test fun persistedReadFailureRemainsVisibleAfterUnavailableMetadataIsSkipped() = runBlocking<Unit> {
+        val chat=ChatEntity(ThreadKey("computer","store","external"),"history:store","desktop","External","","",1,"",false)
+        update { it.copy(capabilities=it.capabilities+setOf("threads/history/read","thread/access/read")) }
+        server.intercept={method,_,_->if(method=="threads/history/read") throw WireException("native_history_unavailable","Unreadable") else null}
+        repo.select(chat).join()
+        repo.refreshThreadAccess().join()
+        assertEquals(ConversationLoadState.Failed,repo.state.value.conversationLoadState)
+        assertFalse(repo.state.value.conversationLoadError.isNullOrBlank())
+    }
+
+    @Test fun persistedConversationFollowsExternalProgressWithoutTakingOwnership() = runBlocking<Unit> {
+        val chat = ChatEntity(ThreadKey("computer", "store", "external"), "history:store", "desktop", "Project conversation", "", "D:/project", 1, "", false)
+        val revision = AtomicInteger(0)
+        update { it.copy(capabilities = it.capabilities + "threads/history/read") }
+        server.intercept = { method, params, _ -> if (method == "threads/history/read") {
+            assertEquals("external", params.string("threadId"))
+            buildJsonObject {
+                put("thread", buildJsonObject { put("id", "external") })
+                put("data", buildJsonArray { add(buildJsonObject {
+                    put("id", "external-turn"); put("status", if (revision.get() == 0) "inProgress" else "completed")
+                    put("items", buildJsonArray { add(buildJsonObject { put("id", "answer"); put("type", "agentMessage"); put("text", "Progress ${revision.get()}") }) })
+                }) }); put("nextCursor", JsonNull)
+            }
+        } else null }
+        repo.select(chat).join()
+        val before = server.calls.size
+        // The screen owns this job; leaving the screen stops its reads.
+        val follow = repo.observeConversation(chat.key)
+        revision.set(1)
+        try {
+            await { it.timeline.items.values.any { item -> item.text == "Progress 1" } }
+            assertNull(repo.state.value.timeline.activeTurn)
+            assertTrue(server.calls.drop(before).none { it.method == "codex/request" || it.commandId != null })
+        } finally { follow.cancelAndJoin() }
+    }
+
+    @Test fun persistedRefreshKeepsOlderPagesAndDraftWhileReplacingTheLiveTurn() = runBlocking<Unit> {
+        val chat = ChatEntity(ThreadKey("computer", "store", "external"), "history:store", "desktop", "Project conversation", "", "D:/project", 1, "", false)
+        val revision = AtomicInteger(0)
+        fun turn(id: String, text: String) = buildJsonObject {
+            put("id", id); put("status", "completed"); put("items", buildJsonArray { add(buildJsonObject { put("id", "answer"); put("type", "agentMessage"); put("text", text) }) })
+        }
+        update { it.copy(capabilities = it.capabilities + "threads/history/read") }
+        server.intercept = { method, params, _ -> if (method == "threads/history/read") buildJsonObject {
+            put("thread", buildJsonObject { put("id", "external") })
+            val older = params["cursor"] != null
+            put("data", JsonArray(if (older) listOf(turn("old", "Older answer")) else listOf(turn("live", "Progress ${revision.get()}"))))
+            put("nextCursor", if (older) JsonNull else JsonPrimitive("older"))
+        } else null }
+        repo.select(chat).join(); repo.older().join()
+        repo.scroll(3, 42, false, "saved-anchor")
+        val draft = repo.state.value.draft
+        val follow = repo.observeConversation(chat.key)
+        revision.set(1)
+        try {
+            await { it.timeline.items.values.any { item -> item.text == "Progress 1" } }
+            assertEquals(listOf("Older answer", "Progress 1"), repo.state.value.timeline.items.values.map { it.text })
+            assertEquals(draft, repo.state.value.draft)
+            assertTrue(repo.state.value.historyExhausted)
+        } finally { follow.cancelAndJoin() }
+        repo.select(repo.state.value.chats.first { it.key == key }).join()
+        repo.select(chat).join()
+        assertEquals(listOf("Older answer", "Progress 1"), repo.state.value.timeline.items.values.map { it.text })
+        assertEquals(draft, repo.state.value.draft)
+        assertTrue(repo.state.value.historyExhausted)
+    }
+
+    @Test fun persistedProgressReplyCannotReplaceAnotherSelectedConversation() = runBlocking<Unit> {
+        val chat = ChatEntity(ThreadKey("computer", "store", "external"), "history:store", "desktop", "Project conversation", "", "D:/project", 1, "", false)
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val reads = AtomicInteger()
+        update { it.copy(capabilities = it.capabilities + "threads/history/read") }
+        server.intercept = { method, _, _ -> if (method == "threads/history/read") {
+            if (reads.incrementAndGet() > 1) { entered.complete(Unit); release.await() }
+            buildJsonObject { put("thread", buildJsonObject { put("id", "external") }); put("data", buildJsonArray {}); put("nextCursor", JsonNull) }
+        } else null }
+        repo.select(chat).join()
+        val follow = repo.observeConversation(chat.key)
+        try {
+            withTimeout(5_000) { entered.await() }
+            repo.select(repo.state.value.chats.first { it.key == key }).join()
+            release.complete(Unit)
+            follow.join()
+            assertEquals(key, repo.state.value.selected?.key)
+            assertEquals("native", repo.state.value.conversationReadSource)
+            assertEquals(ConversationLoadState.Ready, repo.state.value.conversationLoadState)
+        } finally { release.complete(Unit); follow.cancelAndJoin() }
+    }
+
+    @Test fun persistedRefreshBridgesNewPagesBeforeAppendingAndKeepsItsOldestCursor() = runBlocking<Unit> {
+        val chat = ChatEntity(ThreadKey("computer", "store", "external"), "history:store", "desktop", "Project conversation", "", "D:/project", 1, "", false)
+        val advanced = AtomicInteger()
+        update { it.copy(capabilities = it.capabilities + "threads/history/read") }
+        server.intercept = { method, params, _ -> if (method == "threads/history/read") {
+            val ids = when {
+                advanced.get() == 0 -> listOf("old")
+                params.string("cursor") == "bridge" -> listOf("middle", "old")
+                else -> listOf("new")
+            }
+            buildJsonObject {
+                put("thread", buildJsonObject { put("id", "external") })
+                put("data", JsonArray(ids.map { id -> buildJsonObject {
+                    put("id", id); put("status", "completed"); put("items", buildJsonArray { add(buildJsonObject { put("id", "answer"); put("type", "agentMessage"); put("text", id) }) })
+                } }))
+                put("nextCursor", if (advanced.get() > 0 && params["cursor"] == null) JsonPrimitive("bridge") else JsonNull)
+            }
+        } else null }
+        repo.select(chat).join()
+        advanced.set(1)
+        val follow = repo.observeConversation(chat.key)
+        try {
+            await { it.timeline.items.values.any { item -> item.text == "new" } }
+            assertEquals(listOf("old", "middle", "new"), repo.state.value.timeline.items.values.map { it.text })
+            assertTrue(repo.state.value.historyExhausted)
+        } finally { follow.cancelAndJoin() }
+    }
     private fun call(name: String): Job = PocketRepository::class.java.getMethod(name).invoke(repo) as Job
     @Suppress("UNCHECKED_CAST") private fun update(transform: (PocketState) -> PocketState) {
         val field = PocketRepository::class.java.getDeclaredField("_state").apply { isAccessible = true }
@@ -2075,6 +2540,55 @@ class PocketRepositoryTest {
         val job = repo.refresh(); withTimeout(5_000) { entered.await() }; job.cancelAndJoin()
         assertFalse(repo.state.value.directoryLoading); assertFalse(repo.state.value.directoryRefreshing)
         assertTrue(repo.state.value.online)
+    }
+
+    @Test fun lateRuntimeReadCannotOverwriteReadyNotification() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val held = AtomicInteger()
+        val older = buildJsonObject { put("data", server.runtimes()) }
+        server.intercept = { method, _, _ ->
+            if (method == "runtimes/list" && held.incrementAndGet() == 1) {
+                entered.complete(Unit); release.await(); older
+            } else null
+        }
+        val refreshing = repo.refresh()
+        withTimeout(5_000) { entered.await() }
+        server.owner = "ready-runtime"
+        server.notify("runtimes/changed", buildJsonObject { put("data", server.runtimes()) })
+        await { it.runtimes.singleOrNull()?.id == "ready-runtime" }
+        release.complete(Unit)
+        refreshing.join()
+        assertEquals("ready-runtime", repo.state.value.runtimes.single().id)
+    }
+
+    @Test fun returningToForegroundRefreshesRuntimeWithoutReplacingHealthyLink() = runBlocking<Unit> {
+        repo.setWatch(true)
+        repo.setForeground(false)
+        val link = server.links.last()
+        val before = server.calls.count { it.method == "runtimes/list" }
+        repo.setForeground(true)
+        until { server.calls.count { it.method == "runtimes/list" } > before }
+        assertSame(link, server.links.last())
+        assertTrue(repo.state.value.online)
+    }
+
+    @Test fun lateOwnershipRecheckCannotOverwriteReadyRuntimeNotification() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val held = AtomicInteger()
+        val older = buildJsonObject { put("data", server.runtimes()) }
+        server.intercept = { method, _, _ ->
+            if (method == "runtimes/list" && held.incrementAndGet() == 1) {
+                entered.complete(Unit); release.await(); older
+            } else null
+        }
+        val checking = repo.recheckThreadOwnership()
+        withTimeout(5_000) { entered.await() }
+        server.owner = "ready-runtime"
+        server.notify("runtimes/changed", buildJsonObject { put("data", server.runtimes()) })
+        await { it.runtimes.singleOrNull()?.id == "ready-runtime" }
+        release.complete(Unit); checking.join()
+        assertEquals("ready-runtime", repo.state.value.runtimes.single().id)
     }
 
     private class BrokerFixture {

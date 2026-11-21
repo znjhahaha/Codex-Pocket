@@ -322,6 +322,22 @@ pub enum Failure {
     StorageUnavailable,
 }
 
+/// A sharing/byte-range lock is temporary evidence unavailability. Permission,
+/// schema, identity and digest failures are deliberately not retryable here.
+pub(crate) fn file_contention(error: &anyhow::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(32 | 33)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Heartbeat diagnostics contain no capability token and make no handoff claim.
 #[derive(Default)]
 pub struct Gate {
@@ -355,6 +371,17 @@ impl Gate {
             ProcessIdentity::capture,
             presence,
         );
+    }
+    #[cfg(test)]
+    pub(crate) fn test_poll_with(
+        &mut self,
+        state: &Path,
+        generation: Option<&str>,
+        child_pid: Option<u32>,
+        capture: impl Fn(u32) -> Result<ProcessIdentity>,
+        probe: impl Fn(&ProcessIdentity) -> Presence,
+    ) {
+        self.poll_with(state, generation, child_pid, capture, probe);
     }
     fn poll_with(
         &mut self,
@@ -447,6 +474,7 @@ impl Gate {
         })
         .map_err(|_| Failure::JournalInvalid)?;
         let mut error = None;
+        let mut consume_request = true;
         let has_request = present(&mailbox)?;
         if has_request {
             let request: Request = read_private(&mailbox).map_err(|_| Failure::RequestRejected)?;
@@ -463,14 +491,37 @@ impl Gate {
             }) && request.action != Action::Cancel
             {
                 error = Some(Failure::RequestRejected);
-            } else if request.action == Action::Release
-                && super::upgrade::local::release_proven(state, &request).is_err()
-            {
-                error = Some(Failure::RequestRejected);
-            } else if transition(&mut next, Some(&request), &observed, probe).is_err() {
-                error = Some(Failure::RequestRejected);
             } else {
-                journal = next;
+                let proof = if request.action == Action::Release {
+                    super::upgrade::local::release_proven(state, &request)
+                } else {
+                    Ok(())
+                };
+                match proof {
+                    Err(failure) if file_contention(&failure) => {
+                        // Keep the exact durable intent and owned respawn fence.
+                        // Next poll repeats every identity/receipt/hash check;
+                        // temporary unreadability is never a release permission.
+                        consume_request = false;
+                        error = Some(Failure::StorageUnavailable);
+                    }
+                    Err(failure) => {
+                        let _ = release_diagnostic(state, &request, "proof", "release_proof", &failure,
+                            serde_json::json!({"upgradePhase":operation.as_ref().map(|s| s.phase)}));
+                        error = Some(Failure::RequestRejected);
+                    }
+                    Ok(()) => {
+                        if let Err(failure) = transition(&mut next, Some(&request), &observed, probe) {
+                            if request.action == Action::Release {
+                                let _ = release_diagnostic(state, &request, "transition", "release_transition", &failure,
+                                    serde_json::json!({"observedSupervisor":supervisor,"observedChild":child,"generation":generation}));
+                            }
+                            error = Some(Failure::RequestRejected);
+                        } else {
+                            journal = next;
+                        }
+                    }
+                }
             }
         }
         // Intent is durable BEFORE the loop observes the new respawn gate.
@@ -482,7 +533,7 @@ impl Gate {
             )
             .map_err(|_| Failure::StorageUnavailable)?;
         }
-        if has_request {
+        if has_request && consume_request {
             std::fs::remove_file(&mailbox).map_err(|_| Failure::StorageUnavailable)?;
         }
         Ok((journal, error))
@@ -552,7 +603,7 @@ pub(crate) fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<()> 
 }
 pub(crate) fn open_private(path: &Path) -> Result<File> {
     storage::unredirected(path)?;
-    let file = File::open(path)?;
+    let file = storage::open_physical(path)?;
     ensure!(
         file.metadata()?.is_file(),
         "Maintenance capability must be a file"
@@ -564,7 +615,7 @@ pub(crate) fn open_private(path: &Path) -> Result<File> {
 /// Mailbox/journal authentication continues to require only the current user.
 pub(crate) fn open_agent_private(path: &Path) -> Result<File> {
     storage::unredirected(path)?;
-    let file = File::open(path)?;
+    let file = storage::open_physical(path)?;
     ensure!(
         file.metadata()?.is_file(),
         "Agent capability must be a file"
@@ -585,6 +636,42 @@ pub(crate) fn presence(expected: &ProcessIdentity) -> Presence {
         Ok(_) => Presence::Gone,
         Err(_) => Presence::Unknown,
     }
+}
+
+/// Diagnostic only: fixed classifications and query-only OS identities. Never
+/// serialize errors, capability files, RPC replies or handoff checkpoints.
+pub(crate) fn identity_evidence(expected: &ProcessIdentity) -> serde_json::Value {
+    let (actual, presence, raw_os_error) = match inspect(expected.pid) {
+        Ok(Some(actual)) if actual == *expected => (Some(actual), "alive", None),
+        Ok(actual) => (actual, "gone", None),
+        Err(error) => (None, "unknown", error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error())),
+    };
+    serde_json::json!({"expected":expected,"actual":actual,"presence":presence,"rawOsError":raw_os_error})
+}
+pub(crate) fn diagnostic_error(error: &anyhow::Error) -> serde_json::Value {
+    let known = [
+        "Maintenance acknowledgement unavailable", "Maintenance submission unavailable",
+        "Release owner mismatch", "Agent still owns state", "Final checkpoint absent",
+        "Durable flushed release missing", "No release intent", "Child has not exited",
+        "Stale operation or source generation", "Supervisor identity changed",
+        "Coordinator identity unverified", "Stale release", "Maintenance not owned",
+        "No owned operation", "Another maintenance request is pending",
+    ];
+    let category = error.chain().find_map(|e| known.iter().copied().find(|s| e.to_string() == *s)).unwrap_or("evidence_unavailable");
+    serde_json::json!({"category":category,"rawOsError":error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error())})
+}
+pub(crate) fn release_diagnostic(state: &Path, r: &Request, kind: &str, stage: &str, error: &anyhow::Error, extra: serde_json::Value) -> Result<()> {
+    validate(r)?;
+    ensure!(matches!(kind, "coordinator" | "proof" | "transition" | "ack_read"), "Invalid diagnostic kind");
+    let control = storage::control(state);
+    storage::private_dir(&control)?;
+    let path = control.join(format!("release-{kind}-{}.json", r.operation_id));
+    storage::unredirected(&path)?;
+    if path.try_exists()? { open_private(&path)?; return Ok(()); }
+    write_private(&path, &serde_json::json!({"schema":1,"operationId":r.operation_id,"stage":stage,
+        "fromGeneration":r.from_generation,"failure":diagnostic_error(error),
+        "supervisor":identity_evidence(&r.supervisor),"coordinator":identity_evidence(&r.coordinator),
+        "child":r.child.as_ref().map(identity_evidence),"observed":extra}))
 }
 
 #[cfg(windows)]
@@ -757,6 +844,22 @@ fn inspect(_: u32) -> Result<Option<ProcessIdentity>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_diagnostic_preserves_first_failure_without_error_text() {
+        let temp = crate::test_support::tempdir();
+        let r = request();
+        let secret = "token=private-body-never-save";
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(5)).context(secret);
+        release_diagnostic(temp.path(), &r, "coordinator", "releasing_supervisor", &error, serde_json::json!({})).unwrap();
+        let path = storage::control(temp.path()).join(format!("release-coordinator-{}.json", r.operation_id));
+        let first = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&first).contains(secret));
+        let value: serde_json::Value = read_private(&path).unwrap();
+        assert_eq!(value["failure"]["rawOsError"], 5);
+        assert_eq!(value["stage"], "releasing_supervisor");
+        release_diagnostic(temp.path(), &r, "coordinator", "verified", &anyhow::anyhow!("later error"), serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), first);
+    }
     fn identity(pid: u32) -> ProcessIdentity {
         ProcessIdentity {
             pid,

@@ -110,9 +110,22 @@ pub fn atomic<T:Serialize>(path:&Path,value:&T)->Result<()> {
         }
     }
 }
-pub fn read<T:serde::de::DeserializeOwned>(path:&Path)->Result<T>{unredirected(path)?;let m=fs::metadata(path)?;if m.len()>1024*1024{bail!("State file exceeds limit")};Ok(serde_json::from_slice(&fs::read(path)?)?)}
+pub fn open_physical(path:&Path)->Result<File>{
+    unredirected(path)?;let file=File::open(path)?;verify_file_handle(path,&file)?;Ok(file)
+}
+pub(crate) fn verify_file_handle(path:&Path,file:&File)->Result<()> {
+    #[cfg(windows)] {use std::os::windows::io::AsRawHandle;unsafe{verify_physical_handle(path,file.as_raw_handle())?;}}
+    #[cfg(not(windows))] {let _=file;unredirected(path)?;}
+    Ok(())
+}
+pub fn read<T:serde::de::DeserializeOwned>(path:&Path)->Result<T>{
+    use std::io::Read;
+    let file=open_physical(path)?;if file.metadata()?.len()>1024*1024{bail!("State file exceeds limit")};
+    let mut bytes=Vec::new();file.take(1024*1024+1).read_to_end(&mut bytes)?;
+    if bytes.len()>1024*1024{bail!("State file exceeds limit")};Ok(serde_json::from_slice(&bytes)?)
+}
 pub struct Lock(File);
-impl Lock {pub fn acquire(path:&Path)->Result<Self>{plain(path)?;let f=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;f.try_lock_exclusive().context("Another instance already owns this state or user")?;Ok(Self(f))}}
+impl Lock {pub fn acquire(path:&Path)->Result<Self>{unredirected(path)?;let f=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;verify_file_handle(path,&f)?;f.try_lock_exclusive().context("Another instance already owns this state or user")?;Ok(Self(f))}}
 impl Drop for Lock {fn drop(&mut self){let _=FileExt::unlock(&self.0);}}
 
 #[cfg(all(test, windows))]

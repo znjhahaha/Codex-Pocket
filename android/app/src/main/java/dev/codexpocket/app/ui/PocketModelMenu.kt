@@ -326,6 +326,7 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
             ModelCatalogState.Empty, ModelCatalogState.Ready -> "当前运行时未返回可用模型"
             ModelCatalogState.Unsupported -> "当前运行时不支持模型目录"
             ModelCatalogState.Offline -> "电脑离线，连接后可重新读取模型"
+            ModelCatalogState.RuntimeUnavailable -> "电脑已连接，此会话暂无实时运行时"
             ModelCatalogState.Failed -> "模型目录读取失败"
         }
         Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {

@@ -83,7 +83,7 @@ class V051NativeActivityRowsTest {
         compose.onNodeWithText("ChatScreen.kt").assertExists()
         compose.onNodeWithText("Original output").assertDoesNotExist()
         compose.onNodeWithTag("activity-toggle:${command.key}").performClick()
-        compose.onNodeWithText("$ " + command.raw.string("command")).assertExists()
+        compose.onNodeWithText("$ Get-Content README.md").assertExists()
         compose.onNodeWithText("Original output").assertExists()
         compose.onNodeWithText("ChatScreen.kt").performClick()
         compose.onNodeWithTag("inline-diff:file:0").assertExists()

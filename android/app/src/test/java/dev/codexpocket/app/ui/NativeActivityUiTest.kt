@@ -115,14 +115,16 @@ class NativeActivityUiTest {
         compose.onNodeWithText("permission denied").assertIsDisplayed()
     }
 
-    @Test fun wrappedShellCommandKeepsCompactExecutableAndFullInvocationInDetails() {
+    @Test fun wrappedShellCommandShowsScriptAndPreservesFullInvocationForTheDetailViewer() {
         val command = item("""{"id":"c","type":"commandExecution","command":"\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command 'Get-Content README.md'","status":"completed","exitCode":0,"durationMs":3200}""", true)
         // A completed group is folded; `expanded = true` is the group's persisted open state.
         content { TranscriptRowView(TranscriptRow("activity:${command.key}", TranscriptKind.Activity, listOf(command)), "test", true, {}, {}) }
         waitText("Get-Content README.md")
         compose.onNodeWithText("Get-Content README.md", substring = true).assertExists()
         compose.onNodeWithTag("activity-toggle:${command.key}").performClick()
-        compose.onNodeWithText("$ " + command.raw.string("command")).assertExists()
+        compose.onNodeWithText("$ Get-Content README.md").assertExists()
+        compose.onNodeWithText("powershell.exe", substring = true).assertDoesNotExist()
+        assertTrue(nativeActivityDetailText(command).contains(command.raw.string("command")))
         compose.onNodeWithText("3s", substring = true).assertExists()
     }
 
@@ -158,10 +160,14 @@ class NativeActivityUiTest {
         compose.onNodeWithText(compose.activity.getString(R.string.v03_output_unavailable)).assertDoesNotExist()
     }
 
-    @Test fun finishedThoughtIsNotShownOnThePhone() {
-        // Codex shows "正在思考" only while running; the finished "已思考" summary has no row on mobile.
+    @Test fun finishedNativeSummaryIsHiddenFromHistoryAndRemainsInNativeData() {
         val thought = item("""{"id":"r","type":"reasoning","summary":["Compare options"],"content":[]}""", true)
-        assertTrue(ConversationPresentation.rows(NativeTimeline(listOf(thought).associateBy { it.key })).isEmpty())
+        val rows = ConversationPresentation.rows(NativeTimeline(listOf(thought).associateBy { it.key }))
+        content { rows.forEach { TranscriptRowView(it, "summary", false, {}, {}) } }
+        assertTrue(rows.isEmpty())
+        assertEquals(listOf("Compare options"), thought.summaryParts)
+        compose.onNodeWithText("Compare options").assertDoesNotExist()
+        compose.onNodeWithText("正在思考").assertDoesNotExist()
     }
 
     @Test fun manyDesktopImagesShowAsNineCellGridWithOverflowCount() {

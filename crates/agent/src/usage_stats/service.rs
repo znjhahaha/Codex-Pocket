@@ -87,15 +87,46 @@ impl UsageService {
         self.slots.clone().acquire_many_owned(2).await.unwrap()
     }
     pub async fn sources(&self) -> Value {
-        self.execute(None).await
+        self.execute(None, false).await
     }
     pub async fn read(&self, query: UsageQuery) -> Value {
-        self.execute(Some(query)).await
+        // Preserve the strict schema-1 shape consumed by pre-dashboard Android builds.
+        let mut value = self.execute(Some(query), false).await;
+        if let Some(query) = value["query"].as_object_mut() {
+            query.remove("session_page");
+            query.remove("request_page");
+            if let Some(filters) = query.get_mut("filters").and_then(Value::as_object_mut) {
+                filters.remove("session_id");
+            }
+        }
+        if let Some(data) = value["result"]["data"].as_object_mut() {
+            data.remove("session_groups");
+            data.remove("recent_requests");
+        }
+        strip_dashboard_cost_fields(&mut value["result"]["data"]);
+        value
     }
-    async fn execute(&self, query: Option<UsageQuery>) -> Value {
-        let key = query
-            .as_ref()
-            .map_or_else(|| "sources".into(), |q| serde_json::to_string(q).unwrap());
+    pub async fn dashboard(&self, query: UsageQuery) -> Value {
+        self.execute(Some(query), false).await
+    }
+    pub async fn requests(&self, query: UsageQuery) -> Value {
+        self.execute(Some(query), true).await
+    }
+    async fn execute(&self, query: Option<UsageQuery>, requests_only: bool) -> Value {
+        let key = query.as_ref().map_or_else(
+            || "sources".into(),
+            |q| {
+                format!(
+                    "{}:{}",
+                    if requests_only {
+                        "requests"
+                    } else {
+                        "dashboard"
+                    },
+                    serde_json::to_string(q).unwrap()
+                )
+            },
+        );
         let cached = self
             .cache
             .lock()
@@ -123,7 +154,13 @@ impl UsageService {
                     let _permit = permit;
                     match q {
                         Some(q) => match path {
-                            Some(p) => serde_json::to_value(super::query(&p, &q)).unwrap(),
+                            Some(p) => {
+                                if requests_only {
+                                    super::query_requests(&p, &q)
+                                } else {
+                                    serde_json::to_value(super::query(&p, &q)).unwrap()
+                                }
+                            }
                             None => unavailable_read(
                                 &q,
                                 "home_unavailable",
@@ -199,6 +236,22 @@ impl UsageService {
         }
     }
 }
+fn strip_dashboard_cost_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("value_usd");
+            for child in object.values_mut() {
+                strip_dashboard_cost_fields(child);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                strip_dashboard_cost_fields(child);
+            }
+        }
+        _ => {}
+    }
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -265,7 +318,7 @@ pub fn prepare_read(p: &Value, now: i64) -> Result<UsageQuery, ()> {
     let query: UsageQuery = if let Some(query) = obj.get("query") {
         serde_json::from_value(query.clone()).map_err(|_| ())?
     } else {
-        let end_at = now - now.rem_euclid(60);
+        let end_at = now - (now + 8 * 3600).rem_euclid(86400) + 86400;
         let start_at = end_at.checked_sub(7 * 86400).ok_or(())?;
         UsageQuery {
             start_at,
@@ -274,6 +327,8 @@ pub fn prepare_read(p: &Value, now: i64) -> Result<UsageQuery, ()> {
             filters: Filters::default(),
             provider_page: Page::default(),
             model_page: Page::default(),
+            session_page: Page::default(),
+            request_page: RequestPage::default(),
         }
     };
     if super::valid(&query) {

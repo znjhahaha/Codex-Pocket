@@ -1,5 +1,7 @@
 use pocket_runtime_host::HostConfig;
-use pocket_runtime_ipc::{Descriptor, Discovery, HostClient, load_descriptor, read_frame, write_frame};
+use pocket_runtime_ipc::{
+    Descriptor, Discovery, HostClient, load_descriptor, read_frame, write_frame,
+};
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
 use tokio::{io::BufReader, net::TcpStream};
@@ -16,7 +18,10 @@ fn config(dir: &std::path::Path) -> HostConfig {
 
 fn spawn_host(dir: &std::path::Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pocket-host-fixture"));
-    command.arg("--host-test-driver").arg(dir).kill_on_drop(true);
+    command
+        .arg("--host-test-driver")
+        .arg(dir)
+        .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let mut child = command.spawn().unwrap();
@@ -237,6 +242,12 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
     assert_eq!(receipt.generation, d.generation);
     assert!(client.health().await.unwrap().reconciliation_required);
     assert!(
+        client.recovery().await.unwrap()["releasedGenerations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(d.generation))
+    );
+    assert!(
         client
             .request(json!("uncertain"), "fixture/deferred", json!({}))
             .await
@@ -245,7 +256,11 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
     let mut client = HostClient::attach(&next).await.unwrap();
     assert_eq!(
         client
-            .request(json!("new-count"), "thread/read", json!({"threadId":"fixture-thread","includeTurns":true}))
+            .request(
+                json!("new-count"),
+                "thread/read",
+                json!({"threadId":"fixture-thread","includeTurns":true})
+            )
             .await
             .unwrap()["result"]["writes"],
         0
@@ -257,8 +272,41 @@ async fn unresolved_command_survives_native_exit_without_automatic_reissue() {
             .unwrap()
             .snapshot_required
     );
-    assert!(client.shutdown_idle().await.is_err());
-    std::fs::write(dir.path().join("native-exit"), b"exit fixture only").unwrap();
+    client
+        .request(
+            json!("new-writer-thread"),
+            "thread/start",
+            json!({"cwd":dir.path(),"runtimeWorkspaceRoots":[dir.path()],
+        "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":"user"}),
+        )
+        .await
+        .unwrap();
+    let written=client.request(json!("new-writer-turn"),"turn/start",json!({"threadId":"fixture-thread","cwd":dir.path(),
+        "runtimeWorkspaceRoots":[dir.path()],"approvalPolicy":"on-request","approvalsReviewer":"user","input":[],
+        "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[dir.path()],"networkAccess":false,
+            "excludeSlashTmp":true,"excludeTmpdirEnvVar":true}})).await.unwrap();
+    assert_eq!(written["result"]["writes"], 1);
+    assert!(
+        client.shutdown_idle().await.is_err(),
+        "a new live turn still blocks shutdown"
+    );
+    let mut client = HostClient::attach(&next).await.unwrap();
+    client
+        .request(
+            json!("stop-new-writer"),
+            "turn/interrupt",
+            json!({"threadId":"fixture-thread","turnId":"fixture-turn"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.receipt(json!("uncertain")).await.unwrap().state,
+        "unknown"
+    );
+    client
+        .shutdown_idle()
+        .await
+        .expect("ended Unknown retains its result, not a live resource");
     tokio::time::timeout(Duration::from_secs(5), host)
         .await
         .unwrap()
@@ -325,6 +373,117 @@ async fn descriptor(path: &std::path::Path) -> Descriptor {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_admission_client_runs_independent_goal_with_cold_unknown_and_never_replays_it() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let home = pocket_runtime_ipc::support::normalized_home(dir.path()).unwrap();
+    let runtime = format!(
+        "assistant-{}",
+        &format!("{:x}", Sha256::digest(home.as_bytes()))[..24]
+    );
+    let old = uuid::Uuid::new_v4().to_string();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        state.join("recovery.json"),
+        serde_json::to_vec(&json!({
+            "schema":2,"runtime_id":runtime,"generation":old,"sequence":1,
+            "commands":{"s:original":{"generation":old,"completed":false}},
+            "answers":{},"runs":{},"pending":{},"reconciliation_required":true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let host = spawn_host(dir.path());
+    let d = descriptor(&dir.path().join("registry/host.json")).await;
+    let mut client = HostClient::attach(&d).await.unwrap();
+    let health = client.health().await.unwrap();
+    assert_eq!(health.scoped_admission, 1);
+    assert!(health.reconciliation_required);
+    let params = json!({"cwd":dir.path(),"runtimeWorkspaceRoots":[dir.path()],"sandbox":"read-only",
+        "approvalPolicy":"on-request","approvalsReviewer":"user"});
+    let created = client
+        .request(json!("new-thread"), "thread/start", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(created["result"]["thread"]["id"], "fixture-thread");
+    let turn = client
+        .request(
+            json!("new-turn"),
+            "turn/start",
+            json!({
+                "threadId":"fixture-thread","cwd":dir.path(),"runtimeWorkspaceRoots":[dir.path()],
+                "approvalPolicy":"on-request","approvalsReviewer":"user","input":[],
+                "sandboxPolicy":{"type":"readOnly","networkAccess":false}
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn["result"]["writes"], 1);
+    assert_eq!(client.health().await.unwrap().active_turns, 1);
+    let mut writer = params.clone();
+    writer["sandbox"] = json!("workspace-write");
+    let refused = client
+        .request(json!("unproven-writer"), "thread/start", writer)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .downcast_ref::<pocket_runtime_ipc::client::AdmissionRejected>()
+            .is_some()
+    );
+    let mut client = HostClient::attach(&d).await.unwrap();
+    assert_eq!(
+        client
+            .receipt(json!("unproven-writer"))
+            .await
+            .unwrap()
+            .state,
+        "missing"
+    );
+    let original = client
+        .request(json!("original"), "thread/start", params)
+        .await
+        .unwrap_err();
+    assert!(
+        original
+            .downcast_ref::<pocket_runtime_ipc::client::AdmissionRejected>()
+            .is_none(),
+        "An original Unknown is never a pre-dispatch refusal"
+    );
+    let mut client = HostClient::attach(&d).await.unwrap();
+    let original = client.receipt(json!("original")).await.unwrap();
+    assert_eq!(original.state, "unknown");
+    assert_eq!(original.generation, old);
+    let count = client
+        .request(
+            json!("count"),
+            "thread/read",
+            json!({"threadId":"fixture-thread","includeTurns":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count["result"]["writes"], 1);
+    let disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("recovery.json")).unwrap()).unwrap();
+    assert_eq!(
+        disk["commands"]["s:original"],
+        json!({"generation":old,"completed":false})
+    );
+    assert!(client.shutdown_idle().await.is_err());
+    std::fs::write(
+        dir.path().join("native-exit"),
+        b"exit isolated fixture only",
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), host)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -467,13 +626,25 @@ async fn private_native_content_stays_in_memory_and_cold_receipts_never_dispatch
     assert!(client.respond(json!(77), answer).await.is_err());
     let mut client = HostClient::attach(&next).await.unwrap();
     let count = client
-        .request(json!("new-count"), "thread/read", json!({"threadId":"fixture-thread","includeTurns":true}))
+        .request(
+            json!("new-count"),
+            "thread/read",
+            json!({"threadId":"fixture-thread","includeTurns":true}),
+        )
         .await
         .unwrap();
     assert_eq!(count["result"]["writes"], 0);
     assert_eq!(count["result"]["answers"], 0);
-    assert!(client.shutdown_idle().await.is_err());
-    std::fs::write(dir.path().join("native-exit"), b"exit fixture only").unwrap();
+    assert!(
+        client.recovery().await.unwrap()["releasedGenerations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(d.generation))
+    );
+    client
+        .shutdown_idle()
+        .await
+        .expect("old pending evidence is preserved without occupying a live native");
     tokio::time::timeout(Duration::from_secs(5), host)
         .await
         .unwrap()

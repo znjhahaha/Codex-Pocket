@@ -82,14 +82,14 @@ internal class TimelineCache(budget: Long, private val itemWeight: (TimelineItem
 
 internal data class ConversationWindow(
     val runtimeId: String, val conflict: Boolean, val nextTurns: JsonElement?, val exhausted: Boolean,
-    val loadState: ConversationLoadState, val error: String? = null,
+    val loadState: ConversationLoadState, val error: String? = null, val readSource: String = "native",
 ) {
     fun reusable(chat: ChatEntity, online: Boolean, verifiedLink: Long?, link: Long, hasTimeline: Boolean): Boolean =
         online && hasTimeline && !chat.conflict && runtimeId == chat.runtimeId && conflict == chat.conflict &&
             verifiedLink == link && loadState == ConversationLoadState.Ready
     companion object {
         fun from(s: PocketState): ConversationWindow? = s.selected?.let {
-            ConversationWindow(it.runtimeId, it.conflict, s.nextTurns, s.historyExhausted, s.conversationLoadState, s.conversationLoadError)
+            ConversationWindow(it.runtimeId, it.conflict, s.nextTurns, s.historyExhausted, s.conversationLoadState, s.conversationLoadError, s.conversationReadSource)
         }
     }
 }

@@ -17,6 +17,7 @@ use crate::{
     storage,
 };
 use anyhow::{Context, Result, bail};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use pocket_core::{
     directory::{
         ResolveError, RuntimeAdvertisement, RuntimeDirectory, RuntimeId, RuntimeSource, ThreadKey,
@@ -36,10 +37,16 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc};
 mod v051;
 mod session_access;
+mod history;
+mod history_native;
+mod history_takeover;
+mod desktop_control;
 #[path = "broker_usage.rs"]
 mod usage_backend;
 #[path = "broker_handoff.rs"]
 mod broker_handoff;
+#[path = "broker_lifecycle.rs"]
+mod broker_lifecycle;
 #[path = "broker_assistant.rs"]
 mod broker_assistant;
 
@@ -516,6 +523,8 @@ pub(crate) const NOTIFICATION_CAPACITY: usize = 4096;
 
 struct Runtime {
     role: crate::native::NativeRole,
+    readiness_started: std::time::Instant,
+    schema_state: String,
     bridge_version: Option<String>,
     usage: crate::context_usage::UsageCache,
     config_home: PathBuf,
@@ -551,6 +560,8 @@ struct Pending {
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct OwnershipClaim {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auxiliary: bool,
     #[serde(flatten)]
     advertisement: RuntimeAdvertisement,
     #[serde(default)]
@@ -578,6 +589,9 @@ pub struct Broker {
     access: Mutex<session_access::AccessStore>,
     access_drive: Mutex<()>,
     desktop_launch: Mutex<Option<u64>>,
+    cli_launch: Mutex<()>,
+    desktop_attach: Mutex<()>,
+    inventory_refresh: Mutex<()>,
     media: Arc<crate::media::MediaStore>,
     media_histories: Arc<std::sync::Mutex<MediaHistoryCache>>,
     quota: crate::quota::Quota,
@@ -588,6 +602,7 @@ pub struct Broker {
     state_dir: PathBuf,
     state: Mutex<State>,
     writes: Mutex<()>,
+    lifecycle_reads: Mutex<()>,
     notifications: broadcast::Sender<Value>,
     native_events: mpsc::Sender<NativeEvent>,
 }
@@ -655,7 +670,7 @@ impl MediaHistoryCache {
                         let mut roots = extra_image_roots.to_vec();
                         if let Some(cwd) = native.pointer("/thread/cwd").and_then(Value::as_str) { roots.push(PathBuf::from(cwd)); }
                         let image_roots: Vec<_> = roots.into_iter().filter_map(|root| {
-                            crate::workspace::Workspace::new(vec![root]).ok().map(|workspace| workspace.roots()[0].clone())
+                            crate::workspace::native_image_root(&root).ok()
                         }).take(32).collect();
                         let changed = self
                             .metadata
@@ -879,6 +894,14 @@ fn media_history_turns(
         let mut items = Vec::new();
         {
             for item in native_items {
+                if item["type"] == "imageView" {
+                    let id = item["id"].as_str().filter(|id| media_identity(id))?;
+                    let path = item["path"].as_str().filter(|path| path.len() <= 4096)?;
+                    part_count += 1;
+                    if part_count > 16 * 1024 { return None; }
+                    items.push(json!({"type":"imageView","id":id,"path":path}));
+                    continue;
+                }
                 if item["type"] != "userMessage" {
                     items.push(json!({"type":"other"}));
                     continue;
@@ -1054,7 +1077,11 @@ impl Broker {
         }
         let runtime = field(p, "runtimeId")?;
         let thread = field(p, "threadId")?;
-        let (_, generation, _) = self.edit_context(runtime).await?;
+        let persisted=runtime.strip_prefix("history:");
+        let generation=if let Some(store)=persisted {
+            if !self.history_homes().await.contains_key(store)||self.coordinator_visibility()?.internal(store,Some(thread)){bail!("Unknown history media owner")}
+            "persisted".to_owned()
+        }else{self.edit_context(runtime).await?.1};
         let offset = match p.get("offset") {
             None => 0,
             Some(v) => v.as_u64().ok_or_else(|| {
@@ -1087,7 +1114,7 @@ impl Broker {
                 .await
                 .map_err(|_| classify(anyhow::anyhow!("Media worker unavailable"), Code::Unknown))?
                 .map_err(|e| classify(e, Code::InvalidParams))?;
-        self.check_generation(runtime, &generation).await?;
+        if persisted.is_none(){self.check_generation(runtime, &generation).await?;}
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
@@ -1857,6 +1884,9 @@ impl Broker {
                 access: Mutex::new(session_access::AccessStore::open(&state_dir, &config.computer_id)?),
                 access_drive: Mutex::new(()),
                 desktop_launch: Mutex::new(None),
+                cli_launch: Mutex::new(()),
+                desktop_attach: Mutex::new(()),
+                inventory_refresh: Mutex::new(()),
                 media: Arc::new(crate::media::MediaStore::new(&state_dir)?),
                 media_histories: Arc::new(std::sync::Mutex::new(MediaHistoryCache::default())),
                 quota: {
@@ -1888,6 +1918,7 @@ impl Broker {
                     ownership_persist_failed: false,
                 }),
                 writes: Mutex::new(()),
+                lifecycle_reads: Mutex::new(()),
                 notifications,
                 native_events,
             });
@@ -1927,7 +1958,7 @@ impl Broker {
         )
     }
     fn runtime_values(state: &State) -> Vec<Value> {
-        state.runtimes.iter().map(|(id,r)| {
+        state.runtimes.iter().filter(|(_,r)| !r.role.is_auxiliary()).map(|(id,r)| {
             let mut capabilities=r.capabilities.methods();
             capabilities.push("thread/settings/read".into());
             capabilities.retain(|m| !matches!(m.as_str(), "config/read" | "account/rateLimits/read" | "config/value/write" | "config/mcpServer/reload" | "skills/config/write" | "thread/revert"));
@@ -1938,10 +1969,19 @@ impl Broker {
             if r.capabilities.supports("thread/read",&json!({"threadId":"probe","includeTurns":false})) {
                 capabilities.extend(["workspace/list","workspace/read","workspace/image","references/list"].into_iter().map(str::to_owned));
             }
-            json!({"id":id,"source":r.source,"role":r.role,"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models})
+            let stage = if !r.rpc.online() { "disconnected" } else if r.source == "desktop" && r.desktop_initialized != Some(true) { "native_handshake" } else if r.capabilities.0.is_empty() { "native_schema" } else if !r.inventory_ready { "session_inventory" } else { "ready" };
+            json!({"id":id,"source":r.source,"role":r.role,"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models,"initialized":r.desktop_initialized,"schemaState":r.schema_state,"inventoryReady":r.inventory_ready,"readiness":{"stage":stage,"timedOut":stage!="ready" && r.readiness_started.elapsed() >= Duration::from_secs(15),"schemaState":r.schema_state}})
         }).collect()
     }
     pub async fn diagnostics(&self) -> Value {
+        let homes=self.config.codex_homes.clone();
+        let installation=tokio::task::spawn_blocking(move||crate::runtime_catalog::installed(&homes)).await.unwrap_or(Value::Null);
+        let (desktop_control, cli_control) = {
+            let state = self.state.lock().await;
+            let ready = Self::runtime_values(&state);
+            crate::runtime_catalog::native_controls(&ready)
+        };
+        let native_observation = crate::runtime_catalog::observation(desktop_control, cli_control).await;
         let upstream_versions = self.upstream_version_snapshot().await;
         let assistant_error = *self.assistant_error.lock().await;
         let s = self.state.lock().await;
@@ -1953,10 +1993,12 @@ impl Broker {
             value["acceptingWrites"] = json!(handoff.accepting_writes());
         }
         value["protocol"] = json!(1);
+        value["nativeInstallation"] = installation;
+        value["nativeObservation"] = native_observation;
         value["helperRuntime"] = crate::installation::current();
         value["updatedAt"] = json!(crate::connection::now());
         value["runtimes"] = json!(
-            Self::runtime_values(&s)
+            self.public_runtime_values(&s)
                 .into_iter()
                 .map(|mut v| {
                     let o = v.as_object_mut().unwrap();
@@ -1967,6 +2009,7 @@ impl Broker {
                 })
                 .collect::<Vec<_>>()
         );
+        value["auxiliaryRuntimes"] = json!(s.runtimes.iter().filter(|(_,r)|r.role.is_auxiliary()).map(|(id,r)|json!({"id":id,"role":r.role,"online":r.rpc.online(),"version":r.version})).collect::<Vec<_>>());
         value["discoveryErrors"] = json!(
             s.discovery_errors
                 .iter()
@@ -2017,6 +2060,7 @@ impl Broker {
             values.insert(
                 id.clone(),
                 OwnershipClaim {
+                    auxiliary: r.role.is_auxiliary(),
                     native_process: r.native_process.clone(),
                     advertisement: RuntimeAdvertisement {
                         id: RuntimeId {
@@ -2055,6 +2099,7 @@ impl Broker {
         RuntimeDirectory::new(
             self.ownership_values(state)
                 .into_values()
+                .filter(|claim| !claim.auxiliary)
                 .map(|claim| claim.advertisement),
         )
         .map_err(|e| anyhow::anyhow!("Runtime directory invalid: {e:?}"))
@@ -2096,7 +2141,7 @@ impl Broker {
         // Never authorize using a release that could not be persisted.
         self.save_ownership(state)?;
         let _ = self.notifications.send(
-            json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(state)}}),
+            json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(state)}}),
         );
         Ok(())
     }
@@ -2131,7 +2176,7 @@ impl Broker {
         let s = self.state.lock().await;
         // Top-level native capabilities are the intersection of online runtimes;
         // the selected runtime's capabilityFields is authoritative for new fields.
-        let runtimes = Self::runtime_values(&s);
+        let runtimes = self.public_runtime_values(&s);
         let mut online = runtimes.iter().filter(|r| r["online"] == true);
         let methods = |r: &Value| {
             r["capabilities"]
@@ -2157,6 +2202,11 @@ impl Broker {
                 "runtimes/list",
                 "routes/list",
                 "threads/list",
+                "threads/history/read",
+                "threads/control/read",
+                "assistant/artifact/read",
+                "threads/takeover",
+                "threads/takeover/status",
                 "commands/status",
                 "ping",
                 "questions/list",
@@ -2187,11 +2237,15 @@ impl Broker {
                 "quota/sources",
                 "quota/read",
                 "usage/read",
+                "usage/dashboard/read",
+                "usage/requests/read",
                 "usage/sources",
                 "usage.v1",
                 "upstream.versions.v1",
                 "assistant.v1",
+                "assistant.v2",
                 "assistant/read",
+                "assistant/project/read",
                 "push/status",
                 "push/register",
                 "push/unregister",
@@ -2201,8 +2255,10 @@ impl Broker {
             .into_iter()
             .map(str::to_owned),
         );
+        #[cfg(windows)]
+        capabilities.insert("runtime.ensure.cli".to_owned());
         let routes=crate::config::routes::snapshot(&self.config,&self.state_dir);
-        json!({"protocol":1,"computerId":self.config.computer_id,"computerName":self.config.computer_name,"helperVersion":env!("CARGO_PKG_VERSION"),"routes":routes["routes"],"routePolicy":routes["policy"],"capabilities":capabilities,"runtimes":Self::runtime_values(&s)})
+        json!({"protocol":1,"computerId":self.config.computer_id,"computerName":self.config.computer_name,"helperVersion":env!("CARGO_PKG_VERSION"),"routes":routes["routes"],"routePolicy":routes["policy"],"capabilities":capabilities,"runtimes":self.public_runtime_values(&s)})
     }
     pub async fn pair(&self, p: &Value) -> Result<Value> {
         let mut state = self.state.lock().await;
@@ -2252,7 +2308,10 @@ impl Broker {
     }
     async fn add_runtime(&self, c: Connected) -> Result<()> {
         let rpc = c.rpc.clone();
-        let recover_pending = c.source == "desktop";
+        let initial_status = c.initial_status.clone();
+        let runtime_id = c.runtime_id.clone();
+        let connection_id = c.connection_id.clone();
+        let recover_pending = c.source == "desktop" && !c.role.is_auxiliary();
         let store = storage::config_store(&c.config_home)?;
         let mut s = self.state.lock().await;
         if s.runtimes
@@ -2327,6 +2386,8 @@ impl Broker {
         s.runtimes.insert(
             c.runtime_id,
             Runtime {
+                readiness_started: std::time::Instant::now(),
+                schema_state: if c.capabilities.0.is_empty() { "initializing" } else { "ready" }.into(),
                 role: c.role,
                 bridge_version: c.bridge_version,
                 usage,
@@ -2334,8 +2395,7 @@ impl Broker {
                 settings,
                 assistant_permission_floor,
                 fast_models: BTreeSet::new(),
-                desktop_initialized: (c.source == "desktop" && !c.capabilities.0.is_empty())
-                    .then_some(true),
+                desktop_initialized: (c.source == "desktop" && !c.capabilities.0.is_empty()).then_some(true),
                 capabilities: c.capabilities,
                 rpc: c.rpc,
                 native_process,
@@ -2350,9 +2410,12 @@ impl Broker {
                 journal,
             },
         );
+        if let Some(status) = initial_status {
+            Self::apply_desktop_status(&mut s, &runtime_id, &connection_id, &status);
+        }
         let _ = self
             .notifications
-            .send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&s)}}));
+            .send(json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(&s)}}));
         drop(s);
         rpc.activate_events();
         if recover_pending {
@@ -2440,6 +2503,7 @@ impl Broker {
     pub async fn discover(self: Arc<Self>) {
         loop {
             let mut errors = BTreeSet::new();
+            let mut descriptors = Vec::new();
             for dir in &self.config.runtime_directories {
                 if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
                     while let Ok(Some(e)) = entries.next_entry().await {
@@ -2461,21 +2525,21 @@ impl Broker {
                         {
                             continue;
                         }
-                        match native::desktop(&e.path(), self.native_events.clone()).await {
-                            Ok(c) => {
-                                if self.add_runtime(c).await.is_err() {
-                                    errors.insert(("desktop".into(), "registration_failed".into()));
-                                }
-                            }
-                            Err(_) => {
-                                errors.insert(("desktop".into(), "unavailable".into()));
-                            }
-                        }
+                        descriptors.push(e.path());
                     }
                 } else {
                     errors.insert(("desktop".into(), "discovery_unavailable".into()));
                 }
             }
+            let mut registrations = futures_util::stream::iter(descriptors).map(|path| {let broker=&*self;async move {
+                let c = native::desktop(&path,broker.native_events.clone()).await.map_err(|_|"unavailable")?;
+                tokio::time::timeout(Duration::from_secs(3),broker.add_runtime(c)).await
+                    .map_err(|_|"registration_pending")?.map_err(|_|"registration_failed")
+            }}).buffer_unordered(16);
+            while let Some(result)=registrations.next().await {
+                if let Err(code)=result {errors.insert(("desktop".into(),code.into()));}
+            }
+            drop(registrations);
             for home in &self.config.codex_homes {
                 let Ok(store) = storage::config_store(home) else {
                     errors.insert(("cli".into(), "discovery_unavailable".into()));
@@ -2487,7 +2551,7 @@ impl Broker {
                     .await
                     .runtimes
                     .values()
-                    .any(|r| r.source == "cli" && r.store == store && r.rpc.online())
+                    .any(|r| matches!(r.role, native::NativeRole::CliDaemon) && r.store == store && r.rpc.online())
                 {
                     continue;
                 }
@@ -2502,12 +2566,14 @@ impl Broker {
                     }
                 }
             }
+            self.restore_desktop_followers().await;
             self.refresh_desktop_capabilities().await;
             if self.refresh_loaded().await.is_err() {
                 errors.insert(("native".into(), "inventory_unavailable".into()));
             }
             self.refresh_fast_capabilities().await;
             self.drive_access_operations().await;
+            self.drive_history_migrations().await;
             self.state.lock().await.discovery_errors = errors;
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -2538,6 +2604,17 @@ impl Broker {
             return false;
         }
         let previous_initialized = r.desktop_initialized;
+        let previous_auxiliary = r.role.is_auxiliary();
+        let previous_schema = r.schema_state.clone();
+        if native::desktop_role(status).is_auxiliary() {
+            r.role = crate::native::NativeRole::DesktopAuxiliary;
+            r.loaded.clear();
+            r.inventory_ready = false;
+            r.inventory_revision = uuid::Uuid::new_v4();
+        }
+        if let Some(schema) = status["schemaState"].as_str().filter(|s| matches!(*s, "ready" | "initializing" | "error")) {
+            r.schema_state = schema.to_owned();
+        }
         if let Some(initialized) = status["initialized"].as_bool() {
             r.desktop_initialized = Some(initialized);
             if !initialized && previous_initialized != Some(false) {
@@ -2547,7 +2624,7 @@ impl Broker {
                 r.inventory_revision = uuid::Uuid::new_v4();
             }
         }
-        let capabilities = if status["initialized"] == true
+        let capabilities = if !r.role.is_auxiliary() && status["initialized"] == true
             && status["schemaState"] == "ready"
             && status["schemaPending"] != true
         {
@@ -2564,6 +2641,8 @@ impl Broker {
             Default::default()
         };
         let changed = r.capabilities.0 != capabilities.0
+            || previous_auxiliary != r.role.is_auxiliary()
+            || previous_schema != r.schema_state
             || previous_initialized != r.desktop_initialized;
         r.capabilities = capabilities;
         if let Some(version) = status["nativeVersion"].as_str().filter(|v| {
@@ -2575,7 +2654,7 @@ impl Broker {
     }
     async fn refresh_desktop_capabilities(&self) {
         let pending: Vec<_> = self.state.lock().await.runtimes.iter()
-            .filter(|(_, r)| r.source == "desktop" && r.rpc.online() && r.capabilities.0.is_empty())
+            .filter(|(_, r)| r.source == "desktop" && !r.role.is_auxiliary() && r.rpc.online() && r.capabilities.0.is_empty())
             .map(|(id, r)| (id.clone(), r.connection_id.clone(), r.rpc.clone()))
             .collect();
         for (id, generation, rpc) in pending {
@@ -2590,7 +2669,7 @@ impl Broker {
                     r.connection_id == generation && r.capabilities.0.is_empty()
                 });
                 if still_pending && Self::apply_desktop_status(&mut state, &id, &generation, &status) {
-                    let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&state)}}));
+                    let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(&state)}}));
                 }
             }
         }
@@ -2730,6 +2809,7 @@ impl Broker {
         Ok(())
     }
     async fn refresh_loaded(&self) -> Result<()> {
+        let _inventory = self.inventory_refresh.lock().await;
         self.release_terminated_owners(&mut *self.state.lock().await)?;
         let runtimes: Vec<_> = self
             .state
@@ -2737,11 +2817,13 @@ impl Broker {
             .await
             .runtimes
             .iter()
-            .filter(|(_, r)| r.rpc.online())
+            .filter(|(_, r)| r.rpc.online() && !r.role.is_auxiliary())
             .map(|(id, r)| (id.clone(), r.connection_id.clone(), r.rpc.clone()))
             .collect();
-        // Collect every native inventory before considering CLI subscriptions.
-        // A partial/malformed list can never release an earlier ownership claim.
+        // Independent runtimes must not wait behind an unresponsive old connection.
+        // Publish each complete inventory, then consider subscriptions only if all
+        // reads succeeded. Partial lists never release an earlier ownership claim.
+        let mut reads = FuturesUnordered::new();
         for (id, connection_id, rpc) in &runtimes {
             let Some(revision) = self
                 .state
@@ -2757,6 +2839,37 @@ impl Broker {
             else {
                 continue;
             };
+            reads.push(async move {
+                let result = tokio::time::timeout(Duration::from_secs(3), Self::read_loaded_inventory(rpc)).await
+                    .context("Native inventory timed out").and_then(|v|v);
+                (id, connection_id, revision, result)
+            });
+        }
+        let mut failure = None;
+        while let Some((id, connection_id, revision, result)) = reads.next().await {
+            let loaded = match result {Ok(v)=>v,Err(e)=>{failure=Some(e);continue}};
+            let mut state = self.state.lock().await;
+            if let Some(runtime) = state.runtimes.get_mut(id).filter(|r| r.connection_id == *connection_id) {
+                if runtime.inventory_revision != revision {
+                    failure=Some(anyhow::anyhow!("Native ownership changed while inventory was being read"));
+                    continue;
+                }
+                let changed = !runtime.inventory_ready || runtime.loaded != loaded;
+                runtime.subscribed.retain(|thread| loaded.contains(thread));
+                runtime.loaded = loaded;
+                runtime.inventory_ready = true;
+                runtime.inventory_revision = uuid::Uuid::new_v4();
+                self.save_ownership(&mut state)?;
+                if changed {
+                    let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(&state)}}));
+                }
+            }
+        }
+        drop(reads);
+        if let Some(error)=failure {return Err(error)}
+        self.subscribe_loaded(&runtimes).await
+    }
+    async fn read_loaded_inventory(rpc: &Rpc) -> Result<BTreeSet<String>> {
             let mut loaded = BTreeSet::new();
             let mut cursor = Value::Null;
             let mut complete = false;
@@ -2788,22 +2901,9 @@ impl Broker {
             if !complete {
                 bail!("Native loaded-thread inventory is incomplete");
             }
-            let mut state = self.state.lock().await;
-            if let Some(runtime) = state
-                .runtimes
-                .get_mut(id)
-                .filter(|r| r.connection_id == *connection_id)
-            {
-                if runtime.inventory_revision != revision {
-                    bail!("Native ownership changed while inventory was being read");
-                }
-                runtime.subscribed.retain(|thread| loaded.contains(thread));
-                runtime.loaded = loaded;
-                runtime.inventory_ready = true;
-                runtime.inventory_revision = uuid::Uuid::new_v4();
-                self.save_ownership(&mut state)?;
-            }
-        }
+            Ok(loaded)
+    }
+    async fn subscribe_loaded(&self, runtimes: &[(String,String,Rpc)]) -> Result<()> {
         for (id, connection_id, rpc) in runtimes {
             let wanted = self.access.lock().await;
             let subscribe = {
@@ -2811,9 +2911,9 @@ impl Broker {
                 let directory = self.directory(&state)?;
                 state
                     .runtimes
-                    .get(&id)
+                    .get(id)
                     .filter(|r| {
-                        r.connection_id == connection_id && r.source == "cli" && r.inventory_ready
+                        r.connection_id == *connection_id && r.source == "cli" && r.inventory_ready
                     })
                     .map(|r| {
                         r.loaded
@@ -2826,7 +2926,7 @@ impl Broker {
                                         config_store_id: r.store.clone(),
                                         native_thread_id: (*thread).clone(),
                                     })
-                                    .is_ok_and(|owner| owner.runtime_id == id)
+                                    .is_ok_and(|owner| owner.runtime_id == *id)
                             })
                             .cloned()
                             .collect::<Vec<_>>()
@@ -2835,21 +2935,23 @@ impl Broker {
             };
             drop(wanted);
             for thread in subscribe {
-                if rpc
-                    .call(
-                        "thread/resume",
-                        json!({"threadId":thread,"excludeTurns":true}),
-                    )
-                    .await
-                    .is_ok()
+                let params=json!({"threadId":thread,"excludeTurns":true});
+                let observed=self.state.lock().await.runtimes.get_mut(id)
+                    .filter(|r|r.connection_id==*connection_id)
+                    .and_then(|r|r.settings.prepare("thread/resume",&params));
+                if let Ok(result)=rpc.call("thread/resume",params).await
+                    && result["thread"]["id"]==thread
                     && let Some(runtime) = self
                         .state
                         .lock()
                         .await
                         .runtimes
-                        .get_mut(&id)
-                        .filter(|r| r.connection_id == connection_id)
+                        .get_mut(id)
+                        .filter(|r| r.connection_id == *connection_id)
                 {
+                    if let Some(event)=observed.and_then(|o|runtime.settings.accepted(o,&result)) {
+                        self.publish_settings(&id,runtime,event);
+                    }
                     runtime.subscribed.insert(thread);
                 }
             }
@@ -2883,6 +2985,7 @@ impl Broker {
                 }
                 other => other,
             };
+            let visibility = self.coordinator_visibility();
             let mut state = self.state.lock().await;
             match event {
                 NativeEvent::PendingSnapshot {
@@ -2911,7 +3014,8 @@ impl Broker {
                                         native_item_id: None,
                                         payload: event.clone(),
                                     };
-                                    if r.journal.append(record).is_ok() {
+                                    if r.journal.append(record).is_ok()
+                                        && visibility.as_ref().is_ok_and(|v| !v.event(&r.store, &event)) {
                                         let _=self.notifications.send(json!({"method":"codex/event","params":{"runtimeId":runtime_id,"cursor":cursor_value(&r.journal.cursor()),"event":event}}));
                                     }
                                 }
@@ -2970,7 +3074,7 @@ impl Broker {
                         r.inventory_ready = false;
                     }
                     let _ = self.save_ownership(&mut state);
-                    let _=self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&state)}}));
+                    let _=self.notifications.send(json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(&state)}}));
                 }
                 NativeEvent::Message {
                     runtime_id,
@@ -2987,10 +3091,22 @@ impl Broker {
                     let method = value["method"].as_str().unwrap_or_default().to_owned();
                     if method == "pocket/runtimeStatus" {
                         if Self::apply_desktop_status(&mut state, &runtime_id, &connection_id, &value["params"]) {
-                            let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":Self::runtime_values(&state)}}));
+                            let _ = self.notifications.send(json!({"method":"runtimes/changed","params":{"data":self.public_runtime_values(&state)}}));
                         }
                         continue;
                     }
+                    if state.runtimes.get(&runtime_id).is_some_and(|r| r.role.is_auxiliary()) {
+                        continue;
+                    }
+                    // Resolutions may contain only a native request ID. Bind
+                    // them before removing Pending so replay retains identity.
+                    let event_thread = broker_assistant::CoordinatorVisibility::event_thread(&value)
+                        .or_else(|| state.pending.values().find(|p| p.runtime == runtime_id
+                            && p.native_id == value["params"]["requestId"])
+                            .and_then(|p| broker_assistant::CoordinatorVisibility::event_thread(&p.event)))
+                        .map(str::to_owned);
+                    let public_event = visibility.as_ref().is_ok_and(|v| state.runtimes.get(&runtime_id)
+                        .is_some_and(|r| !v.internal(&r.store, event_thread.as_deref())));
                     if method == "account/updated" {
                         drop(state);
                         if let Some(result) =
@@ -3015,6 +3131,7 @@ impl Broker {
                         continue;
                     }
                     if push_event(&value)
+                        && public_event
                         && !state.runtimes.get(&runtime_id).is_some_and(|r|matches!(r.role,crate::native::NativeRole::ManagedHost{..}))
                         && self.push.configured()
                         && let Some(thread) = value["params"]["threadId"].as_str()
@@ -3170,14 +3287,12 @@ impl Broker {
                             r.inventory_revision = uuid::Uuid::new_v4();
                         }
                         let event = JournalEvent {
-                            native_thread_id: value["params"]["threadId"]
-                                .as_str()
-                                .map(str::to_owned),
+                            native_thread_id: event_thread,
                             native_turn_id: value["params"]["turnId"].as_str().map(str::to_owned),
                             native_item_id: value["params"]["itemId"].as_str().map(str::to_owned),
                             payload: value.clone(),
                         };
-                        if r.journal.append(event).is_ok() {
+                        if r.journal.append(event).is_ok() && public_event {
                             let _=self.notifications.send(json!({"method":"codex/event","params":{"runtimeId":runtime_id,"cursor":cursor_value(&r.journal.cursor()),"event":value}}));
                         }
                     }
@@ -3195,9 +3310,15 @@ impl Broker {
         if !self.device_exists(device).await {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
+        if !method.starts_with("assistant/") && let Some(runtime) = p["runtimeId"].as_str() {
+            let thread = if method == "codex/request" { p["params"]["threadId"].as_str() } else { p["threadId"].as_str() };
+            self.reject_coordinator_access(runtime, thread).await?;
+        }
         match method {
-            "usage/read" | "usage/sources" => return self.usage_request(device, method, &p).await,
+            "threads/control/read" => return self.desktop_control(&p).await,
+            "usage/read" | "usage/sources" | "usage/dashboard/read" | "usage/requests/read" => return self.usage_request(device, method, &p).await,
             "assistant/read" => return self.assistant_read(&p).await,
+            "assistant/project/read" => return self.assistant_project_read(device, &p).await,
             "routes/list" => return Ok(crate::config::routes::snapshot(&self.config,&self.state_dir)),
             "session/preferences/read" => {
                 session_access::validate(method, &p)?;
@@ -3316,20 +3437,21 @@ impl Broker {
             }
             "runtimes/list" => {
                 self.refresh_desktop_capabilities().await;
-                return Ok(json!({"data":Self::runtime_values(&*self.state.lock().await)}));
+                return Ok(json!({"data":self.public_runtime_values(&*self.state.lock().await)}));
             }
             "devices/list" => {
                 return Ok(self.devices().await);
             }
             "questions/list" => {
                 if p.as_object().is_none_or(|o|o.keys().any(|k|k!="threadId")) {bail!("Invalid question selector")}
-                return Ok(json!({"data":self.state.lock().await.questions.list(device,p["threadId"].as_str())}));
+                return Ok(json!({"data":self.ordinary_questions(&*self.state.lock().await,device,p["threadId"].as_str())?}));
             }
             "commands/status" => {
                 let key = CommandKey {
                     caller_id: device.into(),
                     command_id: field(&p, "commandId")?.into(),
                 };
+                self.reconcile_assistant_command(&key).await?;
                 let state=self.state.lock().await;
                 let mut value=state.ledger.status(&key).map(status_value)
                     .ok_or_else(|| classify(anyhow::anyhow!("Command not found"), Code::NotFound))?;
@@ -3338,9 +3460,13 @@ impl Broker {
             }
             "sync" => return self.sync(&p).await,
             "threads/list" => return self.threads(&p).await,
+            "threads/history/read" => return self.persisted_history(device,&p).await,
+            "threads/takeover/status" => return self.migration_status(&p).await,
+            "assistant/artifact/read" => return self.assistant_artifact_read(&p).await,
             _ => {}
         }
         let mutation = match method {
+            "threads/takeover"=>{field(&p,"configStoreId")?;field(&p,"threadId")?;true},
             method if method.starts_with("assistant/") => {Self::validate_assistant(method,&p)?;true},
             "session/preferences/update" | "runtime/ensure" | "thread/access/update" | "thread/access/cancel" => {
                 session_access::validate(method, &p)?;
@@ -3452,6 +3578,7 @@ impl Broker {
             }
         }
         let result = match method {
+            "threads/takeover"=>self.begin_history_migration(device,&p).await,
             method if method.starts_with("assistant/") => self.assistant_write(device,method,&p).await,
             "session/preferences/update" => self.update_access_preferences(&p).await,
             "runtime/ensure" => self.ensure_runtime(&p).await,
@@ -3919,6 +4046,7 @@ impl Broker {
         let runtime = field(p, "runtimeId")?;
         let method = field(p, "method")?;
         let mut params = p["params"].clone();
+        self.reject_coordinator_access(runtime, params["threadId"].as_str()).await?;
         let mutation = if permission_guard.is_some() {
             if method != "thread/settings/update"
                 || !crate::permission_policy::valid_update(&params)
@@ -3929,6 +4057,12 @@ impl Broker {
         } else {
             access::validate(method, &params).map_err(access::AccessError::into_request_error)?
         };
+        if mutation && let Some(thread)=params["threadId"].as_str() {
+            let store=self.state.lock().await.runtimes.get(runtime).map(|r|r.store.clone());
+            if let Some(store)=store && self.migration_blocks_write(&store,thread).await {
+                return Err(classify(anyhow::anyhow!("Conversation migration has not confirmed its saved execution settings"),Code::OperationInProgress));
+            }
+        }
         if method == "thread/start" {
             self.refresh_desktop_capabilities().await;
         }
@@ -4249,6 +4383,14 @@ impl Broker {
         }
         drop(s);
         let mut bound = result;
+        if matches!(method, "thread/list" | "thread/loaded/list") {
+            let visibility = self.coordinator_visibility()?;
+            let state = self.state.lock().await;
+            let store = &state.runtimes.get(runtime).context("Runtime unavailable")?.store;
+            if let Some(rows) = bound["data"].as_array_mut() {
+                rows.retain(|r| !visibility.internal(store, r.as_str().or_else(|| r["id"].as_str())));
+            }
+        }
         if method == "thread/items/list" {
             if !bound.is_object() { bail!("Invalid native media page"); }
             for field in ["threadId", "turnId"] {
@@ -4288,6 +4430,7 @@ impl Broker {
     async fn approve(&self, p: &Value, key: &CommandKey) -> Result<Value> {
         let runtime = field(p, "runtimeId")?;
         let id = field(p, "requestId")?;
+        let visibility = self.coordinator_visibility()?;
         let (rpc, native_id) = {
             let mut s = self.state.lock().await;
             let pending = s
@@ -4295,6 +4438,9 @@ impl Broker {
                 .get(id)
                 .filter(|r| r.runtime == runtime && r.command.is_none())
                 .context("Approval already resolved or stale")?;
+            if visibility.pending(&s, pending) {
+                return Err(classify(anyhow::anyhow!("Use the Assistant page to answer coordinator requests"), Code::Rejected));
+            }
             validate_approval(&pending.event, &p["response"])?;
             let native_id = pending.native_id.clone();
             let event = pending.event.clone();
@@ -4323,6 +4469,7 @@ impl Broker {
         Ok(json!({"status":"submitted"}))
     }
     async fn sync(&self, p: &Value) -> Result<Value> {
+        let visibility = self.coordinator_visibility()?;
         let s = self.state.lock().await;
         let mut events = vec![];
         let mut snapshots = vec![];
@@ -4346,6 +4493,8 @@ impl Broker {
             match replay {
                 Some(Replay::Events(items)) => {
                     for e in items {
+                        if visibility.internal(&r.store, e.event.native_thread_id.as_deref())
+                            || visibility.event(&r.store, &e.event.payload) { continue; }
                         events.push(json!({"runtimeId":id,"cursor":cursor_value(&e.cursor),"event":e.event.payload}));
                     }
                 }
@@ -4356,7 +4505,7 @@ impl Broker {
         let pending: Vec<_> = s
             .pending
             .values()
-            .filter(|p| p.command.is_none())
+            .filter(|p| p.command.is_none() && !visibility.pending(&s, p))
             .map(|p| {
                 let unresolved=s.runtimes.get(&p.runtime).is_some_and(|r|s.questions.unresolved_request(&r.store,&p.event));
                 json!({"runtimeId":p.runtime,"event":p.event,"deliveryPending":unresolved})
@@ -4368,26 +4517,27 @@ impl Broker {
     }
     async fn threads(&self, p: &Value) -> Result<Value> {
         let _ = self.refresh_loaded().await;
+        let (mut data,mut next,covered,errors)=self.persisted_directory(p).await?;
         let runtimes = {
             let s = self.state.lock().await;
             let mut stores = BTreeSet::new();
-            let mut available: Vec<_> = s.runtimes.iter().collect();
+            let mut available: Vec<_> = s.runtimes.iter()
+                .filter(|(_, r)| !r.role.is_auxiliary())
+                .collect();
             available.sort_by_key(|(_,r)| (r.source != "desktop", !r.version.contains("Codex Desktop")));
             available.into_iter()
-                .filter(|(_, r)| r.rpc.online() && stores.insert(r.store.clone()))
+                .filter(|(_, r)| r.rpc.online() && !covered.contains(&r.store) && stores.insert(r.store.clone()))
                 .map(|(id, r)| (id.clone(), r.store.clone(), r.rpc.clone()))
                 .collect::<Vec<_>>()
         };
-        let mut data = Vec::new();
-        let mut next = serde_json::Map::new();
-        let mut more = false;
+        let mut more = next.values().any(Value::is_string);
         for (id, store, rpc) in runtimes {
             let previous = &p["cursor"][&store];
             if previous == false {
                 next.insert(store, Value::Bool(false));
                 continue;
             }
-            let mut params = json!({"limit":p["limit"].as_u64().unwrap_or(30).clamp(1,100),"archived":p["archived"].as_bool().unwrap_or(false),"sourceKinds":["cli","vscode","appServer","unknown"],"sortKey":"updated_at"});
+            let mut params = json!({"limit":p["limit"].as_u64().unwrap_or(30).clamp(1,100),"archived":p["archived"].as_bool().unwrap_or(false),"sourceKinds":["cli","vscode","appServer","unknown"],"modelProviders":[],"sortKey":"updated_at"});
             if previous.is_string() {
                 params["cursor"] = previous.clone();
             }
@@ -4395,6 +4545,7 @@ impl Broker {
                 params["searchTerm"] = json!(search);
             }
             let result = rpc.call("thread/list", params).await?;
+            let visibility = self.coordinator_visibility()?;
             if result["nextCursor"].is_string() {
                 next.insert(store.clone(), result["nextCursor"].clone());
                 more = true;
@@ -4408,6 +4559,7 @@ impl Broker {
                 let Some(thread_id) = thread["id"].as_str() else {
                     continue;
                 };
+                if visibility.internal(&store, Some(thread_id)) { continue; }
                 let owner = directory.resolve_write(&ThreadKey {
                     computer_id: self.config.computer_id.clone(),
                     config_store_id: store.clone(),
@@ -4430,7 +4582,10 @@ impl Broker {
             }
         }
         data.sort_by(|a, b| b["updatedAt"].as_i64().cmp(&a["updatedAt"].as_i64()));
-        Ok(json!({"data":data,"nextCursor":if more{Value::Object(next)}else{Value::Null}}))
+        let state = self.state.lock().await;
+        let internal = self.coordinator_visibility()?.metadata(&state, None);
+        Ok(json!({"data":data,"errors":errors,"nextCursor":if more{Value::Object(next)}else{Value::Null},"assistantInternalThreads":internal,
+            "hiddenThreads":internal["hiddenThreads"],"hiddenThreadsAuthoritative":internal["authoritative"]}))
     }
 }
 
@@ -5215,7 +5370,9 @@ mod tests {
 
     pub(super) async fn fixture() -> (tempfile::TempDir, Arc<Broker>) {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::create("wss://example.org/pocket".into()).unwrap();
+        let mut config = Config::create("wss://example.org/pocket".into()).unwrap();
+        config.codex_homes=vec![dir.path().to_owned()];
+        config.runtime_directories=vec![dir.path().join("runtimes")];
         let (b, rx) = Broker::open(config, dir.path().into()).unwrap();
         b.state
             .lock()
@@ -6205,6 +6362,26 @@ mod tests {
                 .loaded
                 .contains("history")
         );
+    }
+    #[tokio::test]
+    async fn slow_runtime_does_not_hide_restarted_desktop_inventory() {
+        let (_dir, b) = fixture().await;
+        let mut slow = peer(&b, "a-slow", "desktop").await;
+        let mut ready = peer(&b, "z-restarted", "desktop").await;
+        let refresh = tokio::spawn({let b=b.clone();async move {b.refresh_loaded().await}});
+        let held = slow.recv().await;
+        let request = tokio::time::timeout(Duration::from_secs(1), ready.recv()).await
+            .expect("a new desktop must be queried without waiting for another runtime");
+        ready.reply(&request, json!({"data":["reopened"],"nextCursor":null})).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if b.state.lock().await.runtimes["z-restarted"].loaded.contains("reopened") {break}
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("publish valid inventory while unrelated reads are still pending");
+        slow.reply(&held, json!({"data":"invalid"})).await;
+        assert!(refresh.await.unwrap().is_err());
+        assert!(b.state.lock().await.runtimes["z-restarted"].inventory_ready);
     }
     #[tokio::test]
     async fn delayed_inventory_cannot_erase_a_new_native_ownership_event() {

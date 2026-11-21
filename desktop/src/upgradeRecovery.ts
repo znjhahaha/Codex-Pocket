@@ -1,6 +1,6 @@
 import {freshHeartbeat,type InstalledComponent,type Snapshot} from './domain';
 
-export type RecoveryKind='current'|'inconsistent'|'ui_outdated'|'unknown'|'old_backend'|'backend_missing'|'starting'|'paused'|'handoff'|'waiting_restart'|'failed'|'rolled_back'|'succeeded'|'bridge'|'retry_waiting'|'retry_starting'|'retry_exhausted'|'retry_blocked'|'recovered';
+export type RecoveryKind='current'|'staged_dashboard'|'inconsistent'|'ui_outdated'|'unknown'|'old_backend'|'backend_missing'|'starting'|'paused'|'handoff'|'waiting_restart'|'failed'|'rolled_back'|'succeeded'|'bridge'|'retry_waiting'|'retry_starting'|'retry_exhausted'|'retry_blocked'|'recovered';
 export interface RecoveryModel {
  kind:RecoveryKind;
  visible:boolean;
@@ -28,12 +28,13 @@ const failureReasons:Record<string,string>={
  startup_context_invalid:'启动交接记录未通过核验。',
 };
 const validGeneration=(generation?:string)=>typeof generation==='string'&&/^[a-f0-9]{64}$/.test(generation);
-const restartInstruction='请先保存并结束当前 Codex 任务，退出 Codex，然后退出并重新登录 Windows，再回来刷新核验。仅重开 Codex 不保证更新常驻后台。';
+const restartInstruction='请运行新版 Pocket 安装包。安装器会在当前会话中核对任务并重启 Pocket 后台。';
 
 /** Installed files, live process identity and a handoff journal are distinct evidence. */
 export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  const installation=s.installation,upgrade=installation?.upgrade,target=installation?.installedGeneration;
- const bridge:RecoveryModel['bridge']=s.processes.some(p=>p.state==='在线'&&p.bridgeUpdatePending===true)||upgrade?.bridgeRestartRequired===true
+ const liveBridgePending=s.processes.some(p=>p.state==='在线'&&p.bridgeUpdatePending===true);
+ let bridge:RecoveryModel['bridge']=liveBridgePending||upgrade?.bridgeRestartRequired===true
   ?'pending':upgrade?'unverified':undefined;
  let upgradeHistorical=false;
  const model=(kind:RecoveryKind,title:string,description:string,options:Partial<RecoveryModel>={}):RecoveryModel=>({
@@ -44,6 +45,10 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  if(!installation||!validGeneration(target))return unknown('安装目标尚未核验，暂时无法判断新版是否已生效。请从 Windows 开始菜单打开 Codex Pocket，再刷新状态。');
  if(upgrade&&Object.hasOwn(progress,upgrade.phase))return model('handoff',progress[upgrade.phase],'交接仍在进行中，请等待状态核验。此时可以刷新进度或检查诊断。',{tone:'progress'});
  const ui=installation.ui;
+ if(ui?.state==='staged_dashboard'&&ui.runningVerified===true&&validGeneration(ui.generation)
+  &&s.updates&&ui.generation===s.updates.generation&&(['staged','waiting_idle'].includes(s.updates.phase)||s.updates.phase==='failed'&&s.updates.failure==='legacy_restart_unverified')){
+  return model('staged_dashboard','新版界面已打开，后台尚未切换','可以查看本机 Codex 运行状态。当前任务与连接仍由原后台处理。',{tone:'neutral',blockMutations:false});
+ }
  if(ui?.state==='restart_required'||(validGeneration(ui?.generation)&&ui?.generation!==target))return model('ui_outdated','请打开新版 Pocket 界面','当前管理界面仍属于旧安装代次。请关闭此界面，从 Windows 开始菜单打开新版 Codex Pocket。');
  if(!ui?.runningVerified||ui.state!=='current'||ui.generation!==target)return unknown('当前界面的安装代次尚未核验。请从 Windows 开始菜单打开新版 Codex Pocket，再刷新状态。');
  const issue=(stages:string[])=>s.issues?.some(e=>stages.includes(e.stage));
@@ -61,11 +66,19 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  const nativeRetry=background&&['waiting','starting','exhausted'].includes(background.phase);
  const noVerifiedOwner=!source?.runningVerified&&!installation.helper?.runningVerified;
  const waitingRestartIsHistory=upgrade?.phase==='waiting_restart'&&(currentBackground||(currentHelper&&noVerifiedOldOwner)||(nativeRetry&&noVerifiedOwner&&upgrade.failure==='handoff_unsupported'));
- upgradeHistorical=waitingRestartIsHistory===true;
+ // A completed operation belongs to its two generations. An independently
+ // verified later installation must not inherit its failed/rollback state.
+ // Active, unknown and current-generation operations still retain their gate.
+ const supersededTerminal=!!upgrade&&['failed','rolled_back','succeeded'].includes(upgrade.phase)
+  &&validGeneration(upgrade.fromGeneration)&&validGeneration(upgrade.toGeneration)
+  &&upgrade.fromGeneration!==target&&upgrade.toGeneration!==target
+  &&currentBackground&&!criticalReadFailed;
+ upgradeHistorical=waitingRestartIsHistory===true||supersededTerminal;
+ if(supersededTerminal)bridge=liveBridgePending?'pending':undefined;
  const reason=upgrade?.failure?(Object.hasOwn(failureReasons,upgrade.failure)?failureReasons[upgrade.failure]:'失败原因尚未识别，请检查诊断。'):'';
- if(upgrade&&!waitingRestartIsHistory){
+ if(upgrade&&!upgradeHistorical){
   if(!validGeneration(upgrade.toGeneration))return unknown('交接记录的目标代次尚未核验。请查看诊断并刷新，暂不重复发起更新。');
-  if(upgrade.phase==='waiting_restart'&&upgrade.toGeneration===target)return model('waiting_restart','后台更新等待重新登录 Windows',`${reason||'等待重启的原因尚未核验。'}${restartInstruction}`);
+  if(upgrade.phase==='waiting_restart'&&upgrade.toGeneration===target)return model('waiting_restart','后台更新等待切换',`${reason||'等待重启的原因尚未核验。'}${restartInstruction}`);
   if(upgrade.phase==='failed'){
    const retry=upgrade.failure==='dispatch_failed'&&canUpgrade&&upgrade.fromGeneration===source?.generation&&upgrade.toGeneration===target;
    return model('failed','后台更新尚未完成',`${reason||'失败原因尚未核验。'}${retry?'可以手动重新尝试更新；提交请求后仍需核验结果。':'请先检查诊断中的交接记录，当前不重复发起变更。'}`,

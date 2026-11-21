@@ -25,6 +25,8 @@
 mod store;
 pub use store::AssistantStore;
 mod executor;
+pub mod inputs;
+pub use inputs::AssistantInput;
 mod schedule;
 mod service;
 mod settings;
@@ -91,6 +93,10 @@ pub enum Command {
         task_id: String,
     },
     ResumeTask {
+        task_id: String,
+    },
+    /// Explicit new attempt after a known failure, never after Unknown.
+    RetryTask {
         task_id: String,
     },
     /// Retains logical task identity and its dependency/group contract. The
