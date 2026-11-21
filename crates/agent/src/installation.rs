@@ -5,7 +5,7 @@ pub fn current() -> Value {
     static STAMP: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     STAMP.get_or_init(|| {
         let generation = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_owned))
-            .and_then(|p| std::fs::read(p.join("windows-manifest.json")).ok())
+            .and_then(|p| std::fs::read(p.join(if cfg!(windows) { "windows-manifest.json" } else { "runtime-manifest.json" })).ok())
             .filter(|bytes| bytes.len() <= 1024 * 1024)
             .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
         let executable_sha256=std::env::current_exe().ok().and_then(|p|std::fs::read(p).ok())

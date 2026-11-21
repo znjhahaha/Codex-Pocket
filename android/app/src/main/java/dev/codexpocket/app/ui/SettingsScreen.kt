@@ -150,6 +150,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     management: Boolean = false, usageState: UsageScreenState? = null, onUsageRefresh: (() -> Unit)? = null,
     onUsageFilter: ((UsageFilter) -> Unit)? = null) {
     val context = LocalContext.current
+    val chooseLocation = LocalExecutionLocationPicker.current
     var forget by rememberSaveable { mutableStateOf(false) }
     var clear by rememberSaveable { mutableStateOf(false) }
     var revoke by remember { mutableStateOf<String?>(null) }
@@ -174,6 +175,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
         when (page) {
             SettingsPage.Connection -> {
                 SettingsPageTitle("电脑连接", "查看连接状态与已配对设备")
+                chooseLocation?.let { choose -> PocketButton("执行位置", choose, Modifier.fillMaxWidth().testTag("settings-execution-locations"), secondary = true) }
                 if (!s.paired) {
                     SettingsSection(context.getString(R.string.no_pair)) {
                         Text(context.getString(R.string.return_pairing), Modifier.padding(12.dp),

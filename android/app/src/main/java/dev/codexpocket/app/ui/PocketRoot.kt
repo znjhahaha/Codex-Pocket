@@ -78,6 +78,7 @@ internal fun PocketBackdrop(content: @Composable () -> Unit) {
 @Composable
 private fun PocketContent(s: PocketState, repo: PocketRepository) {
     val context = LocalContext.current
+    val chooseLocation = LocalExecutionLocationPicker.current
     var home by rememberSaveable { mutableStateOf(true) }
     var runtimeFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var tab by rememberSaveable { mutableStateOf(HomeTab.Chats) }
@@ -316,6 +317,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     }
     if (hostSheet) PocketScreen(s.computerName, { hostSheet = false }, "此电脑上的 Codex") {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            chooseLocation?.let { choose -> PocketButton("切换执行位置", { hostSheet = false; choose() }, Modifier.fillMaxWidth().testTag("execution-location-picker"), secondary = true) }
             s.runtimes.forEach { runtime ->
                 Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { runtimeFilter = runtime.id; hostSheet = false; home = true; tab = HomeTab.Chats }, verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer, null)

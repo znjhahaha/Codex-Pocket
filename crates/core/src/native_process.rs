@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NativeProcess {
     pub pid: u32,
-    /// Windows creation FILETIME; protects against PID reuse across broker restarts.
+    /// Platform birth identity; protects against PID reuse across broker restarts.
     pub created_at: u64,
 }
 
@@ -82,7 +82,11 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "native_process_linux.rs"]
+mod platform;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 mod platform {
     pub fn capture(_: u32) -> std::io::Result<super::NativeProcess> {
         Err(std::io::ErrorKind::Unsupported.into())
@@ -91,6 +95,10 @@ mod platform {
         false
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "native_process_linux.rs"]
+mod linux_format_tests;
 
 #[cfg(all(test, windows))]
 mod tests {

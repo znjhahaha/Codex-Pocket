@@ -8,7 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const HOST_FILENAME: &str = "pocket-runtime-host.exe";
+pub const HOST_FILENAME: &str = if cfg!(windows) { "pocket-runtime-host.exe" } else { "pocket-runtime-host" };
+pub const MANIFEST_FILENAME: &str = if cfg!(windows) { "windows-manifest.json" } else { "runtime-manifest.json" };
 /// Expected generation comes from independently verified local installed metadata.
 /// The launcher verifies the manifest bytes and the executable on every ensure.
 #[derive(Clone, Debug)]
@@ -46,7 +47,7 @@ impl Installation {
     }
     pub fn verify(&self) -> Result<PathBuf> {
         physical(&self.bin, true)?;
-        let manifest = self.bin.join("windows-manifest.json");
+        let manifest = self.bin.join(MANIFEST_FILENAME);
         physical(&manifest, false)?;
         let bytes = crate::storage::read_physical(&manifest, 1024 * 1024)?;
         ensure!(
@@ -79,7 +80,7 @@ impl Installation {
             .files
             .iter()
             .find(|f| f.path == HOST_FILENAME)
-            .context("Installation lacks pocket-runtime-host.exe; repair the installed package")?;
+            .context("Installation lacks the runtime host; repair the installed package")?;
         let path = self.bin.join(HOST_FILENAME);
         physical(&path, false)?;
         let mut file = File::open(&path)?;
@@ -197,6 +198,13 @@ pub(super) fn binary_for_process(
             false,
         );
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let binary = crate::native::native_binary(expected.pid)?;
+        ensure!(pocket_core::native_process::NativeProcess::capture(expected.pid)? == *expected
+            && !expected.terminated(), "Selected process changed during discovery");
+        return physical(&binary, false);
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     anyhow::bail!("Selected native process image discovery unsupported on this platform")
 }

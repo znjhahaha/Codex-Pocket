@@ -40,7 +40,7 @@ impl Args {
             original
         };
         let allowed: &[&str] = match command {
-            "status" | "devices" | "pair" | "run" | "prepare-state" => &["--state"],
+            "status" | "health" | "devices" | "pair" | "run" | "prepare-state" => &["--state"],
             "revoke" => &["--state", "--device-id"],
             "init" => &[
                 "--state",
@@ -75,7 +75,7 @@ impl Args {
                 if json
                     || !matches!(
                         command,
-                        "status"
+                        "status" | "health"
                             | "devices"
                             | "revoke"
                             | "pair"
@@ -123,6 +123,15 @@ impl Args {
         self.option("--state")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
+                #[cfg(not(windows))]
+                {
+                    return std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+                        .filter(|p| p.is_absolute())
+                        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("codex-pocket/agent");
+                }
+                #[cfg(windows)]
                 std::env::var_os("LOCALAPPDATA")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -193,6 +202,7 @@ async fn execute(args: Args) -> Result<()> {
             let mut c = Config::create(args.option("--relay").unwrap_or("").to_owned())?;
             let mut preferences = c.preferences();
             if let Some(bind) = args.option("--lan-bind") {
+                preferences.auto_lan = false;
                 preferences.lan = Some(LanConfig {
                     bind: bind.parse()?,
                     mdns: false,
@@ -234,8 +244,9 @@ async fn execute(args: Args) -> Result<()> {
                 println!("Initialized computer identity.");
             }
         }
-        "status" | "devices" | "revoke" | "pair" => {
-            let result = local::execute(&state, &args.command, args.option("--device-id")).await?;
+        "status" | "health" | "devices" | "revoke" | "pair" => {
+            let method = if args.command == "health" { "helper/health" } else { &args.command };
+            let result = local::execute(&state, method, args.option("--device-id")).await?;
             if args.json {
                 println!("{result}");
             } else {

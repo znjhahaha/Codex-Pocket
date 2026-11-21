@@ -118,6 +118,7 @@ class PocketRepository(
     private val networkAvailable: Flow<Unit> = networkAvailability(context),
     historyCacheBudget: Long = 32L * 1024 * 1024,
     private val directoryTimeoutMillis: Long = 15_000,
+    private val recoverInterruptedCommands: Boolean = true,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val dao = db.dao()
@@ -742,7 +743,7 @@ class PocketRepository(
             }
         }
         scope.launch {
-            dao.markInterruptedUnknown()
+            if (recoverInterruptedCommands) dao.markInterruptedUnknown()
             try {
                 pair = pairStore.load()
                 // Pair identity must not depend on restoring every cached conversation.

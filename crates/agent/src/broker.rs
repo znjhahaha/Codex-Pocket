@@ -2256,7 +2256,7 @@ impl Broker {
             .into_iter()
             .map(str::to_owned),
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         capabilities.insert("runtime.ensure.cli".to_owned());
         let routes=crate::config::routes::snapshot(&self.config,&self.state_dir);
         json!({"protocol":1,"computerId":self.config.computer_id,"computerName":self.config.computer_name,"helperVersion":env!("CARGO_PKG_VERSION"),"routes":routes["routes"],"routePolicy":routes["policy"],"capabilities":capabilities,"runtimes":self.public_runtime_values(&s)})

@@ -377,21 +377,22 @@ impl Broker {
         if let Some(id) = existing {
             return Ok(json!({"phase":"ready","runtimeId":id,"configStoreId":store,"source":"cli"}));
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         return Err(classify(anyhow::anyhow!("No connected Codex CLI"), Code::RuntimeOffline));
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let profile = tokio::task::spawn_blocking(move || {
                 crate::managed_runtime::discovery::for_cli_home(&home)
             }).await.map_err(|err| classify(err.into(), Code::RuntimeUnavailable))?
                 .map_err(|err| classify(err, Code::RuntimeUnavailable))?;
-            let status = tokio::time::timeout(Duration::from_secs(18),
-                tokio::process::Command::new(profile.native_binary())
-                    .args(["app-server", "daemon", "start"])
-                    .env("CODEX_HOME", profile.config_home()).env_remove("CODEX_CLI_PATH")
-                    .creation_flags(0x08000000).kill_on_drop(true)
-                    .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null()).status()
+            let mut command = tokio::process::Command::new(profile.native_binary());
+            command.args(["app-server", "daemon", "start"])
+                .env("CODEX_HOME", profile.config_home()).env_remove("CODEX_CLI_PATH")
+                .kill_on_drop(true).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let status = tokio::time::timeout(Duration::from_secs(18), command.status()
             ).await.map_err(|_| classify(anyhow::anyhow!("Codex CLI startup timed out"), Code::RuntimeUnavailable))?
                 .map_err(|err| classify(err.into(), Code::RuntimeUnavailable))?;
             if !status.success() {

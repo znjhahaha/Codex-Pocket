@@ -348,9 +348,9 @@ pub async fn desktop(descriptor: &Path, events: mpsc::Sender<NativeEvent>) -> Re
 pub async fn cli(home: &Path, events: mpsc::Sender<NativeEvent>) -> Result<Connected> {
     let discovery = Discovery::for_home(home)?;
     let mut connection = codex_cli_adapter::connect(&discovery, Limits::default()).await?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     let native_process = Some(NativeProcess::capture(connection.peer_process_id()?)?);
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     let native_process: Option<NativeProcess> = None;
     connection.write(&json!({"id":"pocket-init","method":"initialize","params":{"clientInfo":{"name":"codex_pocket","title":"Codex Pocket","version":"0.1.0"},"capabilities":{"experimentalApi":true}}})).await?;
     let identity = tokio::time::timeout(Duration::from_secs(10), async {
@@ -446,7 +446,12 @@ pub(crate) fn native_binary(pid: u32) -> Result<PathBuf> {
         &buffer[..size as usize],
     )))
 }
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn native_binary(pid: u32) -> Result<PathBuf> {
+    anyhow::ensure!(pid != 0, "Invalid process identity");
+    Ok(std::fs::read_link(format!("/proc/{pid}/exe"))?)
+}
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub(crate) fn native_binary(_pid: u32) -> Result<PathBuf> {
     bail!("Native executable identity unavailable")
 }

@@ -61,6 +61,7 @@ android {
     buildFeatures { compose = true; buildConfig = true }
     // Built from locked sources by scripts/build-p2p-product.ps1. Never load from downloads.
     sourceSets.getByName("main").jniLibs.srcDir(rootProject.file("../.local/p2p/product-libs"))
+    sourceSets.getByName("main").assets.srcDir(rootProject.file("../.local/execution-runtime/assets"))
     if (huaweiAppId.isNotBlank()) sourceSets.getByName("main") {
         java.srcDir("src/huawei/java")
         manifest.srcFile(huaweiManifest)

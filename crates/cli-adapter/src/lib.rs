@@ -233,6 +233,17 @@ impl JsonRpcConnection<LocalStream> {
         self.stream.get_ref().peer_process_id()
     }
 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl JsonRpcConnection<LocalStream> {
+    pub fn peer_process_id(&self) -> io::Result<u32> {
+        let peer = self.stream.get_ref().peer_cred()?;
+        if peer.uid() != unsafe { libc::geteuid() } {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        peer.pid().filter(|pid| *pid > 0).map(|pid| pid as u32)
+            .ok_or_else(|| io::ErrorKind::PermissionDenied.into())
+    }
+}
 impl<S: AsyncRead + AsyncWrite + Unpin> JsonRpcConnection<S> {
     /// Low-level constructor for an already authenticated, upgraded transport.
     /// Bypasses path/peer validation; normal integrations must use connect.

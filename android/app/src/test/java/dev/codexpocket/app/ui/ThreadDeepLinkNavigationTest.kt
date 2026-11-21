@@ -84,6 +84,7 @@ class ThreadDeepLinkNavigationTest {
                 val current by repo.state.collectAsState(); PocketRoot(current, repo)
             } } }
             compose.onNodeWithTag("assistant-pocket-button").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-screen").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("assistant-screen").assertExists()
             if (userMessage) {
                 compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-message:message"))
