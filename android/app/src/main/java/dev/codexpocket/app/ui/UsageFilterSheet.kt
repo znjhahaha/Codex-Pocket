@@ -11,20 +11,31 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import java.time.LocalDate
 import java.time.ZoneId
 
 @Composable internal fun UsageFilterBar(f: UsageFilter, onOpen: () -> Unit, onFilter: (UsageFilter) -> Unit) {
-    val status = if (f.status == UsageStatusFilter.All) "全部" else f.status.label
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            PocketPill("${f.startDate.toString().takeLast(5)} – ${f.endDate.toString().takeLast(5)}", true, onOpen, modifier = Modifier.testTag("usage-filter-open"))
-            PocketPill("状态：$status", f.status != UsageStatusFilter.All, onOpen)
-            PocketPill("上游：${f.providerId?.let(::usageShortId) ?: "全部"}", f.providerId != null, onOpen)
-            PocketPill("模型：${f.model ?: "全部"}", f.model != null, onOpen)
-            PocketPill("对话：${f.sessionId?.let(::usageShortId) ?: "全部"}", f.sessionId != null, onOpen)
+    val active = listOfNotNull(
+        f.status.takeUnless { it == UsageStatusFilter.All }?.let { "状态：${it.label}" },
+        f.providerId?.let { "上游：${usageShortId(it)}" },
+        f.model?.let { "模型：$it" },
+        f.sessionId?.let { "对话：${usageShortId(it)}" },
+    )
+    val date = "${f.startDate.toString().takeLast(5)} – ${f.endDate.toString().takeLast(5)}"
+    val filterLabel = if (active.isEmpty()) "筛选" else "筛选 · ${active.size}"
+    val largeText = LocalDensity.current.fontScale >= 1.5f
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (largeText) {
+            PocketPill(date, false, onOpen, modifier = Modifier.fillMaxWidth().testTag("usage-filter-open"))
+            PocketPill(filterLabel, active.isNotEmpty(), onOpen, modifier = Modifier.fillMaxWidth().testTag("usage-filters-button"))
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PocketPill(date, false, onOpen, modifier = Modifier.weight(1f).testTag("usage-filter-open"))
+                PocketPill(filterLabel, active.isNotEmpty(), onOpen, modifier = Modifier.testTag("usage-filters-button"))
+            }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             listOf(1 to "今天", 7 to "近 7 天", 30 to "近 30 天").forEach { (days, label) ->
@@ -32,6 +43,7 @@ import java.time.ZoneId
                     Modifier.weight(1f).testTag("usage-date:$days")) { Text(label) }
             }
         }
+        if (active.isNotEmpty()) UsageNote(active.joinToString(" · "), Modifier.testTag("usage-active-filters"))
     }
 }
 

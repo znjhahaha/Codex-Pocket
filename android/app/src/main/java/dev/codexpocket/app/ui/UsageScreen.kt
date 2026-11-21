@@ -75,12 +75,12 @@ fun UsageScreen(
                     UsageFilterBar(f, { filtersOpen = true }, onFilter)
                 }
                 item(key = "status") { UsageStatus(state, snapshot, onRefresh) }
-                if (data == null) {
+                if (data != null && data.totals.requests == 0uL) {
                     item(key = "no-data") { UsageCard {
-                        Text(if (state.phase == UsagePhase.Loading) "正在读取所选范围" else "暂无可展示统计", style = MaterialTheme.typography.titleMedium)
-                        UsageNote("连接电脑后刷新，即可查看 CC Switch 保留的请求记录。")
+                        Text("所选范围没有调用记录", style = MaterialTheme.typography.titleMedium)
+                        UsageNote("可以更换日期或清除筛选条件。")
                     } }
-                } else {
+                } else if (data != null) {
                     item(key = "metrics") { UsageKpis(data.totals, data.trend) { label -> insight = label to data.totals } }
                     item(key = "trend") { UsageTrendChart(data.trend, f.zoneId, trendMetric, { trendMetric = it }) { b -> insight = bucketRange(b, f.zoneId) to b.totals } }
                     item(key = "providers-header") { UsageGroupHeader("按上游", data.providerGroups, "provider", state.canQuery && !state.refreshing, providerTokens, { providerTokens = it }) { offset -> onFilter(f.copy(providerPage = f.providerPage.copy(offset = offset))) } }
@@ -129,7 +129,7 @@ fun UsageScreen(
 
 @Composable
 internal fun UsageCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    PocketGlassSurface(modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), dense = true) {
+    Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
     }
 }
@@ -140,6 +140,7 @@ internal fun UsageNote(text: String, modifier: Modifier = Modifier) {
 
 @Composable
 private fun UsageStatus(state: UsageScreenState, snapshot: UsageSnapshot?, onRefresh: () -> Unit) {
+    var details by rememberSaveable(state.phase, state.observedSchemaVersion) { mutableStateOf(false) }
     val stale = state.cached || snapshot?.response?.cache?.state == "stale"
     val time = snapshot?.let { it.response.cache?.sampledAt ?: it.updatedAt }
     if (state.phase == UsagePhase.Ready && snapshot != null && !stale) {
@@ -151,26 +152,35 @@ private fun UsageStatus(state: UsageScreenState, snapshot: UsageSnapshot?, onRef
         return
     }
     val status = when (state.phase) {
-        UsagePhase.NotConnected -> "用量尚未接入" to "请先连接电脑；需要电脑端提供用量读取能力。"
+        UsagePhase.NotConnected -> "用量尚未接入" to "连接执行位置后，可读取该位置的用量。"
         UsagePhase.Idle -> "等待读取用量" to "刷新后读取当前筛选范围。"
-        UsagePhase.Loading -> "正在读取用量" to "等待电脑端完成只读统计。"
+        UsagePhase.Loading -> "正在读取用量" to "正在读取所选日期的记录。"
         UsagePhase.Ready -> "显示上次统计" to "本次未能更新，数值来自上次成功读取。"
         UsagePhase.Offline -> "电脑已离线" to "请切换到「电脑连接」重新连接，然后刷新。"
-        UsagePhase.Missing -> "电脑上没有可用用量数据库" to "在电脑端确认 CC Switch 已记录用量，再刷新。"
+        UsagePhase.Missing -> "尚未找到 CC Switch 用量" to "当前执行位置没有 CC Switch 请求记录。"
         UsagePhase.Locked -> "用量数据库暂时被锁定" to "稍后刷新重试。"
-        UsagePhase.UnsupportedSchema -> "电脑端无法读取用量数据库" to "请先更新电脑端 Codex Pocket；若仍无法读取，请检查 CC Switch 数据库结构是否完整。"
+        UsagePhase.UnsupportedSchema -> "暂不支持当前用量格式" to "CC Switch 的记录格式与当前读取器不兼容。原始记录仍保留。"
+        UsagePhase.Corrupt -> "CC Switch 数据库无法打开" to "数据库文件损坏或不是有效的 SQLite 数据库，请在 CC Switch 中检查或恢复备份。"
         UsagePhase.UnsupportedHelper -> "电脑端尚不支持用量读取" to "更新电脑端 helper 后重新连接。"
         UsagePhase.InvalidPath -> "用量数据库路径不可安全读取" to "请在电脑端检查默认用量数据库文件。"
         UsagePhase.Rejected -> "统计请求被拒绝" to "缩小日期范围或检查筛选条件后刷新。"
         UsagePhase.Failed -> "用量读取失败" to "确认电脑端正常运行，然后刷新重试。"
     }
     UsageCard(Modifier.testTag("usage-status")) {
-        Text(status.first, style = MaterialTheme.typography.titleSmall)
+        if (state.phase == UsagePhase.Loading) PocketProgressStatus(status.first)
+        else Text(status.first, style = MaterialTheme.typography.titleSmall)
         UsageNote(status.second)
-        if (state.refreshing) PocketProgressStatus("正在刷新，暂时显示上次统计")
+        if (state.refreshing && state.phase != UsagePhase.Loading) PocketProgressStatus("正在刷新，暂时显示上次统计")
         time?.let { UsageNote("缓存快照 · ${usageTime(it, state.filter.zoneId)} · ${state.filter.zoneId}") }
         if (state.canQuery && state.phase != UsagePhase.Loading) {
             PocketTextButton(onRefresh, Modifier.testTag("usage-retry"), enabled = !state.refreshing) { Text("重试") }
+        }
+        if (state.observedSchemaVersion != null || state.failureCode != null) {
+            PocketTextButton({ details = !details }, Modifier.testTag("usage-diagnostics")) { Text(if (details) "收起详情" else "读取详情") }
+            if (details) {
+                state.observedSchemaVersion?.let { UsageNote("CC Switch 数据格式：$it") }
+                state.failureCode?.let { UsageNote("读取状态：$it") }
+            }
         }
     }
 }

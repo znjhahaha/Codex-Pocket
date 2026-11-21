@@ -91,7 +91,7 @@ data class UsageQuery(val startAt: Long, val endAt: Long, val bucketEdges: List<
 }
 
 enum class UsagePhase {
-    NotConnected, Idle, Loading, Ready, Offline, Missing, Locked, UnsupportedSchema, UnsupportedHelper, InvalidPath, Rejected, Failed,
+    NotConnected, Idle, Loading, Ready, Offline, Missing, Locked, UnsupportedSchema, UnsupportedHelper, InvalidPath, Rejected, Failed, Corrupt,
 }
 data class UsageSnapshot(val filter: UsageFilter, val response: UsageResponse, val updatedAt: Long)
 data class UsageScreenState(
@@ -105,6 +105,8 @@ data class UsageScreenState(
     val requestFeed: UsageRequestFeed? = null,
     val requestLoading: Boolean = false,
     val requestError: String? = null,
+    val observedSchemaVersion: Long? = null,
+    val failureCode: String? = null,
 ) {
     val visibleSnapshot: UsageSnapshot? get() = snapshot?.takeIf {
         it.filter == filter && it.response.source.appType == filter.appType && it.response.source.dataSource == filter.dataSource &&
@@ -151,7 +153,8 @@ data class UsageResponse(val availability: String, val coverage: UsageCoverage, 
     val phase: UsagePhase get() = when (availability) {
         "ready" -> UsagePhase.Ready; "missing" -> UsagePhase.Missing; "locked" -> UsagePhase.Locked
         "unsupported_schema" -> UsagePhase.UnsupportedSchema; "invalid_path" -> UsagePhase.InvalidPath
-        "rejected" -> UsagePhase.Rejected; else -> UsagePhase.Failed
+        "rejected" -> UsagePhase.Rejected
+        else -> if (errors.any { it.code == "database_corrupt" }) UsagePhase.Corrupt else UsagePhase.Failed
     }
     companion object {
         /** Accepts the statistics result or the finalized schema=1 RPC envelope. No lossy defaults. */

@@ -218,7 +218,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                                 when (shownTab) {
                                     HomeTab.Chats -> ChatsHome(s, { repo.markRead(it); repo.select(it); home = false }, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention }, onEnsureDirectory = { q, a -> repo.ensureDirectory(q, a) })
                                     HomeTab.Attention -> AttentionHome(s, repo) { repo.markRead(it); repo.select(it); home = false }
-                                    HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true, usageState = s.usage, onUsageRefresh = { repo.loadUsage() }, onUsageFilter = { repo.loadUsage(it) })
+                                    HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true, usageState = s.usage, onUsageRefresh = { repo.loadUsage(refresh = true) }, onUsageFilter = { repo.loadUsage(it) })
                                 }
                             }
                         }
@@ -236,7 +236,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 Column(Modifier.fillMaxSize().padding(if (conversation) PaddingValues(0.dp) else padding)) {
                     if (!conversation && (s.paired || settings)) s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                     when {
-                        settings -> PocketPageEntrance("settings") { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, usageState = s.usage, onUsageRefresh = { repo.loadUsage() }, onUsageFilter = { repo.loadUsage(it) }) }
+                        settings -> PocketPageEntrance("settings") { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, usageState = s.usage, onUsageRefresh = { repo.loadUsage(refresh = true) }, onUsageFilter = { repo.loadUsage(it) }) }
                         !s.initialized -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PocketProgressStatus("正在准备") }
                         !s.paired -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { settings = true })
                         conversation -> holder.SaveableStateProvider(s.selected!!.key.encoded) {

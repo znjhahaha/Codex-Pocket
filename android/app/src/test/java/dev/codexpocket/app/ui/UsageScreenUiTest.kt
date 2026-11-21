@@ -43,6 +43,30 @@ class UsageScreenUiTest {
     }
     private fun scroll(tag: String) = compose.onNodeWithTag("usage-list").performScrollToNode(hasTestTag(tag))
 
+    @Test fun unsupportedSchemaShowsOneRecoveryStateWithoutAnEmptyResult() {
+        content { UsageScreen(UsageScreenState(filter, phase = UsagePhase.UnsupportedSchema, canQuery = true), {}, {}) }
+        compose.onNodeWithTag("usage-status").assertExists()
+        compose.onNodeWithText("暂无可展示统计").assertDoesNotExist()
+        compose.onNodeWithText("连接电脑后刷新", substring = true).assertDoesNotExist()
+        compose.onNodeWithTag("usage-retry").assertIsEnabled()
+    }
+
+    @Test fun firstLoadUsesOneLoadingSurfaceWithoutShowingAnEmptyResult() {
+        content { UsageScreen(UsageScreenState(filter, phase = UsagePhase.Loading, refreshing = true, canQuery = true), {}, {}) }
+        compose.onNodeWithTag("usage-status").assertExists()
+        compose.onNodeWithText("正在读取所选范围").assertDoesNotExist()
+        compose.onNodeWithTag("usage-refresh").assertIsNotEnabled()
+    }
+
+    @Test fun filterActionStaysVisibleAtNarrowWidthAndLargeFont() {
+        var opened = false
+        content(font = 1.8f) {
+            Box(Modifier.width(320.dp)) { UsageFilterBar(filter.withModel("a-long-model-name"), { opened = true }, {}) }
+        }
+        compose.onNodeWithTag("usage-filters-button").assertIsDisplayed().performClick()
+        compose.runOnIdle { assertTrue(opened) }
+    }
+
     @Test fun appliedStatusIsVisibleWithoutOpeningFiltersAndTracksChanges() {
         var current by mutableStateOf(filter.withStatus(UsageStatusFilter.Error))
         var opened = 0
@@ -51,7 +75,8 @@ class UsageScreenUiTest {
                 UsageFilterBar(current, { opened++ }, { current = it })
             }
         }
-        compose.onNodeWithText("状态：失败").assertIsDisplayed().performClick()
+        compose.onNodeWithText("状态：失败").assertIsDisplayed()
+        compose.onNodeWithTag("usage-filters-button").assertIsDisplayed().performClick()
         compose.runOnIdle {
             assertEquals(1, opened)
             current = current.withStatus(UsageStatusFilter.Success)
@@ -60,7 +85,8 @@ class UsageScreenUiTest {
         compose.onNodeWithText("状态：成功").assertIsDisplayed()
         compose.runOnIdle { current = current.withStatus(UsageStatusFilter.All) }
         compose.onNodeWithText("状态：成功").assertDoesNotExist()
-        compose.onNodeWithText("状态：全部").assertIsDisplayed()
+        compose.onNodeWithTag("usage-active-filters").assertDoesNotExist()
+        compose.onNodeWithText("筛选").assertIsDisplayed()
     }
 
     private fun deviceAmount(): UsageScreenState {

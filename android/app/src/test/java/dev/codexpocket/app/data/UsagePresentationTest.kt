@@ -143,6 +143,12 @@ class UsagePresentationTest {
         }
     }
 
+    @Test fun corruptDatabaseDoesNotMasqueradeAsUnsupportedVersion() {
+        val json = JsonObject(usageFixtureJson() + mapOf("availability" to JsonPrimitive("unavailable"), "data" to JsonNull,
+            "errors" to buildJsonArray { add(buildJsonObject { put("code", "database_corrupt"); put("message", "Invalid database") }) }))
+        assertEquals(UsagePhase.Corrupt, UsageResponse.fromJson(json).phase)
+    }
+
     @Test fun zeroMissingInvalidAndAbsentSamplesHaveDistinctLabels() {
         assertEquals("未知", UsageCostAmount("0", 0u, 3u, 1u, 0u).display())
         assertEquals("USD 0", UsageCostAmount("0", 3u, 0u, 0u, 3u).display())

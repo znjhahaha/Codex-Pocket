@@ -43,14 +43,17 @@ impl Broker {
                 if !validate_sources(p) {
                     return Err(invalid());
                 }
-                service.sources().await
+                service
+                    .sources_with_refresh(p["refresh"].as_bool().unwrap_or(false))
+                    .await
             }
             "usage/read" | "usage/dashboard/read" | "usage/requests/read" => {
                 let query = prepare_read(p, crate::storage::now() as i64).map_err(|_| invalid())?;
+                let refresh = p["refresh"].as_bool().unwrap_or(false);
                 match method {
-                    "usage/requests/read" => service.requests(query).await,
-                    "usage/dashboard/read" => service.dashboard(query).await,
-                    _ => service.read(query).await,
+                    "usage/requests/read" => service.requests_with_refresh(query, refresh).await,
+                    "usage/dashboard/read" => service.dashboard_with_refresh(query, refresh).await,
+                    _ => service.read_with_refresh(query, refresh).await,
                 }
             }
             _ => {

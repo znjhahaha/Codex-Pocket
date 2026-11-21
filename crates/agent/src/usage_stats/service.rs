@@ -2,14 +2,19 @@
 use super::*;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+/// Capability marker for the optional `refresh` flag on existing read methods,
+/// not a separate RPC operation. Advertise in the broker hello.
+pub const EXPLICIT_REFRESH_CAPABILITY: &str = "usage/refresh";
 const TTL: u64 = 60;
 const MAX_AGE: u64 = 300;
 const MAX_ENTRIES: usize = 16;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+type InFlightRead = watch::Receiver<Option<Arc<Value>>>;
 #[derive(Clone)]
 struct Entry {
     key: String,
@@ -57,10 +62,14 @@ impl Cache {
         });
     }
 }
+#[derive(Clone)]
 pub struct UsageService {
     path: Option<PathBuf>,
-    cache: Mutex<Cache>,
+    cache: Arc<Mutex<Cache>>,
+    in_flight: Arc<Mutex<BTreeMap<String, InFlightRead>>>,
     slots: Arc<Semaphore>,
+    #[cfg(test)]
+    reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 /// One service per process: paths, concurrency and cache cannot be reset by a remote caller.
 pub fn current_user_service() -> &'static UsageService {
@@ -74,8 +83,11 @@ impl UsageService {
     fn with_path(path: Option<PathBuf>) -> Self {
         Self {
             path,
-            cache: Mutex::new(Cache::default()),
+            cache: Arc::new(Mutex::new(Cache::default())),
+            in_flight: Arc::new(Mutex::new(BTreeMap::new())),
             slots: Arc::new(Semaphore::new(2)),
+            #[cfg(test)]
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
     #[cfg(test)]
@@ -87,11 +99,17 @@ impl UsageService {
         self.slots.clone().acquire_many_owned(2).await.unwrap()
     }
     pub async fn sources(&self) -> Value {
-        self.execute(None, false).await
+        self.sources_with_refresh(false).await
+    }
+    pub async fn sources_with_refresh(&self, refresh: bool) -> Value {
+        self.execute(None, false, refresh).await
     }
     pub async fn read(&self, query: UsageQuery) -> Value {
+        self.read_with_refresh(query, false).await
+    }
+    pub async fn read_with_refresh(&self, query: UsageQuery, refresh: bool) -> Value {
         // Preserve the strict schema-1 shape consumed by pre-dashboard Android builds.
-        let mut value = self.execute(Some(query), false).await;
+        let mut value = self.execute(Some(query), false, refresh).await;
         if let Some(query) = value["query"].as_object_mut() {
             query.remove("session_page");
             query.remove("request_page");
@@ -107,12 +125,29 @@ impl UsageService {
         value
     }
     pub async fn dashboard(&self, query: UsageQuery) -> Value {
-        self.execute(Some(query), false).await
+        self.dashboard_with_refresh(query, false).await
+    }
+    pub async fn dashboard_with_refresh(&self, query: UsageQuery, refresh: bool) -> Value {
+        self.execute(Some(query), false, refresh).await
     }
     pub async fn requests(&self, query: UsageQuery) -> Value {
-        self.execute(Some(query), true).await
+        self.requests_with_refresh(query, false).await
     }
-    async fn execute(&self, query: Option<UsageQuery>, requests_only: bool) -> Value {
+    pub async fn requests_with_refresh(&self, query: UsageQuery, refresh: bool) -> Value {
+        let mut value = self.execute(Some(query), true, refresh).await;
+        // Worker-level failures use the common failure builder; request pages
+        // retain their smaller result contract on every availability state.
+        if let Some(result) = value["result"].as_object_mut() {
+            result.remove("coverage");
+        }
+        value
+    }
+    async fn execute(
+        &self,
+        query: Option<UsageQuery>,
+        requests_only: bool,
+        refresh: bool,
+    ) -> Value {
         let key = query.as_ref().map_or_else(
             || "sources".into(),
             |q| {
@@ -127,20 +162,80 @@ impl UsageService {
                 )
             },
         );
-        let cached = self
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key);
-        if let Some(entry) = &cached {
-            if entry.at.elapsed() < Duration::from_secs(TTL) {
+        let mut receiver = {
+            let mut flights = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(receiver) = flights.get(&key) {
+                receiver.clone()
+            } else {
+                let cached = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key);
+                if !refresh {
+                    if let Some(entry) = &cached {
+                        if entry.at.elapsed() < Duration::from_secs(TTL) {
+                            return envelope(
+                                query,
+                                (*entry.value).clone(),
+                                metadata("fresh", Some(entry), None),
+                            );
+                        }
+                    }
+                }
+                // Bound distinct pending keys as well as active SQLite workers.
+                if flights.len() >= MAX_ENTRIES {
+                    return envelope(
+                        query.clone(),
+                        failure_value(
+                            query.as_ref(),
+                            "backend_busy",
+                            "The usage backend is busy; retry later.",
+                        ),
+                        metadata("unavailable", None, None),
+                    );
+                }
+                let (sender, receiver) = watch::channel(None);
+                flights.insert(key.clone(), receiver.clone());
+                let service = self.clone();
+                let query = query.clone();
+                // The task owns completion so a disconnected caller cannot leave
+                // a stuck flight or allow a duplicate uncancellable SQLite scan.
+                tokio::spawn(async move {
+                    let value = service
+                        .complete(query, requests_only, key.clone(), cached)
+                        .await;
+                    let mut flights = service.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                    sender.send_replace(Some(Arc::new(value)));
+                    flights.remove(&key);
+                });
+                receiver
+            }
+        };
+        loop {
+            if let Some(value) = receiver.borrow().clone() {
+                return (*value).clone();
+            }
+            if receiver.changed().await.is_err() {
                 return envelope(
-                    query,
-                    (*entry.value).clone(),
-                    metadata("fresh", Some(entry), None),
+                    query.clone(),
+                    failure_value(
+                        query.as_ref(),
+                        "backend_failed",
+                        "The usage worker did not complete.",
+                    ),
+                    metadata("unavailable", None, None),
                 );
             }
         }
+    }
+    async fn complete(
+        &self,
+        query: Option<UsageQuery>,
+        requests_only: bool,
+        key: String,
+        cached: Option<Entry>,
+    ) -> Value {
         let permit = tokio::time::timeout(
             Duration::from_millis(250),
             self.slots.clone().acquire_owned(),
@@ -150,8 +245,12 @@ impl UsageService {
             Ok(Ok(permit)) => {
                 let path = self.path.clone();
                 let q = query.clone();
+                #[cfg(test)]
+                let reads = self.reads.clone();
                 match tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    #[cfg(test)]
+                    reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     match q {
                         Some(q) => match path {
                             Some(p) => {
@@ -210,7 +309,9 @@ impl UsageService {
                     };
                     if query.is_some() {
                         value["data"] = entry.value["data"].clone();
-                        value["coverage"] = entry.value["coverage"].clone();
+                        if let Some(coverage) = entry.value.get("coverage") {
+                            value["coverage"] = coverage.clone();
+                        }
                         value["source"] = entry.value["source"].clone();
                     } else {
                         value["schema_version"] = entry.value["schema_version"].clone();
@@ -308,7 +409,8 @@ pub fn prepare_read(p: &Value, now: i64) -> Result<UsageQuery, ()> {
     let obj = p.as_object().ok_or(())?;
     if obj
         .keys()
-        .any(|k| !matches!(k.as_str(), "source_id" | "query"))
+        .any(|k| !matches!(k.as_str(), "source_id" | "query" | "refresh"))
+        || obj.get("refresh").is_some_and(|v| !v.is_boolean())
         || obj
             .get("source_id")
             .is_some_and(|v| v.as_str() != Some("cc_switch"))
@@ -338,7 +440,8 @@ pub fn prepare_read(p: &Value, now: i64) -> Result<UsageQuery, ()> {
     }
 }
 pub fn validate_sources(p: &Value) -> bool {
-    p.as_object().is_some_and(|o| o.is_empty())
+    p.as_object()
+        .is_some_and(|o| o.iter().all(|(k, v)| k == "refresh" && v.is_boolean()))
 }
 #[cfg(test)]
 #[path = "service_tests.rs"]

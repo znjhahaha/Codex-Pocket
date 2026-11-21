@@ -70,6 +70,17 @@ class ManagementUsageRepositoryTest {
         assertNotNull(repo.state.value.usage.visibleSnapshot!!.response.data!!.recentRequests)
     }
 
+    @Test fun manualRefreshBypassesCacheOnlyWhenBackendAdvertisesIt()=runBlocking<Unit> {
+        enableDashboard()
+        repo.loadUsage(filter, refresh=true).join()
+        assertFalse(transport.calls.last().second.containsKey("refresh"))
+        state().update { it.copy(capabilities=it.capabilities + "usage/refresh") }
+        repo.loadUsage(filter, refresh=true).join()
+        assertTrue(transport.calls.last().second.flag("refresh"))
+        repo.loadUsage(filter).join()
+        assertFalse(transport.calls.last().second.containsKey("refresh"))
+    }
+
     @Test fun sourceAndFilterChangesNeverReuseAnotherSourcesSnapshot()=runBlocking<Unit> {
         repo.loadUsage(filter).join()
         val first=repo.state.value.usage.visibleSnapshot!!

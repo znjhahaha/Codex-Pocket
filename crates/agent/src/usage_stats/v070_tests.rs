@@ -93,8 +93,8 @@ fn cache_anomalies_do_not_contribute_to_usage_aggregates() {
 }
 
 #[test]
-fn schema_24_25_26_accept_additive_columns_and_session_identity() {
-    for version in [24, 25, 26] {
+fn compatible_schema_versions_accept_additive_columns_and_session_identity() {
+    for version in [24, 25, 26, 27, 99] {
         let f = Fixture::new();
         f.conn.execute_batch(&format!("PRAGMA user_version={version}; ALTER TABLE proxy_request_logs ADD COLUMN future_stat TEXT;
             ALTER TABLE proxy_request_logs ADD COLUMN session_title TEXT;")).unwrap();
@@ -102,6 +102,12 @@ fn schema_24_25_26_accept_additive_columns_and_session_identity() {
         f.conn.execute_batch("UPDATE proxy_request_logs SET session_id='session-123456789',session_title='A reliable title'").unwrap();
         let result = serde_json::to_value(query(&f.path, &q())).unwrap();
         assert_eq!(result["availability"], "ready", "{result}");
+        assert_eq!(result["source"]["schema_version"], version);
+        assert_eq!(
+            result["data"]["totals"]["costs"]["total"]["known_usd"],
+            "0.1"
+        );
+        assert_eq!(result["data"]["totals"]["tokens"]["total"], 105);
         assert_eq!(
             result["data"]["session_groups"]["items"][0]["session_id"],
             "session-123456789"
@@ -115,6 +121,59 @@ fn schema_24_25_26_accept_additive_columns_and_session_identity() {
             "a"
         );
     }
+}
+
+#[test]
+fn newer_schema_still_requires_compatible_types_identity_and_semantics() {
+    for change in [
+        "ALTER TABLE proxy_request_logs DROP COLUMN input_token_semantics",
+        "ALTER TABLE proxy_request_logs DROP COLUMN input_tokens; ALTER TABLE proxy_request_logs ADD COLUMN input_tokens TEXT",
+        "ALTER TABLE proxy_request_logs DROP COLUMN total_cost_usd; ALTER TABLE proxy_request_logs ADD COLUMN total_cost_usd REAL",
+        "ALTER TABLE proxy_request_logs DROP COLUMN input_token_semantics; ALTER TABLE proxy_request_logs ADD COLUMN input_token_semantics INTEGER DEFAULT 3",
+        "ALTER TABLE proxy_request_logs DROP COLUMN latency_ms; ALTER TABLE proxy_request_logs ADD COLUMN latency_ms TEXT",
+        "ALTER TABLE proxy_request_logs DROP COLUMN input_tokens; ALTER TABLE proxy_request_logs ADD COLUMN input_tokens INTEGER GENERATED ALWAYS AS (output_tokens) VIRTUAL",
+        "ALTER TABLE proxy_request_logs DROP COLUMN latency_ms; ALTER TABLE proxy_request_logs ADD COLUMN latency_ms INTEGER GENERATED ALWAYS AS (output_tokens) VIRTUAL",
+        "ALTER TABLE proxy_request_logs RENAME TO old_logs; CREATE TABLE proxy_request_logs AS SELECT * FROM old_logs",
+    ] {
+        for version in [24, 25, 26, 27, 99] {
+            let f = Fixture::new();
+            f.conn
+                .execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            f.conn.execute_batch(change).unwrap();
+            let r = query(&f.path, &q());
+            assert_eq!(
+                r.availability,
+                Availability::UnsupportedSchema,
+                "v{version}: {change}"
+            );
+            assert_eq!(r.source.schema_version, Some(version));
+            assert!(r.data.is_none());
+            let requests = query_requests(&f.path, &q());
+            assert_eq!(requests["availability"], "unsupported_schema");
+            assert_eq!(requests["source"]["schema_version"], version);
+            let mut observed = None;
+            assert!(matches!(
+                super::reader::probe(&f.path, &mut observed),
+                Err(super::reader::Failure::Schema)
+            ));
+            assert_eq!(observed, Some(version));
+        }
+    }
+}
+
+#[test]
+fn corruption_is_not_an_unsupported_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.db");
+    std::fs::write(&path, b"This is not a SQLite database").unwrap();
+    let r = query(&path, &q());
+    assert_eq!(r.availability, Availability::Unavailable);
+    assert_eq!(r.errors[0].code, "database_corrupt");
+    let r = query_requests(&path, &q());
+    assert_eq!(r["availability"], "unavailable");
+    assert_eq!(r["errors"][0]["code"], "database_corrupt");
+    assert!(!r.to_string().contains("corrupt.db"));
 }
 
 #[test]
@@ -288,7 +347,7 @@ fn request_keyset_paging_has_no_duplicates_at_equal_timestamps() {
 fn optional_session_and_timing_columns_do_not_fabricate_observations() {
     let f = Fixture::new();
     f.row("a", 1, "codex", None, 2, None);
-    f.conn.execute_batch("PRAGMA user_version=25; ALTER TABLE proxy_request_logs DROP COLUMN session_id;
+    f.conn.execute_batch("PRAGMA user_version=99; ALTER TABLE proxy_request_logs DROP COLUMN session_id;
         ALTER TABLE proxy_request_logs DROP COLUMN latency_ms; ALTER TABLE proxy_request_logs DROP COLUMN first_token_ms;
         ALTER TABLE proxy_request_logs DROP COLUMN is_streaming").unwrap();
     let v = serde_json::to_value(query(&f.path, &q())).unwrap();

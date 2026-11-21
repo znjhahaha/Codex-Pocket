@@ -36,6 +36,91 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn explicit_refresh_is_validated_and_bypasses_each_read_cache() {
+        assert_eq!(
+            usage_stats::service::EXPLICIT_REFRESH_CAPABILITY,
+            "usage/refresh"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version=27;
+            CREATE TABLE proxy_request_logs(request_id TEXT PRIMARY KEY,provider_id TEXT,app_type TEXT,model TEXT,
+                input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER,cache_creation_tokens INTEGER,input_token_semantics INTEGER,
+                input_cost_usd TEXT,output_cost_usd TEXT,cache_read_cost_usd TEXT,cache_creation_cost_usd TEXT,total_cost_usd TEXT,
+                status_code INTEGER,created_at INTEGER,data_source TEXT);").unwrap();
+        let b = broker(dir.path().into());
+        for method in [
+            "usage/read",
+            "usage/dashboard/read",
+            "usage/requests/read",
+            "usage/sources",
+        ] {
+            let service = UsageService::test_service(Some(path.clone()));
+            conn.execute_batch("DELETE FROM proxy_request_logs; PRAGMA user_version=27")
+                .unwrap();
+            let params = if method == "usage/sources" {
+                json!({})
+            } else {
+                json!({"query":{"start_at":0,"end_at":30,"bucket_edges":[0,30]}})
+            };
+            let first = b
+                .usage_with_service("phone", method, &params, &service)
+                .await
+                .unwrap();
+            conn.execute_batch("INSERT INTO proxy_request_logs VALUES('a','p','codex','m',100,5,10,20,2,NULL,NULL,NULL,NULL,'0.1',200,1,'proxy'); PRAGMA user_version=28").unwrap();
+            assert_eq!(
+                b.usage_with_service("phone", method, &params, &service)
+                    .await
+                    .unwrap(),
+                first
+            );
+            let mut params = params;
+            params["refresh"] = json!(false);
+            assert_eq!(
+                b.usage_with_service("phone", method, &params, &service)
+                    .await
+                    .unwrap(),
+                first
+            );
+            params["refresh"] = json!(true);
+            let refreshed = b
+                .usage_with_service("phone", method, &params, &service)
+                .await
+                .unwrap();
+            if method == "usage/sources" {
+                assert_eq!(refreshed["sources"][0]["schema_version"], 28);
+            } else {
+                assert_eq!(refreshed["result"]["source"]["schema_version"], 28);
+                if method == "usage/requests/read" {
+                    assert_eq!(
+                        refreshed["result"]["data"]["requests"]["items"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                } else {
+                    assert_eq!(refreshed["result"]["data"]["totals"]["requests"], 1);
+                    if method == "usage/read" {
+                        assert!(refreshed["result"]["data"].get("recent_requests").is_none());
+                    }
+                }
+            }
+            for bad in [json!(null), json!(1), json!("true"), json!({})] {
+                params["refresh"] = bad;
+                assert_eq!(
+                    error::code(
+                        &b.usage_with_service("phone", method, &params, &service)
+                            .await
+                            .unwrap_err()
+                    ),
+                    Code::InvalidParams
+                );
+            }
+        }
+    }
+    #[tokio::test]
     async fn broker_child_preserves_paired_read_and_rejects_remote_paths() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(dir.path().into());

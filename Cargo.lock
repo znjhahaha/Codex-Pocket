@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-agent"
-version = "0.7.1-rc.20261121.43"
+version = "0.7.1-rc.20261121.47"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-bridge"
-version = "0.7.1-rc.20261121.43"
+version = "0.7.1-rc.20261121.47"
 dependencies = [
  "anyhow",
  "pocket-core",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-runtime-ipc"
-version = "0.7.1-rc.20261121.43"
+version = "0.7.1-rc.20261121.47"
 dependencies = [
  "anyhow",
  "pocket-core",

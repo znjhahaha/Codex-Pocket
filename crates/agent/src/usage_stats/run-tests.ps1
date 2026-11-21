@@ -1,4 +1,4 @@
-param([string]$Deps = (Join-Path $PSScriptRoot '..\..\..\..\target\debug\deps'), [switch]$LiveProbe)
+param([string]$Deps = (Join-Path $PSScriptRoot '..\..\..\..\target\debug\deps'), [switch]$LiveProbe, [switch]$SchemaOnly)
 $ErrorActionPreference = 'Stop'
 $Deps = [IO.Path]::GetFullPath($Deps)
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('pocket-usage-tests-' + [Guid]::NewGuid().ToString('N'))
@@ -34,7 +34,11 @@ try {
     Get-ChildItem (Join-Path $Deps '..\build\*\out') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $rustArgs += @('-L', "native=$($_.FullName)") }
     & rustc @rustArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    if ($LiveProbe) { & (Join-Path $scratch 'usage-tests.exe') }
+    if ($LiveProbe) {
+        $probeArgs = @()
+        if ($SchemaOnly) { $probeArgs += '--schema-only' }
+        & (Join-Path $scratch 'usage-tests.exe') @probeArgs
+    }
     else { & (Join-Path $scratch 'usage-tests.exe') '--skip' 'storage::tests::' '--test-threads=1' }
     $testExit = $LASTEXITCODE
 } finally {

@@ -16,6 +16,7 @@ pub(crate) enum Failure {
     Missing,
     Locked,
     Schema,
+    Corrupt,
     Path,
     Limit,
     Overflow,
@@ -27,7 +28,7 @@ impl From<rusqlite::Error> for Failure {
         match e.sqlite_error_code() {
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Locked,
             Some(ErrorCode::OperationInterrupted) => Self::Limit,
-            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Self::Schema,
+            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Self::Corrupt,
             _ => Self::Unavailable,
         }
     }
@@ -49,6 +50,11 @@ impl Failure {
                 Availability::UnsupportedSchema,
                 "unsupported_schema",
                 "The database schema is unsupported.",
+            ),
+            Self::Corrupt => (
+                Availability::Unavailable,
+                "database_corrupt",
+                "The database is corrupt or is not a SQLite database.",
             ),
             Self::Path => (
                 Availability::InvalidPath,
@@ -280,17 +286,20 @@ fn columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<
         .collect::<Vec<_>>()
         .join(",");
     let mut stmt = conn.prepare(&format!(
-        "SELECT name,type FROM pragma_table_info(?1) WHERE name IN ({names})"
+        "SELECT name,type,hidden FROM pragma_table_xinfo(?1) WHERE name IN ({names})"
     ))?;
     let columns = stmt
         .query_map([table], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+            ))
         })?
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     if required.iter().any(|(name, kind)| {
         columns
             .get(*name)
-            .is_none_or(|s| !s.eq_ignore_ascii_case(kind))
+            .is_none_or(|(s, hidden)| !s.eq_ignore_ascii_case(kind) || *hidden != 0)
     }) {
         return Err(Failure::Schema);
     }
@@ -299,7 +308,9 @@ fn columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<
 fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<Schema, Failure> {
     let observed: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     *version = Some(observed);
-    if !(24..=26).contains(&observed) || !table(conn, "proxy_request_logs")? {
+    // Version 24 introduced explicit token semantics. Later versions may add
+    // unrelated features; compatibility is determined by the projection below.
+    if observed < 24 || !table(conn, "proxy_request_logs")? {
         return Err(Failure::Schema);
     }
     columns(
@@ -329,6 +340,22 @@ fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<Schema, Failur
     if primary != 1 || count != 1 {
         return Err(Failure::Schema);
     }
+    // Do not silently interpret a newly declared token accounting convention.
+    // No default is valid: per-row invalid/missing semantics remain observable
+    // as invalid token rows, preserving the existing response contract.
+    let semantics_default: Option<String> = conn.query_row(
+        "SELECT dflt_value FROM pragma_table_info('proxy_request_logs') WHERE name='input_token_semantics'",
+        [], |r| r.get(0),
+    )?;
+    if semantics_default.as_ref().is_some_and(|value| {
+        let value = value.trim().trim_matches(|c| c == '(' || c == ')').trim();
+        !matches!(
+            value,
+            "0" | "1" | "2" | "'0'" | "'1'" | "'2'" | "NULL" | "null"
+        )
+    }) {
+        return Err(Failure::Schema);
+    }
     let providers = table(conn, "providers")?;
     if providers {
         columns(
@@ -345,14 +372,17 @@ fn schema(conn: &Connection, version: &mut Option<i64>) -> Result<Schema, Failur
         ("first_token_ms", "INTEGER"),
         ("is_streaming", "INTEGER"),
     ] {
-        let ty: Option<String> = conn
+        let ty: Option<(String, i64)> = conn
             .query_row(
-                "SELECT type FROM pragma_table_info('proxy_request_logs') WHERE name=?1",
+                "SELECT type,hidden FROM pragma_table_xinfo('proxy_request_logs') WHERE name=?1",
                 [name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if ty.as_ref().is_some_and(|t| !t.eq_ignore_ascii_case(kind)) {
+        if ty
+            .as_ref()
+            .is_some_and(|(t, hidden)| !t.eq_ignore_ascii_case(kind) || *hidden != 0)
+        {
             return Err(Failure::Schema);
         }
         optional.insert(name, ty.is_some());

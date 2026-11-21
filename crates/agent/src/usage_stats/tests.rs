@@ -360,7 +360,7 @@ fn missing_empty_and_unsupported_are_honest() {
     assert_eq!(r.availability, Availability::Missing);
     assert!(r.data.is_none());
     assert_eq!(ready(f.query(&q())).totals.requests, 0);
-    f.conn.execute_batch("PRAGMA user_version=27").unwrap();
+    f.conn.execute_batch("PRAGMA user_version=23").unwrap();
     assert_eq!(f.query(&q()).availability, Availability::UnsupportedSchema);
     f.conn.execute_batch("PRAGMA user_version=24; ALTER TABLE proxy_request_logs RENAME COLUMN input_token_semantics TO wrong").unwrap();
     assert_eq!(f.query(&q()).availability, Availability::UnsupportedSchema);

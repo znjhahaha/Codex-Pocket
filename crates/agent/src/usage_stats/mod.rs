@@ -8,7 +8,8 @@ mod types;
 use std::path::{Path, PathBuf};
 pub use types::*;
 pub fn default_db_path() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cc-switch/cc-switch.db"))
+    let home = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+    home.map(|p| PathBuf::from(p).join(".cc-switch/cc-switch.db"))
 }
 /// Trusted local diagnostic file only; never accept a remote path.
 pub(crate) fn read_projection(path: &Path, limit: u64) -> Option<Vec<u8>> {

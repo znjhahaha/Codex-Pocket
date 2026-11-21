@@ -2240,6 +2240,7 @@ impl Broker {
                 "usage/dashboard/read",
                 "usage/requests/read",
                 "usage/sources",
+                crate::usage_stats::service::EXPLICIT_REFRESH_CAPABILITY,
                 "usage.v1",
                 "upstream.versions.v1",
                 "assistant.v1",

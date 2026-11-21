@@ -479,7 +479,7 @@ class PocketRepository(
     private val usageCache = object : LinkedHashMap<UsageFilter, UsageSnapshot>(16, .75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<UsageFilter, UsageSnapshot>?): Boolean = size > 16
     }
-    fun loadUsage(filter: UsageFilter = _state.value.usage.filter): Job {
+    fun loadUsage(filter: UsageFilter = _state.value.usage.filter, refresh: Boolean = false): Job {
         val selected = pair?.computerId
         val transport = client
         val revision = usageRevision.incrementAndGet()
@@ -505,7 +505,10 @@ class PocketRepository(
             try {
                 val query = if (dashboard) filter.toJson() else filter.legacyJson()
                 val raw = transport.request(if (dashboard) "usage/dashboard/read" else "usage/read",
-                    buildJsonObject { put("source_id", "cc_switch"); put("query", query) }, timeoutMillis = 8000).asObject()
+                    buildJsonObject {
+                        put("source_id", "cc_switch"); put("query", query)
+                        if (refresh && "usage/refresh" in capabilities) put("refresh", true)
+                    }, timeoutMillis = 8000).asObject()
                 val response = UsageResponse.fromJson(raw)
                 require(response.source.appType == filter.appType && response.source.dataSource == filter.dataSource &&
                     (response.query == null || usageQueryMatches(response.query, filter.toJson())))
@@ -518,7 +521,9 @@ class PocketRepository(
                 val snapshot = response.data?.let { UsageSnapshot(filter, response, sampled) }
                 if (snapshot != null) synchronized(usageCache) { usageCache[filter] = snapshot }
                 _state.update { it.copy(usage = UsageScreenState(filter, snapshot ?: cached, response.phase,
-                    refreshing = false, canQuery = true, cached = response.cache?.state == "stale" || snapshot == null && cached != null, canPageRequests = canPage)) }
+                    refreshing = false, canQuery = true, cached = response.cache?.state == "stale" || snapshot == null && cached != null, canPageRequests = canPage,
+                    observedSchemaVersion = response.source.schemaVersion,
+                    failureCode = response.errors.firstOrNull { error -> error.code in setOf("database_missing", "database_locked", "unsupported_schema", "database_corrupt", "invalid_path", "query_limit", "arithmetic_overflow", "invalid_row", "database_unavailable", "backend_busy", "backend_failed") }?.code)) }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
                 if (client === transport && pair?.computerId == selected && revision == usageRevision.get())
