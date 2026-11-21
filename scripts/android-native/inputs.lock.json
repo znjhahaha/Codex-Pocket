@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "codex": {
+    "repository": "https://github.com/openai/codex.git",
+    "tag": "rust-v0.171.0",
+    "commit": "ccf9be8cc458bd6b8336fe84d68d8893f2691a5e",
+    "version": "0.171.0"
+  },
+  "termux": {
+    "repository": "https://github.com/termux/termux-packages.git",
+    "commit": "f6b5a496364e6e5cb239ebe9d508d7fcdb684398",
+    "package_path": "packages/codex"
+  },
+  "v8": {
+    "repository": "https://github.com/openai-oss-forks/rusty_v8.git",
+    "commit": "90a65f887a0c0f048f3784afbcb320b373c8a2e0",
+    "version": "152.2.0",
+    "features": [
+      "v8_enable_sandbox"
+    ],
+    "android_dependencies": {
+      "android_platform": {
+        "repository": "https://chromium.googlesource.com/chromium/src/third_party/android_platform.git",
+        "commit": "e3919359f2387399042d31401817db4a02d756ec"
+      },
+      "catapult": {
+        "repository": "https://chromium.googlesource.com/catapult.git",
+        "commit": "74513188f5cd39f9edb16236ea3a49ed5b3cb3c6"
+      }
+    },
+    "source_patches": [
+      "patches/termux/v8/0001-unset-BINDGEN_EXTRA_CLANG_ARGS-in-v8_s-bindgen.patch",
+      "patches/termux/v8/0002-install-sysroot.patch",
+      "patches/v8-custom-ndk.patch"
+    ]
+  },
+  "openssl": {
+    "version": "3.6.3",
+    "crate_version": "300.6.1+3.6.3",
+    "crate_checksum": "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
+  },
+  "rust_toolchain": "1.99.1",
+  "ndk_version": "28.2.13676358",
+  "min_sdk": 28,
+  "target_sdk": 36,
+  "targets": {
+    "arm64-v8a": {
+      "rust": "aarch64-linux-android",
+      "clang": "aarch64-linux-android",
+      "machine": 183
+    },
+    "x86_64": {
+      "rust": "x86_64-linux-android",
+      "clang": "x86_64-linux-android",
+      "machine": 62
+    }
+  },
+  "binaries": {
+    "codex-app-server": "libcodex-app-server.so",
+    "codex-code-mode-host": "libcodex-code-mode-host.so"
+  },
+  "source_patches": [
+    "patches/android-daemon-auto-start.patch",
+    "patches/termux/android-mxc-sdk-unsupported.patch",
+    "patches/android-packaged-helper.patch"
+  ]
+}

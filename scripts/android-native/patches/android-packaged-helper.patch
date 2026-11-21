@@ -1,0 +1,11 @@
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -10,6 +10,8 @@
+ const BIN_DIRNAME: &str = "bin";
+ const CODE_MODE_HOST_EXECUTABLE_NAME: &str = if cfg!(windows) {
+     "codex-code-mode-host.exe"
++} else if cfg!(target_os = "android") {
++    "libcodex-code-mode-host.so"
+ } else {
+     "codex-code-mode-host"
+ };
