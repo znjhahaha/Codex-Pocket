@@ -140,7 +140,7 @@ internal fun AssistantInputDock(composer: AssistantComposer, state: AssistantUiS
         PocketGlassSurface(Modifier.fillMaxWidth().testTag("assistant-composer-glass"), PocketRadii.panel, dense = true) {
             Column(Modifier.fillMaxWidth()) {
                 if (composer.target != null || project != null || files.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                    .padding(start = 10.dp, end = 10.dp, top = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    .padding(start = 10.dp, end = 10.dp, top = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (composer.target != null) AssistantDockChip(if (missingTarget) "所选任务已不可用" else "@${title(target!!)}",
                         if (missingTarget) "所选任务已不可用，移除" else "不再发给任务 ${title(target!!)}", { composer.target = null },
                         Modifier.testTag("assistant-target-chip"), enabled = !pending, removable = true, tone = if (missingTarget) PTone.Danger else PTone.Accent)
@@ -151,7 +151,7 @@ internal fun AssistantInputDock(composer: AssistantComposer, state: AssistantUiS
                             enabled = !pending, icon = PocketIcons.Description, removable = true)
                     } }
                 }
-                if (note != null) Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (note != null) Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 6.dp, top = if (pending) 2.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     PText(note, Modifier.weight(1f).testTag("assistant-send-status"), style = Pocket.type.caption, color = c.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     if (pending) PTextAction("另写新目标", { composer.newGoal() }, Modifier.testTag("assistant-new-goal"))
                 }
