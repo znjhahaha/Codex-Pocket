@@ -95,7 +95,10 @@ fun sessionRuntimes(runtimes: List<RuntimeInfo>, mode: SessionMode) = runtimes.f
 
 /** Source is historical provenance; only the broker's owner snapshot grants control. */
 fun PocketState.supports(capability: BrokerCapability) = capability.method in capabilities
-fun PocketState.canPrepareRuntime(mode: SessionMode): Boolean = supports(BrokerCapability.EnsureRuntime) &&
+/** A Linux host and this phone have no desktop Codex for a session to follow. */
+val PocketState.sessionModes: List<SessionMode> get() =
+    if ("runtime.desktop.unavailable" in capabilities) listOf(SessionMode.Cli) else SessionMode.entries
+fun PocketState.canPrepareRuntime(mode: SessionMode): Boolean = supports(BrokerCapability.EnsureRuntime) && mode in sessionModes &&
     (mode == SessionMode.Desktop || "runtime.ensure.cli" in capabilities)
 fun PocketState.creationRuntimes(mode: SessionMode) = sessionRuntimes(runtimes, mode).filter {
     supports("thread/start", it) && (mode != SessionMode.Cli || it.readinessStage == null || it.readinessStage == "ready")

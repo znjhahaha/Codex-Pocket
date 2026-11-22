@@ -144,6 +144,23 @@ class ProjectCreationUiTest {
             runtimes = listOf(runtime("cli").copy(capabilities = emptySet())))))
     }
 
+    @Test fun whereThereIsNoDesktopCodexASessionIsNeverOfferedToFollowOne() {
+        // A Linux host and this phone say so; older helpers, all on Windows, do not.
+        val hostless = state.copy(runtimes = emptyList(), capabilities = setOf("runtime/ensure", "runtime.ensure.cli", "runtime.desktop.unavailable"))
+        assertEquals(listOf(SessionMode.Cli), hostless.sessionModes)
+        assertFalse(hostless.canPrepareRuntime(SessionMode.Desktop))
+        assertEquals(SessionMode.Cli, initialCreationMode(hostless))
+        // Even a default remembered from a computer does not bring the choice back.
+        assertEquals(SessionMode.Cli, initialCreationMode(hostless.copy(sessionPreferences = SessionPreferences(SessionMode.Desktop))))
+        assertEquals(SessionMode.entries.toList(), state.sessionModes)
+        state = hostless
+        show()
+        compose.onNodeWithTag("project-advanced").performScrollTo().performClick()
+        compose.waitForIdle()
+        assertTrue(compose.onAllNodesWithTag("session-mode:desktop", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+        assertTrue(compose.onAllNodesWithTag("session-mode:cli", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+    }
+
     @Test fun extendedPathsAreDeduplicatedAndDisplayedCleanlyButSubmittedVerbatim() {
         val raw = "\\\\?\\D:\\work\\project-12"
         state = state.copy(chats = listOf(raw, "D:\\work\\project-12").mapIndexed { n, path ->

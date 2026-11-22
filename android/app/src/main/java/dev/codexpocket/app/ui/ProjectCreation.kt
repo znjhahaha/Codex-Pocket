@@ -199,8 +199,8 @@ internal fun ProjectCreationForm(
                             Icon(PocketIcons.ExpandMore, null, Modifier.padding(start = 8.dp).size(17.dp).graphicsLayer { rotationZ = rotation })
                         }
                         if (advanced) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.selectableGroup()) {
-                                SessionMode.entries.forEach { value ->
+                            if (s.sessionModes.size > 1) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.selectableGroup()) {
+                                s.sessionModes.forEach { value ->
                                     CreationCapsule({ mode = value }, Modifier.weight(1f).testTag("session-mode:${value.wire}")
                                         .semantics { this.selected = mode == value }, !creating, primary = mode == value) {
                                         Text(value.label, style = MaterialTheme.typography.labelMedium)
@@ -364,12 +364,12 @@ private fun ProjectPicker(projects: List<String>, selectedPath: String, query: S
 }
 
 internal fun initialCreationMode(s: PocketState): SessionMode = s.sessionPreferences.defaultMode.let { preferred ->
-    val ready = SessionMode.entries.filter { s.creationRuntimes(it).isNotEmpty() }
+    val ready = s.sessionModes.filter { s.creationRuntimes(it).isNotEmpty() }
     when {
         preferred in ready -> preferred
         ready.isNotEmpty() -> ready.first()
         s.canPrepareRuntime(preferred) -> preferred
-        else -> SessionMode.entries.firstOrNull { s.canPrepareRuntime(it) } ?: preferred
+        else -> s.sessionModes.firstOrNull { s.canPrepareRuntime(it) } ?: preferred.takeIf { it in s.sessionModes } ?: s.sessionModes.first()
     }
 }
 

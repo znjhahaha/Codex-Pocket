@@ -72,7 +72,8 @@ internal fun ThreadOwnership(s: PocketState, repo: PocketRepository) {
             if (access != null) Text("历史来源 ${chat.source.ifBlank { "未知" }} · 当前来源 ${access.source.ifBlank { "未知" }}", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (s.activeRuntime?.bridgeUpdatePending == true) Text("电脑桥接组件等待更新 · 请在电脑上完成更新", style = MaterialTheme.typography.labelSmall)
-            SessionModeChoices(access?.mode, s.online && s.supports(BrokerCapability.AccessUpdate) && status?.loading != true &&
+            // With one place a session can run there is nothing to choose.
+            if (s.sessionModes.size > 1) SessionModeChoices(access?.mode, s.online && s.supports(BrokerCapability.AccessUpdate) && status?.loading != true &&
                 access?.phase?.inProgress != true && !s.sendBusy && !s.uncertainSend && !chat.isSubagent && !chat.archived, repo::setThreadSessionMode)
             if (access?.phase?.inProgress == true && s.supports(BrokerCapability.AccessCancel))
                 PocketTextButton({ repo.cancelThreadHandoff() }, enabled = s.online && status?.loading != true) { Text("取消交接") }

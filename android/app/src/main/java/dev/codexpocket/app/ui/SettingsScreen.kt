@@ -210,7 +210,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                             subtitle = "更新此电脑的授权，保留会话缓存与草稿")
                     }
                     UpstreamVersionPanel(s, repo)
-                    SettingsSection("新会话默认模式") {
+                    if (s.sessionModes.size > 1) SettingsSection("新会话默认模式") {
                         SessionModeChoices(s.sessionPreferences.defaultMode, s.online && s.preferencesFresh &&
                             s.supports(BrokerCapability.PreferencesUpdate) && s.actionStatus["preferences"]?.loading != true, repo::setDefaultSessionMode)
                         Text("默认跟随桌面。独立 CLI 需要显式选择；已有任务保留当前归属。", Modifier.padding(12.dp),
