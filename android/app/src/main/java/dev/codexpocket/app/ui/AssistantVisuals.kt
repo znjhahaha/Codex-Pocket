@@ -5,8 +5,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
@@ -15,13 +13,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import dev.codexpocket.app.ui.kit.PIcon
+import dev.codexpocket.app.ui.kit.Pocket
 
-/** Assistant-local colors; follow the selected app theme, including manual overrides. */
+/**
+ * The assistant's colours, read from Pocket's shared tokens so they follow the selected appearance.
+ * Surfaces are the app's neutrals; the one green is the shared positive tone, used for the assistant's
+ * mark, its readiness and work that is moving.
+ */
 @Immutable
 data class AssistantPalette(
     val background: Color,
@@ -32,29 +35,22 @@ data class AssistantPalette(
     val onAccent: Color,
     val muted: Color,
     val border: Color,
+    /** A quiet fill behind the accent: the mark's tile, a running badge. */
+    val accentSoft: Color = Color.Unspecified,
 )
 
 @Composable
 fun assistantPalette(): AssistantPalette {
-    val c = MaterialTheme.colorScheme
-    return AssistantPalette(c.background, c.surfaceContainerLow, c.surfaceContainerHigh, c.onSurface,
-        c.secondary, c.onSecondary, c.onSurfaceVariant, c.outlineVariant)
+    val c = Pocket.colors
+    return AssistantPalette(c.bg, c.sunken, c.fillStrong, c.ink, c.positive, c.bg, c.inkMuted, c.line, c.positiveSoft)
 }
 
 /** Decorative identity only. The surrounding chat row or control supplies its semantics. */
 @Composable
-fun AssistantAvatar(modifier: Modifier = Modifier, size: Dp = 32.dp) {
+fun AssistantAvatar(modifier: Modifier = Modifier, size: Dp = 32.dp, tint: Color = Color.Unspecified) {
     val palette = assistantPalette()
-    Box(
-        modifier.size(size).background(palette.outgoing, RoundedCornerShape(30)),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(
-            imageVector = AssistantIcons.Mark,
-            contentDescription = null,
-            modifier = Modifier.fillMaxSize(.8f),
-            tint = palette.accent,
-        )
+    Box(modifier.size(size).background(palette.outgoing, RoundedCornerShape(30)), contentAlignment = Alignment.Center) {
+        PIcon(AssistantIcons.Mark, null, Modifier.fillMaxSize(.8f), tint = if (tint != Color.Unspecified) tint else palette.accent)
     }
 }
 
