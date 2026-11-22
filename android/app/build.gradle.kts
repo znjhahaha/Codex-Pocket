@@ -69,7 +69,7 @@ android {
     testOptions { unitTests.isIncludeAndroidResources = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
-    packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+    packaging { resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "/META-INF/{LICENSE,NOTICE}.md", "/META-INF/versions/9/OSGI-INF/MANIFEST.MF") }
 }
 if (huaweiAppId.isNotBlank()) tasks.named("preBuild") { dependsOn(generateHuaweiManifest) }
 kapt { arguments { arg("room.schemaLocation", "$projectDir/schemas") } }
