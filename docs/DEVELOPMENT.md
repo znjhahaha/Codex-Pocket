@@ -47,6 +47,30 @@ Set-Location ..
 
 输出包括签名 APK、Windows ZIP、Windows 文件目录与 SHA-256 清单。每次选择一个不存在的输出目录，旧交付会保留。源码快照可用 `scripts/package-source.ps1 -OutputDirectory <新目录>` 单独生成。
 
+### Linux SSH 运行环境
+
+手机通过 SSH 向 Linux 主机安装的后台（`pocket-agent` 与 `pocket-runtime-host`，静态 musl）不随仓库提交。Android 构建会把 `.local/execution-runtime/assets/linux-runtime/<架构>/` 打进 APK；该目录不存在时构建照常完成，应用在添加 SSH 主机时提示安装包不含此架构的运行环境。
+
+```powershell
+rustup target add x86_64-unknown-linux-musl
+cargo install cargo-zigbuild          # 另需 zig（PATH 或 CARGO_ZIGBUILD_ZIG_PATH）与带 cryptography 的 Python
+.\scripts\linux\build-runtime.ps1 -Architecture x86_64 -SigningKey <已有的 Ed25519 更新签名私钥路径>
+```
+
+脚本交叉编译、用现有签名私钥签署清单，并只在签名成功后替换上述目录；私钥与应用内固定的公钥不符时不会产生任何包，也不会生成或替换密钥。x86_64 的两个文件约 24 MB，APK 约增大 10 MB；`aarch64` 需要对应的 Rust 目标。
+
+SSH 相关的真实主机测试默认跳过，只针对一次性的本机虚拟机运行：
+
+```powershell
+$env:POCKET_LINUX_QA = '<含 known_hosts 与 test-key 的夹具目录>'
+$env:POCKET_LINUX_BIN = '<交叉编译输出目录>'            # 由测试用仅存在于本次进程的密钥签名
+# 或 $env:POCKET_LINUX_BUNDLE = '<正式签名的包目录>'   # 首个用例按应用内固定公钥校验
+Set-Location android
+.\gradlew.bat :wire:cleanTest :wire:test --tests "dev.codexpocket.wire.SshLinux*" --no-daemon
+```
+
+夹具主机需要：用户 `pocket`（密钥登录、免密 sudo）、其 `~/.local/bin/codex` 指向已安装的 Codex CLI；测试自行创建无 sudo 的 `pocketqa2`、为 `pocket` 开启 linger，并切断虚拟机的默认路由。`POCKET_LINUX_QA_PORT` 可改 SSH 转发端口（默认 22247）；虚拟机管理器不能复位客户机时，用 `POCKET_LINUX_QA_RESTART` 指定在客户机关机后重新启动它的命令。
+
 ## 验证
 
 以下命令运行本地测试；真实设备测试需要单独显式启用。不要把真实模型调用作为普通构建检查。
