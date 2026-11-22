@@ -110,7 +110,7 @@ internal fun AssistantAttentionSheet(attention: AssistantAttention, state: Assis
                     AssistantAttentionHeading("进行中", attention.running.size)
                     attention.running.forEach { task -> key("running:${task.id}") {
                         val view = state.jobView(task)
-                        PCard(Modifier.testTag("assistant-attention-running:${task.id}"), padding = PaddingValues(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 4.dp), spacing = 4.dp) {
+                        PCard(Modifier.testTag("assistant-attention-running:${task.id}"), color = c.fill, padding = PaddingValues(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 4.dp), spacing = 4.dp) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 AssistantJobGlyph(view)
                                 PText(view.title, Modifier.weight(1f), style = Pocket.type.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -130,7 +130,7 @@ internal fun AssistantAttentionSheet(attention: AssistantAttention, state: Assis
                     attention.delivered.forEach { task -> key("delivered:${task.id}") {
                         val view = state.jobView(task)
                         val job = view.job
-                        PCard(Modifier.testTag("assistant-attention-delivered:${task.id}"), padding = PaddingValues(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 4.dp), spacing = 4.dp) {
+                        PCard(Modifier.testTag("assistant-attention-delivered:${task.id}"), color = c.fill, padding = PaddingValues(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 4.dp), spacing = 4.dp) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 AssistantJobGlyph(view)
                                 PText(view.title, Modifier.weight(1f), style = Pocket.type.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)

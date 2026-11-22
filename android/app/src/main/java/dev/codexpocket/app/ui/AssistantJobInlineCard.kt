@@ -125,8 +125,7 @@ internal fun AssistantJobGlyph(view: AssistantJobView, modifier: Modifier = Modi
 internal fun AssistantJobStageLine(view: AssistantJobView, modifier: Modifier = Modifier) {
     val c = Pocket.colors
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (view.subagents > 0) Row(Modifier.semantics(mergeDescendants = true) {}, verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (view.subagents > 0) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             PLoopGlyph(MotionGlyphs.Users, view.running, Modifier.size(15.dp), c.accent, millis = 2200)
             PText("${view.subagents} 子代理", style = Pocket.type.labelSmall, color = c.accent, maxLines = 1)
         }
@@ -147,7 +146,7 @@ internal fun AssistantCardAction(text: String, onClick: () -> Unit, modifier: Mo
     Box(modifier.heightIn(min = PocketSpace.touch).widthIn(min = PocketSpace.touch).pocketPressScale(interaction, .96f)
         .pocketPressable(enabled, Role.Button, interaction, pressedScale = 1f, highlight = false, haptic = haptic, onClick = onClick),
         contentAlignment = Alignment.Center) {
-        Row(Modifier.clip(PocketRadii.capsule).background(if (primary && enabled) c.solid else c.fill).padding(horizontal = 14.dp, vertical = 7.dp),
+        Row(Modifier.clip(PocketRadii.capsule).background(if (primary && enabled) c.solid else c.fillStrong).padding(horizontal = 14.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProvidePInk(ink, Pocket.type.labelSmall) { leading?.invoke(); PText(text, maxLines = 1, overflow = TextOverflow.Ellipsis) }
         }
@@ -181,12 +180,13 @@ internal fun AssistantJobInlineCard(task: AssistantTask, state: AssistantUiState
             .padding(start = 16.dp, end = 12.dp, top = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 AssistantJobGlyph(view)
-                PText(view.label, Modifier.weight(1f, fill = false), style = Pocket.type.labelSmall, color = assistantToneInk(view.tone), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (view.unread) PBadge("新进展", tone = PTone.Accent)
-                Spacer(Modifier.weight(1f))
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PText(view.label, Modifier.weight(1f, fill = false), style = Pocket.type.labelSmall, color = assistantToneInk(view.tone), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (view.unread) PBadge("新进展", tone = PTone.Accent)
+                }
                 PToggleGlyph(MotionGlyphs.Chevron, expanded, Modifier.size(18.dp), c.inkFaint)
             }
-            PText(view.title, style = Pocket.type.titleSmall, maxLines = if (expanded) 6 else 2, overflow = TextOverflow.Ellipsis)
+            PText(view.title, Modifier.testTag("assistant-chat-task-title:${task.id}"), style = Pocket.type.titleSmall, maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis)
             view.project?.let { project ->
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     PIcon(PocketIcons.Folder, null, Modifier.size(13.dp), c.inkFaint)
@@ -245,7 +245,7 @@ private fun AssistantJobDetails(view: AssistantJobView, state: AssistantUiState,
         outcome?.let { (text, tone) ->
             PText(text, Modifier.testTag("assistant-job-merge-outcome:${task.id}"), style = Pocket.type.bodySmall, color = assistantToneInk(tone))
         }
-        if (artifacts.isEmpty()) PText("成果尚未交付", style = Pocket.type.caption, color = c.inkFaint)
+        if (artifacts.isEmpty()) { if (task.status != AssistantTaskStatus.Done) PText("成果尚未交付", style = Pocket.type.caption, color = c.inkFaint) }
         else {
             PText("成果 · ${artifacts.size}", style = Pocket.type.labelSmall, color = c.inkMuted)
             artifacts.take(2).forEach { artifact ->

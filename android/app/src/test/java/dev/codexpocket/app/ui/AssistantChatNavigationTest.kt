@@ -18,38 +18,6 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
-internal fun ComposeTestRule.openAssistantPage(page: String) {
-    onNodeWithTag("assistant-more").assertIsDisplayed().performClick()
-    onNodeWithTag("assistant-tab:$page").assertIsDisplayed().performClick()
-}
-
-internal fun AssistantUiState.acceptSend(action: AssistantAction, status: String = "accepted"): AssistantUiState {
-    val binding=action.composerBinding ?: requireNotNull(snapshot).composerBinding(computerId)
-    return copy(sendReceipts = listOf(AssistantSendReceipt(requireNotNull(action.commandId),binding.computerId,binding.runtimeId,binding.conversationId,status)))
-}
-
-internal fun ComposeTestRule.returnToAssistantChat() {
-    onNodeWithContentDescription("返回助理对话").assertIsDisplayed().performClick()
-    onNodeWithContentDescription("返回原页面").assertIsDisplayed()
-}
-
-internal fun ComposeTestRule.selectAssistantWorkspace(threadId: String) {
-    // The selected context chip replaces the tools-panel entry after a choice.
-    if (onAllNodesWithTag("assistant-workspace").fetchSemanticsNodes().isEmpty()) {
-        onNodeWithTag("assistant-tools").assertIsDisplayed().performClick()
-    }
-    onNodeWithTag("assistant-workspace").assertIsDisplayed().performClick()
-    onNodeWithTag("assistant-workspace:$threadId").assertIsDisplayed().performClick()
-}
-
-internal fun ComposeTestRule.expandAssistantTask(taskId: String) {
-    if(onAllNodesWithTag("assistant-detail-list").fetchSemanticsNodes().isNotEmpty()) onNodeWithTag("assistant-back").performClick()
-    onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.ScrollToIndex)).onFirst()
-        .performScrollToNode(hasTestTag("assistant-task:$taskId"))
-    if(onAllNodesWithTag("assistant-task-detail:$taskId").fetchSemanticsNodes().isEmpty()) onNodeWithTag("assistant-task-expand:$taskId").performClick()
-    onNodeWithTag("assistant-task-detail:$taskId").performClick()
-}
-
 /** Deterministic UI actions only; no repository, transport, or model execution. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")

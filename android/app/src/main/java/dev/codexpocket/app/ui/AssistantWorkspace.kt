@@ -18,8 +18,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -114,6 +117,21 @@ private fun AssistantPageEntrance(page: String, returning: Boolean, content: @Co
     Box(Modifier.fillMaxSize().graphicsLayer { alpha = progress.value.coerceIn(0f, 1f); translationX = distance * (1f - progress.value) }) { content() }
 }
 
+/**
+ * Where glass cannot refract what is under it (older systems, power saving, high contrast), the chrome stands on a
+ * veil of the page colour, so the conversation fades out before it instead of showing between its parts.
+ */
+@Composable
+private fun Modifier.assistantChromeVeil(top: Boolean): Modifier {
+    val preferences = rememberPocketGlassPreferences()
+    val optics = LocalPocketGlass.current && !preferences.highContrast && !preferences.batterySaver && LocalView.current.isHardwareAccelerated &&
+        android.os.Build.VERSION.SDK_INT >= 31
+    if (optics) return this
+    val page = Pocket.colors.bg
+    return background(if (top) Brush.verticalGradient(0f to page, .86f to page, 1f to page.copy(alpha = 0f))
+        else Brush.verticalGradient(0f to page.copy(alpha = 0f), .22f to page, 1f to page))
+}
+
 /** The bar every assistant page shares: back, the title in a glass capsule with an optional status mark, then actions. */
 @Composable
 private fun AssistantTopBar(title: String, onBack: () -> Unit, status: (@Composable () -> Unit)? = null, actions: @Composable RowScope.() -> Unit = {}) {
@@ -140,8 +158,12 @@ private fun AssistantStatusRow(issue: String?, unconfirmed: Boolean, loading: Bo
     Column(Modifier.fillMaxWidth()) {
         if (issue != null) PSurface(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 6.dp).fillMaxWidth().testTag("assistant-workspace-error"),
             PocketRadii.control, if (unconfirmed) c.warningSoft else c.dangerSoft, if (unconfirmed) c.ink else c.onDangerSoft) {
-            Row(Modifier.padding(start = 14.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                PText(issue, Modifier.weight(1f).padding(vertical = 8.dp).testTag("assistant-workspace-issue"), style = Pocket.type.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            // At large text the sentence takes the full width and the action moves under it.
+            if (LocalDensity.current.fontScale > 1.3f) Column(Modifier.padding(start = 14.dp, end = 2.dp), horizontalAlignment = Alignment.End) {
+                PText(issue, Modifier.fillMaxWidth().padding(top = 8.dp, end = 12.dp).testTag("assistant-workspace-issue"), style = Pocket.type.bodySmall)
+                PTextAction("重试读取", onRetry, Modifier.testTag("assistant-read-retry"))
+            } else Row(Modifier.padding(start = 14.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                PText(issue, Modifier.weight(1f).padding(vertical = 8.dp).testTag("assistant-workspace-issue"), style = Pocket.type.bodySmall)
                 PTextAction("重试读取", onRetry, Modifier.testTag("assistant-read-retry"))
             }
         }
@@ -151,7 +173,7 @@ private fun AssistantStatusRow(issue: String?, unconfirmed: Boolean, loading: Bo
 
 @Composable
 private fun AssistantSubpage(title: String, onBack: () -> Unit, notice: @Composable () -> Unit, content: @Composable () -> Unit) {
-    PFrame(header = { Column { AssistantTopBar(title, onBack); notice() } }) { padding ->
+    PFrame(header = { Column(Modifier.assistantChromeVeil(true)) { AssistantTopBar(title, onBack); notice() } }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding).navigationBarsPadding()) { AssistantSecondaryTheme(content) }
     }
 }
@@ -280,7 +302,7 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
 
     Box(Modifier.fillMaxSize()) {
         PFrame(header = {
-            Column {
+            Column(Modifier.assistantChromeVeil(true)) {
                 AssistantTopBar("口袋助理", onBack, status = { AssistantReadiness(state, connected) }) {
                     PGlassIconButton(AssistantIcons.Schedule, "计划", { navigate("Plans") }, Modifier.testTag("assistant-schedules"),
                         glyph = { PPulseGlyph(MotionGlyphs.Clock, snapshot.schedules.size, Modifier.size(20.dp)) })
@@ -290,7 +312,7 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
                 AssistantAttentionCapsule(attention, { attentionOpen = true })
             }
         }, dock = {
-            AssistantInputDock(composer, state, workspaces, canAct, connected, act, { tools = !tools }, tools)
+            AssistantInputDock(composer, state, workspaces, canAct, connected, act, { tools = !tools }, tools, Modifier.assistantChromeVeil(false))
         }) { padding ->
             AssistantConversation(state, snapshot, rows, recoveries, handoffs, streamOp, working, composer.key, arrivals, list, padding, canAct, connected,
                 act, navigate, open) { confirm = it }
@@ -339,28 +361,6 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
                     enabled = !state.busy("assistant/read"), tint = c.inkMuted)
             }
         }
-        if (!snapshot.prepared && !snapshot.dispatchInFlight) item("prepare") {
-            AssistantCard(Modifier.testTag("assistant-prepare-card")) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    AssistantAvatar(size = 28.dp)
-                    PText(if (connected) "准备好后，把事情交给助理" else "电脑离线，草稿会保留", Modifier.weight(1f), style = Pocket.type.titleSmall)
-                }
-                snapshot.preparationIssue?.let { PText(it, style = Pocket.type.bodySmall, color = c.inkMuted) }
-                if (snapshot.startupStages.isNotEmpty()) AssistantStartupStatus(snapshot)
-                PButton("准备助理", { act { AssistantActions.prepare() } }, Modifier.fillMaxWidth().testTag("assistant-prepare"),
-                    enabled = connected && "assistant/prepare" !in state.pendingActions)
-            }
-        }
-        if (unknown.isNotEmpty()) item("unknown") {
-            AssistantCard(Modifier.testTag("assistant-unknown-notice")) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PIcon(PocketIcons.Info, null, Modifier.size(18.dp), c.warning)
-                    PText("${unknown.size} 次执行待核对", style = Pocket.type.titleSmall)
-                }
-                PText("保留原执行与回执，你可以继续交办其他目标。", style = Pocket.type.bodySmall, color = c.inkMuted)
-                AssistantCardAction("查看待核对任务", { navigate("Tasks") }, Modifier.testTag("assistant-unknown-open"))
-            }
-        }
         if (rows.none { it is AssistantTimeline.Message } && snapshot.prepared) item("greeting") {
             Column(Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 AssistantAvatar(size = 44.dp)
@@ -398,6 +398,29 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
         }
         items(recoveries, key = { "recovery:${it.operationId}:${it.requestId}" }) { request -> AssistantCard { AssistantRecoveryCard(request, runtime, state, canAct, act) } }
         items(handoffs, key = { "handoff:${it.id}" }) { op -> AssistantCard { AssistantHandoffRecoveryCard(op, runtime, state, canAct, act) } }
+        // What the assistant's own state asks for sits after the conversation, next to the composer, not above a long history.
+        if (!snapshot.prepared && !snapshot.dispatchInFlight) item("prepare") {
+            AssistantCard(Modifier.testTag("assistant-prepare-card")) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    AssistantAvatar(size = 28.dp)
+                    PText(if (connected) "准备好后，把事情交给助理" else "电脑离线，草稿会保留", Modifier.weight(1f), style = Pocket.type.titleSmall)
+                }
+                snapshot.preparationIssue?.let { PText(it, style = Pocket.type.bodySmall, color = c.inkMuted) }
+                if (snapshot.startupStages.isNotEmpty()) AssistantStartupStatus(snapshot)
+                PButton("准备助理", { act { AssistantActions.prepare() } }, Modifier.fillMaxWidth().testTag("assistant-prepare"),
+                    enabled = connected && "assistant/prepare" !in state.pendingActions)
+            }
+        }
+        if (unknown.isNotEmpty()) item("unknown") {
+            AssistantCard(Modifier.testTag("assistant-unknown-notice")) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PIcon(PocketIcons.Info, null, Modifier.size(18.dp), c.warning)
+                    PText("${unknown.size} 次执行待核对", style = Pocket.type.titleSmall)
+                }
+                PText("保留原执行与回执，你可以继续交办其他目标。", style = Pocket.type.bodySmall, color = c.inkMuted)
+                AssistantCardAction("查看待核对任务", { navigate("Tasks") }, Modifier.testTag("assistant-unknown-open"))
+            }
+        }
         if (streamOp != null) item("stream") {
             val fresh = remember { arrivals.take("stream") }
             Column(Modifier.fillMaxWidth().assistantArrival(fresh).testTag("assistant-streaming"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
