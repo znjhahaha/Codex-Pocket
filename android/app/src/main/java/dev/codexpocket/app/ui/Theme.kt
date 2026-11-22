@@ -17,6 +17,10 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import dev.codexpocket.app.ui.kit.PocketColors
+import dev.codexpocket.app.ui.kit.PocketDarkColors
+import dev.codexpocket.app.ui.kit.PocketLightColors
+import dev.codexpocket.app.ui.kit.ProvidePocketTokens
 
 /** Codex-neutral surfaces; violet is reserved for selected controls. */
 private val Light = lightColorScheme(
@@ -69,8 +73,12 @@ fun PocketTheme(theme: String, content: @Composable () -> Unit) {
         labelLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
         labelMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
         labelSmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Normal),
-    )) { CompositionLocalProvider(LocalContentColor provides colors.onSurface, content = content) }
+    )) { ProvidePocketTokens(pocketTokens(dark, colors)) { CompositionLocalProvider(LocalContentColor provides colors.onSurface, content = content) } }
 }
+
+/** Pocket's own tokens for this appearance. Screens still on Material read the same values from [scheme]. */
+internal fun pocketTokens(dark: Boolean, scheme: ColorScheme): PocketColors = (if (dark) PocketDarkColors else PocketLightColors).copy(
+    danger = scheme.error, onDanger = scheme.onError, dangerSoft = scheme.errorContainer, onDangerSoft = scheme.onErrorContainer)
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this

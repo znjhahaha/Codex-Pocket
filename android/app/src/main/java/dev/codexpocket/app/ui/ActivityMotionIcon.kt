@@ -3,8 +3,6 @@ package dev.codexpocket.app.ui
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -17,6 +15,8 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import dev.codexpocket.app.ui.kit.PIcon
+import dev.codexpocket.app.ui.kit.Pocket
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -26,7 +26,7 @@ internal enum class ActivityMotion { Terminal, Document, Connection, Tool }
 /** The clock is read only while drawing; no transcript measurement runs on an animation frame. */
 @Composable
 internal fun ActivityMotionIcon(kind: ActivityMotion, running: Boolean, modifier: Modifier = Modifier.size(16.dp),
-    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant, fallback: ImageVector = PocketIcons.Wrench) {
+    tint: Color = Pocket.colors.inkMuted, fallback: ImageVector = PocketIcons.Wrench) {
     val preferences=rememberPocketGlassPreferences()
     val motion=preferences.animatorsEnabled&&!preferences.batterySaver&&!preferences.highContrast
     val last=remember(kind) {floatArrayOf(1f)}
@@ -39,7 +39,7 @@ internal fun ActivityMotionIcon(kind: ActivityMotion, running: Boolean, modifier
         settle.asState()
     } else rememberUpdatedState(1f)
     if(kind==ActivityMotion.Tool) {
-        Icon(fallback,null,modifier.graphicsLayer {
+        PIcon(fallback,null,modifier.graphicsLayer {
             last[0]=phase.value
             rotationZ=sin(phase.value*2f*PI).toFloat()*9f
         },tint=tint)

@@ -3,9 +3,6 @@ package dev.codexpocket.app.ui
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.LocalContentColor
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -16,11 +13,13 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.codexpocket.app.ui.kit.PText
+import dev.codexpocket.app.ui.kit.Pocket
 
 /** Only the glyph layer moves. The tab keeps its measured width and hit target. */
 @Composable
 internal fun PocketTabLabel(text: String, selected: Boolean, modifier: Modifier = Modifier,
-    color: Color = LocalContentColor.current, style: TextStyle = MaterialTheme.typography.labelMedium) {
+    color: Color = Pocket.ink, style: TextStyle = Pocket.type.labelSmall) {
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.batterySaver && !preferences.highContrast
     val target = if (selected) 1f else 0f
@@ -32,12 +31,12 @@ internal fun PocketTabLabel(text: String, selected: Boolean, modifier: Modifier 
         scaleY = .96f + .08f * value
         translationY = (.6f - 1.4f * value).dp.toPx()
     } else Modifier
-    Text(text, modifier.then(transform), style = style, fontWeight = FontWeight.Medium, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    PText(text, modifier.then(transform), style = style, fontWeight = FontWeight.Medium, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
 @Composable
 internal fun PocketDestinationTitle(text: String, modifier: Modifier = Modifier,
-    style: TextStyle = MaterialTheme.typography.titleMedium) {
+    style: TextStyle = Pocket.type.title) {
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.batterySaver && !preferences.highContrast
     AnimatedContent(text, modifier, contentAlignment = Alignment.CenterStart, transitionSpec = {
@@ -45,7 +44,7 @@ internal fun PocketDestinationTitle(text: String, modifier: Modifier = Modifier,
             (slideOutVertically(tween(240, easing = FastOutSlowInEasing)) { -it / 3 } + fadeOut(tween(140))))
             .using(SizeTransform(clip = true, sizeAnimationSpec = { _, _ -> tween(320, easing = FastOutSlowInEasing) }))
         else (EnterTransition.None togetherWith ExitTransition.None).using(null)
-    }, label = "destination-title") { title -> Text(title, style = style, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+    }, label = "destination-title") { title -> PText(title, style = style, maxLines = 1, overflow = TextOverflow.Ellipsis) }
 }
 
 /** A single entrance followed by a moving light band; complete text remains in semantics. */
@@ -62,7 +61,7 @@ internal fun ActivityTextFlow(running: Boolean, animateEntrance: Boolean, modifi
     }
     val phase: State<Float> = if (running && motion) rememberInfiniteTransition(label = "activity-text").animateFloat(
         0f, 1f, infiniteRepeatable(tween(2300, 400, LinearEasing)), label = "travelling-light") else rememberUpdatedState(1f)
-    val light = MaterialTheme.colorScheme.onSurface
+    val light = Pocket.colors.ink
     val effect = if (motion && (running || !entranceFinished)) Modifier
         .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
         .drawWithContent {

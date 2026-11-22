@@ -22,8 +22,6 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,6 +45,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
+import dev.codexpocket.app.ui.kit.PSurface
+import dev.codexpocket.app.ui.kit.Pocket
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.backdrops.rememberCanvasBackdrop
@@ -71,7 +71,7 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
     val registry = remember { OverlayRegistry() }
     val preferences = rememberPocketGlassPreferences()
     val page = rememberLayerBackdrop()
-    val background = MaterialTheme.colorScheme.background
+    val background = Pocket.colors.bg
     // The default backdrop is a constant color, not page content. Recording a render layer
     // here lets nested glass consumers re-enter that layer when Android rebuilds display lists.
     // Drawing the color directly keeps this leaf acyclic; page/transcript glass still samples
@@ -209,7 +209,7 @@ internal fun PocketModal(
                 .clearAndSetSemantics {})
             // Standalone destinations own an opaque page; only small menus use sampled glass.
             BoxWithConstraints(Modifier.fillMaxSize()
-                .then(if (screen) Modifier.background(MaterialTheme.colorScheme.background) else Modifier)
+                .then(if (screen) Modifier.background(Pocket.colors.bg) else Modifier)
                 .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else if (maxWidthDp > 360f) 16.dp else 12.dp),
                 // Sheets rise from the bottom edge like iOS action sheets; dialogs stay centered.
                 contentAlignment = if (sheet && !screen && !anchored) Alignment.BottomCenter else Alignment.Center) {
@@ -257,7 +257,7 @@ internal fun PocketModal(
                         .focusGroup()) { content(handle) }
                 }
                 val panel: @Composable () -> Unit = {
-                    if (screen) Surface(panelModifier, color = MaterialTheme.colorScheme.background) { body() }
+                    if (screen) PSurface(panelModifier, color = Pocket.colors.bg) { body() }
                     else PocketGlassSurface(panelModifier, shape = RoundedCornerShape(if (anchored) 22.dp else if (sheet) 28.dp else 24.dp),
                         backdrop = LocalModalBackdrop.current, dense = true, content = body)
                 }

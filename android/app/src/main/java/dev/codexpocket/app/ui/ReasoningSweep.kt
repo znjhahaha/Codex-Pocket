@@ -5,7 +5,6 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
@@ -19,6 +18,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.lifecycle.Lifecycle
+import dev.codexpocket.app.ui.kit.Pocket
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
@@ -69,8 +69,8 @@ internal fun Modifier.reasoningSweep(active: Boolean): Modifier {
             label = "native-reasoning-sweep-phase",
         )
     } else null
-    val base = MaterialTheme.colorScheme.onSurfaceVariant
-    val bright = MaterialTheme.colorScheme.onSurface
+    val base = Pocket.colors.inkMuted
+    val bright = Pocket.colors.ink
     return then(visibility.modifier()).drawWithCache {
         val bounds = Rect(Offset.Zero, size)
         val layer = Paint()

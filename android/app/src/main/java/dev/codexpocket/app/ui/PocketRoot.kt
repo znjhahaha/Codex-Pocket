@@ -391,15 +391,7 @@ internal fun CircleAction(icon: ImageVector, label: String, onClick: () -> Unit)
 
 @Composable
 internal fun ActionIcon(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    val interaction = remember { MutableInteractionSource() }
-    val pressed by interaction.collectIsPressedAsState()
-    val focused by interaction.collectIsFocusedAsState()
-    val scale by animateFloatAsState(if (pressed) .96f else 1f, pocketPressSpring(), label = "icon-press")
-    Box(Modifier.size(48.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(CircleShape)
-        .background(if (pressed || focused) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)
-        .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, Modifier.size(20.dp), tint = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .6f))
-    }
+    dev.codexpocket.app.ui.kit.PIconButton(icon, label, onClick, enabled = enabled)
 }
 
 @Composable

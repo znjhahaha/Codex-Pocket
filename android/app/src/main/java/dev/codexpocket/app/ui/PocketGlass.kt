@@ -22,7 +22,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
@@ -47,6 +46,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.kyant.backdrop.Backdrop
+import dev.codexpocket.app.ui.kit.Pocket
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
@@ -71,9 +71,9 @@ internal fun PocketGlassSurface(
 ) {
     val view = LocalView.current
     val preferences = rememberPocketGlassPreferences()
-    val colors = MaterialTheme.colorScheme
+    val colors = Pocket.colors
     val clear = LocalPocketClearGlass.current
-    val dark = colors.background.luminance() < .3f
+    val dark = colors.bg.luminance() < .3f
     val glass = LocalPocketGlass.current && !preferences.highContrast && !preferences.batterySaver && view.isHardwareAccelerated
     val optics = glass && Build.VERSION.SDK_INT >= 31 && backdrop != null
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
@@ -206,7 +206,7 @@ internal fun PocketGlassSurface(
                     if (glass && motion) {
                         drawOutline(outline, Color.White.copy(alpha = feedback * if (dark) .045f else .035f))
                     } else {
-                        drawOutline(outline, colors.onSurface.copy(alpha = feedback * if (preferences.highContrast) .16f else .08f))
+                        drawOutline(outline, colors.ink.copy(alpha = feedback * if (preferences.highContrast) .16f else .08f))
                     }
                 }
                 // All light remains below the glyphs and within the actual component contour.
