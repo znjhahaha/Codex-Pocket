@@ -177,7 +177,7 @@ class SshLinuxHostLifecycleLiveTest {
         assertEquals(first.pairing.computerId, phone.online { _, hello -> hello.string("computerId") })
 
         // The link is cut while the executable is still arriving.
-        val late = TestRuntimeSigner.verified(LinuxQa.bundle("0.0.3-qa"))
+        val late = TestRuntimeSigner.verified(LinuxQa.bundle("0.0.3-qa-${UUID.randomUUID()}"))
         val settled = running()
         SshSession.open(LinuxQa.pocket).use { admin ->
             suspend fun sessions() = admin.execute("pgrep -u pocket -x sshd\n", 20, emptyMap()).lines().filter { it.isNotBlank() }.toSet()
@@ -204,5 +204,11 @@ class SshLinuxHostLifecycleLiveTest {
         LinuxQa.prepare(directory = late.directory)
         assertEquals(late.generation, running().first)
         assertEquals(first.pairing.computerId, phone.online { _, hello -> hello.string("computerId") })
+        // Versions do not pile up: the running one, the one before it, and any that something still runs from.
+        val kept = LinuxQa.sh("ls \"${'$'}HOME/.local/share/codex-pocket/versions\"").lines().filter { it.isNotBlank() }.toSet()
+        val inUse = LinuxQa.sh("for entry in /proc/[0-9]*; do readlink \"${'$'}entry/exe\" 2>/dev/null; done | grep -o 'codex-pocket/versions/[0-9a-f]*' | sed 's#.*/##'").lines().filter { it.isNotBlank() }.toSet()
+        assertTrue(late.generation in kept && newer.generation in kept)
+        assertEquals(emptySet<String>(), kept - late.generation - newer.generation - inUse)
+        assertFalse("the version that could not start is gone", TestRuntimeSigner.verified(broken).generation in kept)
     }
 }

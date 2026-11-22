@@ -197,6 +197,18 @@ suspend fun prepareSshHost(target: SshTarget, bundleFor: suspend (String) -> Lin
                 start_host "${'$'}previous" || exit 63
                 exit 64
               fi
+              # Only the running version and the one before it are kept, and never one a process still runs from.
+              for folder in "${'$'}root"/versions/*/; do
+                name=${'$'}{folder%/}
+                name=${'$'}{name##*/}
+                [ "${'$'}name" != "${'$'}want" ] && [ "${'$'}name" != "${'$'}previous" ] && [ "${'$'}{#name}" -eq 64 ] && [ ! -L "${'$'}root/versions/${'$'}name" ] || continue
+                case "${'$'}name" in *[!0-9a-f]*) continue ;; esac
+                busy=no
+                for entry in /proc/[0-9]*; do
+                  case "${'$'}(readlink "${'$'}entry/exe" 2>/dev/null || true)" in "${'$'}root/versions/${'$'}name"/*) busy=yes; break ;; esac
+                done
+                [ "${'$'}busy" = yes ] || rm -rf -- "${'$'}root/versions/${'$'}name"
+              done
             fi
             printf '%s\n' "${'$'}mode"
             "${'$'}bin/pocket-agent" pair --state "${'$'}state" --json </dev/null >/dev/null
