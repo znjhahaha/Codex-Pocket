@@ -43,22 +43,30 @@ internal class LocalRuntimeLayout(val libraries: File, val root: File) {
     val available: Boolean get() = REQUIRED.all { File(libraries, it).isFile }
 
     /** The static executables read none of Android's own configuration, so everything they need is named here. */
-    fun environment(proxyUrl: String): Map<String, String> = mapOf(
+    fun environment(proxyUrl: String, provider: LocalProvider? = null): Map<String, String> = mapOf(
         "HOME" to home.path, "CODEX_HOME" to codexHome.path, "TMPDIR" to temporary.path,
         "CODEX_CLI_PATH" to codex.path, "SHELL" to "/system/bin/sh", "PATH" to "/system/bin",
         // The agent names itself from this when it is first set up.
         "COMPUTERNAME" to "此手机",
         "SSL_CERT_FILE" to trustRoots.path, "HTTPS_PROXY" to proxyUrl, "https_proxy" to proxyUrl,
-        "NO_PROXY" to "127.0.0.1,localhost,::1", "no_proxy" to "127.0.0.1,localhost,::1")
+        "NO_PROXY" to "127.0.0.1,localhost,::1", "no_proxy" to "127.0.0.1,localhost,::1") +
+        // Codex reads the key of the service in use from here; it is in no file Codex or its commands can open.
+        (provider?.let { mapOf(LocalCodexConfig.KEY_VARIABLE to it.apiKey) } ?: emptyMap())
 
-    fun prepare(trustRootsPem: String) {
+    fun prepare(trustRootsPem: String, provider: LocalProvider? = null) {
         for (directory in listOf(root, home, codexHome, projects, state, temporary)) {
             directory.mkdirs()
             check(directory.isDirectory) { "Local runtime storage is unavailable" }
         }
         val config = File(codexHome, "config.toml")
-        // Written once: Codex and the person may change it afterwards.
-        if (!config.exists()) config.writeText(DEFAULT_CONFIG)
+        // Codex and the person may change the rest; only the lines that name the service in use are Pocket's.
+        val current = if (config.exists()) config.readText() else null
+        val wanted = LocalCodexConfig.apply(current ?: DEFAULT_CONFIG, provider)
+        if (wanted != current) {
+            val next = File(codexHome, "config.toml.new")
+            next.writeText(wanted)
+            java.nio.file.Files.move(next.toPath(), config.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
         val pending = File(root, "trust-roots.pem.new")
         pending.writeText(trustRootsPem)
         java.nio.file.Files.move(pending.toPath(), trustRoots.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
@@ -68,6 +76,13 @@ internal class LocalRuntimeLayout(val libraries: File, val root: File) {
         val REQUIRED = listOf("libpocket-agent.so", "libpocket-runtime-host.so", "libpocket-runtime-manifest.so", "libcodex.so")
         /** Codex's own command sandbox cannot be created inside an Android application, whose sandbox is the boundary here. The packaged agent makes each session ask before commands. */
         const val DEFAULT_CONFIG = "sandbox_mode = \"danger-full-access\"\n"
+        /** The backend answers health before its listener is bound, and a connection made then is refused. */
+        fun listening(health: String): Boolean = runCatching {
+            val report = Json.parseToJsonElement(health.lineSequence().last { it.startsWith("{") }).jsonObject
+            report.getValue("routeStatus").jsonArray.any { route ->
+                route.jsonObject["kind"]?.jsonPrimitive?.contentOrNull == "lan" && route.jsonObject["listenerReady"]?.jsonPrimitive?.booleanOrNull == true
+            }
+        }.getOrDefault(false)
         fun pem(certificates: Iterable<X509Certificate>): String = buildString {
             val encoder = Base64.getMimeEncoder(64, "\n".toByteArray())
             for (certificate in certificates) {
@@ -81,11 +96,14 @@ internal class LocalRuntimeLayout(val libraries: File, val root: File) {
 internal class LocalRuntime(private val context: Context,
     val layout: LocalRuntimeLayout = LocalRuntimeLayout(File(context.applicationInfo.nativeLibraryDir.orEmpty()),
         // The agent refuses a state path that passes through a link, and /data/user/0 is one.
-        File(context.filesDir.canonicalFile, "this-phone"))) {
+        File(context.filesDir.canonicalFile, "this-phone")),
+    private val providers: LocalProviderStore = LocalProviderStore(EncryptedLocationBlob(context, "local_providers",
+        "codex-pocket-local-providers-v1", "dev.codexpocket.app/local-providers/v1"))) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var proxy: LoopbackConnectProxy? = null
     private var agent: Process? = null
     private var loginJob: Job? = null
+    private var restartJob: Job? = null
     /** Set when the person stops Codex on this phone; nothing restarts it until they ask. */
     @Volatile private var stopped = false
     @Volatile private var signInCodex: Process? = null
@@ -94,10 +112,17 @@ internal class LocalRuntime(private val context: Context,
     private val projectState = MutableStateFlow(LocalProjects())
     val projects = projectState.asStateFlow()
     val available: Boolean get() = layout.available
+    /** The saved model services and which one is in use; none in use means OpenAI's own sign-in. */
+    val access = providers.access
+    private val applyingState = MutableStateFlow(false)
+    /** True while Codex here is being started again on another service. */
+    val applying = applyingState.asStateFlow()
+    /** Whether Codex here has anything to reach a model with, without starting it to ask. */
+    val hasAccess: Boolean get() = providers.active() != null || File(layout.codexHome, "auth.json").isFile
 
     private fun environment(): Map<String, String> {
         val tunnel = proxy ?: LoopbackConnectProxy().also { proxy = it }
-        return layout.environment(tunnel.url)
+        return layout.environment(tunnel.url, providers.active())
     }
     private fun command(executable: File, vararg arguments: String) = ProcessBuilder(listOf(executable.path) + arguments)
         .directory(layout.home).apply { environment().putAll(this@LocalRuntime.environment()) }
@@ -110,13 +135,15 @@ internal class LocalRuntime(private val context: Context,
             return process.exitValue() to output.readText().take(65536)
         } finally { output.delete() }
     }
-    private fun healthy() = runCatching { agentCommand("health", "--json", seconds = 10).first == 0 }.getOrDefault(false)
+    private fun healthy() = runCatching {
+        agentCommand("health", "--json", seconds = 10).let { (code, report) -> code == 0 && LocalRuntimeLayout.listening(report) }
+    }.getOrDefault(false)
 
     /** Idempotent. Returns the loopback port the backend listens on. */
     @Synchronized fun start(): Int {
         if (!available) throw WireException("local_runtime_missing", "This package does not include the on-device runtime")
         if (stopped) throw WireException("local_runtime_stopped", "Codex on this phone was stopped")
-        layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots()))
+        layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots()), providers.active())
         if (!File(layout.state, "config.json").isFile) {
             val port = ServerSocket(0, 1, java.net.InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))).use { it.localPort }
             val (code, _) = agentCommand("init", "--lan-bind", "127.0.0.1:$port", "--policy", "lan", "--json")
@@ -146,11 +173,12 @@ internal class LocalRuntime(private val context: Context,
     @Synchronized fun resume() { stopped = false }
     @Synchronized fun stop() {
         stopped = true
-        cancelSignIn()
+        cancelSignIn(); cancelRestart()
         endProcesses()
         LocalRuntimeService.stop(context)
     }
     private fun cancelSignIn() { loginJob?.cancel(); signInCodex?.destroy() }
+    private fun cancelRestart() { restartJob?.cancel(); restartJob = null; applyingState.value = false }
     private fun endProcesses() {
         agent?.destroy(); agent = null
         val prefix = layout.libraries.path + "/"
@@ -194,18 +222,44 @@ internal class LocalRuntime(private val context: Context,
         }
     }
 
-    fun refreshAccount() = signIn(null)
+    /** With a service of the person's own in use there is no OpenAI account to ask about. */
+    fun refreshAccount() { if (providers.active() == null) signIn(null) else { cancelSignIn(); accountState.value = LocalAccount.Unknown } }
     fun signInWithChatGpt() = signIn(buildJsonObject { put("type", "chatgptDeviceCode") })
-    fun signInWithApiKey(key: String) = signIn(buildJsonObject { put("type", "apiKey"); put("apiKey", key) })
+    fun signOut() = signIn(null, leaving = true)
+
+    /** Saves a service and puts it in use. False when it could not be saved as typed. */
+    fun saveProvider(draft: LocalProviderDraft): Boolean {
+        if (runCatching { providers.save(draft) }.getOrNull() == null) return false
+        restart(); return true
+    }
+    /** Null goes back to OpenAI's own sign-in. */
+    fun useProvider(id: String?) { if (access.value.activeId != id && runCatching { providers.use(id) }.getOrDefault(false)) restart() }
+    fun removeProvider(id: String) {
+        val inUse = access.value.activeId == id
+        if (runCatching { providers.remove(id) }.isSuccess && inUse) restart()
+    }
+    /** Codex reads its service and key when it starts, so a change ends what is running here and starts it again. */
+    private fun restart() {
+        cancelSignIn()
+        accountState.value = LocalAccount.Unknown
+        applyingState.value = true
+        restartJob = scope.launch {
+            try { synchronized(this@LocalRuntime) { endProcesses(); if (!stopped && File(layout.state, "config.json").isFile) start() } }
+            catch (cancelled: CancellationException) { throw cancelled }
+            // Left stopped, the location says it is offline and starts again when it is next opened.
+            catch (_: Exception) { }
+            if (restartJob === coroutineContext[Job]) { applyingState.value = false; refreshAccount() }
+        }
+    }
 
     /** Talks to a short-lived Codex of its own; credentials are written by Codex into its private home and never pass through Pocket. */
-    private fun signIn(login: JsonObject?) {
+    private fun signIn(login: JsonObject?, leaving: Boolean = false) {
         cancelSignIn()
         accountState.value = LocalAccount.Checking
         loginJob = scope.launch {
             var codex: Process? = null
             try {
-                synchronized(this@LocalRuntime) { layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots())) }
+                synchronized(this@LocalRuntime) { layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots()), providers.active()) }
                 codex = command(layout.codex, "app-server", "--listen", "stdio://").redirectError(ProcessBuilder.Redirect.appendTo(File(layout.temporary, "sign-in.log"))).start()
                 signInCodex = codex
                 val writer = codex.outputStream.bufferedWriter()
@@ -224,17 +278,22 @@ internal class LocalRuntime(private val context: Context,
                         if (completed["success"]?.jsonPrimitive?.booleanOrNull != true) throw WireException("local_sign_in_failed", "Sign-in was not completed")
                     }
                 }
+                if (leaving) { send(buildJsonObject { put("id", 4); put("method", "account/logout") }); reply(reader, 4) }
                 send(buildJsonObject { put("id", 3); put("method", "account/read"); putJsonObject("params") { put("refreshToken", false) } })
                 val current = reply(reader, 3)["account"] as? JsonObject
                 accountState.value = when (current?.get("type")?.jsonPrimitive?.content) {
                     "chatgpt" -> LocalAccount.SignedIn(current["email"]?.jsonPrimitive?.contentOrNull ?: "ChatGPT")
-                    "apiKey" -> LocalAccount.SignedIn("API Key")
+                    "apiKey" -> LocalAccount.SignedIn("OpenAI API Key")
                     else -> LocalAccount.SignedOut
                 }
                 // The backend's Codex read its credentials when it started.
-                if (login != null && accountState.value is LocalAccount.SignedIn) synchronized(this@LocalRuntime) { codex.destroy(); endProcesses(); start() }
+                if (leaving || (login != null && accountState.value is LocalAccount.SignedIn)) synchronized(this@LocalRuntime) {
+                    codex.destroy(); endProcesses()
+                    if (!stopped) runCatching { start() }
+                }
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { if (isActive) accountState.value = LocalAccount.Failed(if (login == null) "暂时无法读取登录状态" else "登录未完成，请重试") }
+            catch (_: Exception) { if (isActive) accountState.value = LocalAccount.Failed(
+                if (leaving) "未能退出登录，请重试" else if (login == null) "暂时无法读取登录状态" else "登录未完成，请重试") }
             finally { codex?.destroy() }
         }
     }

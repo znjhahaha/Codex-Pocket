@@ -52,11 +52,23 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
             val account by locations.thisPhone.account.collectAsStateWithLifecycle()
             val added = catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }
             val projects by locations.thisPhone.projects.collectAsStateWithLifecycle()
+            val access by locations.thisPhone.access.collectAsStateWithLifecycle()
+            val applying by locations.thisPhone.applying.collectAsStateWithLifecycle()
             LaunchedEffect(added) { if (added) { locations.thisPhone.refreshAccount(); locations.thisPhone.refreshProjects() } }
             ThisPhoneSheet(added, account, progress, { thisPhone = false }, locations::connectThisPhone,
-                locations.thisPhone::signInWithChatGpt, locations.thisPhone::signInWithApiKey, locations.thisPhone::refreshAccount,
+                locations.thisPhone::signInWithChatGpt, locations.thisPhone::refreshAccount,
                 onStop = { locations.stopThisPhone(); thisPhone = false },
+                access = access, applying = applying, onUseProvider = locations.thisPhone::useProvider,
+                onSaveProvider = locations.thisPhone::saveProvider, onRemoveProvider = locations.thisPhone::removeProvider,
+                onSignOut = locations.thisPhone::signOut,
                 projects = projects, onImport = locations.thisPhone::importProject, onExport = locations.thisPhone::exportProject)
+        }
+        // Codex on this phone can do nothing until it has an account or a service to use; say so once instead of failing in a conversation.
+        var askedForAccess by rememberSaveable { mutableStateOf(false) }
+        LaunchedEffect(catalog.selected?.kind, state.online) {
+            if (!askedForAccess && state.online && catalog.selected?.kind == ExecutionTargetKind.ThisPhone && !locations.thisPhone.hasAccess) {
+                askedForAccess = true; thisPhone = true
+            }
         }
         if (addingSsh) SshLocationSheet(progress, { if (progress == null) addingSsh = false },
             onConnect = { label, config -> locations.connectSsh(label, config) })
@@ -99,7 +111,7 @@ internal fun ExecutionLocationChoices(catalog: ExecutionTargetDirectory, current
         PocketButton("连接另一台电脑", onAddComputer, Modifier.fillMaxWidth().testTag("execution-add-computer"), secondary = true)
         PocketButton("添加 SSH 主机", onAddSsh, Modifier.fillMaxWidth().testTag("execution-add-ssh"), secondary = true)
         // Offered only by a package that carries the on-device runtime.
-        if (onThisPhone != null) PocketButton(if (catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }) "此手机的登录与运行" else "在此手机上运行",
+        if (onThisPhone != null) PocketButton(if (catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }) "此手机的账号与模型服务" else "在此手机上运行",
             onThisPhone, Modifier.fillMaxWidth().testTag("execution-this-phone"), secondary = true)
     }
 }

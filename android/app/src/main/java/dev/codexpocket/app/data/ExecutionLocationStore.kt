@@ -20,10 +20,10 @@ internal interface LocationBlob {
 }
 
 /** The catalogue and its credentials commit together in one Keystore-encrypted record. */
-internal class EncryptedLocationBlob(context: Context) : LocationBlob {
-    private val prefs = context.getSharedPreferences("execution_locations", Context.MODE_PRIVATE)
-    private val alias = "codex-pocket-locations-v1"
-    private val aad = "dev.codexpocket.app/locations/v1".toByteArray()
+internal class EncryptedLocationBlob(context: Context, name: String = "execution_locations",
+    private val alias: String = "codex-pocket-locations-v1", purpose: String = "dev.codexpocket.app/locations/v1") : LocationBlob {
+    private val prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE)
+    private val aad = purpose.toByteArray()
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
