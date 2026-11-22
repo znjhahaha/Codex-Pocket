@@ -156,6 +156,10 @@
     <string name="action_error">暂时无法完成操作，草稿已保留，请检查连接后重试。</string>
     <string name="notification_channel_connection">电脑连接</string>
     <string name="notification_channel_activity">任务动态</string>
+    <string name="notification_channel_local_runtime">此手机上的 Codex</string>
+    <string name="notification_local_runtime_title">Codex 正在此手机上运行</string>
+    <string name="notification_local_runtime_text">任务在应用自己的私有目录内执行</string>
+    <string name="notification_local_runtime_stop">停止运行</string>
     <string name="notification_watch_title">Codex Pocket · 后台关注</string>
     <string name="notification_watch_body">正在关注已配对电脑的任务进展</string>
     <string name="notification_watch_stop">停止关注</string>

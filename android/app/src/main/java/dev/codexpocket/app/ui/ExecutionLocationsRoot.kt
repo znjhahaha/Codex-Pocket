@@ -28,6 +28,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
     val progress by locations.progress.collectAsStateWithLifecycle()
     var choosing by rememberSaveable { mutableStateOf(false) }
     var addingSsh by rememberSaveable { mutableStateOf(false) }
+    var thisPhone by rememberSaveable { mutableStateOf(false) }
     val pages = rememberSaveableStateHolder()
     val current = repository
     if (current == null) {
@@ -43,7 +44,16 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         }
         if (choosing) PocketSheet("执行位置", { choosing = false }, subtitle = "项目、对话与用量跟随所选位置") {
             ExecutionLocationChoices(catalog, state.online, { id -> locations.select(id); choosing = false },
-                { locations.addComputer(); choosing = false }, { choosing = false; addingSsh = true })
+                { locations.addComputer(); choosing = false }, { choosing = false; addingSsh = true },
+                onThisPhone = if (locations.thisPhone.available) ({ choosing = false; thisPhone = true }) else null)
+        }
+        if (thisPhone) {
+            val account by locations.thisPhone.account.collectAsStateWithLifecycle()
+            val added = catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }
+            LaunchedEffect(added) { if (added) locations.thisPhone.refreshAccount() }
+            ThisPhoneSheet(added, account, progress, { thisPhone = false }, locations::connectThisPhone,
+                locations.thisPhone::signInWithChatGpt, locations.thisPhone::signInWithApiKey, locations.thisPhone::refreshAccount,
+                onStop = { locations.stopThisPhone(); thisPhone = false })
         }
         if (addingSsh) SshLocationSheet(progress, { if (progress == null) addingSsh = false },
             onConnect = { label, config -> locations.connectSsh(label, config) })
@@ -58,7 +68,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
 
 @Composable
 internal fun ExecutionLocationChoices(catalog: ExecutionTargetDirectory, currentOnline: Boolean,
-    onSelect: (String) -> Unit, onAddComputer: () -> Unit, onAddSsh: () -> Unit = {}) {
+    onSelect: (String) -> Unit, onAddComputer: () -> Unit, onAddSsh: () -> Unit = {}, onThisPhone: (() -> Unit)? = null) {
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         catalog.targets.forEach { target ->
@@ -82,5 +92,8 @@ internal fun ExecutionLocationChoices(catalog: ExecutionTargetDirectory, current
         }
         PocketButton("连接另一台电脑", onAddComputer, Modifier.fillMaxWidth().testTag("execution-add-computer"), secondary = true)
         PocketButton("添加 SSH 主机", onAddSsh, Modifier.fillMaxWidth().testTag("execution-add-ssh"), secondary = true)
+        // Offered only by a package that carries the on-device runtime.
+        if (onThisPhone != null) PocketButton(if (catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }) "此手机的登录与运行" else "在此手机上运行",
+            onThisPhone, Modifier.fillMaxWidth().testTag("execution-this-phone"), secondary = true)
     }
 }

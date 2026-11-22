@@ -62,6 +62,16 @@ android {
     // Built from locked sources by scripts/build-p2p-product.ps1. Never load from downloads.
     sourceSets.getByName("main").jniLibs.srcDir(rootProject.file("../.local/p2p/product-libs"))
     sourceSets.getByName("main").assets.srcDir(rootProject.file("../.local/execution-runtime/assets"))
+    // The on-device variant: a directory staged by scripts/android-native (fetch_official.py, package_agent.py).
+    // Android runs executables only from the extracted native library directory, hence legacy packaging.
+    providers.gradleProperty("pocketOnDeviceRuntime").orNull?.let { staged ->
+        val libraries = file(staged).resolve("jniLibs")
+        require(libraries.isDirectory) { "pocketOnDeviceRuntime has no jniLibs directory" }
+        sourceSets.getByName("main").jniLibs.srcDir(libraries)
+        packaging.jniLibs.useLegacyPackaging = true
+        packaging.jniLibs.keepDebugSymbols += "**/lib*.so"
+        providers.gradleProperty("pocketOnDeviceAbis").orNull?.let { defaultConfig.ndk.abiFilters += it.split(',') }
+    }
     if (huaweiAppId.isNotBlank()) sourceSets.getByName("main") {
         java.srcDir("src/huawei/java")
         manifest.srcFile(huaweiManifest)

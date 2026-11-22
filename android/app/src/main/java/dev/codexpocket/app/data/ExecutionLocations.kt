@@ -21,6 +21,7 @@ internal class ExecutionLocations(private val context: Context,
     private val preparation = MutableStateFlow<String?>(null)
     val progress = preparation.asStateFlow()
     @Volatile private var foreground = false
+    val thisPhone by lazy { LocalRuntime(context) }
     private var recovered = false
 
     init {
@@ -36,7 +37,11 @@ internal class ExecutionLocations(private val context: Context,
 
     fun setForeground(value: Boolean) { foreground = value; selected.value?.setForeground(value) }
     fun select(id: String) = scope.launch {
-        try { activate(id) }
+        try {
+            // Choosing this phone is the request to run Codex here again after it was stopped.
+            if (store.directory().targets.firstOrNull { it.id == id }?.kind == ExecutionTargetKind.ThisPhone) thisPhone.resume()
+            activate(id)
+        }
         catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { failure.value = "暂时无法切换执行位置，请重试。" }
     }
@@ -66,7 +71,7 @@ internal class ExecutionLocations(private val context: Context,
                 val config = SshTarget.parse(checkNotNull(store.connector(target.id)));
                 { SshPocketConnection(config) }
             }
-            else -> error("Execution location runtime has not been prepared")
+            ExecutionTargetKind.ThisPhone -> { { LoopbackPocketConnection { withContext(Dispatchers.IO) { thisPhone.start() } } } }
         }
         // Commands cut off by the last process end are marked once, by the first location to open.
         return PocketRepository(context, connectionFactory = connector, pairStore = store.pairing(target.id),
@@ -116,6 +121,42 @@ internal class ExecutionLocations(private val context: Context,
         } }
         finally { preparation.value = null }
     }
+
+    /** Runs Codex on this phone and pairs this application with it over loopback. Sign-in is separate. */
+    fun connectThisPhone() = scope.launch {
+        if (preparation.value != null) return@launch
+        preparation.value = "正在启动此手机上的运行环境"
+        try {
+            thisPhone.resume()
+            val code = withContext(Dispatchers.IO) { thisPhone.pairing() }
+            val port = withContext(Dispatchers.IO) { thisPhone.start() }
+            val connection = LoopbackPocketConnection { port }
+            val pair = try {
+                connection.connect(code.connectionConfig())
+                val response = connection.request("pair", kotlinx.serialization.json.buildJsonObject {
+                    put("pairingToken", kotlinx.serialization.json.JsonPrimitive(code.pairingToken))
+                    put("deviceId", kotlinx.serialization.json.JsonPrimitive(UUID.randomUUID().toString()))
+                    put("deviceName", kotlinx.serialization.json.JsonPrimitive(android.os.Build.MODEL.take(80)))
+                }).asObject()
+                require(response.string("computerId") == code.computerId)
+                PairedComputer(code.connectionConfig(), response.string("deviceId"), response.string("deviceSecret"),
+                    response.string("computerId"), "此手机")
+            } finally { connection.close() }
+            val existing = store.directory().targets.firstOrNull { it.endpointId == pair.computerId }
+            require(existing == null || existing.kind == ExecutionTargetKind.ThisPhone)
+            val target = ExecutionTarget(existing?.id ?: UUID.randomUUID().toString(), ExecutionTargetKind.ThisPhone, "此手机")
+            store.register(target, pair)
+            activate(target.id)
+            thisPhone.refreshAccount()
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: Exception) { failure.value = when ((error as? WireException)?.code) {
+            "local_runtime_missing" -> "这个安装包不包含手机本机运行环境。"
+            else -> "此手机上的运行环境未能启动，请重试。已有本机会话与登录信息会保留。"
+        } }
+        finally { preparation.value = null }
+    }
+    /** Ends Codex on this phone until this location is selected again. Its sessions and sign-in stay. */
+    fun stopThisPhone() = scope.launch { thisPhone.stop() }
 
     private suspend fun linuxBundle(architecture: String): LinuxRuntimeBundle = withContext(Dispatchers.IO) {
         require(architecture in setOf("x86_64", "aarch64"))
