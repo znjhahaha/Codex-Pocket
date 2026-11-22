@@ -36,12 +36,13 @@ class AssistantProjectReadUiTest {
         var state by mutableStateOf(AssistantUiState(snapshot))
         content({listOf(choice)},{state})
         assertTrue(selected.isEmpty())
-        compose.onNodeWithTag("assistant-tools").performClick()
-        compose.onNodeWithTag("assistant-workspace").performClick()
-        compose.onNodeWithTag("assistant-workspace:thread").performClick()
+        compose.selectAssistantWorkspace("thread")
         assertEquals(listOf(choice),selected)
         compose.runOnIdle {state=state.copy(snapshot=snapshot.copy(paused=false))}
         assertEquals(1,selected.filterNotNull().size)
+        // The chip reopens the chooser, which shows what the computer verified and offers to verify again.
+        compose.onNodeWithTag("assistant-workspace-project").performClick()
+        compose.onNodeWithTag("assistant-project-permission-status").assertTextEquals(choice.permissionStatus)
         compose.onNodeWithTag("assistant-project-recheck").performClick()
         assertEquals(2,selected.filterNotNull().size)
         assertTrue(actions.isEmpty())
@@ -49,8 +50,7 @@ class AssistantProjectReadUiTest {
     @Test fun scheduleWriteToggleRequiresFreshProofAndResetsOnRevocation() {
         var current by mutableStateOf(choice)
         content({listOf(current)})
-        compose.onNodeWithTag("assistant-more").performClick()
-        compose.onNodeWithTag("assistant-tab:Schedules").performClick()
+        compose.openAssistantPage("Schedules")
         compose.onNodeWithTag("assistant-schedule-add").performClick()
         compose.onNodeWithTag("assistant-schedule-workspace").performClick()
         compose.onNodeWithTag("assistant-schedule-workspace:${choice.selectionKey}").performClick()

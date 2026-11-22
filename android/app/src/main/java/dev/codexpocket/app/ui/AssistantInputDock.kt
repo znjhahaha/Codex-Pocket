@@ -74,7 +74,8 @@ internal fun rememberAssistantComposer(state: AssistantUiState): AssistantCompos
     val composer = remember(key, binding, attachments, draft, sentId, sentText, project, target) {
         AssistantComposer(key, binding, attachments, preferences, draft, sentId, sentText, project, target)
     }
-    LaunchedEffect(state.sendReceipts, sentId.value) {
+    // Keyed by the composer too: two scopes can hold the same pending command, and each settles under its own binding.
+    LaunchedEffect(state.sendReceipts, sentId.value, composer) {
         val receipt = state.sendReceipts.firstOrNull { it.key == sentId.value?.let(binding::receiptKey) }
         if (receipt != null) composer.settle(receipt.status)
     }

@@ -40,7 +40,8 @@ class AssistantScreenTest {
             PocketTheme(theme) {
                 val d = LocalDensity.current
                 CompositionLocalProvider(LocalPocketGlass provides false, LocalDensity provides Density(d.density, fontScale)) {
-                    AssistantScreen(state(),modelDirectory,runtime,project,{actions += it},{r,t -> opens += r to t},{},nowMs=now,connected=connected())
+                    // Dialogs open in Pocket's overlay layer, as they do under the app's root.
+                    PocketOverlayHost {AssistantScreen(state(),modelDirectory,runtime,project,{actions += it},{r,t -> opens += r to t},{},nowMs=now,connected=connected())}
                 }
             }
         } }
