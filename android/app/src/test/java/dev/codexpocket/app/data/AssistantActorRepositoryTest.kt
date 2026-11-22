@@ -198,7 +198,8 @@ class AssistantActorRepositoryTest {
 
     @Test fun accountAndConfigurationPreparationFailuresNeverClearErrorDespiteReadyWorker()=runBlocking<Unit> {
         for((status,code,hint) in listOf(Triple("needs_login","assistant_needs_login","登录"),Triple("missing_cli","assistant_missing_cli","CLI"),
-            Triple("missing_config","assistant_missing_config","配置"),Triple("recoverable_error","assistant_prepare_failed","重试"))) {
+            Triple("missing_config","assistant_missing_config","配置"),Triple("recoverable_error","assistant_prepare_failed","重试"),
+            Triple("recoverable_error","assistant_unavailable_on_device","此手机"))) {
             transport.snapshot=JsonObject(actorSnapshot()+mapOf("preparationStatus" to JsonPrimitive(status),"error" to JsonPrimitive(code)))
             repo.loadAssistant().join()
             val current=repo.state.value.assistant
