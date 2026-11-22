@@ -230,11 +230,12 @@ object AssistantActions {
         return payload("assistant/respond",runtime) {put("operationId",operation);put("requestId",request);put("response",response)}.copy(
             commandId=java.util.UUID.nameUUIDFromBytes(JsonArray(listOf(runtime,operation,request,response.toString()).map(::JsonPrimitive)).toString().toByteArray(Charsets.UTF_8)).toString())
     }
-    fun settings(runtime: String, settings: AssistantSettings, models: List<NativeModel>): AssistantAction {
+    /** `stored` is what the computer last reported: a coordinator model it already holds may be sent back unchanged even when the catalogue no longer lists it. */
+    fun settings(runtime: String, settings: AssistantSettings, models: List<NativeModel>, stored: AssistantSettings? = null): AssistantAction {
         bounded(settings.personality,8192,"人格描述不能为空，最多 8KiB");bounded(settings.tone,2048,"语气不能为空，最多 2KiB")
         bounded(settings.timezone,256,"请输入有效时区");require(runCatching {ZoneId.of(settings.timezone)}.isSuccess) {"时区名称无效"}
         require(settings.model == null || models.any {it.model == settings.model}) {"当前模型未在电脑传入目录中确认"}
-        require(settings.coordinatorModel == null || models.any {it.model == settings.coordinatorModel}) {"助理自身模型未在电脑传入目录中确认"}
+        require(settings.coordinatorModel == null || settings.coordinatorModel == stored?.coordinatorModel || models.any {it.model == settings.coordinatorModel}) {"助理自身模型未在电脑传入目录中确认"}
         return payload("assistant/settings/update",runtime) {put("settings",buildJsonObject {
             put("personality",settings.personality);put("tone",settings.tone);put("model",settings.model?.let(::JsonPrimitive) ?: JsonNull);put("timezone",settings.timezone)
             settings.coordinatorModel?.let {put("coordinator_model",it)}

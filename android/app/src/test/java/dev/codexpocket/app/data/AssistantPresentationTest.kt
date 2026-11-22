@@ -91,6 +91,12 @@ class AssistantPresentationTest {
         val unset = AssistantActions.settings("r", chosen.copy(coordinatorModel = null), listOf(native)).params.obj("settings")
         assertEquals("An older computer receives exactly what it always did", setOf("personality", "tone", "model", "timezone", "notifications"), unset.keys)
         assertThrows(IllegalArgumentException::class.java) { AssistantActions.settings("r", chosen.copy(coordinatorModel = "not-in-directory"), listOf(native)) }
+        // A value the computer already holds goes back unchanged with any other edit, even when the catalogue no longer lists it.
+        val retired = chosen.copy(coordinatorModel = "retired-model")
+        val kept = AssistantActions.settings("r", retired.copy(tone = "耐心"), listOf(native), stored = retired).params.obj("settings")
+        assertEquals(JsonPrimitive("retired-model"), kept["coordinator_model"])
+        assertEquals("耐心", kept.string("tone"))
+        assertThrows(IllegalArgumentException::class.java) { AssistantActions.settings("r", retired.copy(coordinatorModel = "another-unlisted"), listOf(native), stored = retired) }
     }
 
     @Test fun jobsExposeTheirBranchAndOnlyNameOneTaskWhenMergedOrDiscarded() {

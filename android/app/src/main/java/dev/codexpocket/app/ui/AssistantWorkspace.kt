@@ -175,7 +175,7 @@ private fun AssistantStatusRow(issue: String?, unconfirmed: Boolean, loading: Bo
 @Composable
 private fun AssistantSubpage(title: String, onBack: () -> Unit, notice: @Composable () -> Unit, content: @Composable () -> Unit) {
     PFrame(header = { Column(Modifier.assistantChromeVeil(true)) { AssistantTopBar(title, onBack); notice() } }) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding).navigationBarsPadding()) { AssistantSecondaryTheme(content) }
+        Box(Modifier.fillMaxSize().padding(padding).navigationBarsPadding()) { content() }
     }
 }
 
