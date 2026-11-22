@@ -8,8 +8,12 @@ internal fun shellWord(value: String): String {
     return "'" + value.replace("'", "'\"'\"'") + "'"
 }
 
-/** [persistent] is false when the host runs but was not allowed to start again by itself after a reboot. */
-data class SshPreparation(val pairing: PairingCode, val backendPort: Int, val nativeInstalled: Boolean, val persistent: Boolean = true)
+/**
+ * [persistent] is false when the host runs but was not allowed to start again by itself after a reboot.
+ * [nativeSignedIn] is what `codex login status` says; a host using its own model provider can work without it.
+ */
+data class SshPreparation(val pairing: PairingCode, val backendPort: Int, val nativeInstalled: Boolean, val persistent: Boolean = true,
+    val nativeSignedIn: Boolean = false)
 
 /** Exit statuses the remote scripts reserve; anything else stays an unexplained preparation failure. */
 internal val sshRemoteFailures = mapOf(61 to "ssh_platform_unsupported", 62 to "ssh_remote_path_unsafe",
@@ -203,7 +207,12 @@ suspend fun prepareSshHost(target: SshTarget, bundleFor: suspend (String) -> Lin
         val route = code.routes.firstOrNull { it.kind == "lan" && java.net.URI(it.url).host == "127.0.0.1" }
             ?: throw WireException("ssh_backend_route_missing", "Remote host has no private loopback route")
         progress("正在检查 Codex")
-        val native = ssh.execute("export PATH=\"${'$'}HOME/.local/bin:${'$'}HOME/.npm-global/bin:${'$'}PATH\"\nif command -v codex >/dev/null 2>&1; then printf yes; else printf no; fi\n").trim() == "yes"
-        return SshPreparation(code, java.net.URI(route.url).port, native, raw.substringBefore('\n') == "service")
+        val native = ssh.execute("""
+            export PATH="${'$'}HOME/.local/bin:${'$'}HOME/.npm-global/bin:${'$'}PATH"
+            if ! command -v codex >/dev/null 2>&1; then printf missing
+            elif codex login status </dev/null >/dev/null 2>&1; then printf ready
+            else printf signed_out; fi
+        """.trimIndent()).trim()
+        return SshPreparation(code, java.net.URI(route.url).port, native != "missing", raw.substringBefore('\n') == "service", native == "ready")
     }
 }

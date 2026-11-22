@@ -22,22 +22,7 @@ class SshLinuxHostLifecycleLiveTest {
     private suspend fun active(target: SshTarget = LinuxQa.pocket) = LinuxQa.sh("cat \"${'$'}HOME/.local/share/codex-pocket/active\"\n", target).trim()
     private suspend fun nativeDaemon() = LinuxQa.sh("pgrep -u pocket -f 'codex app-server --listen unix://' || true\n").trim()
 
-    private suspend fun awaitNative(connection: PocketConnection): JsonObject {
-        connection.request("runtime/ensure", buildJsonObject { put("source", "cli") }, UUID.randomUUID().toString(), 30_000)
-        return withTimeout(45_000) {
-            var native: JsonObject? = null
-            while (native == null) {
-                native = connection.request("runtimes/list").jsonObject.getValue("data").jsonArray.map { it.jsonObject }.firstOrNull {
-                    it["online"] == JsonPrimitive(true) && it["source"] == JsonPrimitive("cli") && it["role"]?.jsonObject?.get("kind") == JsonPrimitive("cliDaemon")
-                }
-                if (native == null) delay(500)
-            }
-            native!!
-        }
-    }
-    private suspend fun threads(connection: PocketConnection, native: JsonObject) = connection.request("codex/request", buildJsonObject {
-        put("runtimeId", native.string("id")); put("method", "thread/list"); put("params", buildJsonObject { put("limit", 10) })
-    }).jsonObject.getValue("data").jsonArray
+    private suspend fun threads(connection: PocketConnection, native: JsonObject) = connection.native(native, "thread/list") { put("limit", 10) }.getValue("data").jsonArray
 
     @Test fun droppedSshSurfacesTheUnknownOutcomeAndTheSavedIdentityReconnects() = runBlocking {
         LinuxQa.assume()
@@ -106,6 +91,12 @@ class SshLinuxHostLifecycleLiveTest {
         val again = LinuxQa.prepare(target)
         assertEquals(prepared.pairing.computerId, again.pairing.computerId)
         assertEquals(host, running(target).second)
+        // A stand-in that only answers the login question: an installed, signed-in Codex is reported as such.
+        try {
+            LinuxQa.sh("mkdir -p \"${'$'}HOME/.local/bin\"; printf '#!/bin/sh\\n[ \"${'$'}1 ${'$'}2\" = \"login status\" ]\\n' > \"${'$'}HOME/.local/bin/codex\"; chmod 700 \"${'$'}HOME/.local/bin/codex\"", target)
+            val signedIn = LinuxQa.prepare(target)
+            assertTrue(signedIn.nativeInstalled && signedIn.nativeSignedIn)
+        } finally { LinuxQa.sh("rm -f \"${'$'}HOME/.local/bin/codex\"", target) }
     }
 
     @Test fun hostRestartBringsTheServiceBackWithoutALoginAndSavedPairingsStillWork() = runBlocking {

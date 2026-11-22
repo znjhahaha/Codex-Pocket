@@ -177,6 +177,52 @@ class SshLinuxLiveTest {
         assertEquals(first.pairing.computerId, LinuxQa.pair(LinuxQa.pocket, second).online { _, hello -> hello.string("computerId") })
     }
 
+    /** Everything a phone can do with native Codex on a host where nobody has signed in to Codex, with the VM cut off from the model. */
+    @Test fun nativeSessionWithoutACodexLoginIsCreatedReadStartedAndStoppedAndThePhoneIsToldWhy() = runBlocking {
+        LinuxQa.assume()
+        val prepared = LinuxQa.prepare()
+        assertTrue(prepared.nativeInstalled)
+        assertFalse("the bootstrap reports that Codex on the host has no login", prepared.nativeSignedIn)
+        LinuxQa.sh("mkdir -p \"${'$'}HOME/qa-project\"")
+        LinuxQa.pair(LinuxQa.pocket, prepared).online { connection, _ ->
+            val events = java.util.concurrent.CopyOnWriteArrayList<JsonObject>()
+            val collector = launch { connection.notifications.collect { if (it["method"] == JsonPrimitive("codex/event")) events += it.getValue("params").jsonObject.getValue("event").jsonObject } }
+            suspend fun event(method: String, matches: (JsonObject) -> Boolean = { true }) = withTimeout(40_000) {
+                var found: JsonObject? = null
+                while (found == null) { found = events.firstOrNull { it["method"] == JsonPrimitive(method) && matches(it.getValue("params").jsonObject) }; if (found == null) delay(200) }
+                found!!.getValue("params").jsonObject
+            }
+            val native = awaitNative(connection)
+            assertTrue(connection.native(native, "thread/list") { put("limit", 10) }["data"] is JsonArray)
+            assertTrue(connection.native(native, "model/list").getValue("data").jsonArray.isNotEmpty())
+            // Signing in or out of Codex is not something a phone may ask the host to do.
+            for (method in listOf("account/read", "account/login/start", "account/logout"))
+                assertEquals(method, "unsupported", wireFailure { connection.native(native, method, mutation = true) })
+            val thread = connection.native(native, "thread/start", mutation = true) { put("cwd", "/home/pocket/qa-project") }.getValue("thread").jsonObject
+            assertEquals("/home/pocket/qa-project", thread.string("cwd"))
+            val id = thread.string("id")
+            assertEquals("awaiting_first_message", connection.native(native, "thread/read") { put("threadId", id); put("includeTurns", true) }.string("pocketHistoryState"))
+            val turn = connection.native(native, "turn/start", mutation = true) {
+                put("threadId", id); put("clientUserMessageId", UUID.randomUUID().toString())
+                put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", "Say hi") }) })
+            }.getValue("turn").jsonObject
+            assertEquals("inProgress", turn.string("status"))
+            event("turn/started") { it["threadId"] == JsonPrimitive(id) }
+            // The model cannot be reached from the isolated VM: the phone is told while native Codex retries, it is not left waiting.
+            val trouble = event("error") { it["turnId"] == JsonPrimitive(turn.string("id")) }
+            assertEquals(JsonPrimitive(true), trouble["willRetry"])
+            assertTrue(trouble.getValue("error").jsonObject.string("message").isNotBlank())
+            connection.native(native, "turn/interrupt", mutation = true) { put("threadId", id); put("turnId", turn.string("id")) }
+            val ended = event("turn/completed") { it["threadId"] == JsonPrimitive(id) }.getValue("turn").jsonObject
+            assertEquals("interrupted", ended.string("status"))
+            val read = connection.native(native, "thread/read") { put("threadId", id); put("includeTurns", true) }.getValue("thread").jsonObject
+            assertEquals("interrupted", read.getValue("turns").jsonArray.single().jsonObject.string("status"))
+            assertTrue(connection.native(native, "thread/list") { put("limit", 10) }.getValue("data").jsonArray.any { it.jsonObject["id"] == JsonPrimitive(id) })
+            connection.native(native, "thread/archive", mutation = true) { put("threadId", id) }
+            collector.cancel()
+        }
+    }
+
     /** Android answers to the provider name SSHJ asks for with a provider that has no algorithms left. */
     @Test fun aPlatformProviderWithoutAlgorithmsUnderTheSameNameDoesNotBreakSsh() = runBlocking {
         LinuxQa.assume()

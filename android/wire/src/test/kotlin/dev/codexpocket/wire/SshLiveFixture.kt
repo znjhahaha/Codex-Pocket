@@ -42,6 +42,24 @@ internal class SavedPhone(val target: SshTarget, val config: ConnectionConfig, v
     }
 }
 
+/** Starts the account's own Codex CLI daemon through the host and waits until the host has attached to it. */
+internal suspend fun awaitNative(connection: PocketConnection): JsonObject {
+    connection.request("runtime/ensure", buildJsonObject { put("source", "cli") }, UUID.randomUUID().toString(), 30_000)
+    return withTimeout(45_000) {
+        var native: JsonObject? = null
+        while (native == null) {
+            native = connection.request("runtimes/list").jsonObject.getValue("data").jsonArray.map { it.jsonObject }.firstOrNull {
+                it["online"] == JsonPrimitive(true) && it["source"] == JsonPrimitive("cli") && it["role"]?.jsonObject?.get("kind") == JsonPrimitive("cliDaemon")
+            }
+            if (native == null) delay(500)
+        }
+        native!!
+    }
+}
+internal suspend fun PocketConnection.native(runtime: JsonObject, method: String, mutation: Boolean = false, params: JsonObjectBuilder.() -> Unit = {}): JsonObject =
+    request("codex/request", buildJsonObject { put("runtimeId", runtime.string("id")); put("method", method); put("params", buildJsonObject(params)) },
+        if (mutation) UUID.randomUUID().toString() else null).jsonObject
+
 /**
  * The disposable VM: `pocket` administers it (key login, passwordless sudo, lingering, native Codex on PATH);
  * `pocketqa2` is an ordinary account with neither sudo, lingering nor Codex.
