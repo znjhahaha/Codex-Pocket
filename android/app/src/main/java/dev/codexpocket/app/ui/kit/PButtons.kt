@@ -170,11 +170,11 @@ internal fun PBadge(text: String, modifier: Modifier = Modifier, tone: PTone = P
     }
 }
 
-/** One line in a menu or a settings list: glyph, label, optional hint and trailing slot. */
+/** One line in a menu or a settings list: glyph, label, optional hint and trailing slot. [glyph] replaces the static icon with an animated one. */
 @Composable
 internal fun PRow(title: String, onClick: () -> Unit, modifier: Modifier = Modifier, icon: ImageVector? = null, subtitle: String? = null,
     enabled: Boolean = true, selected: Boolean = false, destructive: Boolean = false, haptic: PocketHaptic? = null,
-    accentSelection: Boolean = false, trailing: (@Composable () -> Unit)? = null) {
+    accentSelection: Boolean = false, glyph: (@Composable () -> Unit)? = null, trailing: (@Composable () -> Unit)? = null) {
     val c = Pocket.colors
     val motion = rememberPocketMotion()
     val fill by animateColorAsState(if (!selected) Color.Transparent else if (accentSelection) c.accentSoft.copy(alpha = .42f) else c.fillStrong.copy(alpha = .7f),
@@ -186,7 +186,7 @@ internal fun PRow(title: String, onClick: () -> Unit, modifier: Modifier = Modif
         .padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         ProvidePInk(ink) {
-            if (icon != null) PIcon(icon, null, Modifier.size(19.dp))
+            if (glyph != null) glyph() else if (icon != null) PIcon(icon, null, Modifier.size(19.dp))
             Column(Modifier.weight(1f)) {
                 PText(title, style = Pocket.type.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (!subtitle.isNullOrBlank()) PText(subtitle, style = Pocket.type.caption, color = c.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
