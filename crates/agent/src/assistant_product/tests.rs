@@ -3092,3 +3092,89 @@ async fn thin_coordinator_dispatches_a_job_and_hears_only_its_settlement_through
     assert_eq!(detail["summary"], "报告已完成：共 12 页");
     assert_eq!(settled[0]["wake_coordinator"], true);
 }
+
+/// Git on this worker's thread can outlast one read's 1.5 s budget; the phone would be
+/// served its cache meanwhile, the test simply asks again.
+async fn patient_read(f: &Fixture) -> Value {
+    for _ in 0..20 {
+        if let Ok(value) = f.call("assistant/read", json!({}), "read", false).await {
+            return value;
+        }
+    }
+    panic!("worker never answered a read")
+}
+
+fn project_git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn write_job_runs_on_its_own_branch_and_only_the_user_merges_it_through_the_actual_worker() {
+    let f = Fixture::new(false).await;
+    let project = dunce::canonicalize(f.project.path()).unwrap();
+    project_git(&project, &["init", "-q"]);
+    project_git(&project, &["config", "core.autocrlf", "false"]);
+    std::fs::write(project.join("a.txt"), "one\n").unwrap();
+    project_git(&project, &["add", "-A"]);
+    project_git(&project, &["commit", "-q", "-m", "initial"]);
+
+    let s = f.send("phone-1").await;
+    let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.tool(
+        json!(101),
+        &cm,
+        "call-dispatch",
+        "assistant_dispatch_session",
+        json!({"title":"加一个文件","prompt":"Add b.txt","directory":f.project.path(),"writes":true}),
+    );
+    let s = patient_read(&f).await;
+    let job = s["jobs"][0].clone();
+    assert_eq!(job["workspaceMode"], "worktree", "{job}");
+    assert_eq!(job["status"], "running", "the executor must accept the job's private directory");
+    assert_eq!(job["directory"], json!(project));
+    let task = job["taskId"].as_str().unwrap();
+    let em = Fixture::mapping(&Fixture::op(&s, "Execution"));
+    let cwd = {
+        let io = f.io.0.lock().unwrap();
+        let start = io.calls.iter().rev().find(|(_, method, _)| method == "thread/start").unwrap();
+        PathBuf::from(start.2["cwd"].as_str().unwrap())
+    };
+    assert!(cwd.components().any(|part| part.as_os_str() == "worktrees"), "{cwd:?}");
+    assert_ne!(dunce::canonicalize(&cwd).unwrap(), project);
+
+    // The model has no tool for this, and the user cannot merge while the job runs.
+    assert!(f.call("assistant/v2/task/merge", json!({"taskId":task}), "merge-early", false).await.is_err());
+    std::fs::write(cwd.join("b.txt"), "two\n").unwrap();
+    f.at(1_001_000);
+    f.io.complete(&em, "已添加 b.txt");
+    let s = patient_read(&f).await;
+    assert_eq!(s["jobs"][0]["readyToMerge"], true);
+    assert_eq!(s["jobs"][0]["diffStats"], json!({"files":1,"insertions":1,"deletions":0}));
+    assert!(!project.join("b.txt").exists());
+
+    let reply = f.call("assistant/v2/task/merge", json!({"taskId":task}), "merge-1", false).await.unwrap();
+    assert_eq!(reply["accepted"], true);
+    assert_eq!(reply["result"]["merge"]["outcome"], "merged");
+    assert_eq!(std::fs::read_to_string(project.join("b.txt")).unwrap(), "two\n");
+    assert_eq!(project_git(&project, &["status", "--porcelain"]), "");
+    assert_eq!(reply["snapshot"]["jobs"][0]["mergedAtMs"], 1_001_000);
+    assert!(!cwd.exists());
+    let io = f.io.0.lock().unwrap();
+    let offered = io
+        .calls
+        .iter()
+        .filter(|(_, method, _)| method == "thread/start")
+        .flat_map(|(_, _, params)| params["dynamicTools"].as_array().cloned().unwrap_or_default())
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(!offered.is_empty());
+    assert!(!offered.iter().any(|name| name.contains("merge") || name.contains("discard")), "{offered:?}");
+}

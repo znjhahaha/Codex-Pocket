@@ -854,6 +854,7 @@ impl Broker {
             "assistant/send" => &["message", "threadId", "sourceRuntimeId", "sourceConfigStoreId", "memberId", "taskId", "artifactId", "artifactVersion", "attachments"],
             "assistant/task/pause" | "assistant/task/resume" => &["taskId"],
             "assistant/v2/task/retry" => &["taskId"],
+            "assistant/v2/task/merge" | "assistant/v2/task/discard_worktree" => &["taskId"],
             "assistant/v2/task/seen" => &["taskId","throughSequence"],
             "assistant/task/memory" => &["taskId", "enabled"],
             "assistant/settings/update" => &["settings"],
@@ -897,6 +898,9 @@ impl Broker {
                         }
                     })
                 }))
+            // Merging or dropping a branch names exactly one job; nothing is inferred.
+            || (matches!(method, "assistant/v2/task/merge" | "assistant/v2/task/discard_worktree")
+                && !p.get("taskId").is_some_and(valid_scope_id))
             || p.to_string().len() > if method=="assistant/send" {2*1024*1024} else {131072}
         {
             return Err(classify(
@@ -1364,6 +1368,16 @@ mod tests {
         .unwrap();
         assert_eq!(value["preparation"]["status"], "preparing");
         assert_eq!(value["ready"], false);
+    }
+    #[test]
+    fn job_merge_and_discard_take_exactly_one_task_and_a_runtime() {
+        for method in ["assistant/v2/task/merge", "assistant/v2/task/discard_worktree"] {
+            assert!(Broker::validate_assistant(method, &json!({"commandId":"c","runtimeId":"r","taskId":"t"})).is_ok(), "{method}");
+            assert!(Broker::validate_assistant(method, &json!({"commandId":"c","taskId":"t"})).is_err(), "{method} needs a runtime");
+            assert!(Broker::validate_assistant(method, &json!({"commandId":"c","runtimeId":"r"})).is_err(), "{method} needs a task");
+            assert!(Broker::validate_assistant(method, &json!({"commandId":"c","runtimeId":"r","taskId":"t","force":true})).is_err(), "{method} takes nothing else");
+            assert!(Broker::validate_assistant(method, &json!({"commandId":"c","runtimeId":"r","taskId":"../t"})).is_err(), "{method} rejects a path as a task");
+        }
     }
     #[test]
     fn collaboration_send_accepts_member_and_task_scope_but_requires_runtime() {

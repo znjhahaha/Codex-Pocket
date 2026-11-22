@@ -2,6 +2,9 @@
 //! lineage that runs in one ordinary native session; follow-ups continue that session.
 //! Nothing here dispatches: tasks, leases and deliveries stay with the existing machinery.
 use super::*;
+use crate::assistant::worktree::{
+    self, DiffStats, JobWorktree, MergeOutcome, ModeReason, WorkspaceMode,
+};
 use serde_json::{Value, json};
 
 /// Results finishing within this window reach the coordinator as one wake.
@@ -17,6 +20,14 @@ pub enum SessionControl {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeAttempt {
+    #[serde(flatten)]
+    pub outcome: MergeOutcome,
+    pub at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,10 +36,44 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_worktree: Option<bool>,
     pub created_at_ms: i64,
+    /// Why the job runs where it runs; None for jobs saved before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_reason: Option<ModeReason>,
+    /// The user's project directory. With a worktree the tasks run in a copy elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<JobWorktree>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_stats: Option<DiffStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_merge: Option<MergeAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at_ms: Option<i64>,
+    /// When the worktree and its branch were removed, after a merge or instead of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_at_ms: Option<i64>,
+}
+impl Job {
+    fn mode(&self) -> WorkspaceMode {
+        if self.worktree.is_some() {
+            WorkspaceMode::Worktree
+        } else {
+            WorkspaceMode::Direct
+        }
+    }
+    /// Its tasks' directory still exists, so the job can be continued.
+    fn workspace_present(&self) -> bool {
+        self.worktree.is_none() || self.discarded_at_ms.is_none()
+    }
 }
 
 fn terminal(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Done | TaskStatus::Failed)
+}
+/// A directory name for the job's worktree that a replayed call computes again.
+fn worktree_id(journal: &str) -> Result<String> {
+    Ok(fingerprint(&journal)?.chars().take(32).collect())
 }
 
 impl<E: Executor> AssistantService<E> {
@@ -49,13 +94,15 @@ impl<E: Executor> AssistantService<E> {
         self.job_of_operation(op)
             .and_then(|root| self.state.jobs.get(&root)?.model.clone())
     }
-    /// The newest task of a job: the one a correction or a stop has to reach.
-    fn job_head(&self, root: &str, tasks: &[Task]) -> Option<Task> {
+    fn job_tasks<'a>(&self, root: &str, tasks: &'a [Task]) -> Vec<&'a Task> {
         tasks
             .iter()
-            .rev()
-            .find(|task| self.job_root(task).as_deref() == Some(root))
-            .cloned()
+            .filter(|task| self.job_root(task).as_deref() == Some(root))
+            .collect()
+    }
+    /// The newest task of a job: the one a correction or a stop has to reach.
+    fn job_head(&self, root: &str, tasks: &[Task]) -> Option<Task> {
+        self.job_tasks(root, tasks).last().map(|task| (*task).clone())
     }
     fn resolve_job(&self, task_id: &str) -> Result<(String, Task)> {
         let named = self.store.task(task_id).context("Job not found")?;
@@ -64,6 +111,25 @@ impl<E: Executor> AssistantService<E> {
             .job_head(&root, &self.store.tasks()?)
             .context("Job has no task")?;
         Ok((root, head))
+    }
+    /// A follow-up or resume needs the directory the job's tasks run in.
+    pub(super) fn ensure_job_workspace(&self, task: &Task) -> Result<()> {
+        if let Some(job) = self.job_root(task).and_then(|root| self.state.jobs.get(&root)) {
+            ensure!(
+                job.workspace_present(),
+                "This job's branch was merged or discarded; dispatch a new job instead"
+            );
+        }
+        Ok(())
+    }
+    /// The project a task acts for: the user's directory, not the job's private copy of it.
+    pub fn task_source_directory(&self, task_id: &str) -> Result<PathBuf> {
+        let task = self.store.task(task_id)?;
+        self.ensure_job_workspace(&task)?;
+        Ok(self
+            .job_root(&task)
+            .and_then(|root| self.state.jobs.get(&root)?.source_directory.clone())
+            .unwrap_or(task.directory))
     }
     fn job_status(&self, head: &Task) -> String {
         let operations = self
@@ -89,10 +155,29 @@ impl<E: Executor> AssistantService<E> {
                 .unwrap_or_default()
         }
     }
+    /// Every task of the job has a known, final outcome and nothing is on its way to it.
+    fn job_settled(&self, root: &str, tasks: &[Task]) -> bool {
+        let members = self.job_tasks(root, tasks);
+        let ids: Vec<&str> = members.iter().map(|task| task.id.as_str()).collect();
+        let owns = |id: Option<&str>| id.is_some_and(|id| ids.contains(&id));
+        members.iter().all(|task| {
+            task.active_run_id.is_none()
+                && !task.reconciliation_required
+                && (terminal(task.status) || task.status == TaskStatus::Paused)
+        }) && !self.state.operations.values().any(|o| {
+            owns(o.task_id.as_deref())
+                && o.phase.live()
+                && !self.state.released_generations.contains(&o.expected_generation)
+        }) && !self.state.collaboration.deliveries.values().any(|d| {
+            owns(d.task_id.as_deref())
+                && !d.cancelled
+                && matches!(d.status.as_str(), "queued" | "sending" | "unknown")
+        })
+    }
     fn job_thread(&self, root: &str, tasks: &[Task]) -> Option<String> {
-        let members: Vec<&str> = tasks
+        let members: Vec<&str> = self
+            .job_tasks(root, tasks)
             .iter()
-            .filter(|task| self.job_root(task).as_deref() == Some(root))
             .map(|task| task.id.as_str())
             .collect();
         self.state
@@ -105,16 +190,25 @@ impl<E: Executor> AssistantService<E> {
     fn job_view(&self, root: &str, tasks: &[Task]) -> Result<Value> {
         let job = self.state.jobs.get(root).context("Job not found")?;
         let head = self.job_head(root, tasks).context("Job has no task")?;
+        let changed = job.diff_stats.is_some_and(|stats| stats.files > 0);
         Ok(json!({
             "taskId": root,
             "title": job.title,
-            "directory": head.directory,
+            "directory": job.source_directory.as_ref().unwrap_or(&head.directory),
             "writes": head.writes,
             "status": self.job_status(&head),
             "activeTaskId": head.id,
             "threadId": self.job_thread(root, tasks),
             "model": job.model,
-            "workspaceMode": "direct",
+            "workspaceMode": job.mode(),
+            "modeReason": job.mode_reason,
+            "branch": job.worktree.as_ref().map(|tree| &tree.branch),
+            "diffStats": job.diff_stats,
+            "readyToMerge": job.worktree.is_some() && job.merged_at_ms.is_none()
+                && job.discarded_at_ms.is_none() && changed && self.job_settled(root, tasks),
+            "lastMerge": job.last_merge,
+            "mergedAtMs": job.merged_at_ms,
+            "discardedAtMs": job.discarded_at_ms,
             "createdAtMs": job.created_at_ms,
             "detail": head.detail.as_deref().map(|d| collaboration::clip_bytes(d, 1000)),
         }))
@@ -178,7 +272,6 @@ impl<E: Executor> AssistantService<E> {
         }
         Ok(serde_json::to_string(&kept)?)
     }
-
     /// The newest public message for the coordinator's prompt. A job's result is in the
     /// conversation for the user to read; the coordinator gets only its opening lines.
     pub(super) fn coordinator_recent_conversation(&self) -> Result<Value> {
@@ -200,6 +293,7 @@ impl<E: Executor> AssistantService<E> {
         Ok(page)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch_session(
         &mut self,
         op: &Operation,
@@ -224,13 +318,21 @@ impl<E: Executor> AssistantService<E> {
                 "Invalid model"
             );
         }
-        let directory = self.authorize_task_directory(op, &directory)?;
+        let source = self.authorize_task_directory(op, &directory)?;
+        let decision = worktree::decide_mode(&source, writes, use_worktree);
+        let tree = if decision.mode == WorkspaceMode::Worktree {
+            // A private copy is not a way around the grant: the project itself must be writable.
+            self.executor.validate_directory(&source, true)?;
+            Some(worktree::ensure_created(&self.state_dir, &worktree_id(journal)?, &source)?)
+        } else {
+            None
+        };
         // The task, not this call, owns execution: the coordinator is free as soon as it is saved.
         let receipt = self.store.apply(
             journal,
             Command::CreateTask {
                 prompt,
-                directory,
+                directory: tree.as_ref().map_or(source.clone(), |t| t.directory.clone()),
                 writes,
                 not_before_ms: 0,
             },
@@ -239,13 +341,26 @@ impl<E: Executor> AssistantService<E> {
             anyhow::bail!("Dispatch did not create a task")
         };
         self.inherit_task_inputs(&task.id, op);
-        self.state.jobs.entry(task.id.clone()).or_insert(Job {
+        let job = self.state.jobs.entry(task.id.clone()).or_insert(Job {
             title,
             model,
             use_worktree,
             created_at_ms: now,
+            mode_reason: Some(decision.reason),
+            source_directory: Some(source),
+            worktree: tree,
+            diff_stats: None,
+            last_merge: None,
+            merged_at_ms: None,
+            discarded_at_ms: None,
         });
-        Ok(json!({"task_id": task.id, "status": "queued", "workspace_mode": "direct"}))
+        Ok(json!({
+            "task_id": task.id,
+            "status": "queued",
+            "workspace_mode": job.mode(),
+            "mode_reason": job.mode_reason,
+            "branch": job.worktree.as_ref().map(|tree| &tree.branch),
+        }))
     }
 
     pub(super) fn steer_session(
@@ -257,7 +372,8 @@ impl<E: Executor> AssistantService<E> {
         now: i64,
     ) -> Result<Value> {
         let (root, head) = self.resolve_job(task_id)?;
-        self.authorize_task_directory(op, &head.directory)?;
+        let source = self.task_source_directory(&head.id)?;
+        self.authorize_task_directory(op, &source)?;
         let inputs = self.operation_inputs(op);
         self.submit_targeted_with_inputs(journal, instruction, None, Some(&head.id), false, inputs, now)?;
         if let Some(entry) = self
@@ -300,15 +416,20 @@ impl<E: Executor> AssistantService<E> {
 
     /// What the coordinator learns when a job's native turn ends: a bounded summary, never
     /// the transcript, command output or a long stack trace.
-    pub(super) fn job_settlement(&self, op: &Operation, kind: &str, result: &str) -> Result<Option<String>> {
+    pub(super) fn job_settlement(&mut self, op: &Operation, kind: &str, result: &str) -> Result<Option<String>> {
         let Some(root) = self.job_of_operation(op) else {
             return Ok(None);
         };
-        let title = self
-            .state
-            .jobs
-            .get(&root)
-            .map(|job| collaboration::clip_bytes(&job.title, 240).to_owned());
+        // Reading the diff is best effort: a job is settled whether or not Git answers.
+        if let Some(job) = self.state.jobs.get_mut(&root) {
+            if let Some(tree) = job.worktree.as_ref().filter(|_| job.discarded_at_ms.is_none()) {
+                if let Ok(stats) = worktree::stats(tree) {
+                    job.diff_stats = Some(stats);
+                }
+            }
+        }
+        let job = self.state.jobs.get(&root).context("Job not found")?;
+        let title = collaboration::clip_bytes(&job.title, 240);
         let (status, summary, error) = match kind {
             "completed" => ("completed", Some(result), None),
             "failed" => ("failed", None, Some(result)),
@@ -323,6 +444,11 @@ impl<E: Executor> AssistantService<E> {
                 "status": status,
                 "summary": summary.map(|s| collaboration::clip_bytes(s, limit)),
                 "truncated": summary.or(error).is_some_and(|s| s.len() > limit),
+                "diffStats": job.diff_stats,
+                "worktree": job.worktree.as_ref().map(|tree| json!({
+                    "branch": tree.branch,
+                    "readyToMerge": job.diff_stats.is_some_and(|stats| stats.files > 0),
+                })),
                 "error": error.map(|s| collaboration::clip_bytes(s, limit.min(400))),
             })
             .to_string()
@@ -336,5 +462,94 @@ impl<E: Executor> AssistantService<E> {
         }
         ensure!(detail.len() <= SETTLED_LIMIT, "Job settlement exceeds its bound");
         Ok(Some(detail))
+    }
+
+    /// A job whose branch may be merged or removed: finished, with nothing unknown about it.
+    fn settled_worktree(&self, task_id: &str) -> Result<(String, JobWorktree)> {
+        let (root, _) = self.resolve_job(task_id)?;
+        let job = self.state.jobs.get(&root).context("Job not found")?;
+        let tree = job.worktree.clone().context("This job did not run on its own branch")?;
+        ensure!(job.discarded_at_ms.is_none(), "This job's branch was already removed");
+        ensure!(
+            self.job_settled(&root, &self.store.tasks()?),
+            "The job is still running or its outcome is unverified"
+        );
+        Ok((root, tree))
+    }
+
+    /// The user's decision to bring a job's branch into the project. Never offered to the model.
+    pub fn merge_job(&mut self, command_id: &str, task_id: &str, now: i64) -> Result<Value> {
+        clock(now)?;
+        let hash = fingerprint(&("merge_job", task_id))?;
+        if let Some(result) = self.replay(command_id, &hash)? {
+            return Ok(result);
+        }
+        ensure!(!self.is_paused(), "Assistant is paused");
+        let (root, tree) = self.settled_worktree(task_id)?;
+        let job = self.state.jobs.get(&root).context("Job not found")?;
+        ensure!(job.merged_at_ms.is_none(), "This job was already merged");
+        // The grant may have been withdrawn since the job was dispatched.
+        let project = job.source_directory.clone().unwrap_or_else(|| tree.repository.clone());
+        self.executor.validate_directory(&project, true)?;
+        let message = format!("Merge Pocket job: {}", collaboration::clip_bytes(&job.title, 480));
+        let outcome = worktree::merge(&tree, &message)?;
+        let merged = matches!(outcome, MergeOutcome::Merged { .. });
+        let removed = merged && worktree::discard(&tree).is_ok();
+        let job = self.state.jobs.get_mut(&root).context("Job not found")?;
+        job.last_merge = Some(MergeAttempt {
+            outcome: outcome.clone(),
+            at_ms: now,
+        });
+        if merged {
+            job.merged_at_ms = Some(now);
+            if removed {
+                job.discarded_at_ms = Some(now);
+            }
+        }
+        let result = json!({"taskId": root, "merge": job.last_merge});
+        if merged {
+            // Only a merge is final; anything else may be tried again with the same command.
+            self.record(command_id, hash, result.clone());
+            self.event(
+                format!("job-merged:{command_id}"),
+                None,
+                "job_merged",
+                result.to_string(),
+                false,
+                false,
+                now,
+            );
+        }
+        self.save()?;
+        Ok(result)
+    }
+
+    /// The user's decision to drop a job's branch and its changes.
+    pub fn discard_job_worktree(&mut self, command_id: &str, task_id: &str, now: i64) -> Result<Value> {
+        clock(now)?;
+        let hash = fingerprint(&("discard_job_worktree", task_id))?;
+        if let Some(result) = self.replay(command_id, &hash)? {
+            return Ok(result);
+        }
+        let (root, tree) = self.settled_worktree(task_id)?;
+        worktree::discard(&tree)?;
+        self.state
+            .jobs
+            .get_mut(&root)
+            .context("Job not found")?
+            .discarded_at_ms = Some(now);
+        let result = json!({"taskId": root, "discarded": true});
+        self.record(command_id, hash, result.clone());
+        self.event(
+            format!("job-discarded:{command_id}"),
+            None,
+            "job_discarded",
+            result.to_string(),
+            false,
+            false,
+            now,
+        );
+        self.save()?;
+        Ok(result)
     }
 }

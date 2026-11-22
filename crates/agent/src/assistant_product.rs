@@ -792,6 +792,7 @@ struct Worker<R: RuntimeIo + Clone> {
     messages: Connection,
     projects: Vec<Project>,
     workspace: PathBuf,
+    worktrees: PathBuf,
     deferred: BTreeMap<String, PendingToolCall>,
     local_receipts_pending: BTreeSet<String>,
     handoff: Option<Arc<crate::handoff::Handoff>>,
@@ -850,6 +851,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         crate::storage::private_directory(&root)?;
         let workspace = root.join("workspace");
         crate::storage::private_directory(&workspace)?;
+        // Job branches are checked out here; the service decides which project each may copy.
+        let worktrees = root.join("worktrees");
+        crate::storage::private_directory(&worktrees)?;
         let health = io.health()?;
         let account = if health.online && health.initialized {
             io.account().unwrap_or(AccountReadiness::Unavailable)
@@ -913,7 +917,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         ensure!(projects.len() <= 64, "Too many persisted projects");
-        let mut grants = vec![DirectoryGrant {root:workspace.clone(),writable:true}];
+        let mut grants = vec![DirectoryGrant {root:workspace.clone(),writable:true},DirectoryGrant {root:worktrees.clone(),writable:true}];
         for project in &mut projects {
             if let Ok((actual, writable, proof)) = verify_project(
                 &mut probe,
@@ -980,6 +984,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             messages,
             projects,
             workspace,
+            worktrees,
             deferred: BTreeMap::new(),
             local_receipts_pending: BTreeSet::new(),
             handoff,
@@ -1188,6 +1193,32 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         self.sync_grants()?;
         Ok(())
     }
+    /// Re-read the native permission of the project that contains `directory`.
+    fn reauthorize_project(&mut self, directory: &Path, writes: bool, refusal: &'static str) -> Result<()> {
+        if physical(directory).is_ok_and(|d| d == self.workspace) {
+            return Ok(());
+        }
+        let project = self
+            .projects
+            .iter()
+            .find(|p| physical(directory).is_ok_and(|d| within(&d, &p.root)))
+            .context(refusal)?;
+        let (thread, root, writable, source, source_generation) = (
+            project.thread.clone(),
+            project.root.clone(),
+            project.writable,
+            project.source_runtime.clone(),
+            project.source_generation.clone(),
+        );
+        self.authorize(&source, Some(&source_generation), &thread, &root, writable)?;
+        ensure!(
+            self.projects.iter().any(|project| project.verified
+                && (!writes || project.writable)
+                && physical(directory).is_ok_and(|root| within(&root, &project.root))),
+            "{refusal}"
+        );
+        Ok(())
+    }
     fn sync_grants(&self) -> Result<()> {
         self.executor.replace_directory_grants(
             self.projects
@@ -1197,9 +1228,14 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     root: p.root.clone(),
                     writable: p.writable,
                 })
-                .chain(std::iter::once(DirectoryGrant {root:self.workspace.clone(),writable:true}))
+                .chain([DirectoryGrant {root:self.workspace.clone(),writable:true},DirectoryGrant {root:self.worktrees.clone(),writable:true}])
                 .collect(),
         )
+    }
+    /// The project whose permission covers a task. A job on its own branch runs in a private
+    /// copy, but it is its source project that must still be authorized.
+    fn project_directory(&self, task_id: &str, directory: PathBuf) -> PathBuf {
+        self.service.task_source_directory(task_id).unwrap_or(directory)
     }
     fn revalidate_pending_projects(&mut self) -> Result<()> {
         let mut pending = self
@@ -1207,7 +1243,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .tasks()?
             .into_iter()
             .filter(|t| t.status == TaskStatus::Queued)
-            .map(|t| t.directory)
+            .map(|t| self.project_directory(&t.id, t.directory))
             .collect::<Vec<_>>();
         pending.extend(
             self.service
@@ -1221,7 +1257,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 .deliveries()
                 .into_iter()
                 .filter(|d| matches!(d.status.as_str(), "queued" | "sending" | "unknown"))
-                .map(|d| d.directory),
+                .map(|d| match &d.task_id {
+                    Some(task) => self.project_directory(task, d.directory),
+                    None => d.directory,
+                }),
         );
         self.revalidate_project_paths(&pending)
     }
@@ -1268,10 +1307,11 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             .filter(|t| t.status == TaskStatus::Queued)
         {
             if physical(&task.directory).is_ok_and(|d|d==self.workspace) {continue;}
+            let directory = self.project_directory(&task.id, task.directory.clone());
             if !self.projects.iter().any(|p| {
                 p.verified
                     && (!task.writes || p.writable)
-                    && physical(&task.directory).is_ok_and(|d| within(&d, &p.root))
+                    && physical(&directory).is_ok_and(|d| within(&d, &p.root))
             }) {
                 self.service.apply(
                     &format!("product-project-check:{}", task.id),
@@ -1428,6 +1468,23 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     at,
                 )?;
             }
+            "assistant/v2/task/merge" | "assistant/v2/task/discard_worktree" => {
+                let task_id = text(p, "taskId")?;
+                let result = if r.method.ends_with("/merge") {
+                    // Merging writes the user's project: its current permission is read again.
+                    let project = self.service.task_source_directory(task_id)?;
+                    self.reauthorize_project(&project, true, "Reauthorize project before merging")?;
+                    self.service.merge_job(&r.id, task_id, at)?
+                } else {
+                    self.service.discard_job_worktree(&r.id, task_id, at)?
+                };
+                // The outcome travels in the receipt; the job's card shows the same from the snapshot.
+                let mut receipt = json!({"accepted":true,"commandId":r.id});
+                if let (Some(receipt), Some(result)) = (receipt.as_object_mut(), result.as_object()) {
+                    receipt.extend(result.clone());
+                }
+                return Ok(receipt);
+            }
             "assistant/task/resume" | "assistant/v2/task/retry" => {
                 let task_id = text(p, "taskId")?;
                 let task = self
@@ -1437,29 +1494,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     .find(|t| t.id == task_id)
                     .context("Task not found")?;
                 // Explicit resume cannot reuse permission evidence captured
-                // before a native project policy change.
-                if !physical(&task.directory).is_ok_and(|d|d==self.workspace) {
-                let project = self
-                    .projects
-                    .iter()
-                    .find(|p| physical(&task.directory).is_ok_and(|d| within(&d, &p.root)))
-                    .context("Reauthorize project before resuming task")?;
-                let (thread, root, writable, source, source_generation) = (
-                    project.thread.clone(),
-                    project.root.clone(),
-                    project.writable,
-                    project.source_runtime.clone(),
-                    project.source_generation.clone(),
-                );
-                self.authorize(&source, Some(&source_generation), &thread, &root, writable)?;
-                ensure!(
-                    self.projects.iter().any(|project| project.verified
-                        && (!task.writes || project.writable)
-                        && physical(&task.directory)
-                            .is_ok_and(|root| within(&root, &project.root))),
-                    "Reauthorize project before resuming task"
-                );
-                }
+                // before a native project policy change. A job on its own branch
+                // answers for the project it was copied from.
+                let project = self.service.task_source_directory(task_id)?;
+                self.reauthorize_project(&project, task.writes, "Reauthorize project before resuming task")?;
                 self.service.apply(
                     &r.id,
                     if r.method=="assistant/v2/task/retry" {Command::RetryTask {task_id:task_id.into()}}

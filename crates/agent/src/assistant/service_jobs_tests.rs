@@ -388,3 +388,277 @@ fn coordinator_model_override_applies_only_to_coordinator_role() {
             .is_err()
     );
 }
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Turns the fixture's project into a repository with one commit, granted for writing.
+fn repository(f: &mut Fixture) -> PathBuf {
+    let work = canonical_directory(&f.root.path().join("work")).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "core.autocrlf", "false"]);
+    std::fs::write(work.join("a.txt"), "one\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "initial"]);
+    f.service.executor.project_grants.push((work.clone(), true));
+    work
+}
+
+fn dispatch_write(f: &mut Fixture, lead: &Operation, call: &str, use_worktree: Option<bool>) -> Result<serde_json::Value> {
+    f.service.tool(
+        lead.mapping.clone().unwrap(),
+        call,
+        ToolCall::DispatchSession {
+            title: format!("写入 {call}"),
+            prompt: format!("Change files for {call}"),
+            directory: f.root.path().join("work"),
+            writes: true,
+            use_worktree,
+            model: None,
+        },
+        1,
+    )
+}
+
+fn request_of<'a>(f: &'a Fixture, task: &str) -> &'a StartRequest {
+    let op = running(f, task);
+    f.service.executor.requests.iter().find(|r| r.operation_id == op.id).unwrap()
+}
+
+fn job<'a>(jobs: &'a [serde_json::Value], task: &str) -> &'a serde_json::Value {
+    jobs.iter().find(|job| job["taskId"] == task).unwrap()
+}
+
+#[test]
+fn write_jobs_in_a_clean_repository_run_at_once_on_their_own_branches() {
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    let lead = f.submit();
+    let first = dispatch_write(&mut f, &lead, "one", None).unwrap();
+    let second = dispatch_write(&mut f, &lead, "two", None).unwrap();
+    for result in [&first, &second] {
+        assert_eq!(result["workspace_mode"], "worktree");
+        assert_eq!(result["mode_reason"], "clean");
+        assert!(result["branch"].as_str().unwrap().starts_with("pocket/job-"));
+    }
+    assert_ne!(first["branch"], second["branch"]);
+    // The same call replayed is the same job on the same branch.
+    assert_eq!(dispatch_write(&mut f, &lead, "one", None).unwrap(), first);
+    let (a, b) = (first["task_id"].as_str().unwrap(), second["task_id"].as_str().unwrap());
+
+    f.service.tick(2).unwrap();
+    let (ra, rb) = (request_of(&f, a), request_of(&f, b));
+    let worktrees = canonical_directory(f.root.path()).unwrap().join("worktrees");
+    for request in [ra, rb] {
+        assert!(request.writes && request.role == Role::Execution);
+        assert!(request.directory.as_ref().unwrap().starts_with(&worktrees), "{:?}", request.directory);
+    }
+    assert_ne!(ra.directory, rb.directory, "both write at once only because their directories differ");
+
+    // Each sees only its own change; the project sees neither until a merge.
+    std::fs::write(ra.directory.as_ref().unwrap().join("from-a.txt"), "a\n").unwrap();
+    assert!(!rb.directory.as_ref().unwrap().join("from-a.txt").exists());
+    assert!(!work.join("from-a.txt").exists());
+    let jobs = f.service.jobs().unwrap();
+    assert_eq!(job(&jobs, a)["directory"], serde_json::json!(work));
+    assert_eq!(job(&jobs, a)["workspaceMode"], "worktree");
+    assert_eq!(job(&jobs, a)["readyToMerge"], false, "a running job is not offered for merging");
+}
+
+#[test]
+fn non_git_and_dirty_projects_keep_the_serial_writer_slot() {
+    let mut f = Fixture::new();
+    let lead = f.submit();
+    // Not a repository: both jobs share the directory, so the second waits for the first.
+    let first = dispatch_write(&mut f, &lead, "one", Some(true)).unwrap();
+    let second = dispatch_write(&mut f, &lead, "two", None).unwrap();
+    for result in [&first, &second] {
+        assert_eq!(result["workspace_mode"], "direct");
+        assert_eq!(result["mode_reason"], "not_git");
+        assert!(result["branch"].is_null());
+    }
+    f.service.tick(2).unwrap();
+    assert_eq!(f.service.executor.requests.iter().filter(|r| r.role == Role::Execution).count(), 1);
+    let read_only = f
+        .service
+        .tool(
+            lead.mapping.clone().unwrap(),
+            "read",
+            ToolCall::DispatchSession {
+                title: "只读".into(),
+                prompt: "Read".into(),
+                directory: f.root.path().join("work"),
+                writes: false,
+                use_worktree: Some(true),
+                model: None,
+            },
+            3,
+        )
+        .unwrap();
+    assert_eq!(read_only["mode_reason"], "read_only");
+
+    // A repository with uncommitted work: a branch from HEAD would not contain it.
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    std::fs::write(work.join("a.txt"), "edited but not committed\n").unwrap();
+    let lead = f.submit();
+    let dirty = dispatch_write(&mut f, &lead, "dirty", None).unwrap();
+    assert_eq!((dirty["workspace_mode"].as_str(), dirty["mode_reason"].as_str()), (Some("direct"), Some("dirty")));
+    let asked = dispatch_write(&mut f, &lead, "asked", Some(true)).unwrap();
+    assert_eq!((asked["workspace_mode"].as_str(), asked["mode_reason"].as_str()), (Some("worktree"), Some("requested")));
+
+    // A private copy is not a way around a read-only grant.
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    f.service.executor.project_grants = vec![(work, false)];
+    let lead = f.submit();
+    assert!(dispatch_write(&mut f, &lead, "ungranted", None).is_err());
+    assert!(f.service.tasks().unwrap().is_empty());
+    let leftovers = std::fs::read_dir(f.root.path().join("worktrees")).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn merge_brings_a_finished_job_into_the_project_and_removes_its_branch() {
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    let lead = f.submit();
+    let result = dispatch_write(&mut f, &lead, "feature", None).unwrap();
+    let task = result["task_id"].as_str().unwrap().to_owned();
+    let branch = result["branch"].as_str().unwrap().to_owned();
+    f.service.tick(2).unwrap();
+    let op = running(&f, &task);
+    let directory = request_of(&f, &task).directory.clone().unwrap();
+    assert!(f.service.merge_job("too-early", &task, 3).is_err(), "a running job cannot be merged");
+
+    // The job leaves its work uncommitted: its sandbox cannot write the repository's .git.
+    std::fs::write(directory.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(directory.join("new.txt"), "new\n").unwrap();
+    finish(&mut f, &op, 4);
+    let settled = f.service.events(0, 256).unwrap().into_iter().find(|e| e.kind == "job_settled").unwrap();
+    let detail: serde_json::Value = serde_json::from_str(&settled.detail).unwrap();
+    assert_eq!(detail["diffStats"], serde_json::json!({"files": 2, "insertions": 2, "deletions": 0}));
+    assert_eq!(detail["worktree"], serde_json::json!({"branch": branch, "readyToMerge": true}));
+    assert_eq!(job(&f.service.jobs().unwrap(), &task)["readyToMerge"], true);
+    assert!(!work.join("new.txt").exists());
+
+    let merged = f.service.merge_job("merge-1", &task, 5).unwrap();
+    assert_eq!(merged["merge"]["outcome"], "merged");
+    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "one\ntwo\n");
+    assert!(work.join("new.txt").exists());
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), merged["merge"]["commit"].as_str().unwrap());
+    assert!(!directory.exists(), "the worktree is removed after a merge");
+    assert_eq!(git(&work, &["branch", "--list", "pocket/job-*"]), "");
+    let jobs = f.service.jobs().unwrap();
+    let view = job(&jobs, &task);
+    assert_eq!(view["mergedAtMs"], 5);
+    assert_eq!(view["discardedAtMs"], 5);
+    assert_eq!(view["readyToMerge"], false);
+    assert_eq!(view["lastMerge"]["outcome"], "merged");
+
+    // The same command again is the same receipt; a new one finds nothing left to merge.
+    assert_eq!(f.service.merge_job("merge-1", &task, 6).unwrap(), merged);
+    assert!(f.service.merge_job("merge-2", &task, 7).is_err());
+    assert!(f.service.discard_job_worktree("discard-late", &task, 8).is_err());
+    // Its directory is gone, so it cannot be continued, by the coordinator or by the user.
+    let steer = f.service.tool(
+        lead.mapping.clone().unwrap(),
+        "steer-merged",
+        ToolCall::SteerSession { task_id: task.clone(), instruction: "more".into() },
+        9,
+    );
+    assert!(steer.is_err());
+    assert!(f.service.submit_targeted("user-follow-up", "more", None, Some(&task), false, 10).is_err());
+    let mut f = reopen_fixture(f);
+    assert_eq!(job(&f.service.jobs().unwrap(), &task)["mergedAtMs"], 5);
+    assert_eq!(f.service.merge_job("merge-1", &task, 11).unwrap(), merged);
+}
+
+#[test]
+fn merge_conflict_leaves_the_project_untouched_and_the_job_can_still_be_discarded() {
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    let lead = f.submit();
+    let task = dispatch_write(&mut f, &lead, "conflict", None).unwrap()["task_id"].as_str().unwrap().to_owned();
+    f.service.tick(2).unwrap();
+    let op = running(&f, &task);
+    let directory = request_of(&f, &task).directory.clone().unwrap();
+    std::fs::write(directory.join("a.txt"), "job\n").unwrap();
+    finish(&mut f, &op, 3);
+    std::fs::write(work.join("a.txt"), "user\n").unwrap();
+    git(&work, &["commit", "-q", "-am", "user change"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+
+    let attempt = f.service.merge_job("merge-1", &task, 4).unwrap();
+    assert_eq!(attempt["merge"]["outcome"], "conflict");
+    assert_eq!(attempt["merge"]["files"], serde_json::json!(["a.txt"]));
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "user\n");
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+    let jobs = f.service.jobs().unwrap();
+    assert_eq!(job(&jobs, &task)["lastMerge"]["outcome"], "conflict");
+    assert_eq!(job(&jobs, &task)["readyToMerge"], true, "the user may resolve and try again");
+    assert!(job(&jobs, &task)["mergedAtMs"].is_null());
+
+    // An uncommitted edit of the user's is another reason not to touch the project.
+    std::fs::write(work.join("a.txt"), "user, unsaved\n").unwrap();
+    assert_eq!(f.service.merge_job("merge-2", &task, 5).unwrap()["merge"]["outcome"], "main_dirty");
+    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "user, unsaved\n");
+
+    assert_eq!(f.service.discard_job_worktree("discard-1", &task, 6).unwrap()["discarded"], true);
+    assert!(!directory.exists());
+    assert_eq!(git(&work, &["branch", "--list", "pocket/job-*"]), "");
+    assert_eq!(job(&f.service.jobs().unwrap(), &task)["discardedAtMs"], 6);
+    assert_eq!(f.service.discard_job_worktree("discard-1", &task, 7).unwrap()["discarded"], true);
+    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "user, unsaved\n");
+}
+
+#[test]
+fn unknown_task_worktree_is_never_discarded_or_merged() {
+    let mut f = Fixture::new();
+    let work = repository(&mut f);
+    let lead = f.submit();
+    let task = dispatch_write(&mut f, &lead, "unknown", None).unwrap()["task_id"].as_str().unwrap().to_owned();
+    f.service.tick(2).unwrap();
+    let op = running(&f, &task);
+    let directory = request_of(&f, &task).directory.clone().unwrap();
+    std::fs::write(directory.join("partial.txt"), "half\n").unwrap();
+    let refused = |f: &mut Fixture, id: &str| {
+        assert!(f.service.merge_job(&format!("merge-{id}"), &task, 9).is_err(), "merge while {id}");
+        assert!(f.service.discard_job_worktree(&format!("discard-{id}"), &task, 9).is_err(), "discard while {id}");
+        assert!(directory.join("partial.txt").exists());
+        assert!(!work.join("partial.txt").exists());
+    };
+    refused(&mut f, "running");
+    f.observe(&op, ExecutionStatus::Unknown, "lost", 3);
+    assert_eq!(job(&f.service.jobs().unwrap(), &task)["status"], "needs_verification");
+    refused(&mut f, "unknown");
+    let mut f = reopen_fixture(f);
+    refused(&mut f, "unknown-after-restart");
+    assert_eq!(job(&f.service.jobs().unwrap(), &task)["readyToMerge"], false);
+
+    // A correction still on its way to the job also keeps its branch in place.
+    f.observe(&op, ExecutionStatus::Interrupted(op.mapping.clone().unwrap()), "stopped", 4);
+    f.service.submit_targeted("pending-follow-up", "one more thing", None, Some(&task), false, 5).unwrap();
+    refused(&mut f, "delivery-pending");
+
+    // A job that ran in the project itself has no branch to merge or remove.
+    let mut plain = Fixture::new();
+    let lead = plain.submit();
+    let direct = dispatch(&mut plain, &lead, "direct", "直接运行", None);
+    plain.service.tick(2).unwrap();
+    let op = running(&plain, &direct);
+    finish(&mut plain, &op, 3);
+    assert!(plain.service.merge_job("merge-direct", &direct, 4).is_err());
+    assert!(plain.service.discard_job_worktree("discard-direct", &direct, 4).is_err());
+}

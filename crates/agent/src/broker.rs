@@ -2245,6 +2245,7 @@ impl Broker {
                 "upstream.versions.v1",
                 "assistant.v1",
                 "assistant.v2",
+                "assistant.jobs.v1",
                 "assistant/read",
                 "assistant/project/read",
                 "push/status",

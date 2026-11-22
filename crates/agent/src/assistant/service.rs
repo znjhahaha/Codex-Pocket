@@ -307,6 +307,8 @@ pub struct AssistantService<E: Executor> {
     store: AssistantStore,
     state: State,
     generation: String,
+    /// Where this profile's private files live; job worktrees are created beneath it.
+    state_dir: PathBuf,
     opened_at: Option<i64>,
     _owner: File,
 }
@@ -427,6 +429,7 @@ impl<E: Executor> AssistantService<E> {
                 store,
                 state,
                 generation: generation.into(),
+                state_dir: canonical_parent,
                 opened_at: None,
                 _owner: owner,
             };
@@ -438,6 +441,7 @@ impl<E: Executor> AssistantService<E> {
             store,
             state,
             generation: generation.into(),
+            state_dir: canonical_parent,
             opened_at: None,
             _owner: owner,
         };

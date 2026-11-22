@@ -992,6 +992,9 @@ impl<E: Executor> AssistantService<E> {
         }
         ensure!(!self.is_paused(), "Assistant is paused");
         let task = task_id.map(|id| self.store.task(id)).transpose()?;
+        if let Some(task) = &task {
+            self.ensure_job_workspace(task)?;
+        }
         if reassign {
             let task = task.as_ref().context("Reassignment requires a task")?;
             ensure!(member_id.is_some(), "Reassignment requires a member");

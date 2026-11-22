@@ -82,6 +82,8 @@ pub enum MergeOutcome {
         files: Vec<String>,
     },
     MainDirty,
+    /// The main working tree is on no branch; a merge commit there would be left dangling.
+    MainDetached,
     /// Git older than 2.38 has no `merge-tree --write-tree`; we refuse rather than touch the
     /// working tree.
     UnsupportedGit {
@@ -135,13 +137,64 @@ pub fn branch_name(task_id: &str) -> String {
     format!("{BRANCH_PREFIX}{}", short.to_ascii_lowercase())
 }
 
-pub fn create(state_dir: &Path, task_id: &str, directory: &Path) -> Result<JobWorktree> {
-    // The task id becomes a directory name, so nothing that could leave `worktrees` is accepted.
+/// The task id becomes a directory name, so nothing that could leave `worktrees` is accepted.
+fn checked_id(task_id: &str) -> Result<()> {
     let safe = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
     ensure!(
         !task_id.is_empty() && task_id.len() <= 128 && task_id.bytes().all(safe),
         "invalid task id"
     );
+    Ok(())
+}
+
+/// `create`, or the worktree that an interrupted earlier call for the same id already made.
+/// Only for a job that has not started: the adopted branch tip is taken as its base.
+pub fn ensure_created(state_dir: &Path, task_id: &str, directory: &Path) -> Result<JobWorktree> {
+    checked_id(task_id)?;
+    let path = state_dir.join("worktrees").join(task_id);
+    let in_use = path
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_some());
+    if !in_use {
+        return create(state_dir, task_id, directory);
+    }
+    let directory = dunce::canonicalize(directory).context("job directory is not accessible")?;
+    let toplevel = run(&directory, &["rev-parse", "--show-toplevel"])?;
+    let repository =
+        dunce::canonicalize(toplevel.trim()).context("repository top-level is not accessible")?;
+    let relative = directory
+        .strip_prefix(&repository)
+        .context("job directory is outside its repository")?
+        .to_owned();
+    let path = dunce::canonicalize(&path).context("job worktree is not accessible")?;
+    // Taken over only if it is a checkout of this same repository on one of our branches.
+    let common = |dir: &Path| -> Result<PathBuf> {
+        let shared = run(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        dunce::canonicalize(shared.trim()).context("git directory is not accessible")
+    };
+    ensure!(
+        common(&path)? == common(&repository)?,
+        "job worktree path belongs to another repository"
+    );
+    let branch = run(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
+    ensure!(
+        branch.starts_with(&branch_name(task_id)),
+        "job worktree path is on another branch"
+    );
+    let worktree = JobWorktree {
+        base: head(&path)?,
+        directory: path.join(relative),
+        repository,
+        path,
+        branch,
+    };
+    validate(&worktree)?;
+    std::fs::create_dir_all(&worktree.directory).context("job directory could not be created")?;
+    Ok(worktree)
+}
+
+pub fn create(state_dir: &Path, task_id: &str, directory: &Path) -> Result<JobWorktree> {
+    checked_id(task_id)?;
     let stem = branch_name(task_id);
     ensure!(
         stem.len() >= BRANCH_PREFIX.len() + 4,
@@ -319,6 +372,9 @@ pub fn merge(worktree: &JobWorktree, message: &str) -> Result<MergeOutcome> {
     // An unfinished merge of the user's can look clean, and aborting ours would abort theirs.
     if !is_clean(repository)? || resolves(repository, "MERGE_HEAD") {
         return Ok(MergeOutcome::MainDirty);
+    }
+    if !git(repository, &["symbolic-ref", "--quiet", "HEAD"])?.status.success() {
+        return Ok(MergeOutcome::MainDetached);
     }
 
     let arguments = ["merge-tree", "--write-tree", "--name-only", "HEAD", branch];
