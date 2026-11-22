@@ -474,6 +474,8 @@ class V070LiveAcceptanceDeviceTest {
             val hasMore = when (kind) { "provider" -> data.providerGroups.hasMore; "model" -> data.modelGroups.hasMore; else -> data.sessionGroups?.hasMore == true }
             if (hasMore) {
                 val before = repository.state.value.usage.filter
+                scroll("usage-group:$kind")
+                node("usage-group:$kind").performClick()
                 scroll("usage-$kind-next")
                 node("usage-$kind-next").assertIsEnabled().performClick()
                 await("group page RPC", 20_000) { repository.state.value.usage.filter != before && !repository.state.value.usage.refreshing }

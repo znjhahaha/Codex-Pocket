@@ -21,4 +21,18 @@ class KitNoMaterialTest {
         }
         assertEquals("Material references", emptyList<String>(), offenders)
     }
+
+    /** Screens rebuilt on the kit, by file-name prefix. Append a prefix when another screen has been moved over. */
+    private val rebuiltScreens = listOf("Usage")
+
+    @Test fun rebuiltScreensNeverReferenceMaterial() {
+        rebuiltScreens.forEach { prefix ->
+            val sources = ui.listFiles { file -> file.isFile && file.extension == "kt" && file.name.startsWith(prefix) }.orEmpty().sortedBy { it.name }
+            assertTrue("No $prefix*.kt sources were found from ${File(".").absolutePath}", sources.isNotEmpty())
+            val offenders = sources.flatMap { file ->
+                file.readLines().mapIndexedNotNull { index, line -> if ("androidx.compose.material" in line) "${file.name}:${index + 1}" else null }
+            }
+            assertEquals("Material references in $prefix*.kt", emptyList<String>(), offenders)
+        }
+    }
 }
