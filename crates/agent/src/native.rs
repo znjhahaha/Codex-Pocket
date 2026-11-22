@@ -114,6 +114,22 @@ pub enum NativeRole {
 
 impl NativeRole {
     pub fn is_auxiliary(&self) -> bool { matches!(self, Self::DesktopAuxiliary) }
+    /// The assistant's own runtime, kept apart from ordinary sessions. A packaged Android
+    /// installation has no assistant and cannot run a Codex CLI daemon, which binds its socket
+    /// under /tmp; there the hosted runtime carries the ordinary sessions instead.
+    pub fn assistant_private(&self) -> bool { self.assistant_private_when(crate::managed_runtime::packaged()) }
+    /// Where a session that is not the desktop's runs.
+    pub fn serves_cli_sessions(&self) -> bool { self.serves_cli_sessions_when(crate::managed_runtime::packaged()) }
+    pub(crate) fn assistant_private_when(&self, packaged: bool) -> bool { matches!(self, Self::ManagedHost { .. }) && !packaged }
+    pub(crate) fn serves_cli_sessions_when(&self, packaged: bool) -> bool {
+        matches!(self, Self::CliDaemon) || (packaged && matches!(self, Self::ManagedHost { .. }))
+    }
+    /// What a phone is told. It keeps a hosted runtime out of ordinary sessions by its kind.
+    pub fn shown(&self) -> Value { self.shown_when(crate::managed_runtime::packaged()) }
+    pub(crate) fn shown_when(&self, packaged: bool) -> Value {
+        let role = if packaged && matches!(self, Self::ManagedHost { .. }) { &Self::CliDaemon } else { self };
+        serde_json::to_value(role).unwrap_or(Value::Null)
+    }
 }
 
 pub(crate) fn desktop_role(status: &Value) -> NativeRole {

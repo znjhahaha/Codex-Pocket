@@ -173,8 +173,9 @@ impl Broker {
             Ok(params)=>params,
             Err(_)=>return Ok(json!({"phase":"blocked","reason":"saved_settings_unavailable","canSend":false})),
         };
-        let existing={let s=self.state.lock().await;s.runtimes.iter().find(|(_,r)|r.store==store&&r.rpc.online()&&r.source=="cli"&&!matches!(r.role,native::NativeRole::ManagedHost{..})).map(|(id,_)|id.clone())};
-        if existing.is_none(){
+        let existing={let s=self.state.lock().await;s.runtimes.iter().find(|(_,r)|r.store==store&&r.rpc.online()&&r.source=="cli"&&!r.role.assistant_private()).map(|(id,_)|id.clone())};
+        let hosted=crate::managed_runtime::packaged();
+        if existing.is_none()&&!hosted{
             let home_copy=home.clone();
             let profile=tokio::task::spawn_blocking(move||{
                 crate::managed_runtime::discovery::for_cli_home(&home_copy)
@@ -189,7 +190,12 @@ impl Broker {
             let status=tokio::time::timeout(Duration::from_secs(15),child.wait()).await;
             if !matches!(status,Ok(Ok(s))if s.success()){return Ok(json!({"phase":"waiting_release","reason":"native_start_unconfirmed","canSend":false}))}
         }
-        let runtime=if let Some(id)=existing{id}else{
+        let runtime=if let Some(id)=existing{id}else if hosted{
+            match self.ensure_device_runtime().await {
+                Ok(id)=>id,
+                Err(_)=>return Ok(json!({"phase":"waiting_release","reason":"native_start_unconfirmed","canSend":false})),
+            }
+        }else{
             let connected=native::cli(&home,self.native_events.clone()).await?;let id=connected.runtime_id.clone();self.add_runtime(connected).await?;id
         };
         self.refresh_loaded().await?;

@@ -1978,7 +1978,7 @@ impl Broker {
                 capabilities.extend(["workspace/list","workspace/read","workspace/image","references/list"].into_iter().map(str::to_owned));
             }
             let stage = if !r.rpc.online() { "disconnected" } else if r.source == "desktop" && r.desktop_initialized != Some(true) { "native_handshake" } else if r.capabilities.0.is_empty() { "native_schema" } else if !r.inventory_ready { "session_inventory" } else { "ready" };
-            json!({"id":id,"source":r.source,"role":r.role,"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models,"initialized":r.desktop_initialized,"schemaState":r.schema_state,"inventoryReady":r.inventory_ready,"readiness":{"stage":stage,"timedOut":stage!="ready" && r.readiness_started.elapsed() >= Duration::from_secs(15),"schemaState":r.schema_state}})
+            json!({"id":id,"source":r.source,"role":r.role.shown(),"version":r.version,"bridgeVersion":r.bridge_version,"helperVersion":env!("CARGO_PKG_VERSION"),"bridgeUpdatePending":r.bridge_version.as_deref().is_some_and(|v|v!=env!("CARGO_PKG_VERSION")),"configStoreId":r.store,"online":r.rpc.online(),"loadedThreadIds":r.loaded,"capabilities":capabilities,"capabilityFields":fields,"fastModels":r.fast_models,"initialized":r.desktop_initialized,"schemaState":r.schema_state,"inventoryReady":r.inventory_ready,"readiness":{"stage":stage,"timedOut":stage!="ready" && r.readiness_started.elapsed() >= Duration::from_secs(15),"schemaState":r.schema_state}})
         }).collect()
     }
     pub async fn diagnostics(&self) -> Value {
@@ -2272,6 +2272,9 @@ impl Broker {
         );
         #[cfg(any(windows, target_os = "linux"))]
         capabilities.insert("runtime.ensure.cli".to_owned());
+        // Only Windows has a desktop Codex for a session to follow.
+        #[cfg(not(windows))]
+        capabilities.insert("runtime.desktop.unavailable".to_owned());
         let routes=crate::config::routes::snapshot(&self.config,&self.state_dir);
         json!({"protocol":1,"computerId":self.config.computer_id,"computerName":self.config.computer_name,"helperVersion":env!("CARGO_PKG_VERSION"),"routes":routes["routes"],"routePolicy":routes["policy"],"capabilities":capabilities,"runtimes":self.public_runtime_values(&s)})
     }
@@ -2566,7 +2569,8 @@ impl Broker {
                     .await
                     .runtimes
                     .values()
-                    .any(|r| matches!(r.role, native::NativeRole::CliDaemon) && r.store == store && r.rpc.online())
+                    .any(|r| r.role.serves_cli_sessions() && r.store == store && r.rpc.online())
+                    || crate::managed_runtime::packaged()
                 {
                     continue;
                 }
@@ -3147,7 +3151,7 @@ impl Broker {
                     }
                     if push_event(&value)
                         && public_event
-                        && !state.runtimes.get(&runtime_id).is_some_and(|r|matches!(r.role,crate::native::NativeRole::ManagedHost{..}))
+                        && !state.runtimes.get(&runtime_id).is_some_and(|r|r.role.assistant_private())
                         && self.push.configured()
                         && let Some(thread) = value["params"]["threadId"].as_str()
                     {
@@ -3243,7 +3247,7 @@ impl Broker {
                         }
                     }
                     if value.get("id").is_some()
-                        && !state.runtimes.get(&runtime_id).is_some_and(|r|matches!(r.role,crate::native::NativeRole::ManagedHost { .. }))
+                        && !state.runtimes.get(&runtime_id).is_some_and(|r|r.role.assistant_private())
                         && matches!(
                             method.as_str(),
                             "item/commandExecution/requestApproval"

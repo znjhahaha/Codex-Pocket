@@ -504,7 +504,7 @@ impl Broker {
             state
                 .runtimes
                 .get(runtime)
-                .is_some_and(|r| matches!(r.role, crate::native::NativeRole::ManagedHost { .. }))
+                .is_some_and(|r| r.role.assistant_private())
         };
         let actor = self.assistant.lock().await.clone();
         let snapshot = actor.as_ref().map(Actor::snapshot).unwrap_or(Value::Null);
@@ -624,9 +624,12 @@ impl Broker {
         // The assistant's coordinator is held read-only and its jobs to their own worktree by
         // Codex's sandbox, which an Android application cannot create. It is not offered there
         // rather than run without those limits.
+        // What is prepared there is the runtime its ordinary sessions run on.
         if crate::managed_runtime::packaged() {
-            *self.assistant_error.lock().await = Some(ASSISTANT_UNAVAILABLE_ON_DEVICE);
-            anyhow::bail!("The assistant is not available on this device");
+            let started = self.ensure_device_runtime().await;
+            *self.assistant_error.lock().await =
+                Some(if started.is_ok() { ASSISTANT_UNAVAILABLE_ON_DEVICE } else { "assistant_runtime_start_failed" });
+            return started.map(|_| ());
         }
         self.prepare_assistant_using(
             crate::managed_runtime::discovery::from_environment,
@@ -652,6 +655,33 @@ impl Broker {
         });
         *self.assistant_error.lock().await = error;
         result
+    }
+
+    /// Starts, or attaches to, the hosted runtime that carries ordinary sessions on a packaged
+    /// Android installation, and returns its id. The assistant is not started on it.
+    pub(super) async fn ensure_device_runtime(&self) -> Result<String> {
+        // One preparation at a time, as for the assistant this runtime otherwise belongs to.
+        let _serial = self.assistant.lock().await;
+        let online = |state: &State| state.runtimes.iter()
+            .find(|(_, r)| r.rpc.online() && matches!(r.role, crate::native::NativeRole::ManagedHost { .. }))
+            .map(|(id, _)| id.clone());
+        if let Some(id) = online(&*self.state.lock().await) { return Ok(id); }
+        self.check_write_fence()?;
+        let selected = crate::managed_runtime::discovery::from_environment()?;
+        let executable = std::env::current_exe()?;
+        let generation = crate::installation::current()["generation"].as_str().context("Installed generation unavailable")?.to_string();
+        let installation = Installation::new(executable.parent().context("Missing installation")?, generation)?;
+        let registry = Registry::new(self.state_dir.join("managed-runtimes"))?;
+        let descriptor = registry.profile_directory(&selected)?.join("descriptor.json");
+        let runtime = Controller::new(installation, registry).ensure(&selected).await?;
+        let cursor = self.handoff.get().and_then(|h| h.recovery_snapshot())
+            .and_then(|s| s.runtimes.get(runtime.runtime_id()).and_then(|r| r.host_cursor.as_ref())
+                .map(|c| crate::native::host::Cursor { generation: c.generation.clone(), after: c.after }));
+        let connected = runtime.attach(self.native_events.clone(), cursor).await?;
+        if let Some(h) = self.handoff.get() { h.register_host_descriptor(runtime.runtime_id(), &descriptor)?; }
+        let id = connected.runtime_id.clone();
+        self.add_runtime(connected).await?;
+        Ok(id)
     }
 
     async fn ensure_assistant(&self, profile: Profile) -> Result<Actor> {
@@ -940,6 +970,9 @@ impl Broker {
         p: &Value,
     ) -> Result<Value> {
         Self::validate_assistant(method, p)?;
+        if withheld_write(method, crate::managed_runtime::packaged()) {
+            return Err(classify(anyhow::anyhow!("The assistant is not available on this device"), Code::RuntimeUnavailable));
+        }
         if method == "assistant/prepare" {
             self.prepare_assistant_inner().await?;
             return self.assistant_read(&json!({})).await;
@@ -1117,6 +1150,11 @@ fn validate_fenced_saved_profile(home:&Path,binary:&Path)->Result<SelectedProfil
 }
 
 const ASSISTANT_UNAVAILABLE_ON_DEVICE: &str = "assistant_unavailable_on_device";
+/// Preparing is allowed on a packaged Android installation because it starts the runtime
+/// ordinary sessions use; nothing that would drive the assistant itself is.
+fn withheld_write(method: &str, packaged: bool) -> bool {
+    packaged && method != "assistant/prepare"
+}
 fn runtime_restore_error(error:anyhow::Error)->anyhow::Error {
     if error.downcast_ref::<RestoreFailure>().is_some(){error}else{error.context(RestoreFailure::RuntimeStart)}
 }
@@ -1192,6 +1230,26 @@ fn manual_write_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packaged_device_runs_ordinary_sessions_on_the_hosted_runtime_and_withholds_the_assistant() {
+        use crate::native::NativeRole;
+        let hosted = NativeRole::ManagedHost { generation: "g".into(), reconciliation_required: false };
+        // Elsewhere the hosted runtime is the assistant's alone.
+        assert!(hosted.assistant_private_when(false) && !hosted.serves_cli_sessions_when(false));
+        assert_eq!(hosted.shown_when(false)["kind"], "managedHost");
+        // On the device it is where sessions run, and a phone is told so.
+        assert!(!hosted.assistant_private_when(true) && hosted.serves_cli_sessions_when(true));
+        assert_eq!(hosted.shown_when(true), json!({"kind":"cliDaemon"}));
+        for packaged in [false, true] {
+            assert!(NativeRole::CliDaemon.serves_cli_sessions_when(packaged) && !NativeRole::CliDaemon.assistant_private_when(packaged));
+            assert!(!NativeRole::Desktop.serves_cli_sessions_when(packaged));
+            assert_eq!(NativeRole::Desktop.shown_when(packaged)["kind"], "desktop");
+        }
+        assert!(!withheld_write("assistant/prepare", true));
+        for method in ["assistant/send", "assistant/enable", "assistant/settings/update", "assistant/schedule/create"] {
+            assert!(withheld_write(method, true) && !withheld_write(method, false));
+        }
+    }
     #[test]
     fn silent_prepare_accepts_no_selected_runtime_and_rejects_phone_paths() {
         assert!(

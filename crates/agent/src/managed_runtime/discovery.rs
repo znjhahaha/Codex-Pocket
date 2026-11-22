@@ -77,7 +77,21 @@ pub(crate) fn restore_saved_profile_with(
 }
 
 pub(crate) fn replacement_binary(old:&Path)->Result<PathBuf> {
+    if let Some(current)=packaged_replacement(old,std::env::current_exe().ok().as_deref(),super::packaged()) {
+        return installation::physical(&current,false);
+    }
     replacement_binary_with(old,registered_codex_packages)
+}
+
+/// Android installs every update of a package at a new path, so the Codex a runtime was
+/// started from is gone by the time its successor looks for it. The Codex packaged beside
+/// this executable takes its place; nothing else on the device can.
+pub(crate) fn packaged_replacement(old:&Path,executable:Option<&Path>,packaged:bool)->Option<PathBuf> {
+    if !packaged||!old.is_absolute() {return None}
+    let name=old.file_name().filter(|name|*name=="libcodex.so")?;
+    let current=executable?.parent()?.join(name);
+    let gone=matches!(std::fs::symlink_metadata(old),Err(e) if e.kind()==std::io::ErrorKind::NotFound);
+    (gone&&current!=old&&current.is_file()).then_some(current)
 }
 
 #[derive(Debug,PartialEq,Eq)]

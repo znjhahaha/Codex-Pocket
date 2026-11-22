@@ -19,7 +19,7 @@ impl Broker {
         if let Some(b)=&bound {page["cursor"]=b["cursor"].clone();}
         let candidate={let s=self.state.lock().await;
             s.runtimes.iter().filter(|(id,r)|r.store==store&&r.rpc.online()&&
-                !matches!(r.role,native::NativeRole::ManagedHost{..}|native::NativeRole::DesktopFollower)&&
+                !r.role.assistant_private()&&!matches!(r.role,native::NativeRole::DesktopFollower)&&
                 bound.as_ref().is_none_or(|b| b["runtime"]==id.as_str()&&b["generation"]==r.connection_id)&&
                 r.capabilities.supports("thread/read",&read)&&r.capabilities.supports("thread/turns/list",&page))
                 // An unloaded reader can project another process's live turn as

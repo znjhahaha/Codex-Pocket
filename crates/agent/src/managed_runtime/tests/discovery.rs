@@ -44,6 +44,28 @@ fn vendor(package: &Path) -> PathBuf {
 }
 
 #[test]
+fn packaged_codex_from_before_an_update_is_replaced_by_the_one_now_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = dir.path().join("app-before/lib/x86_64/libcodex.so");
+    let agent = dir.path().join("app-now/lib/x86_64/libpocket-agent.so");
+    let now = agent.with_file_name("libcodex.so");
+    write(&now, b"now");
+    // The path an update left behind points at the Codex beside the running agent.
+    assert_eq!(packaged_replacement(&before, Some(&agent), true), Some(now.clone()));
+    // Only on a packaged installation, only for Codex, and only once the old one is really gone.
+    assert_eq!(packaged_replacement(&before, Some(&agent), false), None);
+    assert_eq!(packaged_replacement(&before.with_file_name("libother.so"), Some(&agent), true), None);
+    assert_eq!(packaged_replacement(Path::new("lib/libcodex.so"), Some(&agent), true), None);
+    assert_eq!(packaged_replacement(&now, Some(&agent), true), None);
+    write(&before, b"before");
+    assert_eq!(packaged_replacement(&before, Some(&agent), true), None);
+    std::fs::remove_file(&before).unwrap();
+    std::fs::remove_file(&now).unwrap();
+    assert_eq!(packaged_replacement(&before, Some(&agent), true), None);
+    assert_eq!(packaged_replacement(&before, None, true), None);
+}
+
+#[test]
 fn explicit_native_config_precedes_path_and_preserves_config_home() {
     let (dir, home) = fixture();
     let selected = dir.path().join("selected/codex.exe");

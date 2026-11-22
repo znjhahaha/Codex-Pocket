@@ -14,14 +14,19 @@ pub(super) fn ownership_reason(owner: &std::result::Result<RuntimeId, ResolveErr
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum AccessMode {
-    #[default]
     Desktop,
     Cli,
 }
+impl Default for AccessMode {
+    fn default() -> Self { Self::Desktop.offered(cfg!(windows)) }
+}
 impl AccessMode {
+    /// Only Windows has a desktop Codex for a session to follow; elsewhere a session is the CLI's,
+    /// whatever was remembered.
+    fn offered(self, desktop: bool) -> Self { if desktop { self } else { Self::Cli } }
     fn parse(value: &Value) -> Result<Self> {
         match value.as_str() {
             Some("desktop") => Ok(Self::Desktop),
@@ -196,7 +201,7 @@ pub(super) fn validate(method: &str, params: &Value) -> Result<()> {
 impl Broker {
     pub(crate) async fn access_preferences(&self) -> Value {
         let access = self.access.lock().await;
-        json!({"defaultMode":access.default_mode,"revision":access.revision})
+        json!({"defaultMode":access.default_mode.offered(cfg!(windows)),"revision":access.revision})
     }
 
     pub(crate) async fn update_access_preferences(&self, p: &Value) -> Result<Value> {
@@ -293,7 +298,7 @@ impl Broker {
         let mode = match owner_source.as_deref() {
             Some("cli") => AccessMode::Cli,
             Some("desktop") => AccessMode::Desktop,
-            _ => access.modes.get(&key).copied().unwrap_or(access.default_mode),
+            _ => access.modes.get(&key).copied().unwrap_or(access.default_mode).offered(cfg!(windows)),
         };
         let owner_id = owner.as_ref().ok().map(|o| o.runtime_id.as_str());
         let conflict = matches!(
@@ -372,9 +377,13 @@ impl Broker {
         ))?;
         let store = storage::config_store(&home).map_err(|err| classify(err, Code::RuntimeUnavailable))?;
         let existing = self.state.lock().await.runtimes.iter().find_map(|(id, r)| {
-            (matches!(r.role, native::NativeRole::CliDaemon) && r.store == store && r.rpc.online()).then(|| id.clone())
+            (r.role.serves_cli_sessions() && r.store == store && r.rpc.online()).then(|| id.clone())
         });
         if let Some(id) = existing {
+            return Ok(json!({"phase":"ready","runtimeId":id,"configStoreId":store,"source":"cli"}));
+        }
+        if crate::managed_runtime::packaged() {
+            let id = self.ensure_device_runtime().await.map_err(|err| classify(err, Code::RuntimeUnavailable))?;
             return Ok(json!({"phase":"ready","runtimeId":id,"configStoreId":store,"source":"cli"}));
         }
         #[cfg(not(any(windows, target_os = "linux")))]
@@ -1712,7 +1721,7 @@ mod tests {
             .request("phone", "session/preferences/read", json!({}))
             .await
             .unwrap();
-        assert_eq!(initial["defaultMode"], "desktop");
+        assert_eq!(initial["defaultMode"], if cfg!(windows) { "desktop" } else { "cli" });
         let params = json!({"commandId":"pref","mode":"cli","knownRevision":initial["revision"]});
         let first = b
             .request("phone", "session/preferences/update", params.clone())
@@ -1834,9 +1843,16 @@ mod tests {
         assert_eq!(snapshot["ownerRuntimeId"], "d");
     }
     #[test]
+    fn sessions_follow_a_desktop_only_where_there_is_one() {
+        assert_eq!(AccessMode::Desktop.offered(true), AccessMode::Desktop);
+        assert_eq!(AccessMode::Desktop.offered(false), AccessMode::Cli);
+        assert_eq!(AccessMode::Cli.offered(true), AccessMode::Cli);
+        assert_eq!(AccessMode::default(), if cfg!(windows) { AccessMode::Desktop } else { AccessMode::Cli });
+    }
+    #[test]
     fn default_is_desktop_and_watch_is_explicit() {
         let mut access = AccessStore::default();
-        assert_eq!(access.default_mode, AccessMode::Desktop);
+        assert_eq!(access.default_mode, AccessMode::default());
         assert!(!access.wants_subscription("cli", "thread"));
         access.watched.insert(("cli".into(), "thread".into()));
         assert!(access.wants_subscription("cli", "thread"));
