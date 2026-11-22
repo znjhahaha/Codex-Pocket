@@ -89,6 +89,8 @@ internal object LinuxQa {
             sudo passwd -l pocketqa2 >/dev/null
         """.trimIndent())
     } }
+    /** Acceptance reaches the VM only through its forwarded SSH port, and nothing in the VM reaches the internet. */
+    suspend fun isolate() = sh("sudo ip route del default 2>/dev/null || true")
     /** A host accepts eight devices; every test starts without the ones earlier tests paired. */
     suspend fun forgetAcceptanceDevices(target: SshTarget = pocket) = sh("""
         root="${'$'}HOME/.local/share/codex-pocket"; state="${'$'}HOME/.local/state/codex-pocket/agent"
@@ -100,7 +102,7 @@ internal object LinuxQa {
     fun assume() {
         assumeTrue("Run only against the prepared disposable Linux VM", home != null)
         provisioned
-        runBlocking { forgetAcceptanceDevices() }
+        runBlocking { isolate(); forgetAcceptanceDevices() }
     }
 
     /** A fresh key for the ordinary account, made on the VM and held only in this JVM. */

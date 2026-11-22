@@ -26,8 +26,7 @@ class SshPocketConnection(private val target: SshTarget) : PocketConnection {
             session = ssh
             if (closed) { ssh.close(); throw CancellationException("Connection closed") }
             ssh.execute(sshResumeScript, 40)
-            val port = ssh.forwardLoopback(target.backendPort)
-            val connection = PocketClient(LanConnector("tls://127.0.0.1:$port"))
+            val connection = PocketClient(ssh.loopback(target.backendPort))
             delegate = connection
             scope.launch { connection.state.collect { mutableState.value = it } }
             scope.launch { try { connection.notifications.collect { events.send(it) } } finally { close() } }
