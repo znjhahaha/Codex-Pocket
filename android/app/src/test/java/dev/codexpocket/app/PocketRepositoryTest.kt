@@ -2591,6 +2591,146 @@ class PocketRepositoryTest {
         assertEquals("ready-runtime", repo.state.value.runtimes.single().id)
     }
 
+    private fun assistantSnapshot(messages: List<Pair<String, String>> = emptyList()) = buildJsonObject {
+        put("enabled", true); put("ready", true); put("fresh", true); put("runtimeId", "assistant-runtime"); put("coordinatorThreadId", "coordinator"); put("assistantId", "assistant"); put("paused", false)
+        put("operations", buildJsonArray { add(buildJsonObject { put("id", "op-1"); put("role", "Coordinator"); put("phase", "Running"); put("suspended", false) }) })
+        put("messages", buildJsonArray { messages.forEach { (id, text) -> add(buildJsonObject { put("id", id); put("role", "Assistant"); put("text", text); put("operationId", "op-1") }) } })
+    }
+    private fun streamFrame(sequence: Long, kind: String, runtime: String = "assistant-runtime", fields: JsonObjectBuilder.() -> Unit = {}) = buildJsonObject {
+        put("runtimeId", runtime); put("generation", "generation"); put("epoch", "stream-epoch"); put("sequence", sequence); put("kind", kind); fields()
+    }
+    private fun streamDelta(sequence: Long, text: String, runtime: String = "assistant-runtime") =
+        streamFrame(sequence, "coordinator_delta", runtime) { put("operationId", "op-1"); put("threadId", "coordinator"); put("delta", text); put("reset", false) }
+    private fun assistantReads() = server.calls.count { it.method == "assistant/read" }
+    /** The assistant page was opened on this link, so its snapshot is loaded, as it is whenever frames matter. */
+    private suspend fun openAssistant(read: suspend () -> JsonObject = { assistantSnapshot() }) {
+        update { it.copy(capabilities = it.capabilities + setOf("assistant.v1", "assistant.stream.v1")) }
+        server.intercept = { method, _, _ -> if (method == "assistant/read") read() else null }
+        repo.loadAssistant().join()
+        assertEquals("assistant-runtime", repo.state.value.assistant.snapshot?.runtimeId)
+    }
+
+    @Test fun assistantStreamFramesReachOnlyTheLiveLinkAndTheRuntimeOfTheLoadedSnapshot() = runBlocking<Unit> {
+        val syncs = server.calls.count { it.method == "sync" }
+        server.notify("assistant/stream", streamDelta(1, "无人打开助理"))
+        server.notify("pocket/resync", buildJsonObject {})
+        until { server.calls.count { it.method == "sync" } > syncs }
+        assertNull(repo.state.value.assistant.streamingCoordinatorOpId)
+        assertEquals("An assistant that was never opened is not read in the background", 0, assistantReads())
+
+        openAssistant()
+        server.notify("assistant/stream", streamDelta(1, "你"))
+        server.notify("assistant/stream", streamDelta(2, "别的运行时", runtime = "another-runtime"))
+        server.notify("assistant/stream", buildJsonObject { put("kind", "coordinator_delta"); put("sequence", "2") })
+        server.notify("assistant/stream", streamDelta(2, "好"))
+        await { it.assistant.streamingCoordinatorText == "你好" }
+        assertEquals("op-1", repo.state.value.assistant.streamingCoordinatorOpId)
+        assertEquals("Frames in order need no snapshot read", 1, assistantReads())
+
+        val owner = PocketRepository::class.java.getDeclaredField("assistantComputer").apply { isAccessible = true }
+        owner.set(repo, "another-computer")
+        repo.consumeAssistantStream(streamDelta(3, "别的电脑"))
+        owner.set(repo, "computer")
+        repo.consumeAssistantStream(streamDelta(3, "被取代的连接")) { false }
+        assertEquals("你好", repo.state.value.assistant.streamingCoordinatorText)
+        repo.consumeAssistantStream(streamDelta(3, "！"))
+        assertEquals("你好！", repo.state.value.assistant.streamingCoordinatorText)
+        assertEquals("Dropped frames took no place in the sequence", 1, assistantReads())
+
+        server.failConnections = true
+        server.links.last().close()
+        val offline = await { !it.online && it.assistant.streamingCoordinatorOpId == null }
+        assertEquals("", offline.assistant.streamingCoordinatorText)
+        assertNull(offline.assistant.lastStreamEpoch)
+        assertNotNull("The last snapshot stays readable offline", offline.assistant.snapshot)
+        repo.consumeAssistantStream(streamDelta(4, "断开之后"))
+        assertNull(repo.state.value.assistant.streamingCoordinatorOpId)
+        assertEquals(0L, repo.state.value.assistant.lastStreamSequence)
+        assertEquals(1, assistantReads())
+    }
+
+    @Test fun aBurstOfOutOfOrderAssistantFramesSharesOneSnapshotReadAfterTheOneInFlight() = runBlocking<Unit> {
+        val release = CompletableDeferred<Unit>()
+        val hold = java.util.concurrent.atomic.AtomicBoolean(false)
+        val active = AtomicInteger(); val parallel = AtomicInteger()
+        openAssistant {
+            val now = active.incrementAndGet(); parallel.updateAndGet { maxOf(it, now) }
+            try { if (hold.get()) release.await(); assistantSnapshot() } finally { active.decrementAndGet() }
+        }
+        server.notify("assistant/stream", streamDelta(1, "你好"))
+        await { it.assistant.streamingCoordinatorText == "你好" }
+        hold.set(true)
+        server.notify("assistant/stream", streamDelta(5, "断档"))
+        until { assistantReads() == 2 }
+        for (sequence in 1..40L) server.notify("assistant/stream", streamDelta(sequence * 10, "乱序"))
+        await { it.assistant.lastStreamSequence == 400L }
+        assertEquals("Text from before a gap is dropped, not joined", "乱序", repo.state.value.assistant.streamingCoordinatorText)
+        assertEquals(2, assistantReads())
+        release.complete(Unit)
+        until { assistantReads() == 3 }
+        delay(300)
+        assertEquals("Forty-one hints cost the read in flight and one after it", 3, assistantReads())
+        assertEquals("Snapshot reads never overlap", 1, parallel.get())
+    }
+
+    @Test fun aFinishedAssistantReplyStaysUntilTheSnapshotReadAfterItsEndIsStored() = runBlocking<Unit> {
+        // Room evidence of an accepted draft and of an action whose outcome is still unconfirmed.
+        db.dao().insertAssistantCommand(CommandEntity("accepted-send", "computer", null, "assistant/send", "accepted", 1, AssistantSendReceipt.draft("assistant-runtime", "assistant:assistant", "已接受的草稿")))
+        server.statuses["unconfirmed-pause"] = "unknown"
+        db.dao().putCommand(CommandEntity("unconfirmed-pause", "computer", null, "assistant/task/pause", "unknown", 1))
+        val entered = Channel<Unit>(Channel.UNLIMITED); val releases = Channel<Unit>(Channel.UNLIMITED)
+        val hold = java.util.concurrent.atomic.AtomicBoolean(false); val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        openAssistant {
+            // The computer answers with what it holds when the request arrives, however late the reply lands.
+            val reply = assistantSnapshot(if (finished.get()) listOf("message:final" to "最终回复") else emptyList())
+            if (hold.get()) { entered.send(Unit); releases.receive() }
+            reply
+        }
+        update { it.copy(assistant = it.assistant.copy(pendingActions = it.assistant.pendingActions + "assistant/send")) }
+        await { it.assistant.sendReceipts.any { r -> r.commandId == "accepted-send" } && "assistant/task/pause" in it.assistant.unconfirmedActions }
+        server.notify("assistant/stream", streamDelta(1, "最终"))
+        server.notify("assistant/stream", streamDelta(2, "回复"))
+        await { it.assistant.streamingCoordinatorText == "最终回复" }
+
+        hold.set(true)
+        val poll = repo.loadAssistant()
+        withTimeout(5_000) { entered.receive() }
+        finished.set(true)
+        server.notify("assistant/stream", streamFrame(3, "coordinator_done") { put("operationId", "op-1"); put("threadId", "coordinator"); put("status", "completed") })
+        await { it.assistant.streamCoordinatorEnd > 0 }
+        assertEquals("The end of the turn alone removes nothing", "最终回复", repo.state.value.assistant.streamingCoordinatorText)
+        releases.send(Unit); poll.join()
+        assertTrue(repo.state.value.assistant.messages.none { it.id == "message:final" })
+        assertEquals("A snapshot requested before the end cannot replace the reply", "最终回复", repo.state.value.assistant.streamingCoordinatorText)
+
+        withTimeout(5_000) { entered.receive() }
+        assertEquals("最终回复", repo.state.value.assistant.streamingCoordinatorText)
+        releases.send(Unit)
+        val stored = await { it.assistant.messages.any { m -> m.id == "message:final" } }.assistant
+        assertNull("The message and the live reply are never shown together", stored.streamingCoordinatorOpId)
+        assertEquals("", stored.streamingCoordinatorText)
+        assertEquals("One poll and one read for the finished turn", 3, assistantReads())
+        assertTrue("assistant/send" in stored.pendingActions)
+        assertEquals(setOf("assistant/task/pause"), stored.unconfirmedActions)
+        assertEquals(listOf("accepted-send"), stored.sendReceipts.map { it.commandId })
+        assertEquals("原操作结果尚未确认，正在核对；不会重复提交", stored.error)
+    }
+
+    @Test fun resyncReadsTheLoadedAssistantAndItsSnapshotReplacesWhatNoFrameRenewed() = runBlocking<Unit> {
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        openAssistant { assistantSnapshot(if (finished.get()) listOf("message:final" to "最终回复") else emptyList()) }
+        server.notify("assistant/stream", streamDelta(1, "最终回复"))
+        server.notify("assistant/stream", streamFrame(2, "job_stage") { put("operationId", "job-op"); put("taskId", "task-1"); put("threadId", JsonNull); put("status", "running"); put("stage", "command"); put("stageLabel", "运行测试"); put("activeSubagents", 1) })
+        await { it.assistant.liveJobStages["task-1"]?.stageLabel == "运行测试" && it.assistant.streamingCoordinatorText == "最终回复" }
+        // The frames that ended both were among the notifications the computer had to skip.
+        finished.set(true)
+        server.notify("pocket/resync", buildJsonObject { put("reason", "event_backlog") })
+        val stored = await { it.assistant.messages.any { m -> m.id == "message:final" } }.assistant
+        assertNull(stored.streamingCoordinatorOpId)
+        assertTrue(stored.liveJobStages.isEmpty())
+        assertEquals(2, assistantReads())
+    }
+
     private class BrokerFixture {
         val calls = CopyOnWriteArrayList<Call>()
         val links = CopyOnWriteArrayList<Link>()

@@ -77,4 +77,48 @@ class AssistantPresentationTest {
         assertEquals("source-store", action.params.string("sourceConfigStoreId"))
         assertThrows(IllegalArgumentException::class.java) { AssistantActions.schedule("r", choice, AssistantScheduleDraft("汇总", "Daily", "2030-01-02", "09:30", 0, "60", zone, true), now) }
     }
+
+    @Test fun coordinatorModelFollowsTheSettingsSerdeShapeAndIsLeftOutWhenUnset() {
+        fun settings(extra: String) = AssistantSnapshot.from(obj("""{"settings":{"personality":"认真","tone":"简洁","model":"actual-model","timezone":"Asia/Shanghai","notifications":{"completed":true,"failed":false,"waiting_user":true}$extra}}""")).settings!!
+        assertNull("A computer that never sends the field means the coordinator follows `model`", settings("").coordinatorModel)
+        assertNull(settings(""","coordinator_model":null""").coordinatorModel)
+        val chosen = settings(""","coordinator_model":"actual-model"""")
+        assertEquals("actual-model", chosen.coordinatorModel)
+        assertEquals(chosen.copy(coordinatorModel = null), settings(""))
+        val saved = AssistantActions.settings("r", chosen, listOf(native)).params.obj("settings")
+        assertEquals(JsonPrimitive("actual-model"), saved["coordinator_model"])
+        assertEquals(setOf("personality", "tone", "model", "timezone", "notifications", "coordinator_model"), saved.keys)
+        val unset = AssistantActions.settings("r", chosen.copy(coordinatorModel = null), listOf(native)).params.obj("settings")
+        assertEquals("An older computer receives exactly what it always did", setOf("personality", "tone", "model", "timezone", "notifications"), unset.keys)
+        assertThrows(IllegalArgumentException::class.java) { AssistantActions.settings("r", chosen.copy(coordinatorModel = "not-in-directory"), listOf(native)) }
+    }
+
+    @Test fun jobsExposeTheirBranchAndOnlyNameOneTaskWhenMergedOrDiscarded() {
+        val jobs = AssistantSnapshot.from(obj("""{"runtimeId":"r","jobs":[
+            {"taskId":"task-a","title":"加一个文件","directory":"D:/project","writes":true,"status":"done","activeTaskId":"task-b","threadId":"job-thread","model":null,"workspaceMode":"worktree","modeReason":"clean","branch":"pocket/job-1a2b","diffStats":{"files":1,"insertions":3,"deletions":0},"readyToMerge":true,"lastMerge":{"outcome":"conflict","files":["a.txt"],"atMs":5},"mergedAtMs":null,"discardedAtMs":null,"createdAtMs":1,"detail":"已添加 b.txt"},
+            {"taskId":"task-c","title":"查资料","directory":"D:/project","writes":false,"status":"running","activeTaskId":"task-c","threadId":null,"workspaceMode":"direct","modeReason":"read_only","branch":null,"diffStats":null,"readyToMerge":false,"lastMerge":null,"mergedAtMs":null,"discardedAtMs":null,"createdAtMs":2,"detail":null},
+            {"taskId":"task-d","title":"已合并","status":"done","workspaceMode":"worktree","branch":"pocket/job-3c4d","diffStats":{"files":2,"insertions":"many","deletions":1},"readyToMerge":"true","lastMerge":{"outcome":"merged","commit":"abc123","atMs":9},"mergedAtMs":9,"discardedAtMs":9},
+            {"title":"没有标识"}]}""")).let { snapshot -> assertSame(snapshot.jobs[0], snapshot.job("task-b")); assertNull(snapshot.job("missing")); snapshot.jobs }
+        assertEquals(listOf("task-a", "task-c", "task-d"), jobs.map { it.taskId })
+        assertEquals(AssistantJob("task-a", "加一个文件", "done", true, "D:/project", "task-b", "job-thread", null, "worktree", "clean", "pocket/job-1a2b",
+            AssistantJobDiffStats(1, 3, 0), true, AssistantJobMerge("conflict", 5, files = listOf("a.txt")), null, null, 1, "已添加 b.txt"), jobs[0])
+        assertEquals("direct" to "read_only", jobs[1].workspaceMode to jobs[1].modeReason)
+        assertNull(jobs[1].branch); assertNull(jobs[1].diffStats); assertNull(jobs[1].lastMerge); assertFalse(jobs[1].readyToMerge)
+        assertEquals(AssistantJobMerge("merged", 9, "abc123"), jobs[2].lastMerge)
+        assertEquals(9L to 9L, jobs[2].mergedAtMs to jobs[2].discardedAtMs)
+        assertNull("Counts that are not numbers are not shown as counts", jobs[2].diffStats)
+        assertFalse("Only the computer's own boolean offers a merge", jobs[2].readyToMerge)
+        assertTrue(AssistantSnapshot.from(buildJsonObject {}).jobs.isEmpty())
+
+        val merge = AssistantActions.mergeTask("r", "task-a"); val discard = AssistantActions.discardWorktree("r", "task-a")
+        assertEquals("assistant/v2/task/merge" to obj("""{"runtimeId":"r","taskId":"task-a"}"""), merge.method to merge.params)
+        assertEquals("assistant/v2/task/discard_worktree" to obj("""{"runtimeId":"r","taskId":"task-a"}"""), discard.method to discard.params)
+        assertNull("A merge that ended in a conflict is tried again as a new command", merge.commandId)
+        for (bad in listOf("", " ", "t".repeat(257))) {
+            assertThrows(IllegalArgumentException::class.java) { AssistantActions.mergeTask("r", bad) }
+            assertThrows(IllegalArgumentException::class.java) { AssistantActions.discardWorktree("r", bad) }
+            assertThrows(IllegalArgumentException::class.java) { AssistantActions.mergeTask(bad, "task-a") }
+            assertThrows(IllegalArgumentException::class.java) { AssistantActions.discardWorktree(bad, "task-a") }
+        }
+    }
 }

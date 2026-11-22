@@ -30,7 +30,8 @@ enum class AssistantTaskStatus { Queued, Running, WaitingUser, Paused, Done, Fai
 enum class AssistantOperationPhase { Unknown, Running, Waiting, Paused, Completed, Failed }
 enum class AssistantQuestionKind { Input, Approval, Unknown }
 data class AssistantNotifications(val completed: Boolean = true, val failed: Boolean = true, val waitingUser: Boolean = true)
-data class AssistantSettings(val personality: String = "", val tone: String = "", val model: String? = null, val timezone: String = "Asia/Shanghai", val notifications: AssistantNotifications = AssistantNotifications())
+data class AssistantSettings(val personality: String = "", val tone: String = "", val model: String? = null, val timezone: String = "Asia/Shanghai", val notifications: AssistantNotifications = AssistantNotifications(),
+    val coordinatorModel: String? = null)
 data class AssistantTask(val id: String, val prompt: String, val status: AssistantTaskStatus, val activeRunId: String?, val reconciliationRequired: Boolean, val detail: String?, val assignment: AssistantAssignment? = null)
 data class AssistantQuestion(val requestId: String, val kind: AssistantQuestionKind, val text: String)
 data class AssistantOperation(val id: String, val role: String, val taskId: String?, val phase: AssistantOperationPhase, val suspended: Boolean, val threadId: String?, val question: AssistantQuestion?, val result: String?, val heldInputs:List<AssistantHeldInput> = emptyList(),
@@ -75,7 +76,8 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
     val fresh: Boolean? = null, val dispatchInFlight: Boolean = false, val assistantId: String? = null,
     val artifacts:List<AssistantArtifact> = emptyList(), val scheduleRuns:List<AssistantScheduleRun> = emptyList(),
     val memoryUsage:Map<String,List<String>> = emptyMap(), val memoryDisabledTasks:List<String> = emptyList(),
-    val protocolVersion:Int = 1,val acceptingMessages:Boolean? = null,val domain:AssistantDomain? = null) {
+    val protocolVersion:Int = 1,val acceptingMessages:Boolean? = null,val domain:AssistantDomain? = null,
+    val jobs:List<AssistantJob> = emptyList()) {
     val prepReady get() = preparationStatus in setOf(null,"ready") && errorCode.isNullOrBlank()
     val prepared get() = if(protocolVersion>=2) enabled==true && ready==true && acceptingMessages==true else enabled==true && ready==true && prepReady && recoveries.isEmpty() && (startupStages.isEmpty() ||
         listOf("runtime","account","capabilities","coordinator").all {id -> startupStages.firstOrNull {it.id==id}?.status in setOf("ready","paused")})
@@ -117,6 +119,7 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
             protocolVersion=(o.assistantLong("protocolVersion") ?: 1).toInt(),
             acceptingMessages=o.assistantBoolean("acceptingMessages"),
             domain=(o["domain"] as? JsonObject)?.let(AssistantDomain::from),
+            jobs = o.assistantObjects("jobs").mapNotNull(AssistantJob::from),
             memoryUsage = (o["memoryUsage"] as? JsonObject)?.mapValues {(_,value)->(value as? JsonArray)?.mapNotNull {(it as? JsonPrimitive)?.contentOrNull}.orEmpty()}.orEmpty(),
             memoryDisabledTasks = o.assistantStrings("memoryDisabledTasks"),
             artifacts = o.assistantObjects("artifacts").mapNotNull(AssistantArtifact::from),
@@ -141,7 +144,7 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
             settings = (o["settings"] as? JsonObject)?.let { s ->
                 val n = s["notifications"] as? JsonObject
                 if (s.assistantText("personality") == null || s.assistantText("tone") == null || s.assistantText("timezone") == null || n == null || listOf("completed", "failed", "waiting_user").any { n.assistantBoolean(it) == null }) null
-                else AssistantSettings(s.assistantText("personality")!!, s.assistantText("tone")!!, s.assistantText("model"), s.assistantText("timezone")!!, AssistantNotifications(n.flag("completed"), n.flag("failed"), n.flag("waiting_user")))
+                else AssistantSettings(s.assistantText("personality")!!, s.assistantText("tone")!!, s.assistantText("model"), s.assistantText("timezone")!!, AssistantNotifications(n.flag("completed"), n.flag("failed"), n.flag("waiting_user")), s.assistantText("coordinator_model"))
             },
             tasks = o.assistantObjects("tasks").mapNotNull { t -> t.assistantText("id")?.let { id ->
                 AssistantTask(id, t.assistantText("prompt").orEmpty(), when (t.assistantText("status")) {
@@ -172,7 +175,11 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
 data class AssistantUiState(val snapshot: AssistantSnapshot? = null, val messages: List<AssistantChatMessage> = emptyList(), val loading: Boolean = false, val error: String? = null,
     val pendingActions: Set<String> = emptySet(), val nextBefore: Long? = null, val historyPaged: Boolean = false,
     val unconfirmedActions: Set<String> = emptySet(), val readError: String? = null, val modelError: String? = null,
-    val computerId: String = "", val sendReceipts: List<AssistantSendReceipt> = emptyList())
+    val computerId: String = "", val sendReceipts: List<AssistantSendReceipt> = emptyList(),
+    val streamingCoordinatorOpId: String? = null, val streamingCoordinatorText: String = "",
+    val liveJobStages: Map<String, AssistantLiveJobStage> = emptyMap(), val lastStreamEpoch: String? = null, val lastStreamSequence: Long = 0,
+    /** Stream bookkeeping, not for display: a local frame counter and the revisions at which held entries ended. */
+    val streamRevision: Long = 0, val streamCoordinatorEnd: Long = 0, val streamJobEnds: Map<String, Long> = emptyMap())
 data class AssistantScheduleDraft(val prompt: String = "", val kind: String = "Once", val date: String = "", val time: String = "09:00", val weekday: Int = 0, val intervalMinutes: String = "60", val timezone: String = "Asia/Shanghai", val writes: Boolean = false)
 object AssistantActions {
     private fun payload(method: String, runtime: String, fields: JsonObjectBuilder.() -> Unit = {}): AssistantAction {
@@ -194,6 +201,15 @@ object AssistantActions {
     fun task(runtime: String, id: String, resume: Boolean): AssistantAction {
         bounded(id,256,"缺少任务标识")
         return payload(if(resume) "assistant/task/resume" else "assistant/task/pause",runtime) {put("taskId",id)}
+    }
+    /** Only the user brings a job's private branch into the project or drops it; each attempt is its own command. */
+    fun mergeTask(runtime: String, id: String): AssistantAction {
+        bounded(id,256,"缺少任务标识")
+        return payload("assistant/v2/task/merge",runtime) {put("taskId",id)}
+    }
+    fun discardWorktree(runtime: String, id: String): AssistantAction {
+        bounded(id,256,"缺少任务标识")
+        return payload("assistant/v2/task/discard_worktree",runtime) {put("taskId",id)}
     }
     fun send(runtime: String, message: String, workspace: AssistantWorkspaceChoice?, memberId: String? = null, taskId: String? = null): AssistantAction {
         bounded(message,65536,"请输入消息，最多 64KiB")
@@ -218,8 +234,10 @@ object AssistantActions {
         bounded(settings.personality,8192,"人格描述不能为空，最多 8KiB");bounded(settings.tone,2048,"语气不能为空，最多 2KiB")
         bounded(settings.timezone,256,"请输入有效时区");require(runCatching {ZoneId.of(settings.timezone)}.isSuccess) {"时区名称无效"}
         require(settings.model == null || models.any {it.model == settings.model}) {"当前模型未在电脑传入目录中确认"}
+        require(settings.coordinatorModel == null || models.any {it.model == settings.coordinatorModel}) {"助理自身模型未在电脑传入目录中确认"}
         return payload("assistant/settings/update",runtime) {put("settings",buildJsonObject {
             put("personality",settings.personality);put("tone",settings.tone);put("model",settings.model?.let(::JsonPrimitive) ?: JsonNull);put("timezone",settings.timezone)
+            settings.coordinatorModel?.let {put("coordinator_model",it)}
             put("notifications",buildJsonObject {put("completed",settings.notifications.completed);put("failed",settings.notifications.failed);put("waiting_user",settings.notifications.waitingUser)})
         })}
     }

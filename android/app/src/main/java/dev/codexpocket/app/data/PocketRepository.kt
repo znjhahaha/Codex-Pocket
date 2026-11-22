@@ -151,6 +151,9 @@ class PocketRepository(
     private var assistantModelRuntime: String? = null
     private val assistantProjectGate = Any()
     private var assistantProjectTicket = 0L
+    private val assistantReconcileGate = Any()
+    private var assistantReconciling = false
+    private var assistantReconcileQueued = false
     private fun assistantProjectScope(workspace: AssistantWorkspaceChoice): AssistantProjectReadScope? {
         val s=_state.value
         val transport=client ?: return null
@@ -213,6 +216,47 @@ class PocketRepository(
             catch (_: Exception) {finish(null)}
         }
     }
+    private fun invalidateAssistantStream() = _state.update {it.copy(assistant=it.assistant.withoutStream())}
+    private fun assistantStreamCurrent(): Boolean {
+        val computer=pair?.computerId ?: return false
+        val s=_state.value
+        return client != null && s.online && s.computerId == computer && assistantComputer == computer && s.assistant.snapshot != null
+    }
+    /** Display-only and lossy: a frame updates transient fields and may ask for the snapshot, never anything else. */
+    internal fun consumeAssistantStream(raw: JsonObject, current: () -> Boolean = {true}) {
+        val transport=client ?: return
+        val computer=pair?.computerId ?: return
+        val link=connectionGeneration.get()
+        var reconcile=false
+        _state.update {s ->
+            reconcile=false
+            if(!current() || client !== transport || connectionGeneration.get() != link || pair?.computerId != computer || assistantComputer != computer ||
+                !s.online || s.computerId != computer) return@update s
+            val reduced=AssistantStream.reduce(s.assistant,raw) ?: return@update s
+            reconcile=reduced.reconcile
+            s.copy(assistant=reduced.state)
+        }
+        if(reconcile) reconcileAssistant()
+    }
+    /** Any number of hints during a read share one read that starts after it; reads never run in parallel. */
+    private fun reconcileAssistant() {
+        synchronized(assistantReconcileGate) {
+            assistantReconcileQueued=true
+            if(assistantReconciling) return
+            assistantReconciling=true
+        }
+        scope.launch {
+            try {
+                while(true) {
+                    synchronized(assistantReconcileGate) {
+                        if(!assistantReconcileQueued) {assistantReconciling=false;return@launch}
+                        assistantReconcileQueued=false
+                    }
+                    if(assistantStreamCurrent()) loadAssistant(automaticPrepare=false,explicitRead=true).join()
+                }
+            } catch(cancelled: CancellationException) {synchronized(assistantReconcileGate) {assistantReconciling=false};throw cancelled}
+        }
+    }
     fun loadAssistant(params: JsonObject = buildJsonObject {put("after",0);put("limit",50)}, automaticPrepare: Boolean = true, explicitRead: Boolean = false): Job = scope.launch {
         val requestedComputer=pair?.computerId
         val requestedTransport=client
@@ -236,6 +280,7 @@ class PocketRepository(
                 _state.update { it.copy(assistant = it.assistant.copy(loading = false, error = "电脑助手尚不支持此功能，请更新 Windows 端")) }; return@launch
             }
             if (_state.value.assistant.snapshot == null) _state.update { it.copy(assistant = it.assistant.copy(loading = true)) }
+            val streamMark = _state.value.assistant.streamRevision
             var raw = transport.request("assistant/read", params, timeoutMillis = 8000).asObject()
             if (client !== transport || pair?.computerId != computer) return@launch
             if (automaticPrepare && raw["fresh"] != JsonPrimitive(false) && raw["dispatchInFlight"] != JsonPrimitive(true) && !_state.value.commands.any {it.method == "assistant/prepare" && CommandPolicy.blocksNewSend(it.status)} && (raw["enabled"] == JsonPrimitive(false) || raw["ready"] == JsonPrimitive(false))) {
@@ -276,7 +321,8 @@ class PocketRepository(
                     nextBefore = if(!older && sameConversation && previous.historyPaged) previous.nextBefore else cursor,
                     historyPaged = older || (sameConversation && previous.historyPaged), loading = false,
                     error = previous.unconfirmedFeedback ?: snapshot.preparationIssue,
-                    readError = if(snapshot.fresh == false) "助理状态暂未更新，显示上次读取结果" else null))
+                    readError = if(snapshot.fresh == false) "助理状态暂未更新，显示上次读取结果" else null)
+                    .streamReconciled(previous.snapshot?.runtimeId, if(older || params.containsKey("taskId")) null else if(snapshot.fresh == false) -1 else streamMark))
             }
             }
             val runtime = snapshot.runtimeId
@@ -881,6 +927,7 @@ class PocketRepository(
                         if (connectionJob !== ownerContext[Job]) throw CancellationException("Connection superseded")
                         generation = connectionGeneration.incrementAndGet()
                         invalidateAssistantProject()
+                        invalidateAssistantStream()
                         client = transport
                     }
                     fun requireCurrent() {
@@ -1028,6 +1075,7 @@ class PocketRepository(
                     transport.close()
                     synchronized(connectionGate) { if (client === transport) {
                         client = null
+                        invalidateAssistantStream()
                         _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) }
                     } }
                 }
@@ -1040,7 +1088,7 @@ class PocketRepository(
         job.start()
     }
 
-    private fun disconnect() = synchronized(connectionGate) { invalidateAssistantProject(); connectionJob?.cancel(); connectionJob = null; client?.close(); client = null; _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", connectionPhase = "offline", activeRouteKind = null, relayVersion = null, modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) } }
+    private fun disconnect() = synchronized(connectionGate) { invalidateAssistantProject(); invalidateAssistantStream(); connectionJob?.cancel(); connectionJob = null; client?.close(); client = null; _state.update { it.copy(online = false, settingsFresh = false, conversationLoadState = ConversationLoadState.Idle, connection = "Offline", connectionPhase = "offline", activeRouteKind = null, relayVersion = null, modelCatalogState = ModelCatalogState.Offline, approvalsFresh = false, unknownHistoryInspected = false, nativeQueue = emptyList(), queueSupported = null) } }
 
     fun reloadConversation(): Job = _state.value.selected?.let { select(it, forceRefresh = true) } ?: scope.launch {}
 
@@ -3858,7 +3906,17 @@ class PocketRepository(
             }
             "codex/event" -> consumeEvent(notification.obj("params"))
             "assistant/changed" -> loadAssistant()
-            "pocket/resync" -> { invalidateAssistantProject(); invalidateHistoryVerification(); resyncRequested = true }
+            "assistant/stream" -> {
+                // Same ownership rule as quota/updated: a cancelled pipeline cannot feed the next connection.
+                val receiver = currentCoroutineContext()[Job] ?: return
+                val owner = connectionJob ?: return
+                fun ownsReceiver(job: Job): Boolean = job === receiver || job.children.any { ownsReceiver(it) }
+                consumeAssistantStream(notification["params"] as? JsonObject ?: return) { receiver.isActive && owner.isActive && connectionJob === owner && ownsReceiver(owner) }
+            }
+            "pocket/resync" -> {
+                invalidateAssistantProject(); invalidateHistoryVerification(); resyncRequested = true
+                if (assistantStreamCurrent()) { _state.update { it.copy(assistant = it.assistant.withStreamUnverified()) }; reconcileAssistant() }
+            }
             "runtimes/changed" -> {
                 synchronized(runtimeSnapshotGate) {
                     invalidateAssistantProject()
