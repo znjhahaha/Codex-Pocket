@@ -6,14 +6,14 @@ pub(super) fn thread_params(
     model: Option<&str>,
     resume: bool,
 ) -> Value {
-    let mut v = json!({"model":model,"cwd":directory,"sandbox":if req.writes{"workspace-write"}else{"read-only"},"approvalPolicy":"on-request","approvalsReviewer":"user","baseInstructions":req.instructions,"runtimeWorkspaceRoots":[directory]});
+    let mut v = json!({"model":model,"cwd":directory,"sandbox":if sandbox_writes(req){"workspace-write"}else{"read-only"},"approvalPolicy":"on-request","approvalsReviewer":"user","baseInstructions":req.instructions,"runtimeWorkspaceRoots":[directory]});
     if resume {
         v["threadId"] = json!(req.thread_id);
     } else {
         v["ephemeral"] = json!(false);
         v["allowProviderModelFallback"] = json!(false);
         if req.role == Role::Coordinator {
-            v["dynamicTools"] = json!(dynamic_tools());
+            v["dynamicTools"] = json!(super_pa_tools());
         } else {
             v["dynamicTools"] = json!(
                 collaboration_tools()
@@ -31,12 +31,63 @@ pub(super) fn turn_params(
     directory: &Path,
     model: Option<&str>,
 ) -> Value {
-    let sandbox = if req.writes {
+    let sandbox = if sandbox_writes(req) {
         json!({"type":"workspaceWrite","writableRoots":[directory],"networkAccess":false,"excludeSlashTmp":true,"excludeTmpdirEnvVar":true})
     } else {
         json!({"type":"readOnly","networkAccess":false})
     };
     json!({"threadId":thread,"model":model,"cwd":directory,"input":crate::assistant::inputs::native_input(&req.prompt,&req.inputs),"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":sandbox,"runtimeWorkspaceRoots":[directory],"clientUserMessageId":req.operation_id})
+}
+/// The coordinator only routes; whatever the request says, it never gets a writable sandbox.
+pub(super) fn sandbox_writes(req: &StartRequest) -> bool {
+    req.writes && req.role == Role::Execution
+}
+fn function_tool((name, description, properties, required): (&str, &str, Value, Vec<&str>)) -> Value {
+    json!({"type":"function","name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
+}
+/// Tool revision 5: a thin coordinator. It hands work to ordinary native sessions and
+/// steers them; members, groups and reassignment are no longer offered to new threads.
+pub fn super_pa_tools() -> Vec<Value> {
+    let id = json!({"type":"string","minLength":1,"maxLength":256});
+    let text = json!({"type":"string","minLength":1,"maxLength":65536});
+    let specs = [
+        (
+            "assistant_dispatch_session",
+            "Hand a new piece of work to its own native session and return at once with its task_id; never wait or poll for it. The prompt must stand alone: goal, scope, known facts, constraints and completion criteria. directory must be one of the handoff's authorizedDirectories or inside one. Set use_worktree only when the user asked for or against an isolated branch.",
+            json!({"title":{"type":"string","minLength":1,"maxLength":120},"prompt":text,"directory":{"type":"string","minLength":1,"maxLength":32768},"writes":{"type":"boolean"},"use_worktree":{"type":"boolean"},"model":id}),
+            vec!["title", "prompt", "directory", "writes"],
+        ),
+        (
+            "assistant_steer_session",
+            "Send a correction or follow-up to an existing job by its task_id. A running job receives it in its current turn; an idle one continues in its own session. Delivery is persisted and shown to the user; do not redo the job's work.",
+            json!({"task_id":id,"instruction":text}),
+            vec!["task_id", "instruction"],
+        ),
+        (
+            "assistant_control_session",
+            "status reads one job's state; stop asks its native turn to stop and is confirmed only by native evidence. Never use this to answer a job's approval or question.",
+            json!({"task_id":id,"action":{"type":"string","enum":["status","stop"]}}),
+            vec!["task_id", "action"],
+        ),
+        (
+            "assistant_list_jobs",
+            "Read active and recent jobs to tell which one the user means. Never poll to wait.",
+            json!({"limit":{"type":"integer","minimum":1,"maximum":30}}),
+            vec!["limit"],
+        ),
+        (
+            "assistant_request_input",
+            "Ask the user one clarifying question and wait; never answer approvals.",
+            json!({"request_id":id,"text":text}),
+            vec!["request_id", "text"],
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(function_tool)
+        .chain(collaboration_tools().into_iter().filter(|tool| tool["name"] == "assistant_read_main"))
+        .chain(housekeeping_tools())
+        .collect()
 }
 pub fn dynamic_tools() -> Vec<Value> {
     let string = json!({"type":"string","minLength":1,"maxLength":65536});
@@ -192,7 +243,12 @@ pub(super) fn decode_tool(name: &str, args: &Value) -> Result<ToolCall> {
         );
         return Ok(ToolCall::Collaboration(serde_json::from_value(value)?));
     }
+    let optional: &[&str] = if name == "assistant_dispatch_session" { &["use_worktree", "model"] } else { &[] };
     let fields: &[&str] = match name {
+        "assistant_dispatch_session" => &["title", "prompt", "directory", "writes"],
+        "assistant_steer_session" => &["task_id", "instruction"],
+        "assistant_control_session" => &["task_id", "action"],
+        "assistant_list_jobs" => &["limit"],
         "assistant_list_sessions" => &["limit"],
         "assistant_progress" | "assistant_pause_task" => &["task_id"],
         "assistant_create_task" => &["prompt", "directory", "writes"],
@@ -202,14 +258,18 @@ pub(super) fn decode_tool(name: &str, args: &Value) -> Result<ToolCall> {
     };
     let object = args.as_object().context("Tool arguments must be object")?;
     ensure!(
-        object.len() == fields.len() && object.keys().all(|k| fields.contains(&k.as_str())),
+        fields.iter().all(|key| object.contains_key(*key))
+            && object.keys().all(|k| fields.contains(&k.as_str()) || optional.contains(&k.as_str())),
         "Unknown/missing tool argument"
     );
     let get = |key: &str| {
         max_string(
             &args[key],
-            if key == "text" || key == "prompt" {
+            if key == "text" || key == "prompt" || key == "instruction" {
                 65536
+            } else if key == "title" {
+                // 120 characters; the service counts them, this bounds the bytes.
+                480
             } else if key == "directory" {
                 32768
             } else {
@@ -218,6 +278,30 @@ pub(super) fn decode_tool(name: &str, args: &Value) -> Result<ToolCall> {
         )
     };
     Ok(match name {
+        "assistant_dispatch_session" => ToolCall::DispatchSession {
+            title: get("title")?,
+            prompt: get("prompt")?,
+            directory: PathBuf::from(get("directory")?),
+            writes: args["writes"].as_bool().context("Invalid writes")?,
+            use_worktree: match object.get("use_worktree") {
+                Some(value) => Some(value.as_bool().context("Invalid use_worktree")?),
+                None => None,
+            },
+            model: object.get("model").map(|_| get("model")).transpose()?,
+        },
+        "assistant_steer_session" => ToolCall::SteerSession {
+            task_id: get("task_id")?,
+            instruction: get("instruction")?,
+        },
+        "assistant_control_session" => ToolCall::ControlSession {
+            task_id: get("task_id")?,
+            action: serde_json::from_value(args["action"].clone()).context("Invalid session action")?,
+        },
+        "assistant_list_jobs" => {
+            let n = args["limit"].as_u64().context("Invalid job limit")?;
+            ensure!((1..=30).contains(&n), "Invalid job limit");
+            ToolCall::ListJobs { limit: n as usize }
+        }
         "assistant_list_sessions" => {
             let n = args["limit"].as_u64().context("Invalid session limit")?;
             ensure!((1..=100).contains(&n), "Invalid session limit");

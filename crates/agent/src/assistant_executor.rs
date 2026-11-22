@@ -31,7 +31,7 @@ pub use permissions::{
 pub use protocol::dynamic_tools;
 pub(crate) use protocol::normalize_input_answers;
 pub use shared::SharedHostExecutor;
-const TOOL_REVISION: u32 = 4;
+const TOOL_REVISION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeHealth {

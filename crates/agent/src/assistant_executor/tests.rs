@@ -2382,13 +2382,15 @@ fn coordinator_uses_native_thread_and_turn_protocol_with_read_only_tools() {
         .find(|(_, m, _)| m == "thread/start")
         .unwrap();
     assert_eq!(thread.2["sandbox"], "read-only");
-    assert!(
+    let offered = |name: &str| {
         thread.2["dynamicTools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool["name"] == "assistant_create_member")
-    );
+            .any(|tool| tool["name"] == name)
+    };
+    assert!(offered("assistant_dispatch_session"));
+    assert!(!offered("assistant_create_member"), "members are no longer offered to new threads");
     let turn = executor
         .runtime
         .calls
@@ -2396,4 +2398,138 @@ fn coordinator_uses_native_thread_and_turn_protocol_with_read_only_tools() {
         .find(|(_, m, _)| m == "turn/start")
         .unwrap();
     assert_eq!(turn.2["sandboxPolicy"]["type"], "readOnly");
+}
+
+#[test]
+fn coordinator_sandbox_is_read_only_regardless_of_request() {
+    let f = Fixture::new();
+    let directory = f.root.path().to_owned();
+    let mut coordinator = f.req("lead", Role::Coordinator);
+    coordinator.writes = true;
+    let thread = protocol::thread_params(&coordinator, &directory, None, false);
+    assert_eq!(thread["sandbox"], "read-only");
+    let turn = protocol::turn_params(&coordinator, "thread-1", &directory, None);
+    assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
+    assert!(turn["sandboxPolicy"].get("writableRoots").is_none());
+    // A job keeps exactly what it was granted.
+    let job = f.req("job", Role::Execution);
+    assert_eq!(protocol::thread_params(&job, &directory, None, false)["sandbox"], "workspace-write");
+    assert_eq!(protocol::turn_params(&job, "thread-2", &directory, None)["sandboxPolicy"]["type"], "workspaceWrite");
+    // And the executor still refuses a writing coordinator outright.
+    let mut f = f;
+    assert!(f.executor.start(coordinator).is_err());
+}
+
+#[test]
+fn new_coordinator_threads_get_only_the_thin_tool_set() {
+    let f = Fixture::new();
+    let thread = protocol::thread_params(&f.req("lead", Role::Coordinator), f.root.path(), None, false);
+    let names: Vec<&str> = thread["dynamicTools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "assistant_dispatch_session",
+        "assistant_steer_session",
+        "assistant_control_session",
+        "assistant_list_jobs",
+        "assistant_request_input",
+        "assistant_read_main",
+        "assistant_memory_read",
+        "assistant_memory_add",
+        "assistant_memory_update",
+        "assistant_memory_delete",
+        "assistant_schedule_list",
+        "assistant_schedule_create",
+        "assistant_schedule_delete",
+    ] {
+        assert!(names.contains(&expected), "{expected} missing");
+    }
+    assert_eq!(names.len(), 13, "{names:?}");
+    for tool in protocol::super_pa_tools() {
+        let input = &tool["inputSchema"];
+        assert_eq!(input["additionalProperties"], false);
+        assert!(!conforms(&json!({"rpc":"inject"}), input, input));
+    }
+    let s = schema("v2/ThreadStartParams");
+    assert!(conforms(&thread, &s, &s), "thin tools must be valid native thread parameters");
+    assert_eq!(TOOL_REVISION, 5);
+}
+
+#[test]
+fn thin_tools_decode_strictly_and_legacy_tool_names_still_decode() {
+    let dispatch = json!({"title":"修复登录超时","prompt":"Fix it","directory":"C:/work","writes":true});
+    assert_eq!(
+        protocol::decode_tool("assistant_dispatch_session", &dispatch).unwrap(),
+        ToolCall::DispatchSession {
+            title: "修复登录超时".into(),
+            prompt: "Fix it".into(),
+            directory: PathBuf::from("C:/work"),
+            writes: true,
+            use_worktree: None,
+            model: None,
+        }
+    );
+    let mut full = dispatch.clone();
+    full["use_worktree"] = json!(false);
+    full["model"] = json!("gpt-fast");
+    assert!(matches!(
+        protocol::decode_tool("assistant_dispatch_session", &full).unwrap(),
+        ToolCall::DispatchSession { use_worktree: Some(false), model: Some(model), .. } if model == "gpt-fast"
+    ));
+    for bad in [
+        json!({"title":"t","prompt":"p","directory":"d"}),
+        json!({"title":"t","prompt":"p","directory":"d","writes":"yes"}),
+        json!({"title":"t","prompt":"p","directory":"d","writes":true,"approve":true}),
+        json!({"title":"t","prompt":"p","directory":"d","writes":true,"use_worktree":"no"}),
+        json!({"title":"t","prompt":"p","directory":"d","writes":true,"model":""}),
+        json!({"title":"","prompt":"p","directory":"d","writes":true}),
+    ] {
+        assert!(protocol::decode_tool("assistant_dispatch_session", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(
+        protocol::decode_tool("assistant_steer_session", &json!({"task_id":"t1","instruction":"faster"})).unwrap(),
+        ToolCall::SteerSession { task_id: "t1".into(), instruction: "faster".into() }
+    );
+    assert!(protocol::decode_tool("assistant_steer_session", &json!({"task_id":"t1"})).is_err());
+    for (action, expected) in [("status", SessionControl::Status), ("stop", SessionControl::Stop)] {
+        assert_eq!(
+            protocol::decode_tool("assistant_control_session", &json!({"task_id":"t1","action":action})).unwrap(),
+            ToolCall::ControlSession { task_id: "t1".into(), action: expected }
+        );
+    }
+    for action in ["approve", "resume", "retry", "merge"] {
+        assert!(protocol::decode_tool("assistant_control_session", &json!({"task_id":"t1","action":action})).is_err());
+    }
+    assert_eq!(
+        protocol::decode_tool("assistant_list_jobs", &json!({"limit":30})).unwrap(),
+        ToolCall::ListJobs { limit: 30 }
+    );
+    assert!(protocol::decode_tool("assistant_list_jobs", &json!({"limit":31})).is_err());
+
+    // Calls recorded by earlier coordinator threads replay to the same values as before.
+    assert_eq!(
+        protocol::decode_tool("assistant_create_task", &json!({"prompt":"p","directory":"d","writes":false})).unwrap(),
+        ToolCall::CreateTask { prompt: "p".into(), directory: PathBuf::from("d"), writes: false }
+    );
+    assert!(protocol::decode_tool("assistant_create_task", &json!({"prompt":"p","directory":"d","writes":false,"title":"t"})).is_err());
+    assert_eq!(protocol::decode_tool("assistant_progress", &json!({"task_id":"t"})).unwrap(), ToolCall::Progress { task_id: "t".into() });
+    assert_eq!(protocol::decode_tool("assistant_pause_task", &json!({"task_id":"t"})).unwrap(), ToolCall::PauseTask { task_id: "t".into() });
+    assert_eq!(protocol::decode_tool("assistant_list_sessions", &json!({"limit":5})).unwrap(), ToolCall::ListSessions { limit: 5 });
+    assert_eq!(protocol::decode_tool("assistant_summarize", &json!({"text":"s"})).unwrap(), ToolCall::Summarize { text: "s".into() });
+    assert!(matches!(
+        protocol::decode_tool("assistant_create_member", &json!({"name":"n","duty":"d","directory":"x"})).unwrap(),
+        ToolCall::Collaboration(CollaborationTool::CreateMember { .. })
+    ));
+    assert!(matches!(
+        protocol::decode_tool("assistant_send_to_member", &json!({"member_id":"m","message":"hi"})).unwrap(),
+        ToolCall::Collaboration(CollaborationTool::SendToMember { .. })
+    ));
+    assert!(matches!(
+        protocol::decode_tool("assistant_memory_read", &json!({"limit":5})).unwrap(),
+        ToolCall::Housekeeping(_)
+    ));
+    assert!(protocol::decode_tool("assistant_unknown", &json!({})).is_err());
 }

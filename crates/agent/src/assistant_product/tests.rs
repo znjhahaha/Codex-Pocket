@@ -960,7 +960,7 @@ async fn collaboration_legacy_coordinator_gets_new_tools_without_losing_chat_his
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool["name"] == "assistant_create_member")
+            .any(|tool| tool["name"] == "assistant_dispatch_session")
     );
     drop(io);
     f.stop().await;
@@ -1810,13 +1810,16 @@ async fn actual_actor_phone_to_native_tool_question_human_answer_result_and_rest
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     for required in [
-        "assistant_create_task",
+        "assistant_dispatch_session",
+        "assistant_steer_session",
+        "assistant_control_session",
+        "assistant_list_jobs",
         "assistant_request_input",
-        "assistant_assign_task",
-        "assistant_create_member",
-        "assistant_seal_group",
     ] {
         assert!(tool_names.contains(&required));
+    }
+    for retired in ["assistant_create_task", "assistant_assign_task", "assistant_create_member", "assistant_seal_group"] {
+        assert!(!tool_names.contains(&retired), "{retired} must not be offered to a new coordinator");
     }
     let s = f.create(&cm, 101, "写一份报告").await;
     let execution = Fixture::op(&s, "Execution");
@@ -3043,3 +3046,49 @@ fn native_answer_receipt_requires_confirmed_written_result() {
 
 #[path = "tests/product_flow.rs"]
 mod product_flow;
+
+#[tokio::test]
+async fn thin_coordinator_dispatches_a_job_and_hears_only_its_settlement_through_the_actual_worker() {
+    let f = Fixture::new(false).await;
+    let s = f.send("phone-1").await;
+    let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.tool(
+        json!(101),
+        &cm,
+        "call-dispatch",
+        "assistant_dispatch_session",
+        json!({"title":"整理季度报告","prompt":"写一份报告","directory":f.project.path(),"writes":true}),
+    );
+    let s = f.read().await;
+    let job = &s["jobs"][0];
+    assert_eq!(job["title"], "整理季度报告");
+    assert_eq!(job["status"], "running");
+    assert_eq!(job["workspaceMode"], "direct");
+    let em = Fixture::mapping(&Fixture::op(&s, "Execution"));
+    assert_eq!(job["threadId"], em.thread_id);
+    assert_ne!(cm.thread_id, em.thread_id);
+    assert_eq!(s["tasks"][0]["id"], job["taskId"]);
+    // The coordinator's call was answered with the job's identity, not held until it ends.
+    let answered = f.io.answers();
+    assert!(
+        answered.iter().any(|answer| answer.1.to_string().contains(job["taskId"].as_str().unwrap())),
+        "{answered:?}"
+    );
+
+    f.at(1_001_000);
+    f.io.complete(&em, "报告已完成：共 12 页");
+    let s = f.read().await;
+    assert_eq!(s["jobs"][0]["status"], "done");
+    let settled: Vec<_> = s["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "job_settled")
+        .collect();
+    assert_eq!(settled.len(), 1);
+    let detail: Value = serde_json::from_str(settled[0]["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(detail["taskId"], job["taskId"]);
+    assert_eq!(detail["status"], "completed");
+    assert_eq!(detail["summary"], "报告已完成：共 12 页");
+    assert_eq!(settled[0]["wake_coordinator"], true);
+}

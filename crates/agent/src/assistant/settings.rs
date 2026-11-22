@@ -23,6 +23,9 @@ pub struct Settings {
     pub tone: String,
     /// None means use the Host's selected model; no invented model identifiers.
     pub model: Option<String>,
+    /// The coordinator's own model; None means it follows `model`. Jobs never use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_model: Option<String>,
     pub timezone: String,
     pub notifications: NotificationSettings,
 }
@@ -32,6 +35,7 @@ impl Default for Settings {
             personality: "Helpful personal assistant".into(),
             tone: "Clear and concise".into(),
             model: None,
+            coordinator_model: None,
             timezone: "Asia/Shanghai".into(),
             notifications: NotificationSettings::default(),
         }
@@ -49,12 +53,26 @@ impl Settings {
                 "Invalid assistant setting"
             );
         }
-        if let Some(model) = &self.model {
+        for model in [&self.model, &self.coordinator_model].into_iter().flatten() {
             ensure!(
                 !model.trim().is_empty() && model.len() <= 256 && !model.contains('\0'),
                 "Invalid model"
             );
         }
         Ok(())
+    }
+    /// What a native request for this role runs on. A job may name its own model.
+    pub fn for_role(&self, role: super::Role, job_model: Option<&str>) -> Self {
+        let model = match role {
+            super::Role::Coordinator => self.coordinator_model.clone(),
+            super::Role::Execution => job_model.map(str::to_owned),
+        };
+        // The request carries only the model it runs on, so changing the coordinator's
+        // model never alters what a job's request looks like.
+        Self {
+            model: model.or_else(|| self.model.clone()),
+            coordinator_model: None,
+            ..self.clone()
+        }
     }
 }

@@ -3325,6 +3325,7 @@ fn settings_and_explicit_memory_crud_survive_reopen_without_text_copies() {
         personality: "Patient".into(),
         tone: "Warm".into(),
         model: Some("host-known-model".into()),
+        coordinator_model: None,
         timezone: "Asia/Shanghai".into(),
         notifications: NotificationSettings {
             completed: false,
@@ -3890,3 +3891,6 @@ fn event_id_reuse_with_different_payload_is_rejected_before_transition() {
 mod product_tests;
 #[path = "rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[path = "service_jobs_tests.rs"]
+mod jobs;

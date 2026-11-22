@@ -388,7 +388,7 @@ impl<E: Executor> AssistantService<E> {
     pub fn operation_assignment(&self, id: &str) -> Option<&TaskAssignment> {
         self.state.collaboration.operation_assignments.get(id)
     }
-    fn anonymous_lineage_root(&self, task: &Task) -> Result<String> {
+    pub(super) fn anonymous_lineage_root(&self, task: &Task) -> Result<String> {
         let mut current = task.clone();
         let mut seen = BTreeSet::new();
         let mut declared = Vec::new();
@@ -719,7 +719,7 @@ impl<E: Executor> AssistantService<E> {
         );
         Ok(member.clone())
     }
-    fn authorize_task_directory(&self, op: &Operation, directory: &Path) -> Result<PathBuf> {
+    pub(super) fn authorize_task_directory(&self, op: &Operation, directory: &Path) -> Result<PathBuf> {
         let directory = canonical_directory(directory)?;
         ensure!(
             op.authorized_directories
@@ -1616,7 +1616,9 @@ impl<E: Executor> AssistantService<E> {
         Ok(())
     }
     pub fn direct_result(&self, op: &Operation) -> bool {
+        // A job's text stays in its own session; the main conversation gets its settlement.
         op.role == Role::Execution
+            && self.job_of_operation(op).is_none()
             && self
                 .state
                 .collaboration
