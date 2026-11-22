@@ -4276,6 +4276,7 @@ impl Broker {
             if method == "thread/start" {
                 crate::native_history_compat::prepare_creation(&mut params, &r.capabilities);
             }
+            crate::managed_runtime::apply_packaged_policy(method, &mut params, crate::managed_runtime::packaged());
             if method == "thread/resume"
                 && r.capabilities.supports("thread/resume", &json!({"threadId":"probe","excludeTurns":true}))
             {
