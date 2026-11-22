@@ -29,7 +29,14 @@ class SshPocketConnection(private val target: SshTarget) : PocketConnection {
             val connection = PocketClient(ssh.loopback(target.backendPort))
             delegate = connection
             scope.launch { connection.state.collect { mutableState.value = it } }
-            scope.launch { try { connection.notifications.collect { events.send(it) } } finally { close() } }
+            scope.launch {
+                // A transport that fails ends its notifications with that failure; it is this connection's, not the process's.
+                var cause: Throwable? = null
+                try { connection.notifications.collect { events.send(it) } }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) { cause = failure; failureCode = failureCode ?: (failure as? WireException)?.code }
+                finally { events.close(cause); close() }
+            }
             connection.connect(config)
         } catch (cancelled: CancellationException) { close(); throw cancelled }
         catch (failure: Exception) { failureCode = (failure as? WireException)?.code ?: "ssh_connection_failed"; close(); throw failure }
