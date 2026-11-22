@@ -367,7 +367,20 @@ fn pin_directories(path: &Path) -> Result<Vec<File>> {
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let file = options.open(ancestor)?;
+        // Pinning needs search permission only; an Android application cannot read /data.
+        // OpenOptions cannot express this: musl counts O_PATH as an access mode, which std masks.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let file = {
+            use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+            let name = std::ffi::CString::new(ancestor.as_os_str().as_bytes())?;
+            let fd = unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            unsafe { File::from_raw_fd(fd) }
+        };
         ensure!(file.metadata()?.is_dir(), "Invalid state directory");
         #[cfg(windows)]
         {

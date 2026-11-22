@@ -70,10 +70,15 @@ mod platform {
         pub fn open(path: &Path) -> Result<Self> {
             let path = std::path::absolute(path)?;
             let mut components = path.components().peekable();
+            // Walking an ancestor needs search permission only; an Android application cannot read /data.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const WALK: libc::c_int = libc::O_PATH;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const WALK: libc::c_int = libc::O_RDONLY;
             let mut directory = unsafe {
                 libc::open(
                     c"/".as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    WALK | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
             };
             if directory < 0 {
@@ -100,11 +105,12 @@ mod platform {
                         }
                     }
                 }
+                let access = if final_component { libc::O_RDONLY } else { WALK };
                 directory = unsafe {
                     libc::openat(
                         parent.as_raw_fd(),
                         name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     )
                 };
                 if directory < 0 {

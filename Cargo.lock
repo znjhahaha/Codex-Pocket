@@ -1276,6 +1276,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
+ "libc",
  "mdns-sd",
  "png",
  "pocket-bridge",
