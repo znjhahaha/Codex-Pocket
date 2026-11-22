@@ -3178,3 +3178,154 @@ async fn write_job_runs_on_its_own_branch_and_only_the_user_merges_it_through_th
     assert!(!offered.is_empty());
     assert!(!offered.iter().any(|name| name.contains("merge") || name.contains("discard")), "{offered:?}");
 }
+
+fn drain(frames: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+    std::iter::from_fn(|| frames.try_recv().ok()).collect()
+}
+fn kinds(frames: &[Value]) -> Vec<&str> {
+    frames.iter().map(|frame| frame["kind"].as_str().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn coordinator_deltas_emit_stream_frames_while_worker_stdout_is_filtered() {
+    let f = Fixture::new(false).await;
+    let mut frames = f.actor.as_ref().unwrap().subscribe_stream();
+    let s = f.send("phone-1").await;
+    let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.emit(Value::Null, "item/agentMessage/delta", &cm, json!({"itemId":"answer","delta":"已安排，"}));
+    f.read().await;
+    f.io.emit(Value::Null, "item/agentMessage/delta", &cm, json!({"itemId":"answer","delta":"稍后汇报"}));
+    f.io.tool(
+        json!(101),
+        &cm,
+        "call-dispatch",
+        "assistant_dispatch_session",
+        json!({"title":"跑回归测试","prompt":"Run the tests","directory":f.project.path(),"writes":false}),
+    );
+    let s = f.read().await;
+    let em = Fixture::mapping(&Fixture::op(&s, "Execution"));
+    let task = s["jobs"][0]["taskId"].clone();
+
+    // The job talks, runs a command with secret-looking output, edits a file and starts agents.
+    f.io.emit(Value::Null, "item/agentMessage/delta", &em, json!({"itemId":"job-answer","delta":"JOB-TRANSCRIPT-TEXT"}));
+    f.io.emit(Value::Null, "item/started", &em, json!({"item":{"id":"c1","type":"commandExecution","command":"cargo test --workspace","aggregatedOutput":"STDOUT-SECRET-123"}}));
+    f.io.emit(Value::Null, "item/commandExecution/outputDelta", &em, json!({"itemId":"c1","delta":"STDOUT-SECRET-456"}));
+    f.io.emit(Value::Null, "item/completed", &em, json!({"item":{"id":"c1","type":"commandExecution","command":"cargo test --workspace","aggregatedOutput":"STDOUT-SECRET-789","exitCode":0}}));
+    f.read().await;
+    f.io.emit(Value::Null, "item/started", &em, json!({"item":{"id":"a1","type":"collabAgentToolCall","tool":"spawnAgent","prompt":"AGENT-PROMPT-TEXT",
+        "agentsStates":{"child-1":{"status":"running","message":"AGENT-MESSAGE-TEXT"},"child-2":{"status":"pending_init"}}}}));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    f.read().await;
+    f.io.complete(&cm, "已安排，稍后汇报");
+    f.read().await;
+
+    let seen = drain(&mut frames);
+    let all = serde_json::to_string(&seen).unwrap();
+    for leaked in ["STDOUT-SECRET", "JOB-TRANSCRIPT-TEXT", "AGENT-PROMPT-TEXT", "AGENT-MESSAGE-TEXT"] {
+        assert!(!all.contains(leaked), "{leaked} reached the phone's stream");
+    }
+    // Every frame is addressed and numbered without a gap.
+    let epoch = seen[0]["epoch"].clone();
+    for (index, frame) in seen.iter().enumerate() {
+        assert_eq!(frame["sequence"], index as u64 + 1, "{frame}");
+        assert_eq!(frame["epoch"], epoch);
+        assert_eq!(frame["runtimeId"], s["runtimeId"]);
+        assert!(frame["generation"].is_string());
+    }
+    // The coordinator's words arrive as deltas that rebuild its message, then one close.
+    let spoken: String = seen
+        .iter()
+        .filter(|frame| frame["kind"] == "coordinator_delta")
+        .map(|frame| {
+            assert_eq!(frame["operationId"], Fixture::op(&s, "Coordinator")["id"]);
+            assert_eq!(frame["reset"], false);
+            frame["delta"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(spoken, "已安排，稍后汇报");
+    assert_eq!(kinds(&seen).iter().filter(|kind| **kind == "coordinator_done").count(), 1);
+    // The job is described by status and one line only.
+    let stages: Vec<&Value> = seen.iter().filter(|frame| frame["kind"] == "job_stage").collect();
+    assert!(stages.iter().all(|frame| frame["taskId"] == task && frame["threadId"] == em.thread_id));
+    assert_eq!(stages[0]["status"], "running");
+    assert!(stages.iter().any(|frame| frame["stage"] == "command" && frame["stageLabel"] == "cargo test --workspace"));
+    let last = stages.last().unwrap();
+    assert_eq!((last["stage"].as_str(), last["activeSubagents"].as_u64()), (Some("subagent"), Some(2)));
+    assert!(stages.iter().all(|frame| frame["stageLabel"].as_str().unwrap().chars().count() <= 80));
+}
+
+#[tokio::test]
+async fn attention_events_carry_original_request_id_without_rewording() {
+    let f = Fixture::new(false).await;
+    let mut frames = f.actor.as_ref().unwrap().subscribe_stream();
+    let s = f.send("phone-1").await;
+    let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.tool(
+        json!(101),
+        &cm,
+        "call-dispatch",
+        "assistant_dispatch_session",
+        json!({"title":"改配置","prompt":"Edit the config","directory":f.project.path(),"writes":true}),
+    );
+    let s = f.read().await;
+    let execution = Fixture::op(&s, "Execution");
+    let em = Fixture::mapping(&execution);
+    drain(&mut frames);
+
+    f.io.emit(
+        json!("native-approval-7"),
+        "item/commandExecution/requestApproval",
+        &em,
+        json!({"itemId":"cmd","command":"rm -rf build","reason":"APPROVAL-REASON-TEXT","startedAtMs":0}),
+    );
+    let s = f.read().await;
+    let pending = s["pendingRequests"].as_array().unwrap();
+    let request = pending.iter().find(|p| p["operationId"] == execution["id"]).unwrap()["requestId"].clone();
+    let seen = drain(&mut frames);
+    let opened: Vec<&Value> = seen.iter().filter(|frame| frame["kind"] == "attention_opened").collect();
+    assert_eq!(opened.len(), 1, "{seen:?}");
+    assert_eq!(opened[0]["requestId"], request, "the frame names the request the snapshot holds");
+    assert_eq!(opened[0]["operationId"], execution["id"]);
+    assert_eq!(opened[0]["taskId"], s["jobs"][0]["taskId"]);
+    assert_eq!(opened[0]["questionKind"], "approval");
+    let all = serde_json::to_string(&seen).unwrap();
+    assert!(!all.contains("rm -rf build") && !all.contains("APPROVAL-REASON-TEXT"), "the request must not be restated: {all}");
+    assert!(seen.iter().any(|frame| frame["kind"] == "job_stage" && frame["status"] == "waiting_approval"));
+    // The coordinator was not started to relay it.
+    assert_eq!(s["operations"].as_array().unwrap().iter().filter(|o| o["role"] == "Coordinator").count(), 1);
+
+    f.io.resolve(json!("native-approval-7"));
+    f.read().await;
+    let seen = drain(&mut frames);
+    let resolved: Vec<&Value> = seen.iter().filter(|frame| frame["kind"] == "attention_resolved").collect();
+    assert_eq!(resolved.len(), 1, "{seen:?}");
+    assert_eq!(resolved[0]["requestId"], request);
+    assert!(seen.iter().any(|frame| frame["kind"] == "job_stage" && frame["status"] == "running"));
+}
+
+#[tokio::test]
+async fn stream_epoch_changes_after_restart() {
+    let mut f = Fixture::new(false).await;
+    let mut frames = f.actor.as_ref().unwrap().subscribe_stream();
+    let s = f.send("phone-1").await;
+    let cm = Fixture::mapping(&Fixture::op(&s, "Coordinator"));
+    f.io.emit(Value::Null, "item/agentMessage/delta", &cm, json!({"itemId":"answer","delta":"First "}));
+    f.read().await;
+    let before = drain(&mut frames);
+    assert!(!before.is_empty());
+    let (epoch, last) = (before[0]["epoch"].clone(), before.last().unwrap()["sequence"].as_u64().unwrap());
+    assert!(last >= 1);
+
+    f.stop().await;
+    f.start().await;
+    let mut frames = f.actor.as_ref().unwrap().subscribe_stream();
+    f.io.emit(Value::Null, "item/agentMessage/delta", &cm, json!({"itemId":"answer","delta":"second"}));
+    f.read().await;
+    let after = drain(&mut frames);
+    assert!(!after.is_empty());
+    assert_ne!(after[0]["epoch"], epoch, "a restarted worker must not look like a continuation");
+    assert_eq!(after[0]["sequence"], 1);
+    // What the phone held is replaced: the first frame after a restart carries the whole text.
+    let delta = after.iter().find(|frame| frame["kind"] == "coordinator_delta").unwrap();
+    assert_eq!(delta["delta"], "First second");
+}

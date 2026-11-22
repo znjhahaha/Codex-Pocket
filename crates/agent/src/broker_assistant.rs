@@ -739,6 +739,21 @@ impl Broker {
         .await?;
         *current = Some(actor.clone());
         *self.assistant_error.lock().await = None;
+        // Live frames go to connected phones as they are; the task ends with this actor.
+        let (mut frames, phones) = (actor.subscribe_stream(), self.notifications.clone());
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match frames.recv().await {
+                    Ok(frame) => {
+                        let _ = phones.send(json!({"method":"assistant/stream","params":frame}));
+                    }
+                    // A phone that missed frames sees the gap in their sequence and reads again.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
         Ok(actor)
     }
     pub(super) async fn assistant_artifact_read(&self, p:&Value)->Result<Value> {

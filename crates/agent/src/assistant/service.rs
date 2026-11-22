@@ -36,7 +36,7 @@ pub enum OperationPhase {
     Failed,
 }
 impl OperationPhase {
-    fn live(&self) -> bool {
+    pub fn live(&self) -> bool {
         matches!(self, Self::Unknown | Self::Running | Self::Waiting)
     }
 }

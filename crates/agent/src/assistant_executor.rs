@@ -284,6 +284,17 @@ pub struct EventProjection {
     pub resolved_tools: Vec<(NativeMapping, String)>,
     pub pending_snapshot: bool,
     pub streams: Vec<StreamObservation>,
+    /// What a job is doing right now, for display only. Never command output.
+    pub stages: Vec<StageObservation>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageObservation {
+    pub operation_id: String,
+    /// thinking | command | file_change | web_search | tool | subagent
+    pub kind: &'static str,
+    /// The command line, path, query or tool name: at most 80 characters.
+    pub label: String,
+    pub active_subagents: u32,
 }
 #[derive(Clone, Debug)]
 pub struct StreamObservation {
@@ -298,6 +309,8 @@ pub struct HostExecutor<R: RuntimeIo> {
     state: Durable,
     pending: BTreeMap<String, PendingRequest>,
     statuses: BTreeMap<String, ExecutionStatus>,
+    /// Native child agents seen per operation and whether each is still working.
+    subagents: BTreeMap<String, BTreeMap<String, bool>>,
     event_gap: bool,
     _owner: File,
 }
@@ -377,6 +390,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             state,
             pending: BTreeMap::new(),
             statuses: BTreeMap::new(),
+            subagents: BTreeMap::new(),
             event_gap,
             _owner: owner,
         };

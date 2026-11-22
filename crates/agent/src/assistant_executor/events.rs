@@ -96,6 +96,12 @@ impl<R: RuntimeIo> HostExecutor<R> {
                             });
                         }
                     }
+                } else if op.role == Role::Execution
+                    && matches!(method, "item/started" | "item/completed")
+                {
+                    if let Some(stage) = self.stage(&op.operation_id, &p["item"], method == "item/started") {
+                        projection.stages.push(stage);
+                    }
                 } else if method == "item/tool/call" {
                     let current = self.state.threads[&mapping.thread_id]
                             .current_operation
@@ -230,6 +236,74 @@ impl<R: RuntimeIo> HostExecutor<R> {
         }
         Ok(projection)
     }
+    /// One line about what a job has just begun, taken from the item's own description of
+    /// itself. Output, diffs and message text are never read here.
+    fn stage(&mut self, operation: &str, item: &Value, started: bool) -> Option<StageObservation> {
+        let field = |name: &str| item[name].as_str().unwrap_or_default();
+        let (kind, label) = match field("type") {
+            "reasoning" => ("thinking", String::new()),
+            "commandExecution" => ("command", field("command").to_owned()),
+            "fileChange" => (
+                "file_change",
+                item["changes"]
+                    .as_array()
+                    .and_then(|changes| changes.first())
+                    .and_then(|change| change["path"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            "webSearch" => ("web_search", field("query").to_owned()),
+            "mcpToolCall" | "dynamicToolCall" => ("tool", field("tool").to_owned()),
+            "collabAgentToolCall" | "subAgentActivity" => ("subagent", field("tool").to_owned()),
+            _ => return None,
+        };
+        let before = self.active_subagents(operation);
+        if kind == "subagent" {
+            let working = |status: &str| {
+                matches!(
+                    status.to_ascii_lowercase().replace('_', "").as_str(),
+                    "running" | "active" | "pendinginit" | "inprogress" | "started" | "working"
+                )
+            };
+            let agents = self.subagents.entry(operation.to_owned()).or_default();
+            if let Some(states) = item["agentsStates"].as_object() {
+                for (agent, state) in states.iter().take(64) {
+                    if agent.len() <= 256 && (agents.len() < 64 || agents.contains_key(agent)) {
+                        agents.insert(agent.clone(), working(state["status"].as_str().unwrap_or_default()));
+                    }
+                }
+            }
+            if let Some(agent) = item["agentThreadId"].as_str().filter(|id| id.len() <= 256) {
+                // `interacted` records contact, not a change of state.
+                if matches!(field("kind"), "started" | "completed" | "interrupted")
+                    && (agents.len() < 64 || agents.contains_key(agent))
+                {
+                    agents.insert(agent.to_owned(), field("kind") == "started");
+                }
+            }
+        }
+        let active_subagents = self.active_subagents(operation);
+        // A finished step leaves the line as it was; only a changed agent count is news.
+        if !started && active_subagents == before {
+            return None;
+        }
+        let label: String = label
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(80)
+            .collect();
+        Some(StageObservation {
+            operation_id: operation.to_owned(),
+            kind,
+            label: label.trim().to_owned(),
+            active_subagents,
+        })
+    }
+    fn active_subagents(&self, operation: &str) -> u32 {
+        self.subagents
+            .get(operation)
+            .map_or(0, |agents| agents.values().filter(|working| **working).count() as u32)
+    }
     fn insert_pending(&mut self, p: PendingRequest) -> Result<()> {
         if let Some(old) = self.pending.get(&p.handle) {
             ensure!(
@@ -287,6 +361,7 @@ impl<R: RuntimeIo> HostExecutor<R> {
             let p = self.ingest(&generation, event)?;
             result.observations.extend(p.observations);
             result.streams.extend(p.streams);
+            result.stages.extend(p.stages);
             result.tools.extend(p.tools);
             result.resolved_tools.extend(p.resolved_tools);
         }

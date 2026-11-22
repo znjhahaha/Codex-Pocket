@@ -90,6 +90,10 @@ impl<E: Executor> AssistantService<E> {
         let task = self.store.task(op.task_id.as_deref()?).ok()?;
         self.job_root(&task)
     }
+    /// The job an operation works for, if it was dispatched as one.
+    pub fn operation_job(&self, op: &Operation) -> Option<String> {
+        self.job_of_operation(op)
+    }
     pub(super) fn job_model(&self, op: &Operation) -> Option<String> {
         self.job_of_operation(op)
             .and_then(|root| self.state.jobs.get(&root)?.model.clone())

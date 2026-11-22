@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 
 mod command_receipts;
 mod artifacts;
+mod stream;
 pub(crate) use command_receipts::read_completed_command;
 
 /// Read retained role identity without starting the Actor, acquiring executor
@@ -541,6 +542,7 @@ pub struct Actor {
     sender: mpsc::SyncSender<Request>,
     snapshot: Arc<Mutex<Value>>,
     alive: Arc<AtomicBool>,
+    frames: tokio::sync::broadcast::Sender<Value>,
 }
 struct WorkerLife(Arc<AtomicBool>);
 impl Drop for WorkerLife {
@@ -589,10 +591,12 @@ impl Actor {
         let alive = Arc::new(AtomicBool::new(true));
         let out = snapshot.clone();
         let running = alive.clone();
+        let (frames, _) = tokio::sync::broadcast::channel(256);
+        let live = frames.clone();
         let (started, ready) = oneshot::channel();
         std::thread::Builder::new().name("pocket-assistant".into()).spawn(move ||{
             let _life=WorkerLife(running.clone());
-            let mut worker=match Worker::open(root,computer,profile,io,handoff,clock){
+            let mut worker=match Worker::open(root,computer,profile,io,handoff,clock,live){
                 Ok(worker)=>worker,Err(error)=>{running.store(false,Ordering::Release);let _=started.send(Err(error));return;}
             };
             match worker.snapshot(None){
@@ -600,8 +604,12 @@ impl Actor {
                 Err(error)=>{drop(worker);running.store(false,Ordering::Release);let _=started.send(Err(error));return;}
             }
             let mut parked=false;
+            let mut published=std::time::Instant::now();
             loop{
-                let request=match receiver.recv_timeout(Duration::from_millis(500)){
+                // While the coordinator is speaking its words are passed on in small batches;
+                // otherwise the half-second beat is enough.
+                let beat=Duration::from_millis(if !parked && worker.streaming(){80}else{500});
+                let request=match receiver.recv_timeout(beat){
                     Ok(request)=>Some(request),Err(mpsc::RecvTimeoutError::Timeout)=>None,Err(mpsc::RecvTimeoutError::Disconnected)=>break,
                 };
                 if let Some(r)=request.as_ref().filter(|r|r.caller.is_none() && r.method.starts_with("local/lifecycle/")) {
@@ -627,6 +635,13 @@ impl Actor {
                 // Observe buffered native results before recording a newer
                 // user message. Explicit requests wake this loop immediately.
                 if request.as_ref().is_some_and(|r| is_read(&r.method)) { worker.account_checked_at = i64::MIN; }
+                // Between requests the fast beat only reads events and passes them on; status
+                // reads, dispatch and the published snapshot keep their half-second cadence.
+                if request.is_none() && published.elapsed()<Duration::from_millis(450) {
+                    worker.observe_events();
+                    worker.flush_stream();
+                    continue;
+                }
                 worker.observe_runtime();
                 if request.as_ref().is_some_and(|r| !is_read(&r.method)) {
                     let mut cache = out.lock().unwrap();
@@ -664,6 +679,8 @@ impl Actor {
                     request => request,
                 };
                 worker.dispatch_pending();
+                worker.flush_stream();
+                published=std::time::Instant::now();
                 let value=worker.snapshot(None);
                 if let Ok(v)=&value{*out.lock().unwrap()=v.clone();}
                 if let Some(request)=request{
@@ -699,7 +716,12 @@ impl Actor {
             sender,
             snapshot,
             alive,
+            frames,
         })
+    }
+    /// Live display frames. Lossy by design: the snapshot is what a phone reconciles with.
+    pub fn subscribe_stream(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.frames.subscribe()
     }
     pub fn snapshot(&self) -> Value {
         let mut value = self.snapshot.lock().unwrap().clone();
@@ -808,6 +830,8 @@ struct Worker<R: RuntimeIo + Clone> {
     account: AccountReadiness,
     account_checked_at: i64,
     revision: u64,
+    stream: stream::Stream,
+    stream_clock: std::time::Instant,
 }
 fn messages_db(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
@@ -847,6 +871,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         mut io: R,
         handoff: Option<Arc<crate::handoff::Handoff>>,
         clock: Clock,
+        frames: tokio::sync::broadcast::Sender<Value>,
     ) -> Result<Self> {
         crate::storage::private_directory(&root)?;
         let workspace = root.join("workspace");
@@ -1000,6 +1025,8 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             account,
             account_checked_at: (clock)(),
             revision: 0,
+            stream: stream::Stream::new(frames),
+            stream_clock: std::time::Instant::now(),
         };
         worker.sync_timeline()?;
         worker.pause_unverified_tasks()?;
@@ -1651,6 +1678,21 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         self.confirm_known();
     }
     fn observe_runtime(&mut self) {
+        self.observe_health();
+        self.observe_events();
+        self.reconcile_only();
+        if self.executor.reconcile_answer_receipts().is_err() {
+            self.error = Some("native_tool_answer_requires_reconciliation");
+        }
+        self.confirm_known();
+        if self.service.reconcile_deliveries().is_err() {
+            self.error = Some("delivery_requires_reconciliation");
+        }
+        if self.sync_timeline().is_err() {
+            self.error = Some("timeline_unavailable");
+        }
+    }
+    fn observe_health(&mut self) {
         self.error = None;
         let health = self.probe.health();
         self.startup_runtime_ready = health.as_ref().is_ok_and(|h| {
@@ -1678,13 +1720,21 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 .unwrap_or(AccountReadiness::Unavailable);
             self.account_checked_at = at;
         }
+    }
+    fn observe_events(&mut self) {
         match self.executor.poll_events(256) {
             Ok(projection) => {
+                let operations = self.service.operations();
+                for stage in projection.stages {
+                    self.stream.stage(stage);
+                }
                 for stream in projection.streams {
-                    if self.service.operations().iter().any(|o| {
-                        o.id == stream.operation_id
-                            && (o.role == Role::Coordinator || self.service.direct_result(o))
-                    }) {
+                    let Some(owner) = operations.iter().find(|o| o.id == stream.operation_id) else { continue };
+                    // Only the coordinator's own words are streamed to the phone.
+                    if owner.role == Role::Coordinator {
+                        self.stream.text(&stream.operation_id, stream.text.clone());
+                    }
+                    if owner.role == Role::Coordinator || self.service.direct_result(owner) {
                         if self.messages.execute("INSERT INTO product_timeline(id,role,text,at_ms,operation_id) VALUES(?1,'Assistant',?2,?3,?4) ON CONFLICT(id) DO UPDATE SET text=excluded.text",
                             params![format!("assistant-operation:{}",stream.operation_id),stream.text,(self.clock)(),stream.operation_id]).is_err() {
                             self.error = Some("timeline_unavailable");
@@ -1753,17 +1803,47 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             }
             Err(_) => self.error = Some("runtime_reconnecting"),
         }
-        self.reconcile_only();
-        if self.executor.reconcile_answer_receipts().is_err() {
-            self.error = Some("native_tool_answer_requires_reconciliation");
-        }
-        self.confirm_known();
-        if self.service.reconcile_deliveries().is_err() {
-            self.error = Some("delivery_requires_reconciliation");
-        }
-        if self.sync_timeline().is_err() {
-            self.error = Some("timeline_unavailable");
-        }
+    }
+    /// A coordinator turn is producing text: the loop should look again soon.
+    fn streaming(&self) -> bool {
+        self.stream.text_pending()
+            || self.service.operations().iter().any(|o| {
+                o.role == Role::Coordinator && o.phase == OperationPhase::Running && !o.suspended
+            })
+    }
+    fn flush_stream(&mut self) {
+        let views = self
+            .service
+            .operations()
+            .into_iter()
+            .filter(|o| o.phase.live() || self.stream.tracks(&o.id))
+            .map(|o| {
+                let waiting = o.phase == OperationPhase::Waiting && !o.suspended;
+                let kind = o.question.as_ref().map(|q| match q.kind {
+                    QuestionKind::Approval => "approval",
+                    QuestionKind::Input => "input",
+                });
+                stream::OperationView {
+                    coordinator: o.role == Role::Coordinator,
+                    task_id: self.service.operation_job(&o).or_else(|| o.task_id.clone()),
+                    thread_id: o.mapping.as_ref().map(|m| m.thread_id.clone()),
+                    status: match o.phase {
+                        _ if o.suspended && o.phase.live() => "stop_requested",
+                        OperationPhase::Running => "running",
+                        OperationPhase::Waiting if kind == Some("approval") => "waiting_approval",
+                        OperationPhase::Waiting => "waiting_input",
+                        OperationPhase::Unknown => "needs_verification",
+                        OperationPhase::Completed => "completed",
+                        OperationPhase::Failed => "failed",
+                        OperationPhase::Paused => "paused",
+                    },
+                    question: o.question.as_ref().filter(|_| waiting).map(|q| (q.request_id.clone(), kind.unwrap_or("input"))),
+                    id: o.id,
+                }
+            })
+            .collect::<Vec<_>>();
+        let now = self.stream_clock.elapsed().as_millis() as i64;
+        self.stream.flush(&self.runtime_id, &self.generation, &views, now);
     }
     fn dispatch_pending(&mut self) {
         if self.allowed() && self.runtime_ready {
