@@ -58,7 +58,7 @@ internal fun UsageFigureText(figure: UsageFigure, widthPx: Int, modifier: Modifi
         format = if (short) figure.compactFormat else figure.format)
 }
 
-private class UsageTile(val id: String, val label: String, val figure: UsageFigure, val note: String, val series: List<Double?>,
+private class UsageTile(val id: String, val label: String, val figure: UsageFigure, val note: String, val series: List<Double?>?,
     val detail: String = figure.text)
 
 @Composable
@@ -104,22 +104,28 @@ private fun usagePaired(width: Dp) = width / LocalDensity.current.fontScale >= 2
 
 /** Cost and calls first, then what the tokens were made of and how many calls succeeded. */
 @Composable
-internal fun UsageOverview(t: UsageTotals, trend: List<UsageTrendBucket>, grow: () -> Float, onDetail: (String) -> Unit) {
+internal fun UsageOverview(t: UsageTotals, trend: List<UsageTrendBucket>, grow: () -> Float, can: UsageCapabilities = UsageCapabilities(),
+    onDetail: (String) -> Unit) {
     BoxWithConstraints(Modifier.fillMaxWidth().testTag("usage-metrics")) {
         val width = maxWidth
         val paired = usagePaired(width)
-        val primary = remember(t, trend) {
+        val primary = remember(t, trend, can) {
             listOfNotNull(
-                // A source that saved no amount has no cost tile; the detail sheet still explains the coverage.
-                if (t.costs.total.knownRows > 0uL) UsageTile("cost", "费用", usageCostFigure(t.costs.total),
+                // A source that keeps no amounts says so in the cost's place; one that kept none this time has no cost tile,
+                // and the detail sheet still explains the coverage.
+                if (!can.cost) UsageTile("cost", "费用", UsageFigure(null, "未提供费用", { "未提供费用" }), "此来源不记录金额", null)
+                else if (t.costs.total.knownRows > 0uL) UsageTile("cost", "费用", usageCostFigure(t.costs.total),
                     "${usageCount(t.costs.total.missingRows + t.costs.total.invalidRows)} 次费用未记录", trend.map { it.totals.chartValue(UsageTrendMetric.Cost) },
                     detail = t.costs.total.display()) else null,
-                UsageTile("requests", "调用", usageCountFigure(t.requests), "成功 ${usageCompact(t.success)} 次", trend.map { it.totals.requests.toDouble() }),
+                UsageTile("requests", "调用", usageCountFigure(t.requests), if (can.status) "成功 ${usageCompact(t.success)} 次" else "每次模型请求计一次",
+                    trend.map { it.totals.requests.toDouble() }),
             )
         }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             UsageTileRow(primary, paired, width, grow, onDetail)
-            if (paired) Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Without a recorded outcome there is no success rate to draw, and the tokens take the row.
+            if (!can.status) UsageTokenTile(t, trend, width, grow, Modifier, onDetail)
+            else if (paired) Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val narrow = (width - 8.dp) * (1f / 2.6f)
                 UsageTokenTile(t, trend, width - 8.dp - narrow, grow, Modifier.weight(1.6f).fillMaxHeight(), onDetail)
                 UsageSuccessTile(t, trend, narrow, false, grow, Modifier.weight(1f).fillMaxHeight(), onDetail)

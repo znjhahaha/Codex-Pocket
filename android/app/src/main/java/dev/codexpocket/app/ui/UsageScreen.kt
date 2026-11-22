@@ -59,6 +59,8 @@ fun UsageScreen(
     val snapshot = state.visibleSnapshot
     val data = snapshot?.response?.data
     val f = state.filter
+    val native = f.source == UsageSourceKind.NativeCodex
+    val can = snapshot?.response?.capabilities ?: UsageCapabilities()
     val c = Pocket.colors
     val density = LocalDensity.current
     val direction = LocalLayoutDirection.current
@@ -104,7 +106,7 @@ fun UsageScreen(
                     // Without a saved amount there is nothing to rank by cost, so the rows rank by tokens.
                     val tokens = !costKnown || when (shown) { UsageGrouping.Provider -> providerTokens; UsageGrouping.Model -> modelTokens; UsageGrouping.Session -> sessionTokens }
                     item(key = "status") { Box(Modifier.padding(top = 10.dp)) { UsageStatusLine(state, snapshot, onRefresh) } }
-                    item(key = "metrics") { Box(Modifier.padding(top = 12.dp)) { UsageOverview(data.totals, data.trend, grow) { label -> insight = label to data.totals } } }
+                    item(key = "metrics") { Box(Modifier.padding(top = 12.dp)) { UsageOverview(data.totals, data.trend, grow, can) { label -> insight = label to data.totals } } }
                     item(key = "trend") {
                         Box(Modifier.padding(top = 8.dp)) {
                             UsageTrendChart(data.trend, f.zoneId, metric, metrics, { trendMetric = it }, grow) { b -> insight = bucketRange(b, f.zoneId) to b.totals }
@@ -137,7 +139,7 @@ fun UsageScreen(
                             UsageHeading("最近请求", Modifier.padding(start = 4.dp, end = 4.dp, top = 24.dp, bottom = 8.dp).testTag("usage-requests"))
                         }
                         itemsIndexed(requests.items, key = { _, r -> "request:${r.requestId}" }) { i, r ->
-                            UsageRequestRow(r, f.zoneId, "usage-request:$i", i == 0, i == requests.items.lastIndex) { request = r }
+                            UsageRequestRow(r, f.zoneId, "usage-request:$i", i == 0, i == requests.items.lastIndex, can) { request = r }
                         }
                         item(key = "requests-footer") {
                             Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -162,16 +164,19 @@ fun UsageScreen(
                     }
                 }
             }
-            item(key = "footer") { UsageNote("${f.zoneId} · 费用为 CC Switch 保存金额；代理与导入来源分别统计。", Modifier.padding(start = 4.dp, end = 4.dp, top = 14.dp)) }
+            item(key = "footer") {
+                UsageNote(if (native) "${f.zoneId} · 原生 Codex 未提供费用；只统计这台电脑观察到或保留在本机历史中的用量，不与 CC Switch 合计。"
+                    else "${f.zoneId} · 费用为 CC Switch 保存金额；代理与导入来源分别统计。", Modifier.padding(start = 4.dp, end = 4.dp, top = 14.dp).testTag("usage-footer"))
+            }
         }
         CompositionLocalProvider(LocalPocketBackdrop provides backdrop) {
-            UsageSourceCapsule(busy, state.canQuery && !busy, onRefresh,
-                Modifier.padding(start = start, end = end, top = top).onSizeChanged { capsule = with(density) { it.height.toDp() } })
+            UsageSourceCapsule(busy, state.canQuery && !busy, onRefresh, state.sources, f.source, { onFilter(f.withSource(it)) },
+                modifier = Modifier.padding(start = start, end = end, top = top).onSizeChanged { capsule = with(density) { it.height.toDp() } })
         }
         if (filtersOpen) UsageFilterSheet(f, { filtersOpen = false }) { filtersOpen = false; onFilter(it) }
-        insight?.let { (title, totals) -> UsageInsightSheet(title, totals, f.dataSource) { insight = null } }
-        request?.let { UsageRequestSheet(it, f.zoneId) { request = null } }
-        if (coverageOpen && snapshot != null) UsageCoverageSheet(snapshot.response.coverage, f.zoneId) { coverageOpen = false }
+        insight?.let { (title, totals) -> UsageInsightSheet(title, totals, f.dataSource, can) { insight = null } }
+        request?.let { UsageRequestSheet(it, f.zoneId, can) { request = null } }
+        if (coverageOpen && snapshot != null) UsageCoverageSheet(snapshot.response.coverage, f.zoneId, native) { coverageOpen = false }
       }
     }
 }

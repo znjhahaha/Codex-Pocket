@@ -30,6 +30,8 @@ import java.time.ZoneId
             sessionId = session.takeIf(String::isNotEmpty), providerPage = filter.providerPage.copy(offset = 0),
             modelPage = filter.modelPage.copy(offset = 0), sessionPage = filter.sessionPage.copy(offset = 0)).also { it.toQuery() } }.getOrNull()
     }
+    // The native ledger is Codex only and has neither an import source nor a per-request status to choose.
+    val native = filter.source == UsageSourceKind.NativeCodex
     val quick = listOf(1, 7, 30)
     val today = runCatching { LocalDate.now(ZoneId.of(zone)) }.getOrNull()
     PSheet("日期与筛选", onDismiss, subtitle = "按自然日统计 · 最多 31 天", maxHeightFraction = .9f) {
@@ -42,6 +44,7 @@ import java.time.ZoneId
                 PTextField(start, { start = it }, Modifier.testTag("usage-filter-start"), label = "开始日期 yyyy-MM-dd", singleLine = true)
                 PTextField(end, { end = it }, Modifier.testTag("usage-filter-end"), label = "结束日期 yyyy-MM-dd", singleLine = true)
                 PTextField(zone, { zone = it }, Modifier.testTag("usage-filter-zone"), label = "时区", singleLine = true)
+                if (!native) {
                 UsageHeading("应用", Modifier.padding(horizontal = 4.dp))
                 UsageChoices(UsageFilter.apps, app, ::usageAppLabel, "usage-filter-app") { app = it; if (it != "codex") source = UsageDataSource.Proxy; provider = ""; model = ""; session = "" }
                 UsageHeading("记录来源", Modifier.padding(horizontal = 4.dp))
@@ -53,6 +56,7 @@ import java.time.ZoneId
                 UsageHeading("状态", Modifier.padding(horizontal = 4.dp))
                 UsageSegmented(UsageStatusFilter.entries.map { UsageSegment(it.label, "usage-filter-status:${it.wire}") }, UsageStatusFilter.entries.indexOf(status),
                     { status = UsageStatusFilter.entries[it] })
+                }
                 PTextField(provider, { provider = it }, Modifier.testTag("usage-filter-provider"), label = "上游 ID（空白为全部）", singleLine = true)
                 PTextField(model, { model = it }, Modifier.testTag("usage-filter-model"), label = "模型（空白为全部）", singleLine = true)
                 PTextField(session, { session = it }, Modifier.testTag("usage-filter-session"), label = "对话 ID（空白为全部）", singleLine = true)

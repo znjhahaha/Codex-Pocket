@@ -40,7 +40,7 @@ class ManagementUsageRepositoryTest {
     @After fun release()=runBlocking<Unit> {
         val scope=PocketRepository::class.java.getDeclaredField("scope").apply {isAccessible=true}.get(repo) as CoroutineScope
         scope.coroutineContext[Job]!!.cancelAndJoin();db.close()
-        assertTrue("Only read-only usage RPC is allowed",transport.calls.all {it.first in setOf("usage/read", "usage/dashboard/read", "usage/requests/read")})
+        assertTrue("Only read-only usage RPC is allowed",transport.calls.all {it.first in setOf("usage/read", "usage/dashboard/read", "usage/requests/read", "usage/v2/read", "usage/v2/requests/read")})
     }
 
     @Test fun managementReadUsesFixedSourceExplicitUtcQueryAndPreservesPerformanceAndCosts()=runBlocking<Unit> {
@@ -61,6 +61,58 @@ class ManagementUsageRepositoryTest {
         assertNull(response.coverage.confirmedFreeRows)
         assertEquals("stored_zero_free_status_unknown",response.coverage.zeroCostInterpretation)
         assertFalse(screen.refreshing)
+    }
+
+    @Test fun nativeLedgerIsOfferedAndReadOnlyThroughUsageV2UnderItsOwnName()=runBlocking<Unit> {
+        enableDashboard()
+        repo.loadUsage(filter).join()
+        assertEquals(listOf(UsageSourceKind.CcSwitch),repo.state.value.usage.sources)
+        state().update {it.copy(capabilities=it.capabilities+"usage.v2")}
+        val native=filter.withSource(UsageSourceKind.NativeCodex)
+        repo.loadUsage(native,refresh=true).join()
+        val (method,params)=transport.calls.last()
+        assertEquals("usage/v2/read",method)
+        assertEquals(setOf("source","query","refresh"),params.keys)
+        assertEquals("native_codex",params.string("source"))
+        assertEquals(native.toJson(),params.obj("query"))
+        val screen=repo.state.value.usage
+        assertEquals(listOf(UsageSourceKind.NativeCodex,UsageSourceKind.CcSwitch),screen.sources)
+        assertEquals(UsagePhase.Ready,screen.phase)
+        val shown=screen.visibleSnapshot!!.response
+        assertEquals("native_codex",shown.source.kind)
+        assertFalse(shown.capabilities.cost)
+        assertEquals(0uL,shown.data!!.totals.costs.total.knownRows)
+        // CC Switch stays on the calls every desktop answers, and each source shows only its own figures.
+        repo.loadUsage(filter).join()
+        assertEquals("usage/dashboard/read",transport.calls.last().first)
+        assertEquals("cc_switch",transport.calls.last().second.string("source_id"))
+        assertEquals("cc_switch",repo.state.value.usage.visibleSnapshot!!.response.source.kind)
+        assertEquals(listOf(UsageSourceKind.NativeCodex,UsageSourceKind.CcSwitch),repo.state.value.usage.sources)
+    }
+
+    @Test fun aComputerWithoutTheNativeLedgerIsAskedForCcSwitchInstead()=runBlocking<Unit> {
+        repo.loadUsage(filter.withSource(UsageSourceKind.NativeCodex)).join()
+        assertEquals("usage/read",transport.calls.single().first)
+        val screen=repo.state.value.usage
+        assertEquals(UsageSourceKind.CcSwitch,screen.filter.source)
+        assertEquals(listOf(UsageSourceKind.CcSwitch),screen.sources)
+        assertEquals("cc_switch",screen.visibleSnapshot!!.response.source.kind)
+    }
+
+    @Test fun nativeRequestPagesUseTheSameSourceAndNeverCcSwitchs()=runBlocking<Unit> {
+        enableDashboard();state().update {it.copy(capabilities=it.capabilities+"usage.v2")}
+        val native=filter.withSource(UsageSourceKind.NativeCodex)
+        transport.nativeMore=true
+        repo.loadUsage(native).join()
+        val first=repo.state.value.usage.visibleRequests!!
+        assertTrue(repo.state.value.usage.canPageRequests)
+        repo.loadUsageRequests(first.nextCursor!!).join()
+        val (method,params)=transport.calls.last()
+        assertEquals("usage/v2/requests/read",method)
+        assertEquals("native_codex",params.string("source"))
+        assertFalse(params.containsKey("source_id"))
+        assertEquals(listOf("41","40"),repo.state.value.usage.visibleRequests!!.items.map {it.requestId})
+        assertNull(repo.state.value.usage.requestError)
     }
 
     @Test fun dashboardCapabilitySelectsNewReadContract()=runBlocking<Unit> {
@@ -173,13 +225,15 @@ class ManagementUsageRepositoryTest {
         override val notifications=emptyFlow<JsonObject>()
         val calls=CopyOnWriteArrayList<Pair<String,JsonObject>>()
         var locked=false
+        var nativeMore=false
         var beforeReply:(suspend ()->Unit)?=null
         override suspend fun connect(config:ConnectionConfig):Unit=error("Fixture must never connect")
         override suspend fun request(method:String,params:JsonObject,commandId:String?,timeoutMillis:Long):JsonElement {
-            require(method in setOf("usage/read", "usage/dashboard/read", "usage/requests/read") && commandId==null)
+            require(method in setOf("usage/read", "usage/dashboard/read", "usage/requests/read", "usage/v2/read", "usage/v2/requests/read") && commandId==null)
             calls+=method to params
             beforeReply?.invoke()
             val query=params.obj("query")
+            if(method.startsWith("usage/v2/")) return nativeReply(method,params)
             val base=if (method=="usage/read") usageFixtureJson() else usageV070Fixture()
             val source=JsonObject(base.obj("source")+mapOf("app_type" to query.obj("filters")["app_type"]!!,"data_source" to query.obj("filters")["data_source"]!!))
             var result=JsonObject(base+mapOf("availability" to JsonPrimitive(if(locked) "locked" else "ready"),"source" to source))
@@ -194,6 +248,31 @@ class ManagementUsageRepositoryTest {
                 put("schema",1);put("query",query);put("result",result)
                 put("cache",buildJsonObject {put("state",if(locked) "stale" else "fresh");put("sampled_at",1794268800);put("age_seconds",if(locked) 90 else 0);put("ttl_seconds",60);put("stale_reason",if(locked) JsonPrimitive("locked") else JsonNull)})
             }
+        }
+        /** The desktop's native-ledger reply for whatever dates were asked, one request per page. */
+        private fun nativeReply(method:String,params:JsonObject):JsonObject {
+            require(params.string("source")=="native_codex" && "source_id" !in params)
+            val query=params.obj("query")
+            val edges=query["bucket_edges"]!!.jsonArray.map {it.jsonPrimitive.long}
+            val zone=java.time.ZoneId.of("Asia/Shanghai")
+            val filter=UsageFilter(java.time.Instant.ofEpochSecond(edges.first()).atZone(zone).toLocalDate(),
+                java.time.Instant.ofEpochSecond(edges.last()).atZone(zone).toLocalDate().minusDays(1),"Asia/Shanghai",source=UsageSourceKind.NativeCodex)
+            val reply=usageNativeFixtureJson(filter)
+            val result=reply.obj("result")
+            val row=result.obj("data").obj("recent_requests")["items"]!!.jsonArray.single().jsonObject
+            fun requests(item:JsonObject,more:Boolean)=buildJsonObject {
+                put("items",JsonArray(listOf(item)));put("limit",50);put("has_more",more)
+                put("next_cursor",if(more) buildJsonObject {put("created_at",item["created_at"]!!);put("request_id",item["request_id"]!!)} else JsonNull)
+            }
+            if(method=="usage/v2/requests/read") {
+                val older=JsonObject(row+mapOf("request_id" to JsonPrimitive("40"),"created_at" to JsonPrimitive(row["created_at"]!!.jsonPrimitive.long-30)))
+                return JsonObject(reply+mapOf("query" to query,"result" to buildJsonObject {
+                    put("availability","ready");put("source",result["source"]!!);put("capabilities",result["capabilities"]!!);put("errors",result["errors"]!!)
+                    put("data",buildJsonObject {put("requests",requests(older,false))})
+                }))
+            }
+            val data=JsonObject(result.obj("data")+("recent_requests" to requests(row,nativeMore)))
+            return JsonObject(reply+mapOf("query" to query,"result" to JsonObject(result+("data" to data))))
         }
         override fun close()=Unit
     }

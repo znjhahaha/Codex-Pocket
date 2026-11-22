@@ -35,6 +35,10 @@ internal object UsageUiFixtures {
     val response: UsageResponse = UsageResponse.fromJson(usageV070Fixture())
     fun filter(): UsageFilter = UsageFilter.lastDays(7, "UTC", LocalDate.of(2026, 11, 10))
     fun ready(filter: UsageFilter = filter()) = UsageScreenState(filter, UsageSnapshot(filter, response, 1794268800), UsagePhase.Ready, canQuery = true, canPageRequests = true)
+    /** The native ledger on a computer that offers both sources: tokens only, no amounts, outcomes or timings. */
+    fun native(filter: UsageFilter = filter().withSource(UsageSourceKind.NativeCodex)) = UsageScreenState(filter,
+        UsageSnapshot(filter, UsageResponse.fromJson(usageNativeFixtureJson(filter, requests = 1280)), 1794268800), UsagePhase.Ready, canQuery = true, canPageRequests = true,
+        sources = listOf(UsageSourceKind.NativeCodex, UsageSourceKind.CcSwitch))
 
     private fun UsageTotals.weighted(weight: Double) = copy(requests = (requests.toDouble() * weight).toULong(), success = (success.toDouble() * weight).toULong(),
         errors = (errors.toDouble() * weight).toULong(),
@@ -748,6 +752,54 @@ class UsageScreenUiTest {
         }
         assertEquals(2, opened)
         assertTrue(PocketHaptic.Tap in haptics)
+    }
+
+    @Test fun nativeSourceSaysCostIsNotProvidedAndDrawsNothingItDoesNotRecord() {
+        var chosen: UsageFilter? = null
+        content { UsageScreen(UsageUiFixtures.native(), {}, { chosen = it }) }
+        compose.onNodeWithTag("usage-source:native_codex").assertIsSelected()
+        compose.onNodeWithTag("usage-scope").assertTextContains("原生会话", substring = true)
+        scroll("usage-metrics")
+        raw("usage-value:cost").assertTextEquals("未提供费用")
+        raw("usage-value:requests").assertTextEquals("1,280")
+        compose.onNodeWithTag("usage-metric:tokens").assertExists()
+        // No outcome, amount or timing is recorded, so no success rate, cost trend or performance is drawn from zeros.
+        listOf("usage-metric:errors", "usage-metric:ttft", "usage-metric:speed", "usage-trend:Cost", "usage-trend:Latency", "usage-trend:Speed")
+            .forEach { compose.onAllNodesWithTag(it).assertCountEquals(0) }
+        compose.onAllNodesWithText("成功", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("$0", substring = true).assertCountEquals(0)
+        scroll("usage-request:0")
+        compose.onNodeWithTag("usage-request:0").assert(hasAnyDescendant(hasText("200")).not()).assert(hasAnyDescendant(hasText("费用未记录", substring = true)).not())
+        scroll("usage-footer")
+        compose.onNodeWithTag("usage-footer").assertTextContains("未提供费用", substring = true).assertTextContains("不与 CC Switch 合计", substring = true)
+        scroll("usage-metrics")
+        compose.onNodeWithTag("usage-metric:cost").performClick()
+        compose.onNodeWithTag("usage-cost-not-provided").assertExists()
+        compose.onAllNodesWithTag("usage-cost-breakdown").assertCountEquals(0)
+        compose.onAllNodesWithTag("usage-performance").assertCountEquals(0)
+        compose.onAllNodesWithTag("usage-insight-field:success").assertCountEquals(0)
+    }
+
+    @Test fun choosingTheOtherSourceAsksForItsFiguresAndTheNativeFilterSheetOffersOnlyWhatApplies() {
+        var chosen: UsageFilter? = null
+        listOf(1f, 2f).forEach { scale ->
+            content(font = scale) { Box(Modifier.width(320.dp).fillMaxHeight()) { UsageScreen(UsageUiFixtures.native(), {}, { chosen = it }) } }
+            listOf("usage-source:native_codex", "usage-source:cc_switch", "usage-refresh").forEach { tag ->
+                val bounds = compose.onNodeWithTag(tag).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+                assertTrue("$tag ${bounds.height / dp}dp at ${scale}x", bounds.height >= 48 * dp - 1f && bounds.width >= 48 * dp - 1f)
+            }
+            chosen = null
+            compose.onNodeWithTag("usage-source:cc_switch").assertIsNotSelected().performClick()
+            assertEquals(UsageSourceKind.CcSwitch, chosen!!.source)
+            assertEquals(UsageUiFixtures.native().filter.startDate, chosen!!.startDate)
+        }
+        content { UsageScreen(UsageUiFixtures.native(), {}, { chosen = it }) }
+        compose.onNodeWithTag("usage-filters-button").performClick()
+        listOf("usage-filter-app:claude", "usage-filter-source:codex_session", "usage-filter-status:error").forEach { compose.onAllNodesWithTag(it).assertCountEquals(0) }
+        compose.onNodeWithTag("usage-filter-model").performScrollTo().performTextInput("gpt-5.2-codex")
+        compose.onNodeWithTag("usage-filter-apply").performClick()
+        assertEquals(UsageSourceKind.NativeCodex, chosen!!.source)
+        assertEquals("gpt-5.2-codex", chosen!!.model)
     }
 
     @Test fun narrowLargeFontLightAndDarkRemainInsideCards() {

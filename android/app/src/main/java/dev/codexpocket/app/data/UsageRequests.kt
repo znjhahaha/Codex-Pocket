@@ -17,7 +17,7 @@ data class UsageRequestPage(val limit: Int = 50, val cursor: UsageRequestCursor?
 }
 data class UsageRequestDetail(
     val requestId: String, val createdAt: Long, val providerId: String, val providerName: String?, val model: String,
-    val sessionId: String?, val sessionTitle: String?, val statusCode: Int, val tokens: UsageTokens?, val costUsd: String?,
+    val sessionId: String?, val sessionTitle: String?, val statusCode: Int?, val tokens: UsageTokens?, val costUsd: String?,
     val ttftMs: ULong?, val latencyMs: ULong?, val tokensPerSecond: Double?,
 ) {
     val sessionLabel: String get() = sessionId?.let { sessionTitle?.takeIf(String::isNotBlank) ?: "会话 ${usageShortId(it)}" } ?: "会话未记录"

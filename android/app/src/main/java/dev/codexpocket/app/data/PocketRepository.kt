@@ -526,7 +526,10 @@ class PocketRepository(
     private val usageCache = object : LinkedHashMap<UsageFilter, UsageSnapshot>(16, .75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<UsageFilter, UsageSnapshot>?): Boolean = size > 16
     }
-    fun loadUsage(filter: UsageFilter = _state.value.usage.filter, refresh: Boolean = false): Job {
+    fun loadUsage(requested: UsageFilter = _state.value.usage.filter, refresh: Boolean = false): Job {
+        // A computer that does not keep the native ledger is asked for the source it does have.
+        val filter = if (requested.source == UsageSourceKind.NativeCodex && _state.value.online && "usage.v2" !in _state.value.capabilities)
+            requested.withSource(UsageSourceKind.CcSwitch) else requested
         val selected = pair?.computerId
         val transport = client
         val revision = usageRevision.incrementAndGet()
@@ -538,26 +541,31 @@ class PocketRepository(
             usageCache[filter]
         }
         val capabilities = _state.value.capabilities
-        val dashboard = "usage/dashboard/read" in capabilities
+        // The native ledger exists only behind usage v2; CC Switch keeps the calls every desktop version answers.
+        val native = filter.source == UsageSourceKind.NativeCodex
+        val v2 = "usage.v2" in capabilities
+        val sources = if (v2) listOf(UsageSourceKind.NativeCodex, UsageSourceKind.CcSwitch) else listOf(UsageSourceKind.CcSwitch)
+        val dashboard = if (native) v2 else "usage/dashboard/read" in capabilities
         val canQuery = selected != null && _state.value.online && (dashboard || "usage/read" in capabilities)
-        val canPage = dashboard && "usage/requests/read" in capabilities
+        val canPage = dashboard && (native || "usage/requests/read" in capabilities)
         val advancedFilter = filter.sessionId != null || filter.sessionPage.offset != 0
-        val supported = dashboard || !advancedFilter
+        val supported = if (native) v2 else dashboard || !advancedFilter
         _state.update { it.copy(usage = UsageScreenState(filter, cached,
             phase = when { selected == null -> UsagePhase.NotConnected; !it.online -> UsagePhase.Offline;
                 !canQuery || !supported -> UsagePhase.UnsupportedHelper; cached == null -> UsagePhase.Loading; else -> UsagePhase.Ready },
-            refreshing = canQuery && supported, canQuery = canQuery && supported, cached = cached != null, canPageRequests = canQuery && canPage)) }
+            refreshing = canQuery && supported, canQuery = canQuery && supported, cached = cached != null, canPageRequests = canQuery && canPage, sources = sources)) }
         return scope.launch {
             if (!canQuery || !supported || transport == null) return@launch
             try {
                 val query = if (dashboard) filter.toJson() else filter.legacyJson()
-                val raw = transport.request(if (dashboard) "usage/dashboard/read" else "usage/read",
+                val raw = transport.request(if (native) "usage/v2/read" else if (dashboard) "usage/dashboard/read" else "usage/read",
                     buildJsonObject {
-                        put("source_id", "cc_switch"); put("query", query)
-                        if (refresh && "usage/refresh" in capabilities) put("refresh", true)
+                        if (native) put("source", filter.source.wire) else put("source_id", "cc_switch")
+                        put("query", query)
+                        if (refresh && (native || "usage/refresh" in capabilities)) put("refresh", true)
                     }, timeoutMillis = 8000).asObject()
                 val response = UsageResponse.fromJson(raw)
-                require(response.source.appType == filter.appType && response.source.dataSource == filter.dataSource &&
+                require(response.source.kind == filter.source.wire && response.source.appType == filter.appType && response.source.dataSource == filter.dataSource &&
                     (response.query == null || usageQueryMatches(response.query, filter.toJson())))
                 if (client !== transport || pair?.computerId != selected || revision != usageRevision.get()) return@launch
                 if (!_state.value.online) {
@@ -567,7 +575,7 @@ class PocketRepository(
                 val sampled = response.cache?.sampledAt ?: (System.currentTimeMillis() / 1000)
                 val snapshot = response.data?.let { UsageSnapshot(filter, response, sampled) }
                 if (snapshot != null) synchronized(usageCache) { usageCache[filter] = snapshot }
-                _state.update { it.copy(usage = UsageScreenState(filter, snapshot ?: cached, response.phase,
+                _state.update { it.copy(usage = UsageScreenState(filter, snapshot ?: cached, response.phase, sources = sources,
                     refreshing = false, canQuery = true, cached = response.cache?.state == "stale" || snapshot == null && cached != null, canPageRequests = canPage,
                     observedSchemaVersion = response.source.schemaVersion,
                     failureCode = response.errors.firstOrNull { error -> error.code in setOf("database_missing", "database_locked", "unsupported_schema", "database_corrupt", "invalid_path", "query_limit", "arithmetic_overflow", "invalid_row", "database_unavailable", "backend_busy", "backend_failed") }?.code)) }
@@ -597,8 +605,13 @@ class PocketRepository(
             usageRequestRevision.get() == revision && _state.value.usage.filter == filter
         return scope.launch {
             try {
-                val response = parseUsageRequests(transport.request("usage/requests/read", buildJsonObject { put("source_id", "cc_switch"); put("query", query) }, timeoutMillis = 8000).asObject())
-                require(usageQueryMatches(response.query, query) && response.source.appType == filter.appType && response.source.dataSource == filter.dataSource)
+                val native = filter.source == UsageSourceKind.NativeCodex
+                val response = parseUsageRequests(transport.request(if (native) "usage/v2/requests/read" else "usage/requests/read", buildJsonObject {
+                    if (native) put("source", filter.source.wire) else put("source_id", "cc_switch")
+                    put("query", query)
+                }, timeoutMillis = 8000).asObject())
+                require(usageQueryMatches(response.query, query) && response.source.kind == filter.source.wire &&
+                    response.source.appType == filter.appType && response.source.dataSource == filter.dataSource)
                 if (!current()) return@launch
                 if (!_state.value.online) {
                     _state.update { it.copy(usage = it.usage.copy(requestLoading = false, requestError = "电脑已离线", canPageRequests = false)) }

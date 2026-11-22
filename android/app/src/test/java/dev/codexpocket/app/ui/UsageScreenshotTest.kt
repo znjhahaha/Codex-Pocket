@@ -57,6 +57,13 @@ class UsageScreenshotTest {
         }
     }
 
+    @Test @Config(qualifiers = "w360dp-h1900dp-xxhdpi")
+    fun nativeSource() {
+        val native = week.withSource(UsageSourceKind.NativeCodex)
+        render("native-light") { UsageScreen(UsageUiFixtures.native(native), {}, {}, contentPadding = padding) }
+        render("native-dark", "dark") { UsageScreen(UsageUiFixtures.native(native), {}, {}, contentPadding = padding) }
+    }
+
     @Test @Config(qualifiers = "w360dp-h2500dp-xxhdpi")
     fun dataLight() {
         render("data-light") { UsageScreen(UsageUiFixtures.rich(week, sampled), {}, {}, contentPadding = padding, onRequests = {}) }

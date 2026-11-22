@@ -25,20 +25,23 @@ internal fun usageAppLabel(app: String) = when (app) { "codex" -> "Codex"; "clau
 
 /** Where the figures come from and the one way to read them again. Glass, because it floats over the list. */
 @Composable
-internal fun UsageSourceCapsule(busy: Boolean, canRefresh: Boolean, onRefresh: () -> Unit, modifier: Modifier = Modifier) {
+internal fun UsageSourceCapsule(busy: Boolean, canRefresh: Boolean, onRefresh: () -> Unit, sources: List<UsageSourceKind> = listOf(UsageSourceKind.CcSwitch),
+    current: UsageSourceKind = UsageSourceKind.CcSwitch, onSource: (UsageSourceKind) -> Unit = {}, modifier: Modifier = Modifier) {
     val c = Pocket.colors
     val width = rememberUsageTextWidth()
     // The figures belong to the selected execution location; where the app can switch it, this is the switch.
     val target = LocalExecutionLocation.current
     val choose = LocalExecutionLocationPicker.current
     val place = target?.label ?: "这台电脑"
-    val source = "CC Switch"
+    val source = current.label
+    // Two ledgers that are never added together: choosing one replaces the figures, it does not filter them.
+    val choice = sources.size > 1
     BoxWithConstraints(modifier.fillMaxWidth()) {
         // One row takes both labels, the refresh target, the hairlines and the gaps; the glyph and the wider gaps only when there is room for them too.
         val labels = width(place, Pocket.type.label) + width(source, Pocket.type.labelSmall) + if (choose != null) 20.dp else 0.dp
         val roomy = labels + 156.dp <= maxWidth
         // Text too large for one row puts the source under the location instead of cutting either short.
-        val stacked = labels + 110.dp > maxWidth
+        val stacked = choice || labels + 110.dp > maxWidth
         val location = @Composable { part: Modifier ->
             val press = if (choose == null) Modifier else Modifier.heightIn(min = 48.dp).clip(PocketRadii.capsule)
                 .pocketPressable(onClickLabel = "切换执行位置", haptic = PocketHaptic.Tap, onClick = choose).testTag("usage-location")
@@ -51,7 +54,9 @@ internal fun UsageSourceCapsule(busy: Boolean, canRefresh: Boolean, onRefresh: (
         }
         // The only source this state offers: shown as the selected one, with nothing to switch to.
         val chosen = @Composable {
-            Box(Modifier.clip(PocketRadii.capsule).background(c.accentSoft).testTag("usage-source:cc_switch")
+            if (choice) UsageSegmented(sources.map { UsageSegment(it.label, "usage-source:${it.wire}") }, sources.indexOf(current),
+                { onSource(sources[it]) }, Modifier.padding(end = 14.dp).semantics { contentDescription = "数据来源" })
+            else Box(Modifier.clip(PocketRadii.capsule).background(c.accentSoft).testTag("usage-source:${current.wire}")
                 .semantics(mergeDescendants = true) { contentDescription = "数据来源 $source"; selected = true }
                 .padding(horizontal = if (roomy) 11.dp else 9.dp, vertical = 5.dp)) {
                 PText(source, style = Pocket.type.labelSmall, color = c.onAccentSoft, maxLines = 1, softWrap = false)
@@ -98,7 +103,7 @@ internal fun UsageFilterBar(f: UsageFilter, onOpen: () -> Unit, onFilter: (Usage
     val preset = presets.indexOfFirst { (days, _) -> f.endDate == today && f.startDate == today.minusDays(days - 1L) }
     val segments = presets.map { (days, label) -> UsageSegment(label, "usage-date:$days") } + UsageSegment("自定义", "usage-filter-open", haptic = null)
     val range = if (f.startDate == f.endDate) f.endDate.toString().takeLast(5) else "${f.startDate.toString().takeLast(5)} – ${f.endDate.toString().takeLast(5)}"
-    val scope = "$range · ${usageAppLabel(f.appType)} · ${f.dataSource.label}"
+    val scope = "$range · ${usageAppLabel(f.appType)} · ${if (f.source == UsageSourceKind.NativeCodex) "原生会话" else f.dataSource.label}"
     val dates = @Composable { modifier: Modifier ->
         UsageSegmented(segments, if (preset >= 0) preset else presets.size, { index ->
             if (index == presets.size) onOpen()

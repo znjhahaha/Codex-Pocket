@@ -13,6 +13,12 @@ import java.time.temporal.ChronoUnit
 enum class UsageDataSource(val wire: String, val label: String) {
     Proxy("proxy", "代理请求"), CodexSession("codex_session", "Codex 会话导入"),
 }
+/** Whose record the figures are read from. The two are separate ledgers and are never added together. */
+enum class UsageSourceKind(val wire: String, val label: String) {
+    CcSwitch("cc_switch", "CC Switch"), NativeCodex("native_codex", "原生 Codex"),
+}
+/** What a source records at all. Absent means the v1 CC Switch contract, which records everything. */
+data class UsageCapabilities(val cost: Boolean = true, val performance: Boolean = true, val status: Boolean = true)
 enum class UsageStatusFilter(val wire: String, val label: String) {
     All("all", "全部状态"), Success("success", "成功"), Error("error", "失败"),
 }
@@ -35,11 +41,14 @@ data class UsageFilter(
     val modelPage: UsagePage = UsagePage(),
     val sessionId: String? = null,
     val sessionPage: UsagePage = UsagePage(),
+    val source: UsageSourceKind = UsageSourceKind.CcSwitch,
 ) {
     init {
         require(ChronoUnit.DAYS.between(startDate, endDate) in 0..30) { "Choose 1 to 31 days" }
         ZoneId.of(zoneId)
         require(appType in apps) { "Unsupported usage app" }
+        // The native ledger is Codex only and has neither an import source nor a per-request status.
+        require(source != UsageSourceKind.NativeCodex || (appType == "codex" && dataSource == UsageDataSource.Proxy && status == UsageStatusFilter.All)) { "Filter does not apply to native usage" }
         require(dataSource != UsageDataSource.CodexSession || appType == "codex") { "Session source requires Codex" }
         listOf(providerId, model, sessionId).forEach { require(it == null || (it.toByteArray(Charsets.UTF_8).size in 1..256 && '\u0000' !in it)) { "Invalid usage identity" } }
     }
@@ -56,6 +65,10 @@ data class UsageFilter(
     private fun reset() = copy(providerPage = providerPage.copy(offset = 0), modelPage = modelPage.copy(offset = 0), sessionPage = sessionPage.copy(offset = 0))
     fun withDates(start: LocalDate, end: LocalDate) = copy(startDate = start, endDate = end).reset()
     fun withZone(zone: String) = copy(zoneId = zone).reset()
+    /** Providers, models and sessions are named differently by each source, so those choices do not carry over. */
+    fun withSource(value: UsageSourceKind) = if (value == source) this else if (value == UsageSourceKind.NativeCodex)
+        copy(source = value, appType = "codex", dataSource = UsageDataSource.Proxy, status = UsageStatusFilter.All, providerId = null, model = null, sessionId = null).reset()
+        else copy(source = value, providerId = null, model = null, sessionId = null).reset()
     fun withAppType(app: String) = copy(appType = app,
         dataSource = if (app == "codex") dataSource else UsageDataSource.Proxy, providerId = null, model = null, sessionId = null).reset()
     fun withDataSource(source: UsageDataSource) = copy(dataSource = source, providerId = null, model = null, sessionId = null).reset()
@@ -107,9 +120,11 @@ data class UsageScreenState(
     val requestError: String? = null,
     val observedSchemaVersion: Long? = null,
     val failureCode: String? = null,
+    /** Sources this computer can be asked for; more than one only when it announces usage v2. */
+    val sources: List<UsageSourceKind> = listOf(UsageSourceKind.CcSwitch),
 ) {
     val visibleSnapshot: UsageSnapshot? get() = snapshot?.takeIf {
-        it.filter == filter && it.response.source.appType == filter.appType && it.response.source.dataSource == filter.dataSource &&
+        it.filter == filter && it.response.source.kind == filter.source.wire && it.response.source.appType == filter.appType && it.response.source.dataSource == filter.dataSource &&
             (it.response.query == null || usageQueryMatches(it.response.query, filter.toJson()))
     }
     val visibleRequests: UsageRequestDetailsPage? get() = visibleSnapshot?.response?.data?.recentRequests?.let { first ->
@@ -149,7 +164,7 @@ data class UsageData(val totals: UsageTotals, val trend: List<UsageTrendBucket>,
     val sessionGroups: UsageGroupPage<UsageSessionGroup>? = null, val recentRequests: UsageRequestDetailsPage? = null)
 
 data class UsageResponse(val availability: String, val coverage: UsageCoverage, val source: UsageSource, val errors: List<UsageError>,
-    val data: UsageData?, val cache: UsageCache? = null, val query: JsonObject? = null) {
+    val data: UsageData?, val cache: UsageCache? = null, val query: JsonObject? = null, val capabilities: UsageCapabilities = UsageCapabilities()) {
     val phase: UsagePhase get() = when (availability) {
         "ready" -> UsagePhase.Ready; "missing" -> UsagePhase.Missing; "locked" -> UsagePhase.Locked
         "unsupported_schema" -> UsagePhase.UnsupportedSchema; "invalid_path" -> UsagePhase.InvalidPath
@@ -157,13 +172,17 @@ data class UsageResponse(val availability: String, val coverage: UsageCoverage, 
         else -> if (errors.any { it.code == "database_corrupt" }) UsagePhase.Corrupt else UsagePhase.Failed
     }
     companion object {
-        /** Accepts the statistics result or the finalized schema=1 RPC envelope. No lossy defaults. */
+        /** Accepts the statistics result, the schema=1 RPC envelope, or the source-naming schema=2 one. No lossy defaults. */
         fun fromJson(json: JsonObject): UsageResponse {
             if ("result" in json) {
                 json.keysRequired("schema query result cache")
-                require(json.long("schema") == 1L) { "Unsupported usage RPC schema" }
+                val schema = json.long("schema")
+                require(schema == 1L || schema == 2L) { "Unsupported usage RPC schema" }
                 val q = json.usageObject("query").also(::validateQuery)
-                return parseResponse(json.usageObject("result")).copy(cache = parseCache(json.usageObject("cache")), query = q)
+                val response = parseResponse(json.usageObject("result")).copy(cache = parseCache(json.usageObject("cache")), query = q)
+                if (schema == 2L) require(json.string("source") == response.source.kind) { "Usage source mismatch" }
+                else require(response.source.kind == UsageSourceKind.CcSwitch.wire) { "Usage source mismatch" }
+                return response
             }
             return parseResponse(json)
         }
@@ -215,22 +234,43 @@ private fun parseResponse(j: JsonObject): UsageResponse {
     j.keysRequired("availability coverage source errors data")
     val availability = j.string("availability")
     require(availability in setOf("ready", "missing", "locked", "unsupported_schema", "invalid_path", "rejected", "unavailable"))
+    val s = j.usageObject("source")
+    s.keysRequired("kind table app_type data_source schema_version")
+    val native = s.string("kind") == UsageSourceKind.NativeCodex.wire
     val c = j.usageObject("coverage")
     c.keysRequired("scope complete matched_rows first_observed_at last_observed_at rollups_present rollups_included cost_known_rows cost_missing_rows cost_invalid_rows zero_cost_rows token_invalid_rows confirmed_free_rows zero_cost_interpretation")
-    require(c.string("scope") == "retained_detail_only" && !c.bool("complete") && !c.bool("rollups_included"))
-    require(c.string("zero_cost_interpretation") == "stored_zero_free_status_unknown" && c.field("confirmed_free_rows") == JsonNull)
+    require(c.string("scope") == (if (native) "native_ledger" else "retained_detail_only") && !c.bool("complete") && !c.bool("rollups_included"))
+    require(c.string("zero_cost_interpretation") == (if (native) "cost_not_provided" else "stored_zero_free_status_unknown") && c.field("confirmed_free_rows") == JsonNull)
     val coverage = UsageCoverage(c.string("scope"), c.bool("complete"), c.unsigned("matched_rows"), c.nullLong("first_observed_at"), c.nullLong("last_observed_at"),
         c.bool("rollups_present"), c.bool("rollups_included"), c.unsigned("cost_known_rows"), c.unsigned("cost_missing_rows"), c.unsigned("cost_invalid_rows"),
         c.unsigned("zero_cost_rows"), c.unsigned("token_invalid_rows"), c.nullUnsigned("confirmed_free_rows"), c.string("zero_cost_interpretation"))
-    val s = j.usageObject("source")
-    s.keysRequired("kind table app_type data_source schema_version")
-    require(s.string("kind") == "cc_switch" && s.string("table") == "proxy_request_logs" && s.string("app_type") in UsageFilter.apps)
-    val info = UsageSource(s.string("kind"), s.string("table"), s.string("app_type"), source(s.string("data_source")), s.nullLong("schema_version"))
-    require(info.dataSource != UsageDataSource.CodexSession || info.appType == "codex")
+    val info = parseSource(s)
     val errors = j.usageArray("errors").map { e -> e.asUsageObject().let { it.keysRequired("code message"); UsageError(it.string("code"), it.string("message")) } }
-    val data = if (j.field("data") == JsonNull) null else parseData(j.usageObject("data"))
+    val capabilities = parseCapabilities(j, native)
+    // A source that says it records no amounts must also say so where its figures are read.
+    require(capabilities.cost || availability != "ready" || errors.any { it.code == "cost_not_provided" }) { "Unpriced usage lacks its notice" }
+    val data = if (j.field("data") == JsonNull) null else parseData(j.usageObject("data"), capabilities)
     require(availability != "ready" || data != null) { "Ready usage lacks data" }
-    return UsageResponse(availability, coverage, info, errors, data)
+    return UsageResponse(availability, coverage, info, errors, data, capabilities = capabilities)
+}
+private fun parseSource(s: JsonObject): UsageSource {
+    s.keysRequired("kind table app_type data_source schema_version")
+    if (s.string("kind") == UsageSourceKind.NativeCodex.wire) {
+        // The native ledger has no import dimension; its null is not one of CC Switch's sources.
+        require(s.string("table") == "native_usage_events" && s.string("app_type") == "codex" && s.field("data_source") == JsonNull)
+        return UsageSource(s.string("kind"), s.string("table"), "codex", UsageDataSource.Proxy, s.nullLong("schema_version"))
+    }
+    require(s.string("kind") == "cc_switch" && s.string("table") == "proxy_request_logs" && s.string("app_type") in UsageFilter.apps)
+    return UsageSource(s.string("kind"), s.string("table"), s.string("app_type"), source(s.string("data_source")), s.nullLong("schema_version")).also {
+        require(it.dataSource != UsageDataSource.CodexSession || it.appType == "codex")
+    }
+}
+private fun parseCapabilities(result: JsonObject, native: Boolean): UsageCapabilities {
+    val c = result["capabilities"]?.takeUnless { it == JsonNull }?.asUsageObject()
+    require(c != null || !native) { "Native usage must state what it records" }
+    if (c == null) return UsageCapabilities()
+    c.keysRequired("cost performance status")
+    return UsageCapabilities(c.bool("cost"), c.bool("performance"), c.bool("status"))
 }
 private fun parseCache(j: JsonObject): UsageCache {
     j.keysRequired("state sampled_at age_seconds ttl_seconds stale_reason")
@@ -254,12 +294,25 @@ private fun parseSpeed(j: JsonObject): UsageSpeedMetric {
         require((it.sampleRows == 0uL) == (it.tokensPerSecond == null))
     }
 }
-private fun parseTotals(j: JsonObject): UsageTotals {
+/** What a source does not record arrives as null and stays "not recorded": zero known rows, never a zero amount. */
+private fun parseTotals(j: JsonObject, can: UsageCapabilities): UsageTotals {
     j.keysRequired("requests success errors tokens costs performance")
     val t = j.usageObject("tokens"); t.keysRequired("fresh_input cache_read cache_write output total invalid_rows")
     val tokens = UsageTokens(t.unsigned("fresh_input"), t.unsigned("cache_read"), t.unsigned("cache_write"), t.unsigned("output"), t.unsigned("total"), t.unsigned("invalid_rows"))
-    val c = j.usageObject("costs"); c.keysRequired("input output cache_read cache_write total")
-    val costs = UsageCosts(parseCost(c.usageObject("input")), parseCost(c.usageObject("output")), parseCost(c.usageObject("cache_read")), parseCost(c.usageObject("cache_write")), parseCost(c.usageObject("total")))
+    val requests = j.unsigned("requests")
+    if (!can.status) require(j.field("success") == JsonNull && j.field("errors") == JsonNull) { "Unrecorded status has figures" }
+    val costs = if (!can.cost) {
+        require(j.field("costs") == JsonNull) { "Unrecorded cost has figures" }
+        UsageCostAmount("0", 0u, requests, 0u, 0u).let { UsageCosts(it, it, it, it, it) }
+    } else j.usageObject("costs").let { c ->
+        c.keysRequired("input output cache_read cache_write total")
+        UsageCosts(parseCost(c.usageObject("input")), parseCost(c.usageObject("output")), parseCost(c.usageObject("cache_read")), parseCost(c.usageObject("cache_write")), parseCost(c.usageObject("total")))
+    }
+    if (!can.performance) {
+        require(j.field("performance") == JsonNull) { "Unrecorded performance has figures" }
+        return UsageTotals(requests, if (can.status) j.unsigned("success") else 0u, if (can.status) j.unsigned("errors") else 0u, tokens, costs,
+            UsagePerformance("not_recorded", 0u, UsageTimingMetric(), UsageTimingMetric(), UsageSpeedMetric()))
+    }
     val p = j.usageObject("performance"); p.keysRequired("scope success_rows ttft duration output_speed")
     require(p.string("scope") == "successful_proxy_observations")
     val performance = UsagePerformance(p.string("scope"), p.unsigned("success_rows"), parseTiming(p.usageObject("ttft")), parseTiming(p.usageObject("duration")), parseSpeed(p.usageObject("output_speed")))
@@ -267,7 +320,7 @@ private fun parseTotals(j: JsonObject): UsageTotals {
         performance.duration.let { listOf(it.sampleRows, it.missingRows, it.invalidRows, it.excludedRows) },
         performance.outputSpeed.let { listOf(it.sampleRows, it.missingRows, it.invalidRows, it.excludedRows) })
     require(metrics.all { rows -> rows.map { BigInteger(it.toString()) }.fold(BigInteger.ZERO, BigInteger::add) == BigInteger(performance.successRows.toString()) })
-    return UsageTotals(j.unsigned("requests"), j.unsigned("success"), j.unsigned("errors"), tokens, costs, performance)
+    return UsageTotals(requests, if (can.status) j.unsigned("success") else 0u, if (can.status) j.unsigned("errors") else 0u, tokens, costs, performance)
 }
 private fun <T> parsePage(j: JsonObject, item: (JsonObject) -> T): UsageGroupPage<T> {
     j.keysRequired("items offset limit total_groups has_more")
@@ -276,8 +329,9 @@ private fun <T> parsePage(j: JsonObject, item: (JsonObject) -> T): UsageGroupPag
     require(items.size <= limit && j.int("total_groups") <= 10000)
     return UsageGroupPage(items, offset, limit, j.int("total_groups"), j.bool("has_more"))
 }
-private fun parseData(j: JsonObject): UsageData {
+private fun parseData(j: JsonObject, can: UsageCapabilities): UsageData {
     j.keysRequired("totals trend provider_groups model_groups")
+    fun parseTotals(totals: JsonObject) = parseTotals(totals, can)
     val trend = j.usageArray("trend").map { e -> e.asUsageObject().let {
         it.keysRequired("start_at end_at totals")
         UsageTrendBucket(it.long("start_at"), it.long("end_at"), parseTotals(it.usageObject("totals"))).also { b -> require(b.endAt > b.startAt) }
@@ -288,7 +342,9 @@ private fun parseData(j: JsonObject): UsageData {
         parsePage(j.usageObject("model_groups")) { it.keysRequired("model totals"); UsageModelGroup(it.string("model"), parseTotals(it.usageObject("totals"))) },
         j["session_groups"]?.takeUnless { it == JsonNull }?.let { parsePage(it.asUsageObject()) { g ->
             g.keysRequired("session_id title totals"); UsageSessionGroup(g.string("session_id"), g.nullString("title"), parseTotals(g.usageObject("totals"))) } },
-        j["recent_requests"]?.takeUnless { it == JsonNull }?.let { parseRequests(it.asUsageObject()) })
+        j["recent_requests"]?.takeUnless { it == JsonNull }?.let { parseRequests(it.asUsageObject()) }?.also { page ->
+            require(!can.status || page.items.all { it.statusCode != null }) { "Request lacks its status" }
+        })
 }
 private fun validateQuery(j: JsonObject) {
     j.keysRequired("start_at end_at bucket_edges filters provider_page model_page")
@@ -330,7 +386,7 @@ private fun parseRequests(j: JsonObject): UsageRequestDetailsPage {
     val items = j.usageArray("items").map { e -> e.asUsageObject().let { r ->
         r.keysRequired("request_id created_at provider_id provider_name model session_id session_title status_code tokens cost_usd ttft_ms latency_ms tokens_per_second")
         UsageRequestDetail(r.string("request_id"), r.long("created_at"), r.string("provider_id"), r.nullString("provider_name"), r.string("model"),
-            r.nullString("session_id"), r.nullString("session_title"), r.int("status_code"),
+            r.nullString("session_id"), r.nullString("session_title"), if (r.field("status_code") == JsonNull) null else r.int("status_code"),
             r["tokens"]?.takeUnless { it == JsonNull }?.let { parseRequestTokens(it.asUsageObject()) },
             r.nullString("cost_usd")?.also { decimal(it) }, r.nullUnsigned("ttft_ms"), r.nullUnsigned("latency_ms"), r.nullDouble("tokens_per_second"))
     } }
@@ -344,14 +400,17 @@ private fun parseRequests(j: JsonObject): UsageRequestDetailsPage {
     return UsageRequestDetailsPage(items, limit, hasMore, cursor)
 }
 fun parseUsageRequests(json: JsonObject): UsageRequestsResponse {
-    json.keysRequired("schema query result cache"); require(json.long("schema") == 1L)
+    json.keysRequired("schema query result cache")
+    val schema = json.long("schema"); require(schema == 1L || schema == 2L)
     val q = json.usageObject("query").also(::validateQuery)
     val result = json.usageObject("result"); result.keysRequired("availability source errors data")
-    val infoJson = result.usageObject("source")
-    require(infoJson.string("kind") == "cc_switch" && infoJson.string("table") == "proxy_request_logs")
-    val info = UsageSource(infoJson.string("kind"), infoJson.string("table"), infoJson.string("app_type"), source(infoJson.string("data_source")), infoJson.nullLong("schema_version"))
+    val info = parseSource(result.usageObject("source"))
+    require(if (schema == 2L) json.string("source") == info.kind else info.kind == UsageSourceKind.CcSwitch.wire) { "Usage source mismatch" }
+    val can = parseCapabilities(result, info.kind == UsageSourceKind.NativeCodex.wire)
     val data = result["data"]?.takeUnless { it == JsonNull }?.asUsageObject()?.let { parseRequests(it.usageObject("requests")) }
     val availability = result.string("availability")
     require(availability != "ready" || data != null)
+    // Only a source without a status dimension may leave a request's status unstated.
+    require(!can.status || data == null || data.items.all { it.statusCode != null }) { "Request lacks its status" }
     return UsageRequestsResponse(q, info, availability, data, parseCache(json.usageObject("cache")))
 }

@@ -64,16 +64,17 @@ internal enum class UsageGrouping(val key: String, val label: String) { Provider
     }
 }
 
-@Composable internal fun UsageRequestRow(request: UsageRequestDetail, zone: String, tag: String, first: Boolean, last: Boolean, onDetail: () -> Unit) {
+@Composable internal fun UsageRequestRow(request: UsageRequestDetail, zone: String, tag: String, first: Boolean, last: Boolean,
+    can: UsageCapabilities = UsageCapabilities(), onDetail: () -> Unit) {
     val ok = request.statusCode in 200..299
     UsageListRow(first, last, onDetail, Modifier.testTag(tag), onClickLabel = "查看请求明细") {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             PText(request.model, Modifier.weight(1f), style = Pocket.type.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            PBadge(request.statusCode.toString(), tone = if (ok) PTone.Positive else PTone.Danger)
+            request.statusCode?.let { PBadge(it.toString(), tone = if (ok) PTone.Positive else PTone.Danger) }
         }
         UsageNote(usageFacts(listOf(request.providerName ?: usageShortId(request.providerId), usageTime(request.createdAt, zone).takeLast(14))))
-        UsageNote(usageFacts(listOf(request.tokens?.total?.let { "${usageCompact(it)} token" } ?: "令牌未记录",
-            request.costUsd?.let { usageMoney(BigDecimal(it)) } ?: "费用未记录")))
+        UsageNote(usageFacts(listOfNotNull(request.tokens?.total?.let { "${usageCompact(it)} token" } ?: "令牌未记录",
+            request.costUsd?.let { usageMoney(BigDecimal(it)) } ?: "费用未记录".takeIf { can.cost })))
         UsageNote(request.sessionLabel, maxLines = 2)
     }
 }
@@ -85,7 +86,7 @@ internal enum class UsageGrouping(val key: String, val label: String) { Provider
     }
 }
 
-@Composable internal fun UsageRequestSheet(r: UsageRequestDetail, zone: String, onDismiss: () -> Unit) {
+@Composable internal fun UsageRequestSheet(r: UsageRequestDetail, zone: String, can: UsageCapabilities = UsageCapabilities(), onDismiss: () -> Unit) {
     PSheet("请求明细", onDismiss, subtitle = usageTime(r.createdAt, zone) + " · " + zone, maxHeightFraction = .8f) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 8.dp).testTag("usage-request-detail"),
             verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -95,18 +96,20 @@ internal enum class UsageGrouping(val key: String, val label: String) { Provider
             }
             SelectionContainer {
                 PCard(spacing = 8.dp) {
-                    UsageField("状态", r.statusCode.toString(), "usage-request-field:status")
+                    r.statusCode?.let { UsageField("状态", it.toString(), "usage-request-field:status") }
                     UsageField("上游", r.providerName ?: r.providerId, "usage-request-field:provider")
-                    UsageField("费用", r.costUsd?.let { "USD $it" } ?: "未记录", "usage-request-field:cost")
+                    UsageField("费用", r.costUsd?.let { "USD $it" } ?: if (can.cost) "未记录" else "未提供费用", "usage-request-field:cost")
                     r.tokens?.let { t ->
                         UsageField("输入", usageCount(t.freshInput), "usage-request-field:input")
                         UsageField("缓存读", usageCount(t.cacheRead), "usage-request-field:cache-read")
                         UsageField("缓存写", usageCount(t.cacheWrite), "usage-request-field:cache-write")
                         UsageField("输出", usageCount(t.output), "usage-request-field:output")
                     } ?: UsageField("令牌", "未记录或无效", "usage-request-field:tokens")
-                    UsageField("首字耗时", r.ttftMs?.let { "$it ms" } ?: "未记录", "usage-request-field:ttft")
-                    UsageField("请求耗时", r.latencyMs?.let { "$it ms" } ?: "未记录", "usage-request-field:latency")
-                    UsageField("输出速度", r.tokensPerSecond?.let { usageDecimal(it) + " tok/s" } ?: "未记录", "usage-request-field:speed")
+                    if (can.performance) {
+                        UsageField("首字耗时", r.ttftMs?.let { "$it ms" } ?: "未记录", "usage-request-field:ttft")
+                        UsageField("请求耗时", r.latencyMs?.let { "$it ms" } ?: "未记录", "usage-request-field:latency")
+                        UsageField("输出速度", r.tokensPerSecond?.let { usageDecimal(it) + " tok/s" } ?: "未记录", "usage-request-field:speed")
+                    }
                 }
             }
             SelectionContainer {
@@ -120,22 +123,29 @@ internal enum class UsageGrouping(val key: String, val label: String) { Provider
 }
 
 /** Every saved total behind a figure or a day: counts, the stored amounts and the measured performance. */
-@Composable internal fun UsageInsightSheet(title: String, totals: UsageTotals, source: UsageDataSource, onDismiss: () -> Unit) {
+@Composable internal fun UsageInsightSheet(title: String, totals: UsageTotals, source: UsageDataSource, can: UsageCapabilities = UsageCapabilities(),
+    onDismiss: () -> Unit) {
     PSheet(title, onDismiss, maxHeightFraction = .8f) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 8.dp).testTag("usage-insight-detail"),
             verticalArrangement = Arrangement.spacedBy(10.dp)) {
             PCard(spacing = 8.dp) {
                 UsageField("调用", usageCount(totals.requests), "usage-insight-field:requests")
-                UsageField("成功", usageCount(totals.success), "usage-insight-field:success")
-                UsageField("失败", usageCount(totals.errors), "usage-insight-field:errors")
+                if (can.status) {
+                    UsageField("成功", usageCount(totals.success), "usage-insight-field:success")
+                    UsageField("失败", usageCount(totals.errors), "usage-insight-field:errors")
+                }
                 PDivider()
                 UsageField("输入", usageCount(totals.tokens.freshInput), "usage-insight-field:input")
                 UsageField("缓存读", usageCount(totals.tokens.cacheRead), "usage-insight-field:cache-read")
                 UsageField("缓存写", usageCount(totals.tokens.cacheWrite), "usage-insight-field:cache-write")
                 UsageField("输出", usageCount(totals.tokens.output), "usage-insight-field:output")
             }
-            UsageCostCard(totals.costs)
-            UsagePerformanceCard(totals.performance, source)
+            if (can.cost) UsageCostCard(totals.costs)
+            else PCard(Modifier.testTag("usage-cost-not-provided"), spacing = 6.dp) {
+                UsageHeading("费用")
+                UsageNote("未提供费用：此来源只记录令牌，不记录金额；这里不按令牌估算。")
+            }
+            if (can.performance) UsagePerformanceCard(totals.performance, source)
         }
     }
 }
@@ -181,9 +191,22 @@ internal enum class UsageGrouping(val key: String, val label: String) { Provider
     }
 }
 
-@Composable internal fun UsageCoverageSheet(c: UsageCoverage, zone: String, onDismiss: () -> Unit) {
+@Composable internal fun UsageCoverageSheet(c: UsageCoverage, zone: String, native: Boolean = false, onDismiss: () -> Unit) {
     PSheet("统计口径", onDismiss, maxHeightFraction = .8f) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 8.dp)) {
+            // The native ledger has its own account of what it covers; CC Switch's cost and rollup rows do not apply to it.
+            if (native) PCard(Modifier.testTag("usage-coverage"), spacing = 8.dp) {
+                UsageHeading("记录覆盖")
+                UsageNote("只统计这台电脑在运行时观察到、或保留在本机原生历史中的 Codex 用量；更早或已清理的会话不在其中。不与 CC Switch 合计。")
+                PDivider()
+                UsageField("匹配记录", "${usageCount(c.matchedRows)} 条", "usage-coverage-field:matched")
+                UsageField("费用", "未提供", "usage-coverage-field:cost")
+                UsageField("无效 token 行", usageCount(c.tokenInvalidRows), "usage-coverage-field:token-invalid")
+                UsageField("首次记录", c.firstObservedAt?.let { usageTime(it, zone) } ?: "未知", "usage-coverage-field:first")
+                UsageField("最后记录", c.lastObservedAt?.let { usageTime(it, zone) } ?: "未知", "usage-coverage-field:last")
+                PDivider()
+                UsageNote("同一会话的重复上报、历史导入与恢复或分叉继承的部分只计一次。")
+            } else
             PCard(Modifier.testTag("usage-coverage"), spacing = 8.dp) {
                 UsageHeading("记录覆盖")
                 UsageNote("仅统计保留明细，历史可能不完整；未混加日汇总或其他来源。")
