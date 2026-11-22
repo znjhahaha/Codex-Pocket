@@ -45,7 +45,7 @@ class AssistantRecoveryTest {
         assertEquals(JsonPrimitive("n:1"),action.params["requestId"])
         assertEquals(JsonPrimitive(false),action.params["response"]!!.jsonObject["Approval"]!!.jsonObject["approved"])
         assertEquals(AssistantOperationPhase.Completed,snapshot.operations.single().phase)
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
     }
     @Test fun offlinePendingAndFailedReadsDisableRecoveryWithoutAutomaticSend() {
         var online by mutableStateOf(false)
@@ -56,9 +56,10 @@ class AssistantRecoveryTest {
         button.assertIsNotEnabled()
         compose.runOnIdle {online=true;state=state.copy(pendingActions=setOf("assistant/respond:original"))}
         button.assertIsNotEnabled()
-        compose.runOnIdle {state=state.copy(pendingActions=emptySet(),error="助理状态暂未读取")}
+        // A failed read is carried in readError; the recovery stays fenced until a fresh read.
+        compose.runOnIdle {state=state.copy(pendingActions=emptySet(),readError="助理状态暂未读取")}
         button.assertIsNotEnabled()
-        compose.runOnIdle {state=state.copy(error=snapshot.preparationIssue)}
+        compose.runOnIdle {state=state.copy(readError=null)}
         button.assertIsEnabled()
         assertTrue(actions.isEmpty())
     }

@@ -35,12 +35,12 @@ class AssistantScreenTest {
         AssistantSettings("认真协助", "简洁", "actual-model", "UTC"),
         listOf(AssistantTask("t","整理项目待办",AssistantTaskStatus.Running,"execution",false,null)),
         listOf(AssistantOperation("execution","Execution","t",AssistantOperationPhase.Running,false,"native-task",null,null)),ready=true)
-    private fun content(state: () -> AssistantUiState, actions: MutableList<AssistantAction>, opens: MutableList<Pair<String,String>> = mutableListOf(), fontScale: Float = 1f, theme: String = "light", modelDirectory: List<NativeModel> = models) {
+    private fun content(state: () -> AssistantUiState, actions: MutableList<AssistantAction>, opens: MutableList<Pair<String,String>> = mutableListOf(), fontScale: Float = 1f, theme: String = "light", modelDirectory: List<NativeModel> = models, connected: () -> Boolean = {true}) {
         compose.activity.runOnUiThread { compose.activity.setContent {
             PocketTheme(theme) {
                 val d = LocalDensity.current
                 CompositionLocalProvider(LocalPocketGlass provides false, LocalDensity provides Density(d.density, fontScale)) {
-                    AssistantScreen(state(),modelDirectory,runtime,project,{actions += it},{r,t -> opens += r to t},{},nowMs=now)
+                    AssistantScreen(state(),modelDirectory,runtime,project,{actions += it},{r,t -> opens += r to t},{},nowMs=now,connected=connected())
                 }
             }
         } }
@@ -66,12 +66,12 @@ class AssistantScreenTest {
     @Test fun disabledEntryRetainsComposerAndOffersPreparationWithoutRuntimeSelection() {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(AssistantSnapshot(enabled=false))},actions)
-        compose.onNodeWithTag("assistant-message-input").performTextInput("保留草稿")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("保留草稿")
         compose.onNodeWithTag("assistant-prepare").performClick()
         assertEquals("assistant/prepare",actions.single().method)
         assertTrue(actions.single().params.isEmpty())
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留草稿")
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留草稿")
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.onNodeWithText("服务已就绪").assertDoesNotExist()
         screenshot("disabled-prepare")
     }
@@ -86,6 +86,8 @@ class AssistantScreenTest {
         compose.onNodeWithText("请整理这个项目的待办").assertExists()
         scroll("assistant-message:a").assertExists()
         screenshot("chat-overview")
+        // The execution's result sits inside its task's card; the full text and the original thread are one page further.
+        compose.expandAssistantTask("t")
         scroll("assistant-result:execution").assertIsDisplayed()
         scroll("assistant-result-detail:execution").performClick()
         scroll("assistant-thread:execution").performClick()
@@ -97,17 +99,17 @@ class AssistantScreenTest {
         val actions = mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot()))
         content({state},actions)
-        compose.onNodeWithTag("assistant-message-input").performTextInput("真实消息")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("真实消息")
         compose.selectAssistantWorkspace("authorized-thread")
-        compose.onNodeWithTag("assistant-send").performClick()
+        compose.onNodeWithTag(AssistantSend).performClick()
         assertEquals("真实消息",actions.last().params.string("message"))
         assertEquals("authorized-thread",actions.last().params.string("threadId"))
         assertFalse(actions.last().params.containsKey("path"))
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("真实消息")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("真实消息")
         compose.runOnIdle { state = state.copy(pendingActions=setOf("assistant/send")) }
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(pendingActions=emptySet()).acceptSend(actions.last()) }
-        compose.onNodeWithTag("assistant-message-input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
+        compose.onNodeWithTag(AssistantDraft).assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
     }
 
     @Test fun questionsAndApprovalDispatchDistinctExplicitHumanResponses() {
@@ -139,7 +141,7 @@ class AssistantScreenTest {
         compose.runOnIdle {state=state.copy(readError=null,snapshot=state.snapshot!!.copy(fresh=true))}
         scroll("assistant-answer:input").assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("fixture answer"))).assertIsEnabled()
         scroll("assistant-respond:input").assertIsEnabled()
-        compose.onNodeWithText("等待你确认").assertExists()
+        compose.onNodeWithContentDescription("等待你确认").assertExists()
         scroll("assistant-respond:input").performClick()
         assertEquals("assistant/respond",actions.last().method)
         assertEquals("q",actions.last().params.string("requestId"))
@@ -218,14 +220,14 @@ class AssistantScreenTest {
         val actions = mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot())},actions,fontScale=1.6f,theme="dark")
         compose.onNodeWithTag("assistant-pocket-button").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("大字模式草稿")
-        compose.onNodeWithTag("assistant-send").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("大字模式草稿")
+        compose.onNodeWithTag(AssistantSend).assertIsDisplayed().assertIsEnabled()
         compose.openAssistantPage("Settings")
         scroll("assistant-save-settings").assertIsDisplayed()
         screenshot("dark-large-font")
         compose.returnToAssistantChat()
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("大字模式草稿")
-        compose.onNodeWithTag("assistant-send").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("大字模式草稿")
+        compose.onNodeWithTag(AssistantSend).assertIsDisplayed().assertIsEnabled()
         assertTrue(actions.isEmpty())
     }
 
@@ -249,22 +251,30 @@ class AssistantScreenTest {
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot().copy(tasks=tasks,operations=listOf(op)))},actions)
         scroll("assistant-deny:paused-input").assertIsNotEnabled()
-        compose.onNodeWithTag("assistant-shortcut:Tasks").performClick()
-        compose.onNodeWithTag("assistant-center:Tasks").assertIsSelected()
-        scroll("assistant-task-expand:queued").assertHasClickAction()
-        compose.onNodeWithTag("assistant-task-pause:queued").assertDoesNotExist()
+        // Stopping is offered on the card of a task that can still be stopped, and waits for the confirmation.
         compose.expandAssistantTask("queued")
-        scroll("assistant-task-pause:queued").performClick()
+        scroll("assistant-job-stop:queued").performClick()
+        assertTrue(actions.isEmpty())
+        compose.onNodeWithText("确认停止").performClick()
         assertEquals("assistant/task/pause",actions.last().method)
         assertEquals("queued",actions.last().params.string("taskId"))
         compose.expandAssistantTask("paused")
-        scroll("assistant-task-resume:paused").performClick()
+        compose.onNodeWithTag("assistant-job-stop:paused").assertDoesNotExist()
+        scroll("assistant-chat-task-open:paused").performClick()
+        compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsActions.ScrollToIndex)).onFirst().performScrollToNode(hasText("继续任务"))
+        compose.onNodeWithText("继续任务").performClick()
         assertEquals("assistant/task/resume",actions.last().method)
         assertEquals("paused",actions.last().params.string("taskId"))
+        compose.returnToAssistantChat()
+        // A task whose execution is being reconciled says so, and cannot be resumed until it is settled.
+        scroll("assistant-chat-task-toggle:uncertain").assert(hasText("待核对"))
         compose.expandAssistantTask("uncertain")
-        compose.onNodeWithTag("assistant-task-resume:uncertain").assertDoesNotExist()
+        scroll("assistant-chat-task-open:uncertain").performClick()
+        compose.onNodeWithText("继续任务").assertDoesNotExist()
+        compose.returnToAssistantChat()
         compose.expandAssistantTask("failed")
-        compose.onNodeWithTag("assistant-task-resume:failed").assertDoesNotExist()
+        scroll("assistant-chat-task-open:failed").performClick()
+        compose.onNodeWithText("继续任务").assertDoesNotExist()
         assertEquals(2,actions.size)
     }
 
@@ -285,10 +295,11 @@ class AssistantScreenTest {
     @Test fun offlineErrorWhileMemoryDeleteConfirmationIsOpenBlocksMutation() {
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot().copy(memories=listOf(AssistantMemory("m","记忆")))))
-        content({state},actions)
+        var online by mutableStateOf(true)
+        content({state},actions,connected={online})
         compose.openAssistantPage("Memory")
         scroll("assistant-memory-delete:m").performClick()
-        compose.runOnIdle {state=state.copy(error="连接电脑后可继续使用助理")}
+        compose.runOnIdle {state=state.copy(error="连接电脑后可继续使用助理");online=false}
         compose.onNodeWithTag("assistant-confirm-delete").assertIsNotEnabled()
         assertTrue(actions.isEmpty())
     }

@@ -77,8 +77,9 @@ class AssistantScrollBehaviorTest {
             swipe(Offset(centerX, height * .35f), Offset(centerX, height * .65f), durationMillis = 600)
         }
         compose.waitForIdle()
-        compose.onNodeWithTag("assistant-latest").assertIsDisplayed()
-        val viewport = list.fetchSemanticsNode().boundsInRoot
+        // Reading history shows nothing by itself; the way back appears only when something new arrives below.
+        compose.onNodeWithTag("assistant-new-progress").assertDoesNotExist()
+        val viewport = compose.onNodeWithTag("assistant-chat-viewport").fetchSemanticsNode().boundsInRoot
         val node = compose.onAllNodes(SemanticsMatcher("recorded history bubble") {
             it.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("assistant-message:history-") == true
         }).fetchSemanticsNodes().first {
@@ -96,18 +97,18 @@ class AssistantScrollBehaviorTest {
 
     private fun assertTailAboveDock(tag: String) {
         val tail = compose.onNodeWithTag(tag).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
-        val chrome = compose.onNodeWithTag("assistant-top-chrome").fetchSemanticsNode().boundsInRoot
+        val clear = compose.onNodeWithTag("assistant-chat-viewport").fetchSemanticsNode().boundsInRoot
         val dock = compose.onNodeWithTag("assistant-bottom-dock").fetchSemanticsNode().boundsInRoot
-        assertTrue("The initial tail must clear the measured header", tail.top >= chrome.bottom - 1f)
+        assertTrue("The initial tail must clear the measured header", tail.top >= clear.top - 1f)
         assertTrue("The initial tail must clear the measured composer", tail.bottom <= dock.top + 1f)
-        compose.onNodeWithTag("assistant-latest").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-new-progress").assertDoesNotExist()
         assertTrue(actions.isEmpty())
     }
 
     @Test fun initialTailClearsMeasuredChromeWithoutManualScrolling() {
         val state = initialState(untimedTask = true)
         content { state }
-        assertTailAboveDock("assistant-task:untimed-tail")
+        assertTailAboveDock("assistant-chat-task:untimed-tail")
     }
 
     @Test fun initialTailUsesTheTaskActiveRunEventTime() {
@@ -120,20 +121,21 @@ class AssistantScrollBehaviorTest {
         assertEquals("task:todo", tail.key)
         assertEquals(event.atMs, tail.atMs)
         content { state }
-        assertTailAboveDock("assistant-task:todo")
+        assertTailAboveDock("assistant-chat-task:todo")
     }
 
     @Test fun initialTailClearsPreparationDockAtLargeText() {
         val state = initialState(untimedTask = true).let { it.copy(snapshot = it.snapshot!!.copy(ready = false)) }
         content(fontScale = 1.4f) { state }
-        compose.onNodeWithTag("assistant-prepare").assertIsDisplayed()
-        assertTailAboveDock("assistant-task:untimed-tail")
+        // What preparation asks for comes after the conversation: both it and the latest task are in view.
+        assertTailAboveDock("assistant-prepare")
+        compose.onNodeWithTag("assistant-chat-task:untimed-tail").assertIsDisplayed()
     }
 
     @Test fun lateMarkdownMeasurementKeepsTheLatestTaskVisible() {
         var state by mutableStateOf(initialState(untimedTask = true))
         content { state }
-        assertTailAboveDock("assistant-task:untimed-tail")
+        assertTailAboveDock("assistant-chat-task:untimed-tail")
         compose.runOnIdle {
             state = state.copy(messages = state.messages.map { message ->
                 message.copy(role = "Assistant", text = "## Recorded result\n\n" +
@@ -141,7 +143,7 @@ class AssistantScrollBehaviorTest {
             })
         }
         compose.waitForIdle()
-        assertTailAboveDock("assistant-task:untimed-tail")
+        assertTailAboveDock("assistant-chat-task:untimed-tail")
     }
 
     @Test fun initialTailIncludesOlderMessageControlAndCoordinatorWorkingRow() {
@@ -150,7 +152,7 @@ class AssistantScrollBehaviorTest {
                 false, "coordinator", null, null)))) }
         content { state }
         assertTailAboveDock("assistant-working")
-        compose.onNodeWithTag("assistant-task:untimed-tail").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-chat-task:untimed-tail").assertIsDisplayed()
     }
 
     @Test fun timedMessageBeforeUntimedTaskPreservesReadingPositionAndShowsUnread() {
@@ -162,11 +164,12 @@ class AssistantScrollBehaviorTest {
         compose.waitForIdle()
 
         assertReadingAnchor(anchor)
-        compose.onNodeWithTag("assistant-latest").assertIsDisplayed().assertTextContains("有新消息", substring = true)
-        compose.onNodeWithTag("assistant-latest").performClick()
+        compose.onNodeWithTag("assistant-new-progress").assertIsDisplayed().assert(hasText("查看新进展"))
+        compose.onNodeWithTag("assistant-new-progress").performClick()
         compose.waitForIdle()
+        compose.onNodeWithTag("assistant-new-progress").assertDoesNotExist()
         compose.onNodeWithTag("assistant-message:inserted").assertIsDisplayed()
-        compose.onNodeWithTag("assistant-task:untimed-tail").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-chat-task:untimed-tail").assertIsDisplayed()
         assertTrue(actions.isEmpty())
     }
 
@@ -175,10 +178,9 @@ class AssistantScrollBehaviorTest {
         content { state }
         val anchor = readHistory()
 
-        compose.onNodeWithTag("assistant-more").performClick()
-        compose.onNodeWithTag("assistant-tab:Memory").performClick()
-        compose.onNodeWithTag("assistant-message-input").assertDoesNotExist()
-        compose.onNodeWithContentDescription("返回助理对话").performClick()
+        compose.openAssistantPage("Memory")
+        compose.onNodeWithTag(AssistantDraft).assertDoesNotExist()
+        compose.returnToAssistantChat()
         compose.waitForIdle()
         assertReadingAnchor(anchor)
 
@@ -186,45 +188,51 @@ class AssistantScrollBehaviorTest {
         compose.runOnIdle { state = state.copy(messages = state.messages + incoming("after-return")) }
         compose.waitForIdle()
         assertReadingAnchor(anchor)
-        compose.onNodeWithTag("assistant-latest").assertIsDisplayed().assertTextContains("有新消息", substring = true)
+        compose.onNodeWithTag("assistant-new-progress").assertIsDisplayed().assert(hasText("查看新进展"))
         assertTrue(actions.isEmpty())
     }
 
     @Test fun returningFromSubpageKeepsNearBottomAnchorWithMultilineDraft() {
         val state = initialState()
         content { state }
-        compose.onNodeWithTag("assistant-message-input").performTextReplacement("Preserved draft\nSecond line")
+        compose.onNodeWithTag(AssistantDraft).performTextReplacement("Preserved draft\nSecond line")
         compose.onNodeWithTag("assistant-chat-list").performScrollToIndex(history.lastIndex)
         compose.waitForIdle()
         val tag = "assistant-message:history-35"
         val before = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot.top
-        compose.onNodeWithTag("assistant-more").performClick()
-        compose.onNodeWithTag("assistant-tab:Memory").performClick()
-        compose.onNodeWithContentDescription("返回助理对话").performClick()
+        compose.openAssistantPage("Memory")
+        compose.returnToAssistantChat()
         compose.waitForIdle()
         assertEquals("Near-bottom history must not be clamped by temporarily zero chrome padding",
             before, compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot.top, 1f)
-        compose.onNodeWithTag("assistant-message-input").assertTextContains("Preserved draft\nSecond line")
+        compose.onNodeWithTag(AssistantDraft).assertTextContains("Preserved draft\nSecond line")
         assertTrue(actions.isEmpty())
     }
 
-    @Test fun acceptedSendMovesToLatestEvenBeforeHistoryRefreshChangesTheTail() {
+    /** A receipt settles the composer; it is not new content, so it neither moves the reader nor offers a way down. */
+    @Test fun acceptedReceiptClearsTheDraftAndLeavesTheReaderInPlaceUntilNewContentArrives() {
         var state by mutableStateOf(initialState())
         content { state }
-        compose.onNodeWithTag("assistant-message-input").performTextInput("Fixture send")
-        compose.onNodeWithTag("assistant-send").performClick()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("Fixture send")
+        compose.onNodeWithTag(AssistantSend).performClick()
         compose.runOnIdle { state = state.copy(pendingActions = setOf("assistant/send")) }
         compose.waitForIdle()
-        readHistory()
+        val anchor = readHistory()
 
         // Repository acknowledgments precede the history reload; no item is added here.
         compose.runOnIdle { state = state.copy(pendingActions = emptySet()).acceptSend(actions.single()) }
         compose.waitForIdle()
-
-        compose.onNodeWithTag("assistant-message:history-35").assertIsDisplayed()
-        compose.onNodeWithTag("assistant-latest").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-message-input").assert(
+        assertReadingAnchor(anchor)
+        compose.onNodeWithTag("assistant-new-progress").assertDoesNotExist()
+        compose.onNodeWithTag(AssistantDraft).assert(
             SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+        // The reload brings the sent message and a reply: the reader keeps their place and is offered the way down.
+        compose.runOnIdle { state = state.copy(messages = state.messages + AssistantChatMessage("sent", "User", "Fixture send", baseTime + 61_000L) + incoming("reply").copy(atMs = baseTime + 62_000L)) }
+        compose.waitForIdle()
+        assertReadingAnchor(anchor)
+        compose.onNodeWithTag("assistant-new-progress").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("assistant-message:reply").assertIsDisplayed()
         assertEquals(listOf("assistant/send"), actions.map { it.method })
     }
 
@@ -249,15 +257,16 @@ class AssistantScrollBehaviorTest {
             startupStages=listOf(AssistantStartupStage("runtime","ready"),AssistantStartupStage("account","ready"),
                 AssistantStartupStage("capabilities","ready"),AssistantStartupStage("coordinator","reconciling","reconcile_retained_native_receipts"))))}
         content(fontScale=2f) {state}
-        val screen=compose.onNodeWithTag("assistant-screen").fetchSemanticsNode().boundsInRoot
-        val chrome=compose.onNodeWithTag("assistant-top-chrome").fetchSemanticsNode().boundsInRoot
-        val dock=compose.onNodeWithTag("assistant-bottom-dock").fetchSemanticsNode().boundsInRoot
-        assertTrue("Preparation chrome must leave a readable transcript viewport at large text",
-            dock.top-chrome.bottom >= screen.height*.22f)
-        compose.onNodeWithTag("assistant-startup-details").performClick()
-        compose.onNodeWithTag("assistant-stage:coordinator").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithTag("assistant-startup-close").performClick()
-        compose.onNodeWithTag("assistant-message-input").assertIsDisplayed()
+        val screen=compose.onNodeWithTag("assistant-workspace").fetchSemanticsNode().boundsInRoot
+        val clear=compose.onNodeWithTag("assistant-chat-viewport").fetchSemanticsNode().boundsInRoot
+        assertTrue("Preparation must leave a readable transcript viewport at large text", clear.height >= screen.height*.22f)
+        // The stages are part of the conversation's last card, read by scrolling, not a separate sheet.
+        listOf("runtime","account","capabilities","coordinator").forEach {id ->
+            compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-stage:$id"))
+            compose.onNodeWithTag("assistant-stage:$id").assertIsDisplayed()
+        }
+        compose.onNodeWithTag("assistant-stage-recovery").assertTextContains("正在读取电脑端回执核对结果",substring=true)
+        compose.onNodeWithTag(AssistantDraft).assertIsDisplayed()
         assertTrue(actions.isEmpty())
     }
 }

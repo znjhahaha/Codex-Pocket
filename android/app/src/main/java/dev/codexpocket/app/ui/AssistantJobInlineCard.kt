@@ -196,7 +196,8 @@ internal fun AssistantJobInlineCard(task: AssistantTask, state: AssistantUiState
             AssistantJobStageLine(view, Modifier.fillMaxWidth().testTag("assistant-job-stage:${task.id}"))
             if (!expanded && job?.diffStats != null && job.diffStats.files > 0) PText(assistantDiffStats(job.diffStats), style = Pocket.type.labelSmall, maxLines = 1)
         }
-        if (view.pending.isNotEmpty()) Column(Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Inside a group the request stays where it already is, in the conversation, so it is never shown twice.
+        if (view.pending.isNotEmpty() && !nested) Column(Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             view.pending.forEach { key(it.id) { AssistantHumanQuestion(it, runtime, state, canAct, act) } }
         }
         if (expanded) AssistantJobDetails(view, state, canAct, navigate, open, confirm, outcome)

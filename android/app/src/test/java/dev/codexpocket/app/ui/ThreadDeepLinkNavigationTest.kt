@@ -84,8 +84,8 @@ class ThreadDeepLinkNavigationTest {
                 val current by repo.state.collectAsState(); PocketRoot(current, repo)
             } } }
             compose.onNodeWithTag("assistant-pocket-button").performClick()
-            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-screen").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithTag("assistant-screen").assertExists()
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-workspace").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("assistant-workspace").assertExists()
             if (userMessage) {
                 compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-message:message"))
                 compose.onNodeWithContentDescription("会话链接", useUnmergedTree = true).assertIsDisplayed().performClick()
@@ -98,7 +98,7 @@ class ThreadDeepLinkNavigationTest {
                     text.getSpans(0, text.length, ClickableSpan::class.java).single().onClick(view)
                 }
             }
-            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-screen").fetchSemanticsNodes().isEmpty() }
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-workspace").fetchSemanticsNodes().isEmpty() }
             assertEquals(chat.key, repo.state.value.selected?.key)
         } finally {
             compose.activity.runOnUiThread { compose.activity.setContent {} }

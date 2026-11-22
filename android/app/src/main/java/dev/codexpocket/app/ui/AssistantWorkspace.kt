@@ -72,7 +72,8 @@ internal fun assistantPageTitle(page: String) = when {
             else if (page != "Main") { page = "Main"; returning = true } else onBack()
         }
         BackHandler { back() }
-        val issue = error ?: state.readError ?: state.error?.takeUnless {
+        // A command whose outcome is unsettled is named for as long as it is, whatever a later refresh reports.
+        val issue = error ?: state.readError ?: state.unconfirmedFeedback?.takeUnless { snapshot?.protocolVersion == 2 } ?: state.error?.takeUnless {
             (it == state.unconfirmedFeedback && snapshot?.protocolVersion == 2) || (page == "Main" && snapshot?.prepared != true && it == snapshot?.preparationIssue)
         }
         val notice: @Composable () -> Unit = {
