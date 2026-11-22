@@ -113,11 +113,11 @@ class SshLinuxHostLifecycleLiveTest {
         val restart = System.getenv("POCKET_LINUX_QA_RESTART")
         failure { LinuxQa.sh(if (restart == null) "sudo systemctl reboot" else "sudo systemctl poweroff") }
         // Only the host key is read while waiting: nobody logs in, so nothing starts the account's services but lingering.
-        withTimeout(120_000) { while (failure { probeSshHostKey("127.0.0.1", LinuxQa.pocket.port) } == null) delay(500) }
+        withTimeout(120_000) { while (failure { probeSshHostKey(LinuxQa.host, LinuxQa.pocket.port) } == null) delay(500) }
         if (restart != null) withContext(Dispatchers.IO) {
             assertEquals(0, ProcessBuilder(restart.split(' ')).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start().waitFor())
         }
-        withTimeout(600_000) { while (failure { probeSshHostKey("127.0.0.1", LinuxQa.pocket.port) } != null) delay(2_000) }
+        withTimeout(600_000) { while (failure { probeSshHostKey(LinuxQa.host, LinuxQa.pocket.port) } != null) delay(2_000) }
         delay(30_000)
         LinuxQa.isolate()
         val evidence = LinuxQa.sh("""

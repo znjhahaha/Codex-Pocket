@@ -24,7 +24,7 @@ class SshLinuxLiveTest {
         assertEquals(LinuxQa.fingerprint, probeSshHostKey(target.host, target.port))
         val release = System.getenv("POCKET_LINUX_BUNDLE")?.let(::File)
         val prepared = prepareSshHost(target, { arch ->
-            assertEquals("x86_64", arch)
+            assertEquals(LinuxQa.architecture, arch)
             if (release != null) LinuxRuntimeBundle.verified(release) else TestRuntimeSigner.verified(LinuxQa.base)
         })
         assertTrue(prepared.nativeInstalled)
@@ -121,7 +121,7 @@ class SshLinuxLiveTest {
                     sudo sshd -t
                     sudo systemctl reload ssh
                 """.trimIndent(), 60, emptyMap())
-                val observed = probeSshHostKey("127.0.0.1", LinuxQa.pocket.port)
+                val observed = probeSshHostKey(LinuxQa.host, LinuxQa.pocket.port)
                 assertNotEquals(LinuxQa.fingerprint, observed)
                 assertEquals("ssh_host_key_changed", wireFailure { phone.online { _, _ -> } })
                 assertEquals("ssh_host_key_changed", wireFailure { LinuxQa.prepare() })
@@ -136,7 +136,7 @@ class SshLinuxLiveTest {
             }
         }
         assertTrue(replaced.startsWith("SHA256:"))
-        assertEquals(LinuxQa.fingerprint, probeSshHostKey("127.0.0.1", LinuxQa.pocket.port))
+        assertEquals(LinuxQa.fingerprint, probeSshHostKey(LinuxQa.host, LinuxQa.pocket.port))
         assertEquals(before, LinuxQa.installation())
         assertEquals(prepared.pairing.computerId, phone.online { _, hello -> hello.string("computerId") })
     }
@@ -153,7 +153,7 @@ class SshLinuxLiveTest {
         // Signed by the test key but offered to the shipped trust, as the application would check it.
         assertEquals("ssh_runtime_invalid", wireFailure { prepareSshHost(LinuxQa.pocket, { LinuxRuntimeBundle.verified(LinuxQa.bundle("0.0.1-qa")) }) })
         // Correctly signed for a processor this host does not have.
-        assertEquals("ssh_runtime_invalid", wireFailure { LinuxQa.prepare(directory = LinuxQa.bundle("0.0.1-qa", "aarch64")) })
+        assertEquals("ssh_runtime_invalid", wireFailure { LinuxQa.prepare(directory = LinuxQa.bundle("0.0.1-qa", LinuxQa.otherArchitecture)) })
         assertEquals("ssh_runtime_missing", wireFailure { prepareSshHost(LinuxQa.pocket, { throw WireException("ssh_runtime_missing", "No bundle") }) })
         assertEquals(before, LinuxQa.installation())
     }
@@ -228,7 +228,7 @@ class SshLinuxLiveTest {
         LinuxQa.assume()
         Security.removeProvider("BC")
         Security.addProvider(object : Provider("BC", "1.0", "stand-in for the platform's cut-down provider") {})
-        assertEquals(LinuxQa.fingerprint, probeSshHostKey("127.0.0.1", LinuxQa.pocket.port))
+        assertEquals(LinuxQa.fingerprint, probeSshHostKey(LinuxQa.host, LinuxQa.pocket.port))
         Security.removeProvider("BC")
         Security.addProvider(object : Provider("BC", "1.0", "stand-in for the platform's cut-down provider") {})
         assertEquals("pocket", LinuxQa.sh("id -un\n").trim())

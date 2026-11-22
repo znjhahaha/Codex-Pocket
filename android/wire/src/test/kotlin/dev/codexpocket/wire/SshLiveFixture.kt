@@ -67,20 +67,24 @@ internal suspend fun PocketConnection.native(runtime: JsonObject, method: String
 internal object LinuxQa {
     private val home = System.getenv("POCKET_LINUX_QA")?.let(::File)
     private val port = (System.getenv("POCKET_LINUX_QA_PORT") ?: "22247").toInt()
+    /** The forwarded port of a local VM, or the address of a disposable cloud host. */
+    val host = System.getenv("POCKET_LINUX_QA_HOST") ?: "127.0.0.1"
+    val architecture = System.getenv("POCKET_LINUX_QA_ARCH") ?: "x86_64"
+    val otherArchitecture get() = if (architecture == "x86_64") "aarch64" else "x86_64"
     val fingerprint by lazy {
         val known = File(home!!, "known_hosts").readText().trim().split(' ')[2]
         "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(MessageDigest.getInstance("SHA-256").digest(Base64.getDecoder().decode(known)))
     }
-    val pocket by lazy { SshTarget("127.0.0.1", port, "pocket", fingerprint, SshAuthentication.PrivateKey(File(home!!, "test-key").readText()), 43821) }
+    val pocket by lazy { SshTarget(host, port, "pocket", fingerprint, SshAuthentication.PrivateKey(File(home!!, "test-key").readText()), 43821) }
     fun target(user: String, authentication: SshAuthentication, backend: Int = 43822, hostKey: String = fingerprint) =
-        SshTarget("127.0.0.1", port, user, hostKey, authentication, backend)
+        SshTarget(host, port, user, hostKey, authentication, backend)
 
     private val scratch by lazy {
         File("build/linux-qa").apply { deleteRecursively(); mkdirs() }.also { Runtime.getRuntime().addShutdownHook(Thread { it.deleteRecursively() }) }
     }
     private val binaries by lazy { File(System.getenv("POCKET_LINUX_BIN") ?: error("POCKET_LINUX_BIN must hold the cross-built pocket-agent and pocket-runtime-host")) }
     /** [agent] replaces the host executable before signing: a validly signed version that cannot run. */
-    fun bundle(version: String = "0.0.0-qa", architecture: String = "x86_64", agent: ByteArray? = null): File {
+    fun bundle(version: String = "0.0.0-qa", architecture: String = LinuxQa.architecture, agent: ByteArray? = null): File {
         val directory = File(scratch, UUID.randomUUID().toString()).apply { mkdirs() }
         for (name in listOf("pocket-agent", "pocket-runtime-host")) {
             val copy = File(directory, name)
@@ -107,8 +111,16 @@ internal object LinuxQa {
             sudo passwd -l pocketqa2 >/dev/null
         """.trimIndent())
     } }
-    /** Acceptance reaches the VM only through its forwarded SSH port, and nothing in the VM reaches the internet. */
-    suspend fun isolate() = sh("sudo ip route del default 2>/dev/null || true")
+    /** Nothing on the host reaches the internet; only the address acceptance itself logs in from keeps a way back. */
+    suspend fun isolate() = sh("""
+        route=${'$'}(ip route show default | head -1); [ -n "${'$'}route" ] || exit 0
+        client=${'$'}{SSH_CLIENT%% *}
+        case "${'$'}client" in
+            127.*|::1|"") ;;
+            *) sudo ip route replace "${'$'}client/32" via "${'$'}(echo "${'$'}route" | awk '{print ${'$'}3}')" dev "${'$'}(echo "${'$'}route" | awk '{print ${'$'}5}')" ;;
+        esac
+        sudo ip route del default 2>/dev/null || true
+    """.trimIndent())
     /** A host accepts eight devices; every test starts without the ones earlier tests paired. */
     suspend fun forgetAcceptanceDevices(target: SshTarget = pocket) = sh("""
         root="${'$'}HOME/.local/share/codex-pocket"; state="${'$'}HOME/.local/state/codex-pocket/agent"
