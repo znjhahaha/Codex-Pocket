@@ -27,7 +27,7 @@ class AssistantWorkspaceTest {
         AssistantAttachmentDraft(context,"main:attachment-ui:a").add(listOf(file))
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true),computerId="attachment-ui"))
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(state,emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}
         compose.onNodeWithText("diagram.png").assertExists()
@@ -49,7 +49,7 @@ class AssistantWorkspaceTest {
         AssistantAttachmentDraft(compose.activity,key).add(listOf(file))
         val actions=mutableListOf<AssistantAction>()
         val state=AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true,tasks=listOf(task)),computerId="artifact-pc")
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantTaskFollowup(task,state,true,{actions+=it()},"按原成果继续",artifact)
         }}}
         compose.onNodeWithTag("assistant-task-send:${task.id}").performClick()
@@ -61,7 +61,7 @@ class AssistantWorkspaceTest {
     }
     @Test fun attachmentPickerIsAvailableInMainAndTaskFollowup() {
         val task=AssistantTask("attachment-task","整理附件",AssistantTaskStatus.Done,null,false,null)
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true,tasks=listOf(task))),
                 emptyList(),emptyList(),emptyList(),{},{_,_->},{})
         }}}
@@ -77,7 +77,7 @@ class AssistantWorkspaceTest {
         val issue="助理准备遇到问题，请检查电脑端后重试"
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot=AssistantSnapshot(preparationStatus="recoverable_error"),error=issue))
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(state,emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}
         compose.onAllNodesWithText(issue).assertCountEquals(1)
@@ -91,7 +91,7 @@ class AssistantWorkspaceTest {
         compose.onAllNodesWithText(issue).assertCountEquals(1)
     }
     @Test fun everyPageOpensFromTheStageAndDraftSurvivesNavigation() {
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true)),emptyList(),emptyList(),emptyList(),{},{_,_->},{})
         }}}
         compose.onNodeWithTag("assistant-workspace-draft").performTextInput("保留这个目标")
@@ -107,7 +107,7 @@ class AssistantWorkspaceTest {
         val op=AssistantOperation("op","Execution","task",AssistantOperationPhase.Waiting,false,"native",AssistantQuestion("q",AssistantQuestionKind.Approval,"允许保存本次报告？"),null)
         val actions=mutableListOf<AssistantAction>()
         val snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true,protocolVersion=2,acceptingMessages=true,tasks=listOf(task),operations=listOf(op))
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {ProvideMarkdownRendering {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {ProvideMarkdownRendering {
             AssistantScreen(AssistantUiState(snapshot,computerId="approval-test"),emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}}
         compose.onNodeWithTag("assistant-approve:op").performScrollTo().performClick()
@@ -130,7 +130,7 @@ class AssistantWorkspaceTest {
         var state by mutableStateOf(AssistantUiState(snapshot,messages=listOf(
             AssistantChatMessage("1","User","把本周进展整理成一页简报。",1),
             AssistantChatMessage("2","Assistant","已经开始整理。简报会包括已完成事项、风险和下周需要决定的问题。",2,taskId="task")),computerId="render-test"))
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(state,emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}
         compose.onNodeWithTag("assistant-workspace-draft").performTextInput("请附上来源")
@@ -155,7 +155,7 @@ class AssistantWorkspaceTest {
             protocolVersion=2,acceptingMessages=true,tasks=listOf(task,child),
             domain=AssistantDomain("main:a",listOf(record,childRecord),emptyList(),emptyList())),
             messages=listOf(AssistantChatMessage("msg","Assistant","正在整理",1,taskId="task")),computerId="summary-card"))
-        compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
+        compose.activity.runOnUiThread {compose.activity.setContent {AssistantTestTheme {
             AssistantScreen(state,emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}
         compose.onNodeWithTag("assistant-chat-task:task").assertExists()

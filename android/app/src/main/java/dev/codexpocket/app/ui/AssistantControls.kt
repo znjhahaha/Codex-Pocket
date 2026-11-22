@@ -93,7 +93,8 @@ internal fun AssistantExpansion(expanded: Boolean, content: @Composable () -> Un
 @OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun AssistantDialog(title: String, onDismiss: () -> Unit, confirm: @Composable () -> Unit, dismiss: (@Composable () -> Unit)? = null,
     content: (@Composable ColumnScope.() -> Unit)? = null) {
-    PocketModal(title, onDismiss, sheet = false) {
+    // A form needs more of the screen than a yes-or-no question; it scrolls inside whatever it is given.
+    PocketModal(title, onDismiss, sheet = false, maxHeightFraction = .86f) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             PText(title, Modifier.semantics { heading() }, style = Pocket.type.titleLarge)
             if (content != null) Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),

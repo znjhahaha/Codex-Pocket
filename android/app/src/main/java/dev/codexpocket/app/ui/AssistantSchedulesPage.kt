@@ -103,7 +103,7 @@ private fun assistantScheduleLabel(s:AssistantSchedule):String = when(val type=s
         val c=Pocket.colors
         PTextField(prompt,{prompt=it},Modifier.testTag("assistant-schedule-prompt"),label="事项",minLines=2,maxLines=5)
         if(editing==null) AssistantChoice("执行范围",project?.label ?: "通用事项 · 助理工作区","assistant-schedule-workspace",listOf("general" to "通用事项 · 助理工作区")+projects.map {it.selectionKey to it.label}) {projectId=if(it=="general") null else it;writes=false;onProjectSelected(projects.firstOrNull {p->p.selectionKey==it})}
-        else PText("保留原事项的执行范围与授权。",style=Pocket.type.bodySmall,color=c.inkMuted)
+        else PText("保留原事项的执行范围与授权。",Modifier.padding(horizontal=4.dp),style=Pocket.type.bodySmall,color=c.inkMuted)
         project?.let {selected ->
             Column {
                 PText(selected.permissionStatus,Modifier.padding(horizontal=4.dp).testTag("assistant-project-permission-status"),style=Pocket.type.bodySmall,color=c.inkMuted)

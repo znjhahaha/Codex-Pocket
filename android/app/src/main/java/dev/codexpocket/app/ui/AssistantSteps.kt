@@ -57,6 +57,7 @@ import dev.codexpocket.app.ui.kit.*
 }
 
 /** A group's tasks, one artifact, or one execution's full result. A task has its own page. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun AssistantDetailPage(destination:String,state:AssistantUiState,canAct:Boolean,act:(()->AssistantAction)->Unit,
     open:(String,String)->Unit,workspaces:List<AssistantWorkspaceChoice>,navigate:(String)->Unit) {
     val snapshot=state.snapshot ?: return
@@ -83,8 +84,10 @@ import dev.codexpocket.app.ui.kit.*
                     Column(verticalArrangement=Arrangement.spacedBy(12.dp)) {
                         snapshot.artifacts.filter {it.operationId==id}.forEach {artifact -> AssistantArtifactCard(artifact,snapshot,navigate,open)}
                         MarkdownText(operation?.result.orEmpty(),"assistant:${snapshot.runtimeId}:result:$id")
-                        operation?.taskId?.let {task -> AssistantCardAction("来源任务与继续操作",{navigate("Task:$task")},Modifier.testTag("assistant-result-source-task:$id"))}
-                        operation?.threadId?.let {thread -> AssistantCardAction("查看原对话",{open(snapshot.runtimeId.orEmpty(),thread)},Modifier.testTag("assistant-thread:$id"))}
+                        FlowRow(horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+                            operation?.taskId?.let {task -> AssistantCardAction("来源任务与继续操作",{navigate("Task:$task")},Modifier.testTag("assistant-result-source-task:$id"))}
+                            operation?.threadId?.let {thread -> AssistantCardAction("查看原对话",{open(snapshot.runtimeId.orEmpty(),thread)},Modifier.testTag("assistant-thread:$id"))}
+                        }
                     }
                 }
             }
