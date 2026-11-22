@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "codex": {
+    "repository": "https://github.com/openai/codex",
+    "tag": "rust-v0.171.0",
+    "version": "0.171.0"
+  },
+  "signer": "https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.171.0",
+  "abis": {
+    "arm64-v8a": {
+      "triple": "aarch64-unknown-linux-musl",
+      "machine": 183,
+      "require_16k_pages": true
+    },
+    "x86_64": {
+      "triple": "x86_64-unknown-linux-musl",
+      "machine": 62,
+      "require_16k_pages": false
+    }
+  },
+  "components": {
+    "codex": {
+      "packaged": "libcodex.so",
+      "assets": {
+        "arm64-v8a": {
+          "archive_sha256": "bcf50b836385e51bd2976ab2bbe92b1b08a1cbe37712eb8dbe378aa78d24871c",
+          "archive_bytes": 124436451,
+          "binary_sha256": "9ba12ec7712e2905b2ea00791f4ebddc9528629cc955d11d25272de445e10643",
+          "binary_bytes": 309207448
+        },
+        "x86_64": {
+          "archive_sha256": "01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d",
+          "archive_bytes": 122664925,
+          "binary_sha256": "b76a027d6b210f9a8da7aaf321dd235c700f0ef7a794d4a5314b9af6c134f0f0",
+          "binary_bytes": 315109048
+        }
+      }
+    },
+    "codex-app-server": {
+      "packaged": "libcodex-app-server.so",
+      "assets": {
+        "arm64-v8a": {
+          "archive_sha256": "565429aaa1f81c8b24d1747cb71670b9dfd1fd476094375e195d81d5c119a30a",
+          "archive_bytes": 95931754,
+          "binary_sha256": "853977850e5b4c0803a3f19d582f4db40d579e8ed4a86917a71e76020266ecf0",
+          "binary_bytes": 239529400
+        },
+        "x86_64": {
+          "archive_sha256": "421bcd19b25b5e5b88fd851ddaba6a155c6f9adebae154a2821b73db12d03787",
+          "archive_bytes": 94390828,
+          "binary_sha256": "bf253b5bfe0c602e58e2cd7c35c679ab652f7eb9ab0d4320fdd9caf220f76244",
+          "binary_bytes": 243341632
+        }
+      }
+    },
+    "codex-code-mode-host": {
+      "packaged": "libcodex-code-mode-host.so",
+      "assets": {
+        "arm64-v8a": {
+          "archive_sha256": "7669c881b78669b5f13ddb99996b5cef3fb10dab5b69f43be31d19e82e9cd62b",
+          "archive_bytes": 27590334,
+          "binary_sha256": "f330aa2016dc441e63084cc7030dce79f3815ed14e5de6b18608528e86826656",
+          "binary_bytes": 72280416
+        },
+        "x86_64": {
+          "archive_sha256": "d78619030c1b8d0a4d9c9c67667c1bfa23ad9d9edc63d87ffeaa86796f3d868c",
+          "archive_bytes": 27435775,
+          "binary_sha256": "f49bd4f0c0cc73cf1ec3a719009e07ce5b6e100520d023c760cc203fb37e5c6f",
+          "binary_bytes": 70072856
+        }
+      }
+    }
+  }
+}
