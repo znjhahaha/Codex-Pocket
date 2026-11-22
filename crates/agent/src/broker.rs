@@ -43,6 +43,8 @@ mod history_takeover;
 mod desktop_control;
 #[path = "broker_usage.rs"]
 mod usage_backend;
+#[path = "broker_usage_v2.rs"]
+mod usage_v2_backend;
 #[path = "broker_handoff.rs"]
 mod broker_handoff;
 #[path = "broker_lifecycle.rs"]
@@ -595,6 +597,7 @@ pub struct Broker {
     media: Arc<crate::media::MediaStore>,
     media_histories: Arc<std::sync::Mutex<MediaHistoryCache>>,
     quota: crate::quota::Quota,
+    native_usage: crate::native_usage::service::NativeUsage,
     pub push: Arc<crate::push::PushDelivery>,
     push_delivery: Arc<Mutex<()>>,
     pub connection: Arc<crate::connection::Connection>,
@@ -1896,6 +1899,11 @@ impl Broker {
                     let quota = crate::quota::Quota::default();
                     quota
                 },
+                // Opened lazily on a blocking worker; profiles are added as they become known.
+                native_usage: crate::native_usage::service::NativeUsage::new(
+                    state_dir.join("usage-ledger.sqlite"),
+                    [],
+                ),
                 push: Arc::new(crate::push::PushDelivery::open(state_dir.clone())?),
                 push_delivery: Arc::new(Mutex::new(())),
                 connection: Arc::new(crate::connection::Connection::default()),
@@ -2242,6 +2250,10 @@ impl Broker {
                 "usage/sources",
                 crate::usage_stats::service::EXPLICIT_REFRESH_CAPABILITY,
                 "usage.v1",
+                "usage/v2/sources",
+                "usage/v2/read",
+                "usage/v2/requests/read",
+                crate::native_usage::CAPABILITY,
                 "upstream.versions.v1",
                 "assistant.v1",
                 "assistant.v2",
@@ -3260,6 +3272,7 @@ impl Broker {
                     }
                     if let Some(r) = state.runtimes.get_mut(&runtime_id) {
                         r.usage.event(&value);
+                        self.native_usage.live(&r.store, &r.config_home, &value);
                         if method == "thread/settings/updated" {
                             let Some(thread) = value["params"]["threadId"]
                                 .as_str()
@@ -3320,6 +3333,7 @@ impl Broker {
         match method {
             "threads/control/read" => return self.desktop_control(&p).await,
             "usage/read" | "usage/sources" | "usage/dashboard/read" | "usage/requests/read" => return self.usage_request(device, method, &p).await,
+            "usage/v2/sources" | "usage/v2/read" | "usage/v2/requests/read" => return self.usage_v2_request(device, method, &p).await,
             "assistant/read" => return self.assistant_read(&p).await,
             "assistant/project/read" => return self.assistant_project_read(device, &p).await,
             "routes/list" => return Ok(crate::config::routes::snapshot(&self.config,&self.state_dir)),

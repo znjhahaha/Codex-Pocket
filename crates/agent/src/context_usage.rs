@@ -118,7 +118,7 @@ fn legacy_breakdown(v: &Value) -> Value {
     Value::Object(out)
 }
 // Rollouts use RFC3339 UTC timestamps. Unknown timestamp forms stay unknown.
-fn timestamp_ms(value: &Value) -> Option<u64> {
+pub(crate) fn timestamp_ms(value: &Value) -> Option<u64> {
     let text = value.as_str()?;
     let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
     let d: Vec<i64> = date

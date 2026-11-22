@@ -36,6 +36,7 @@ pub mod workspace;
 
 pub mod quota;
 pub mod usage_stats;
+pub mod native_usage;
 pub mod upstream_versions;
 pub mod handoff;
 pub mod managed_runtime;
