@@ -9,7 +9,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -20,7 +20,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -49,6 +48,8 @@ import androidx.core.content.ContextCompat
 import dev.codexpocket.app.WatchService
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.pocketSelectable
 
 @Composable
 internal fun PairScreen(
@@ -116,14 +117,17 @@ internal fun SettingsPageLayout(
 private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) -> Unit, modifier: Modifier) {
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    val selection by animateFloatAsState(page.ordinal.toFloat(), if (motion) tween(200) else snap(), label = "settings-selected-thumb")
+    // The quick edge leads and the slow one follows, as in the kit's segmented control.
+    val lead by animateFloatAsState(page.ordinal.toFloat(), spring<Float>(dampingRatio = .85f, stiffness = 640f).orSnap(motion), label = "settings-selected-thumb")
+    val trail by animateFloatAsState(page.ordinal.toFloat(), spring<Float>(dampingRatio = .85f, stiffness = 300f).orSnap(motion), label = "settings-selected-thumb-trail")
+    val selection = minOf(lead, trail)
     CompositionLocalProvider(LocalPocketClearGlass provides true) {
         Surface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
             BoxWithConstraints(Modifier.fillMaxWidth().padding(5.dp)) {
                 val itemWidth = maxWidth / SettingsPage.entries.size
                 Box {
                     Box(Modifier.matchParentSize()) {
-                        Surface(Modifier.offset(x = itemWidth * selection).width(itemWidth).fillMaxHeight()
+                        Surface(Modifier.offset(x = itemWidth * selection).width(itemWidth * (1f + maxOf(lead, trail) - selection)).fillMaxHeight()
                             .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f), RoundedCornerShape(24.dp))
                             .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.primaryContainer) { }
                     }
@@ -131,8 +135,8 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
                         SettingsPage.entries.forEach { item ->
                             val interaction = remember { MutableInteractionSource() }
                             Box(Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp).clip(RoundedCornerShape(24.dp))
-                                .testTag("settings-tab:" + item.name).selectable(page == item, role = Role.Tab,
-                                    interactionSource = interaction, indication = null, onClick = { onSelect(item) })
+                                .testTag("settings-tab:" + item.name).pocketSelectable(page == item, role = Role.Tab,
+                                    interactionSource = interaction, pressedScale = .96f, haptic = null, onClick = { onSelect(item) })
                                 .padding(horizontal = 6.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
                                 PocketTabLabel(item.label, page == item, style = MaterialTheme.typography.labelMedium,
                                     color = if (page == item) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
@@ -154,6 +158,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     var forget by rememberSaveable { mutableStateOf(false) }
     var clear by rememberSaveable { mutableStateOf(false) }
     var revoke by remember { mutableStateOf<String?>(null) }
+    var reconnects by remember { mutableIntStateOf(0) }
+    var deviceRefreshes by remember { mutableIntStateOf(0) }
     fun watch(enable: Boolean) {
         if (enable) {
             try { ContextCompat.startForegroundService(context, Intent(context, WatchService::class.java)) }
@@ -198,7 +204,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                         if (s.connectionDetail.isNotBlank()) Text(s.connectionDetail, Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                             style = MaterialTheme.typography.bodySmall)
                         PocketActionRow("连接诊断", PocketIcons.Search, { repo.inspectConnection() }, enabled = s.online)
-                        PocketActionRow(context.getString(R.string.reconnect), PocketIcons.Refresh, repo::reconnect)
+                        PocketActionRow(context.getString(R.string.reconnect), PocketIcons.Refresh, { reconnects++; repo.reconnect() },
+                            glyph = { PocketRefreshGlyph(reconnects) })
                         if (onPair != null) PocketActionRow("重新扫码配对", PocketIcons.QrCodeScanner, onPair,
                             subtitle = "更新此电脑的授权，保留会话缓存与草稿")
                     }
@@ -226,7 +233,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                         }
                     }
                     SettingsSection(context.getString(R.string.paired_devices)) {
-                        PocketActionRow(context.getString(R.string.refresh_devices), PocketIcons.Refresh, { repo.devices() }, enabled = s.online)
+                        PocketActionRow(context.getString(R.string.refresh_devices), PocketIcons.Refresh, { deviceRefreshes++; repo.devices() }, enabled = s.online,
+                            glyph = { PocketRefreshGlyph(deviceRefreshes) })
                         if (s.devices.isEmpty()) Text(if (s.online) context.getString(R.string.refresh_devices_hint) else context.getString(R.string.offline_devices),
                             Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         s.devices.forEach { device ->

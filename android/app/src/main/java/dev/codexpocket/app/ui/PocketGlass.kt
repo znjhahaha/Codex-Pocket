@@ -12,8 +12,6 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.snap
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -47,6 +45,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.kyant.backdrop.Backdrop
 import dev.codexpocket.app.ui.kit.Pocket
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
@@ -67,6 +67,8 @@ internal fun PocketGlassSurface(
     onClick: (() -> Unit)? = null,
     /** Large text containers need a denser tint so the transcript does not show through the input. */
     dense: Boolean = false,
+    /** For a surface whose click belongs to the caller: its presses get the same glass response as [onClick]. */
+    interactionSource: MutableInteractionSource? = null,
     content: @Composable () -> Unit,
 ) {
     val view = LocalView.current
@@ -77,7 +79,8 @@ internal fun PocketGlassSurface(
     val glass = LocalPocketGlass.current && !preferences.highContrast && !preferences.batterySaver && view.isHardwareAccelerated
     val optics = glass && Build.VERSION.SDK_INT >= 31 && backdrop != null
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    val interaction = remember { MutableInteractionSource() }
+    val interaction = interactionSource ?: remember { MutableInteractionSource() }
+    val responsive = onClick != null || interactionSource != null
     var pressed by remember { mutableStateOf(false) }
     var touchPosition by remember { mutableStateOf(Offset.Unspecified) }
 
@@ -102,7 +105,7 @@ internal fun PocketGlassSurface(
     }
     val press = animateFloatAsState(
         targetValue = if (pressed) 1f else 0f,
-        animationSpec = if (motion) spring(dampingRatio = .82f, stiffness = 900f) else snap(),
+        animationSpec = PocketMotion.press<Float>().orSnap(motion),
         label = "glass-press",
     )
     val followTouch = if (onClick != null && motion) Modifier.pointerInput(interaction) {
@@ -148,7 +151,7 @@ internal fun PocketGlassSurface(
         onDrawSurface = { drawRect(fill) },
     ) else Modifier.background(fill, shape)
 
-    val deformation = if (onClick != null) Modifier.graphicsLayer {
+    val deformation = if (responsive) Modifier.graphicsLayer {
             val elastic = if (motion) press.value.coerceIn(-.04f, 1f) else 0f
             val focus = touchPosition.glassFocus(size)
             val x = if (size.width > 0f) focus.x / size.width - .5f else 0f
@@ -161,7 +164,7 @@ internal fun PocketGlassSurface(
             transformOrigin = TransformOrigin(.5f + x * .18f, .5f + y * .18f)
             this.shape = shape
             // Low and faint: a 4dp shadow showed as a dark band on the edges of small pills.
-            shadowElevation = if (glass) (2f - elastic.coerceAtLeast(0f) * .8f).dp.toPx() else 0f
+            shadowElevation = if (glass && onClick != null) (2f - elastic.coerceAtLeast(0f) * .8f).dp.toPx() else 0f
             ambientShadowColor = Color.Black.copy(alpha = .04f)
             spotShadowColor = Color.Black.copy(alpha = .07f)
         } else Modifier
@@ -196,9 +199,10 @@ internal fun PocketGlassSurface(
             )
             onDrawWithContent {
                 val feedback = if (motion) press.value.coerceIn(0f, 1f) else if (pressed) 1f else 0f
-                if (optics) {
+                if (glass) {
                     // A restrained upper-left rim returns the requested glass edge without
                     // a bright disk following the finger or washing out the icon underneath.
+                    // Drawn for every glass surface, also where the release cannot sample a backdrop.
                     drawOutline(outline, rim, alpha = (if (dark) .16f else .32f) + feedback * .04f,
                         style = Stroke(1.dp.toPx()))
                 }

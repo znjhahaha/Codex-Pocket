@@ -24,11 +24,21 @@ import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
+import dev.codexpocket.app.ui.kit.GlyphMotion
+import dev.codexpocket.app.ui.kit.MotionGlyph
+import dev.codexpocket.app.ui.kit.MotionGlyphs
+import dev.codexpocket.app.ui.kit.MotionIcon
+import dev.codexpocket.app.ui.kit.PToggleGlyph
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberGlyphPulse
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import kotlinx.coroutines.flow.MutableSharedFlow
 
 internal val LocalHomeContentPadding = staticCompositionLocalOf { PaddingValues(0.dp) }
@@ -40,6 +50,34 @@ internal class HomeSearchCoordinator {
     fun toggle() { requests.tryEmit(Unit) }
 }
 private enum class HomeFrameSlot { Header, Dock, Content }
+
+/** Home's own moving glyphs, on the kit's grid. Each rests in the pose of the static icon it replaces. */
+internal object HomeGlyphs {
+    /** The bubble hops while its two lines are written again. */
+    val Chat = MotionGlyph { t ->
+        val first = 1f - .75f * GlyphMotion.pulse(GlyphMotion.window(t, 0f, .7f))
+        val second = 1f - .75f * GlyphMotion.pulse(GlyphMotion.window(t, .25f, 1f))
+        move(0f, -1.2f * GlyphMotion.pulse(t)) {
+            path("M7 4.5h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H10l-5.5 3V7.5a3 3 0 0 1 3-3")
+            line(8.5f, 9f, 8.5f + 7f * first, 9f); line(8.5f, 13f, 8.5f + 4.5f * second, 13f)
+        }
+    }
+    /** The phone steps out from the monitor and back. */
+    val Devices = MotionGlyph { t ->
+        val step = GlyphMotion.pulse(t)
+        path("M12.5 16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2M8 16v4M5.5 20h6")
+        move(1.1f * step, -1.1f * step) { path("M16 10h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1M17.5 18.5h1") }
+    }
+    /** 0 is search, 1 is close: the handle grows into one stroke of the cross as the lens gives way to the other. */
+    val SearchClose = MotionGlyph { t ->
+        val lens = 1f - GlyphMotion.window(t, 0f, .55f)
+        val cross = GlyphMotion.window(t, .3f, 1f)
+        line(15f - 8.5f * cross, 15f - 8.5f * cross, 20.5f - 3f * cross, 20.5f - 3f * cross)
+        if (lens > 0f) scale(.4f + .6f * lens, 10f, 10f) { circle(10f, 10f, 6.5f, lens) }
+        if (cross > 0f) line(17.5f, 6.5f, 17.5f - 11f * cross, 6.5f + 11f * cross, cross)
+    }
+    fun tab(tab: HomeTab): MotionGlyph = when (tab) { HomeTab.Chats -> Chat; HomeTab.Attention -> MotionGlyphs.Bell; HomeTab.Devices -> Devices }
+}
 
 /** Only the content is sampled: the floating controls never capture themselves. */
 @Composable
@@ -81,7 +119,8 @@ internal fun PocketHomeFrame(s: PocketState, tab: HomeTab, attention: Int, compa
 @Composable
 internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpanded: Boolean, onHost: () -> Unit, onNew: () -> Unit, onSettings: () -> Unit) {
     val padding by animateDpAsState(if (compact) 4.dp else 8.dp, tween(pocketMotionMillis(220)), label = "home-header-density")
-    val arrow by animateFloatAsState(if (hostExpanded) 180f else 0f, tween(pocketMotionMillis(140)), label = "host-chevron")
+    val motion = rememberPocketMotion()
+    val arrow by animateFloatAsState(if (hostExpanded) 180f else 0f, PocketMotion.glyph<Float>().orSnap(motion), label = "host-chevron")
     val search = LocalHomeSearchCoordinator.current
     val context = LocalContext.current
     val restoring = s.restoringConnection
@@ -106,7 +145,7 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
             }
             if (tab == HomeTab.Chats && search != null) PocketGlassSurface(onClick = search::toggle, shape = CircleShape, modifier = Modifier.size(48.dp).testTag("home-header-search")
                 .semantics { contentDescription = context.getString(if (search.expanded) R.string.v03_home_hide_search else R.string.v03_home_search) }) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(if (search.expanded) PocketIcons.Close else PocketIcons.Search, null, Modifier.size(21.dp)) }
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PToggleGlyph(HomeGlyphs.SearchClose, search.expanded, Modifier.size(21.dp), tint = LocalContentColor.current) }
             }
             val canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { it.online && s.supports("thread/start", it) })
             PocketGlassSurface(onClick = onNew.takeIf { canCreate }, shape = CircleShape, modifier = Modifier.size(48.dp).testTag("home-new-chat")
@@ -122,15 +161,19 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
 /** Navigation holds its geometry while icons respond to selection; motion never changes hit targets. */
 @Composable
 internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Unit)? = null, canCreate: Boolean = true, onAssistant: (() -> Unit)? = null, onSelect: (HomeTab) -> Unit) {
+    val motion = rememberPocketMotion()
     Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 18.dp, end = if (onAssistant == null) 88.dp else 18.dp, top = 10.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
     // Dense: list text scrolls right under the dock and showed through its rounded end as a gray patch.
     PocketGlassSurface(modifier = Modifier.weight(1f).testTag("home-navigation"), shape = PocketOval, dense = true) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(6.dp)) {
             val itemWidth = maxWidth / 3
-            val selectionX by animateDpAsState(itemWidth * tab.ordinal, tween(pocketMotionMillis(320), easing = FastOutSlowInEasing), label = "navigation-selection")
+            // Two springs on one target: the quick edge leads and the slow one follows, so the pill stretches as it travels.
+            val lead by animateDpAsState(itemWidth * tab.ordinal, spring<Dp>(dampingRatio = .85f, stiffness = 640f).orSnap(motion), label = "navigation-selection")
+            val trail by animateDpAsState(itemWidth * tab.ordinal, spring<Dp>(dampingRatio = .85f, stiffness = 300f).orSnap(motion), label = "navigation-selection-trail")
+            val selectionX = minOf(lead, trail)
             Box {
             Box(Modifier.matchParentSize()) {
-                Box(Modifier.offset(x = selectionX).width(itemWidth).fillMaxHeight().clip(PocketOval)
+                Box(Modifier.offset(x = selectionX).width(itemWidth + (maxOf(lead, trail) - selectionX)).fillMaxHeight().clip(PocketOval)
                     // Opaque: a translucent pill let the refracted list text read as a gray smudge at its end.
                     .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = .65f).compositeOver(MaterialTheme.colorScheme.surface)).testTag("home-tab-selection"))
             }
@@ -145,12 +188,14 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
                     val tint by animateColorAsState(if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
                         tween(pocketMotionMillis(180)), label = "nav-icon-tint")
                     val label = when(item) { HomeTab.Chats -> "会话"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" }
+                    val play = rememberGlyphPulse(selected)
                     Column(Modifier.weight(1f).fillMaxHeight().heightIn(min = 58.dp).clip(PocketOval)
                         .selectable(selected, interactionSource = interaction, indication = null, role = Role.Tab, onClick = { onSelect(item) })
                         .semantics { if (item == HomeTab.Attention && attention > 0) stateDescription = "$attention 项待处理" }
                         .testTag("home-tab-${item.name.lowercase()}"), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                         Box(Modifier.offset(y = offset).graphicsLayer { scaleX = scale; scaleY = scale }) {
-                            Icon(when(item) { HomeTab.Chats -> PocketIcons.ChatBubbleOutline; HomeTab.Attention -> PocketIcons.NotificationsNone; HomeTab.Devices -> PocketIcons.Devices }, null, Modifier.size(21.dp), tint = tint)
+                            // Only the tab being entered plays; the one left behind returns to rest at once.
+                            MotionIcon(HomeGlyphs.tab(item), { if (selected) play.value else 1f }, Modifier.size(21.dp), tint)
                             if (item == HomeTab.Attention && attention > 0) Box(Modifier.align(Alignment.TopEnd).offset(x = 2.dp, y = (-1).dp).size(6.dp).background(MaterialTheme.colorScheme.secondary, CircleShape))
                         }
                         Spacer(Modifier.height(2.dp))

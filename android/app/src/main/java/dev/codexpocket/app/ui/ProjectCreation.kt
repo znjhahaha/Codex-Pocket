@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.material3.*
 import androidx.compose.ui.graphics.graphicsLayer
@@ -46,6 +47,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.MotionGlyphs
+import dev.codexpocket.app.ui.kit.PLoopGlyph
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 
 /** Presentation state is independent of the advanced section's visibility. */
 @Composable
@@ -83,6 +89,7 @@ internal fun ProjectCreationForm(
         (available.any { it.id == runtimeId } || s.canPrepareRuntime(mode))
 
     val pageProgress by animateFloatAsState(if (pickingProject) 1f else 0f, creationTween(520), label = "project-picker-tide")
+    val motion = rememberPocketMotion()
     BackHandler(pickingProject) { pickingProject = false }
     val close = { if (pickingProject) pickingProject = false else onDismiss() }
     PocketPageOverlay("新建对话", close) {
@@ -109,8 +116,9 @@ internal fun ProjectCreationForm(
                             Icon(PocketIcons.Computer, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(s.computerName.ifBlank { "当前电脑" }, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Box(Modifier.size(6.dp).clip(RoundedCornerShape(50)).background(
-                                if (s.online) Color(0xFF62A88A) else MaterialTheme.colorScheme.error))
+                            val connectivity by animateColorAsState(if (s.online) Color(0xFF62A88A) else MaterialTheme.colorScheme.error,
+                                PocketMotion.color<Color>().orSnap(motion), label = "project-connectivity")
+                            Box(Modifier.size(6.dp).clip(RoundedCornerShape(50)).background(connectivity))
                             Text(if (s.online) "已连接" else "未连接", style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -119,9 +127,10 @@ internal fun ProjectCreationForm(
                     if (!createDirectory) {
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             CreationSectionTitle("工作目录")
+                            val pickerPress = remember { MutableInteractionSource() }
                             PocketGlassSurface(Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
-                                .clickable(enabled = !creating, role = Role.Button) { focus.clearFocus(); pickingProject = true }
-                                .testTag("project-picker-open"), shape = RoundedCornerShape(28.dp), dense = true) {
+                                .clickable(pickerPress, indication = null, enabled = !creating, role = Role.Button) { focus.clearFocus(); pickingProject = true }
+                                .testTag("project-picker-open"), shape = RoundedCornerShape(28.dp), dense = true, interactionSource = pickerPress) {
                                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                     CreationFolderBadge(true)
@@ -186,7 +195,7 @@ internal fun ProjectCreationForm(
                             Icon(PocketIcons.Tune, null, Modifier.size(17.dp)); Spacer(Modifier.width(10.dp))
                             Text(if (advanced) "收起高级选项" else "高级选项", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
                             Text(mode.label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            val rotation by animateFloatAsState(if (advanced) 180f else 0f, creationTween(260), label = "advanced-chevron")
+                            val rotation by animateFloatAsState(if (advanced) 180f else 0f, PocketMotion.glyph<Float>().orSnap(motion), label = "advanced-chevron")
                             Icon(PocketIcons.ExpandMore, null, Modifier.padding(start = 8.dp).size(17.dp).graphicsLayer { rotationZ = rotation })
                         }
                         if (advanced) {
@@ -228,7 +237,9 @@ internal fun ProjectCreationForm(
                         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text(if (creating) "正在创建…" else if (createDirectory) "创建项目并开始" else "开始对话", Modifier.weight(1f),
                                 style = MaterialTheme.typography.labelLarge)
-                            Icon(if (creating) PocketIcons.LoaderCircle else PocketIcons.ArrowForward, null, Modifier.size(20.dp))
+                            // Turns only while the request is in flight; the arrow is back as soon as it ends.
+                            if (creating) PLoopGlyph(MotionGlyphs.Spin, true, Modifier.size(20.dp), LocalContentColor.current, millis = 900)
+                            else Icon(PocketIcons.ArrowForward, null, Modifier.size(20.dp))
                         }
                     }
                 }
@@ -266,8 +277,10 @@ private fun CreationSectionTitle(title: String) {
 @Composable
 private fun ProjectChoice(path: String, selected: Boolean, enabled: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val c = MaterialTheme.colorScheme
+    val press = remember { MutableInteractionSource() }
     PocketGlassSurface(modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
-        .selectable(selected, enabled = enabled, role = Role.RadioButton, onClick = onClick), shape = RoundedCornerShape(28.dp), dense = true) {
+        .selectable(selected, press, indication = null, enabled = enabled, role = Role.RadioButton, onClick = onClick),
+        shape = RoundedCornerShape(28.dp), dense = true, interactionSource = press) {
         Row(Modifier.fillMaxWidth().background(if (selected) c.secondary.copy(alpha = .055f) else Color.Transparent)
             .padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {

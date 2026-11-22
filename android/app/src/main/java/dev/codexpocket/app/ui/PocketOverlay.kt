@@ -9,7 +9,9 @@ import androidx.compose.animation.core.spring
 
 import androidx.compose.ui.graphics.TransformOrigin
 
-import androidx.activity.compose.BackHandler
+import androidx.activity.BackEventCompat
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.MutableTransitionState
@@ -25,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
@@ -44,9 +47,15 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kyant.backdrop.Backdrop
 import dev.codexpocket.app.ui.kit.PSurface
 import dev.codexpocket.app.ui.kit.Pocket
+import dev.codexpocket.app.ui.kit.PocketHaptic
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberPocketHaptics
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.backdrops.rememberCanvasBackdrop
@@ -64,6 +73,8 @@ private val LocalModalBackdrop = staticCompositionLocalOf<Backdrop?> { null }
 private val LocalOverlayProgress = staticCompositionLocalOf { 1f }
 // Read at callback time: registry changes can precede the covered editor's recomposition.
 internal val LocalPocketInputActive = staticCompositionLocalOf<() -> Boolean> { { true } }
+// False once the owner has dropped the layer and only its exit is still playing.
+private val LocalOverlayPresent = staticCompositionLocalOf<() -> Boolean> { { true } }
 
 /** One window, two sibling layers. Only the page is recorded, never scrims or modal content. */
 @Composable
@@ -115,13 +126,42 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
                     LaunchedEffect(state.isIdle, state.currentState, entry.present) {
                         if (state.isIdle && !state.currentState && !entry.present) registry.entries.remove(entry)
                     }
-                    CompositionLocalProvider(LocalOverlayProgress provides progress,
+                    CompositionLocalProvider(LocalOverlayProgress provides progress, LocalOverlayPresent provides { entry.present },
                         LocalPocketInputActive provides { entry.present && registry.entries.lastOrNull() === entry }) {
                         entry.content(index == registry.entries.lastIndex)
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * BackHandler that also hears the back gesture's progress where the system reports it (Android 14 and
+ * later, for an activity that opts in). Committing stays the same synchronous call on every release;
+ * without progress events this is exactly BackHandler.
+ */
+@Composable
+private fun PocketBackHandler(enabled: Boolean, onProgress: (BackEventCompat) -> Unit, onCancel: () -> Unit, onBack: () -> Unit) {
+    val progress by rememberUpdatedState(onProgress)
+    val cancel by rememberUpdatedState(onCancel)
+    val back by rememberUpdatedState(onBack)
+    val callback = remember {
+        object : OnBackPressedCallback(enabled) {
+            override fun handleOnBackStarted(backEvent: BackEventCompat) = progress(backEvent)
+            override fun handleOnBackProgressed(backEvent: BackEventCompat) = progress(backEvent)
+            override fun handleOnBackCancelled() = cancel()
+            override fun handleOnBackPressed() = back()
+        }
+    }
+    SideEffect { callback.isEnabled = enabled }
+    val dispatcher = checkNotNull(LocalOnBackPressedDispatcherOwner.current) {
+        "No OnBackPressedDispatcherOwner was provided via LocalOnBackPressedDispatcherOwner"
+    }.onBackPressedDispatcher
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, dispatcher) {
+        dispatcher.addCallback(lifecycleOwner, callback)
+        onDispose { callback.remove() }
     }
 }
 
@@ -166,11 +206,24 @@ internal fun PocketModal(
         val progress = LocalOverlayProgress.current
         val inputActive by rememberUpdatedState(LocalPocketInputActive.current)
         val interactive = inputActive()
+        val haptics by rememberUpdatedState(rememberPocketHaptics())
+        // A sheet let go short of dismissal springs back to rest; with motion off it is simply there.
+        val settle by rememberUpdatedState(PocketMotion.resize<Float>().orSnap(rememberPocketMotion()))
         LaunchedEffect(top) {
             if (top && !focus.restoreFocusedChild()) focus.requestFocus()
         }
+        val present by rememberUpdatedState(LocalOverlayPresent.current)
+        val motion by rememberUpdatedState(rememberPocketMotion())
+        // How far a back gesture has pulled this layer toward leaving: 0 at rest, 1 at the gesture's end.
+        val pull = remember { Animatable(0f) }
         // Keep owning Back and pointer input until the exit animation removes this entry.
-        BackHandler(top) { if (inputActive()) currentDismiss() }
+        PocketBackHandler(top,
+            onProgress = { event -> if (motion && inputActive()) scope.launch { pull.snapTo(event.progress.coerceIn(0f, 1f)) } },
+            onCancel = { scope.launch { pull.animateTo(0f, settle) } }) {
+            if (inputActive()) currentDismiss()
+            // A layer that leaves carries on from where the gesture held it; one that stays returns to rest.
+            if (pull.value != 0f) scope.launch { repeat(2) { withFrameNanos { } }; if (present()) pull.animateTo(0f, settle) }
+        }
         BoxWithConstraints(Modifier.fillMaxSize()
             .then(if (!interactive) Modifier.clearAndSetSemantics {} else Modifier)
             .pointerInput(Unit) {
@@ -208,8 +261,10 @@ internal fun PocketModal(
                 }
                 .clearAndSetSemantics {})
             // Standalone destinations own an opaque page; only small menus use sampled glass.
+            // A back gesture thins that page so the one underneath shows where this one has moved aside.
+            val pageColor = Pocket.colors.bg
             BoxWithConstraints(Modifier.fillMaxSize()
-                .then(if (screen) Modifier.background(Pocket.colors.bg) else Modifier)
+                .then(if (screen) Modifier.drawBehind { drawRect(pageColor, alpha = 1f - pull.value.coerceIn(0f, 1f)) } else Modifier)
                 .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else if (maxWidthDp > 360f) 16.dp else 12.dp),
                 // Sheets rise from the bottom edge like iOS action sheets; dialogs stay centered.
                 contentAlignment = if (sheet && !screen && !anchored) Alignment.BottomCenter else Alignment.Center) {
@@ -219,27 +274,34 @@ internal fun PocketModal(
                         onDragStart = { distance = 0f },
                         onVerticalDrag = { change, amount ->
                             change.consume()
+                            val armed = distance > 72.dp.toPx()
                             distance = (distance + amount).coerceAtLeast(0f)
+                            // The finger feels the point past which letting go dismisses, and the way back.
+                            if (distance > 72.dp.toPx() != armed) haptics.perform(if (armed) PocketHaptic.Tick else PocketHaptic.Threshold)
                             scope.launch { drag.snapTo(distance) }
                         },
                         onDragEnd = {
                             if (distance > 72.dp.toPx() && inputActive()) currentDismiss()
-                            else scope.launch { drag.animateTo(0f, tween(pocketMotionMillis(160))) }
+                            else scope.launch { drag.animateTo(0f, settle) }
                         },
-                        onDragCancel = { scope.launch { drag.animateTo(0f, tween(pocketMotionMillis(160))) } },
+                        onDragCancel = { scope.launch { drag.animateTo(0f, settle) } },
                     )
                 } else Modifier
                 val panelModifier = Modifier
                         .then(if (screen) Modifier.fillMaxSize() else Modifier.widthIn(max = maxWidthDp.dp).fillMaxWidth())
                         .heightIn(max = if (screen || anchored) maxHeight else maxHeight * maxHeightFraction.coerceIn(.1f, 1f)).graphicsLayer {
-                            translationY = drag.value + if (screen) 0f else (1f - progress) * (if (sheet) 28 else 8).dp.toPx()
+                            // A back gesture previews the way out: sheets sink, pages start toward the trailing edge, the rest recede.
+                            val leaving = pull.value.coerceIn(0f, 1f)
+                            translationY = drag.value + (if (screen) 0f else (1f - progress) * (if (sheet) 28 else 8).dp.toPx()) +
+                                if (sheet && !screen && !anchored) leaving * 28.dp.toPx() else 0f
                             // Pages push in from the trailing edge (a third of a screen), like UINavigationController.
-                            translationX = if (screen) (1f - progress) * size.width * .32f else 0f
+                            translationX = if (screen) (1f - progress) * size.width * .32f + leaving * size.width * .14f else 0f
                             alpha = progress.coerceIn(0f, 1f)
                             // Popovers grow out of the control that opened them, like an iOS context menu.
                             val from = if (anchored) .86f else .97f
-                            scaleX = if (screen) 1f else from + progress * (1f - from)
-                            scaleY = if (screen) 1f else from + progress * (1f - from)
+                            val recede = if (sheet) 1f else 1f - .05f * leaving
+                            scaleX = if (screen) 1f else (from + progress * (1f - from)) * recede
+                            scaleY = if (screen) 1f else (from + progress * (1f - from)) * recede
                             if (anchored) transformOrigin = TransformOrigin(if (alignStart) 0f else 1f, if (below) 0f else 1f)
                         }
                         // Own empty panel space without adding a click action or consuming child gestures.

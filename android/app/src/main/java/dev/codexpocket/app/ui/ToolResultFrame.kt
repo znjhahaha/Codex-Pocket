@@ -37,7 +37,7 @@ internal fun ToolResultFrame(title: String, copyText: String, wrap: Boolean, onW
                 Box(Modifier.semantics { stateDescription = if (wrap) "自动换行已开启" else "自动换行已关闭" }) {
                     QuietAction(PocketIcons.WrapText, if (wrap) "关闭自动换行" else "开启自动换行", onWrap)
                 }
-                if (copyText.isNotBlank()) QuietAction(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, if (onClose != null) "复制工具详情" else "复制工具内容") {
+                if (copyText.isNotBlank()) CopyGlyphAction(copied, if (onClose != null) "复制工具详情" else "复制工具内容") {
                     clipboard.setText(AnnotatedString(copyText)); copied = true
                 }
                 if (onClose != null) QuietAction(PocketIcons.Close, "收起工具详情", onClose)

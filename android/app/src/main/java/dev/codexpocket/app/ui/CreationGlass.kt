@@ -8,7 +8,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import dev.codexpocket.app.ui.kit.pocketSelectable
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -139,7 +139,7 @@ internal fun CreationDirectorySwitch(selected: Boolean, enabled: Boolean, onSele
             Row {
                 listOf(false to "已有目录", true to "新建目录").forEach { (value, label) ->
                     Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(50))
-                        .selectable(selected == value, enabled = enabled, role = Role.Tab, onClick = { onSelect(value) }),
+                        .pocketSelectable(selected == value, enabled, Role.Tab, pressedScale = .96f, haptic = null) { onSelect(value) },
                         horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                         Icon(if (value) PocketIcons.Add else PocketIcons.FolderOpen, null, Modifier.size(17.dp),
                             tint = if (selected == value) c.onSurface else c.onSurfaceVariant)

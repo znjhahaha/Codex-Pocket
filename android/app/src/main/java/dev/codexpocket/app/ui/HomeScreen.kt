@@ -7,6 +7,7 @@ import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -50,6 +51,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collect
@@ -165,6 +169,7 @@ private fun ColumnScope.HomeProjectSessions(
         showInitialLoading = false
         if (s.directoryLoading && chats.isEmpty()) { delay(150); showInitialLoading = true }
     }
+    val motion = rememberPocketMotion()
     HomeLibraryHeader(archived, { archived = it }, chats.size,
         searching = searchExpanded, onSearch = toggleSearch.takeIf { searchCoordinator == null })
     androidx.compose.animation.AnimatedVisibility(searchExpanded,
@@ -183,7 +188,7 @@ private fun ColumnScope.HomeProjectSessions(
             HomeSyncState(s, onRetry = { onRefresh(search, archived, false) })
         }
         if (attentionCount > 0 && !archived && search.isBlank()) item(key = "home-attention", contentType = "attention") {
-            HomeAttentionEntry(attentionCount, onAttention)
+            HomeAttentionEntry(attentionCount, onAttention, homeItemMotion(motion))
         }
         if (chats.isEmpty() && !s.directoryLoading) item(key = "home-empty", contentType = "empty") {
             HomeEmptyState(search, project?.cwd, archived, s.online, canCreate,
@@ -192,7 +197,7 @@ private fun ColumnScope.HomeProjectSessions(
         groups.forEach { group ->
             val expanded = group.id !in collapsedGroups
             item(key = "home-group-${group.id}", contentType = "group-header") {
-                HomeGroupHeader(group, expanded, { collapsedGroups = if (expanded) collapsedGroups + group.id else collapsedGroups - group.id })
+                HomeGroupHeader(group, expanded, { collapsedGroups = if (expanded) collapsedGroups + group.id else collapsedGroups - group.id }, homeItemMotion(motion))
             }
             // Both project and status sections use the same lazy vertical flow.
             if (expanded) itemsIndexed(group.chats, key = { _, chat -> chat.key.encoded }, contentType = { _, _ -> "chat" }) { index, chat ->
@@ -200,7 +205,7 @@ private fun ColumnScope.HomeProjectSessions(
                 ChatHomeRow(chat, statuses[chat.key.encoded].orEmpty(), chat.key.encoded in s.unreadKeys, s.online,
                     { onSelect(chat) }, { onPin(chat) }, { onArchive(chat) },
                     archiveEnabled = s.archiveUnavailableReason(chat) == null, showDivider = index < group.chats.lastIndex,
-                    modifier = Modifier.animateItem(fadeInSpec = tween(pocketMotionMillis(150)), placementSpec = tween(pocketMotionMillis(180)), fadeOutSpec = tween(pocketMotionMillis(120))))
+                    modifier = homeItemMotion(motion))
             }
         }
         if (s.nextThreads != null && s.online) item(key = "home-load-more", contentType = "footer") {
@@ -210,6 +215,10 @@ private fun ColumnScope.HomeProjectSessions(
         }
     }
 }
+
+/** Rows that come, go or move within the list. Nothing is attached when motion is off, so items change at once. */
+private fun LazyItemScope.homeItemMotion(motion: Boolean): Modifier =
+    if (motion) Modifier.animateItem(PocketMotion.enter(), PocketMotion.state(), PocketMotion.exit()) else Modifier
 
 @Composable
 private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
@@ -244,7 +253,7 @@ internal fun HomeScopeTab(text: String, selected: Boolean, onClick: () -> Unit, 
 
 @Composable
 private fun HomeGroupHeader(group: HomeChatGroup, expanded: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
-    val rotation by animateFloatAsState(if (expanded) 90f else 0f, tween(pocketMotionMillis(200)), label = "home-group-${group.id}")
+    val rotation by animateFloatAsState(if (expanded) 90f else 0f, PocketMotion.glyph<Float>().orSnap(rememberPocketMotion()), label = "home-group-${group.id}")
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val c = MaterialTheme.colorScheme
@@ -289,10 +298,10 @@ internal fun homeRelativeTime(millis: Long, now: Long): String? {
 }
 
 @Composable
-private fun HomeAttentionEntry(count: Int, onClick: () -> Unit) {
+private fun HomeAttentionEntry(count: Int, onClick: () -> Unit, modifier: Modifier = Modifier) {
     PocketTextButton(
         onClick = onClick,
-        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp).fillMaxWidth().testTag("home-attention")
+        modifier = modifier.padding(horizontal = 20.dp, vertical = 8.dp).fillMaxWidth().testTag("home-attention")
             .border(.7.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f), RoundedCornerShape(14.dp)),
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
     ) {

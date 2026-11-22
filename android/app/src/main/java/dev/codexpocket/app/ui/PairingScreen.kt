@@ -55,6 +55,9 @@ import com.journeyapps.barcodescanner.DefaultDecoderFactory
 import com.journeyapps.barcodescanner.camera.CenterCropStrategy
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.PairingPhase
+import dev.codexpocket.app.ui.kit.MotionGlyphs
+import dev.codexpocket.app.ui.kit.PEntranceGlyph
+import dev.codexpocket.app.ui.kit.PPulseGlyph
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -76,6 +79,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
     var submitting by remember { mutableStateOf(false) }
     var decoding by remember { mutableStateOf(false) }
     var torch by remember { mutableStateOf(false) }
+    var rescans by remember { mutableIntStateOf(0) }
     var issue by remember { mutableStateOf<String?>(null) }
     var permission by remember { mutableStateOf(context.cameraGranted()) }
     var foreground by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
@@ -140,7 +144,9 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 onError = { paused = true; torch = false; issue = "相机暂不可用，请重试、选择相册或手动粘贴" })
             if (!active) Column(Modifier.padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(if (scanner.computerName != null || payload.isNotBlank()) PocketIcons.CheckCircle else PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
+                // A code that has just been read draws its confirmation; a paused scanner shows the still icon.
+                if (scanner.computerName != null || payload.isNotBlank()) PEntranceGlyph(MotionGlyphs.CheckCircle, true, Modifier.size(42.dp), Color.White)
+                else Icon(PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
                 Text(when {
                     scanner.computerName != null -> "已读取配对内容"
                     payload.isNotBlank() -> "已读取配对内容"
@@ -158,8 +164,8 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 PocketProgressStatus("正在扫描")
             }
         }
-        if (permission) PocketTextButton({ retry(); manual = false }, enabled = !working, modifier = Modifier.testTag("pair-scan")) {
-            Icon(PocketIcons.Refresh, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("重新扫描")
+        if (permission) PocketTextButton({ rescans++; retry(); manual = false }, enabled = !working, modifier = Modifier.testTag("pair-scan")) {
+            PPulseGlyph(MotionGlyphs.Refresh, rescans, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("重新扫描")
         }
         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             PocketTextButton({ torch = !torch }, enabled = active && context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {

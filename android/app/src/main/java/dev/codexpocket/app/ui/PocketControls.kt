@@ -38,8 +38,10 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.ui.kit.PButton
 import dev.codexpocket.app.ui.kit.PButtonKind
+import dev.codexpocket.app.ui.kit.MotionGlyphs
 import dev.codexpocket.app.ui.kit.PCheck
 import dev.codexpocket.app.ui.kit.PPill
+import dev.codexpocket.app.ui.kit.PPulseGlyph
 import dev.codexpocket.app.ui.kit.PRow
 import dev.codexpocket.app.ui.kit.PSheetClose
 import dev.codexpocket.app.ui.kit.PSwitch
@@ -98,9 +100,13 @@ internal fun PocketAnchoredMenu(title: String, onDismiss: () -> Unit, anchor: Re
 /** One menu line: 20dp icon, label, optional gray hint and trailing slot. 48dp touch target. */
 @Composable
 internal fun PocketMenuItem(label: String, icon: ImageVector?, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
-    selected: Boolean = false, hint: String? = null, trailing: (@Composable () -> Unit)? = null) {
-    PRow(label, onClick, modifier, icon, hint, enabled, selected, trailing = trailing)
+    selected: Boolean = false, hint: String? = null, glyph: (@Composable () -> Unit)? = null, trailing: (@Composable () -> Unit)? = null) {
+    PRow(label, onClick, modifier, icon, hint, enabled, selected, glyph = glyph, trailing = trailing)
 }
+
+/** The refresh arrows of a row, making one eased turn each time [turns] changes. Same 19dp box as the row's static icon. */
+@Composable
+internal fun PocketRefreshGlyph(turns: Int) = PPulseGlyph(MotionGlyphs.Refresh, turns, Modifier.size(19.dp))
 
 @Composable
 internal fun PocketPageEntrance(key: String, back: Boolean = false, content: @Composable () -> Unit) {
@@ -160,8 +166,9 @@ internal fun PocketTextButton(onClick: () -> Unit, modifier: Modifier = Modifier
 
 @Composable
 internal fun PocketActionRow(title: String, icon: ImageVector, onClick: () -> Unit, subtitle: String? = null,
-    enabled: Boolean = true, selected: Boolean = false, destructive: Boolean = false, trailing: (@Composable () -> Unit)? = null) {
-    PRow(title, onClick, Modifier.heightIn(min = 50.dp), icon, subtitle, enabled, selected, destructive, accentSelection = true, trailing = trailing)
+    enabled: Boolean = true, selected: Boolean = false, destructive: Boolean = false, glyph: (@Composable () -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null) {
+    PRow(title, onClick, Modifier.heightIn(min = 50.dp), icon, subtitle, enabled, selected, destructive, accentSelection = true, glyph = glyph, trailing = trailing)
 }
 
 @Composable
