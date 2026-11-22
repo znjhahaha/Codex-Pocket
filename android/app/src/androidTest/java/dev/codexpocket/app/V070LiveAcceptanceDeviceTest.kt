@@ -376,16 +376,15 @@ class V070LiveAcceptanceDeviceTest {
         compose.runOnIdle { page = "assistant" }
         compose.waitForIdle()
         node("assistant-tools").performClick()
-        node("assistant-workspace").performClick()
-        node("assistant-workspace:${nativeChat.key.nativeId}").assertIsDisplayed().performClick()
+        node("assistant-workspace-project:${nativeChat.key.nativeId}").assertIsDisplayed().performClick()
         val prompt = "This is an acceptance conversation in the selected dedicated workspace. Do not run tools, read files, create tasks, or modify anything. Reply with only this exact marker, without punctuation:\n$assistantMarker"
-        node("assistant-message-input").performTextReplacement(prompt)
+        node("assistant-workspace-draft").performTextReplacement(prompt)
         hideKeyboard()
-        node("assistant-send").assertIsEnabled().performClick()
+        node("assistant-workspace-send").assertIsEnabled().performClick()
         await("assistant accepted receipt", 60_000) {
             repository.state.value.assistant.sendReceipts.any { it.status == "accepted" } && calls.any { it.method == "assistant/send" && it.accepted }
         }
-        compose.waitUntil(10_000) { node("assistant-message-input").fetchSemanticsNode().config[SemanticsProperties.EditableText].text.isEmpty() }
+        compose.waitUntil(10_000) { node("assistant-workspace-draft").fetchSemanticsNode().config[SemanticsProperties.EditableText].text.isEmpty() }
         await("real assistant marker reply", 120_000, poll = { join(repository.loadAssistant(automaticPrepare = false), 20_000) }) {
             assistantMessages().any { it.role == "Assistant" && it.text.trim() == assistantMarker }
         }
@@ -398,9 +397,9 @@ class V070LiveAcceptanceDeviceTest {
         await("assistant offline", 10_000) { !repository.state.value.online }
         join(repository.loadAssistant(automaticPrepare = false), 15_000)
         assertTrue("Offline keeps actual assistant reply", assistantMessages().any { it.role == "Assistant" && it.text.trim() == assistantMarker })
-        node("assistant-message-input").performTextReplacement("Unsent offline draft")
+        node("assistant-workspace-draft").performTextReplacement("Unsent offline draft")
         hideKeyboard()
-        node("assistant-send").assertIsNotEnabled()
+        node("assistant-workspace-send").assertIsNotEnabled()
         capture("02-assistant-offline")
         repository.setForeground(true)
         await("assistant reconnect", 60_000) { repository.state.value.online }
@@ -408,8 +407,8 @@ class V070LiveAcceptanceDeviceTest {
         assertEquals(coordinator, repository.state.value.assistant.snapshot?.coordinatorThreadId)
         assertEquals(assistantBinding, repository.state.value.assistant.snapshot?.composerBinding(repository.state.value.computerId))
         assertTrue(assistantMessages().any { it.role == "Assistant" && it.text.trim() == assistantMarker })
-        node("assistant-message-input").assertTextEquals("Unsent offline draft")
-        node("assistant-message-input").performTextClearance()
+        node("assistant-workspace-draft").assertTextEquals("Unsent offline draft")
+        node("assistant-workspace-draft").performTextClearance()
         hideKeyboard()
         observeNoReplay(2_000)
         assertEquals("Assistant reconnect must not replay", 1, calls.count { it.method == "assistant/send" })

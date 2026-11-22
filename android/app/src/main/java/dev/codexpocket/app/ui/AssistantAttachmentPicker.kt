@@ -3,15 +3,15 @@ package dev.codexpocket.app.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AttachFile
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.*
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 
@@ -42,6 +42,7 @@ internal class AssistantAttachmentDraft(private val context:android.content.Cont
     return remember(context,key) {AssistantAttachmentDraft(context,key)}
 }
 @Composable internal fun AssistantAttachmentPicker(draft:AssistantAttachmentDraft,tag:String,enabled:Boolean=true) {
+    val c=Pocket.colors
     val context=LocalContext.current;val scope=rememberCoroutineScope()
     var loading by remember {mutableStateOf(false)};var issue by remember {mutableStateOf<String?>(null)}
     val launcher=rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {uris->
@@ -52,15 +53,17 @@ internal class AssistantAttachmentDraft(private val context:android.content.Cont
             finally {loading=false}
         }
     }
-    Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
-        draft.files.forEach {file->Row(Modifier.fillMaxWidth()) {
-            Text(file.name,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall)
-            TextButton({draft.remove(file.id)},enabled=enabled && !loading) {Text("移除")}
+    Column(verticalArrangement=Arrangement.spacedBy(2.dp)) {
+        draft.files.forEach {file->Row(Modifier.fillMaxWidth().padding(start=4.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+            PIcon(PocketIcons.Description,null,Modifier.size(16.dp),c.inkMuted)
+            PText(file.name,Modifier.weight(1f),style=Pocket.type.bodySmall,maxLines=2,overflow=TextOverflow.Ellipsis)
+            PTextAction("移除",{draft.remove(file.id)},enabled=enabled && !loading,tint=c.inkMuted)
         }}
-        TextButton({launcher.launch(arrayOf("image/png","image/jpeg","image/webp","text/*","application/json","application/octet-stream"))},
-            enabled=enabled && !loading && draft.files.size<4,modifier=Modifier.testTag("assistant-attach:$tag")) {
-            Icon(Icons.Outlined.AttachFile,null);Text(if(loading) "正在读取附件…" else "添加图片或文本文件")
+        PTextAction({launcher.launch(arrayOf("image/png","image/jpeg","image/webp","text/*","application/json","application/octet-stream"))},
+            Modifier.testTag("assistant-attach:$tag"),enabled=enabled && !loading && draft.files.size<4,contentPadding=PaddingValues(start=4.dp,end=12.dp,top=8.dp,bottom=8.dp)) {
+            if(loading) PSpinner(Modifier.size(16.dp)) else PPulseGlyph(MotionGlyphs.Paperclip,draft.files.size,Modifier.size(18.dp))
+            PText(if(loading) "正在读取附件…" else "添加图片或文本文件",Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)
         }
-        issue?.let {Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
+        issue?.let {PText(it,Modifier.padding(horizontal=4.dp),style=Pocket.type.bodySmall,color=c.danger)}
     }
 }

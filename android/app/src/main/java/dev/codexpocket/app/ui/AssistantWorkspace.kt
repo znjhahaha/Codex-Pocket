@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -79,7 +80,9 @@ internal fun assistantPageTitle(page: String) = when {
         val notice: @Composable () -> Unit = {
             AssistantStatusRow(issue, issue != null && issue == state.unconfirmedFeedback, state.loading) { act { AssistantActions.read(snapshot?.after ?: 0) } }
         }
-        Box(modifier.fillMaxSize().background(Pocket.colors.bg).testTag("assistant-workspace")) {
+        // The overlay layer hands focus back to the page when a menu, sheet or dialog closes. Taking it here keeps it
+        // from landing on the first text field, which would raise the keyboard on a page that was only opened.
+        Box(modifier.fillMaxSize().background(Pocket.colors.bg).testTag("assistant-workspace").focusTarget()) {
             AssistantPageEntrance(page, returning) {
                 holder.SaveableStateProvider("$owner:$page") {
                     if (page == "Main") AssistantStage(state, workspaces, canAct, connected, ::act, ::navigate, onOpenThread, ::back, onProjectSelected, notice)
@@ -175,7 +178,7 @@ private fun AssistantStatusRow(issue: String?, unconfirmed: Boolean, loading: Bo
 @Composable
 private fun AssistantSubpage(title: String, onBack: () -> Unit, notice: @Composable () -> Unit, content: @Composable () -> Unit) {
     PFrame(header = { Column(Modifier.assistantChromeVeil(true)) { AssistantTopBar(title, onBack); notice() } }) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding).navigationBarsPadding()) { AssistantSecondaryTheme(content) }
+        Box(Modifier.fillMaxSize().padding(padding).navigationBarsPadding()) { content() }
     }
 }
 

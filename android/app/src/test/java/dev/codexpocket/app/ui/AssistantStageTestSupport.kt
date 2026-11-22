@@ -51,3 +51,9 @@ internal fun ComposeTestRule.expandAssistantTask(taskId: String) {
     if (onAllNodesWithTag("assistant-chat-task-open:$taskId").fetchSemanticsNodes().isEmpty()) onNodeWithTag("assistant-chat-task-toggle:$taskId").performClick()
     waitForIdle()
 }
+
+/** The light theme with glass on its solid fallback: software rendering cannot replay the backdrop graph, and pictures taken through it ghost. */
+@androidx.compose.runtime.Composable
+internal fun AssistantTestTheme(content: @androidx.compose.runtime.Composable () -> Unit) {
+    PocketTheme("light") { androidx.compose.runtime.CompositionLocalProvider(LocalPocketGlass provides false, content = content) }
+}

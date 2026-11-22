@@ -51,4 +51,35 @@ internal object AssistantStageFixtures {
     fun offline() = idle().copy(error = "连接电脑后可继续使用助理")
 
     val schedule = AssistantSchedule("s", "每天早上整理待办", buildJsonObject { put("Daily", buildJsonObject { put("hour", 9); put("minute", 0) }) }, "UTC", At + 3_600_000, false, null)
+
+    val models = listOf(NativeModel("native-1", "actual-model", "电脑传入模型", "", emptyList(), "", false, true),
+        NativeModel("native-2", "fast-model", "快速模型", "", emptyList(), "", false, true))
+    val runtimes = listOf(AssistantRuntimeChoice("r", "助理 CLI · 0.171.0"))
+    val workspaces = listOf(AssistantWorkspaceChoice("r", "shop", "pocket-shop", true, permissionStatus = "已核验 · 可写"))
+
+    /** Every secondary page has something to show: tasks in each state, results, plans with history, memory with revisions. */
+    fun pages(coordinatorModel: String? = "fast-model"): AssistantUiState {
+        val failed = AssistantTask("report", "整理本周发布简报，附上每项改动的来源链接和负责人", AssistantTaskStatus.Failed, null, false, "缺少两项改动的来源。")
+        val queued = AssistantTask("docs", "更新安装文档", AssistantTaskStatus.Queued, null, false, null)
+        val unknown = AssistantTask("sync", "同步依赖版本", AssistantTaskStatus.Paused, "run-sync", true, null)
+        val delivered = delivered()
+        val snapshot = delivered.snapshot!!
+        return delivered.copy(snapshot = snapshot.copy(
+            settings = AssistantSettings("认真协助，先核对再动手", "直接、简洁", "actual-model", "Asia/Shanghai", AssistantNotifications(true, true, false), coordinatorModel),
+            tasks = snapshot.tasks + listOf(failed, queued, unknown),
+            operations = snapshot.operations + AssistantOperation("run-report", "Execution", "report", AssistantOperationPhase.Failed, false, "native-report", null, "只找到三项改动的来源。"),
+            events = listOf(AssistantEvent(1, "e1", "run-login", "started", "开始修复登录超时", At, taskId = "login"),
+                AssistantEvent(2, "e2", "run-login", "progress", "回归测试通过", At + 60_000, taskId = "login")),
+            domain = AssistantDomain("main:a", listOf(record("login", 1, "done"), record("report", 2, "failed", true), record("docs", 3, "queued"),
+                record("sync", 4, "needs_verification")), emptyList(), listOf(AssistantMemoryRevision("m1", 1, "提交前先跑回归测试", "saved", "你在对话中的陈述"),
+                AssistantMemoryRevision("m1", 2, "提交前先跑回归测试和静态检查", "saved", "你在对话中的陈述"))),
+            artifacts = listOf(AssistantArtifact("a-text", "login", "run-login", "登录超时修复说明", "text", "## 改动\n\n- 超时改为可配置\n- 失败后重试两次", null, "v2-8f31c0", At, "available", "native-login"),
+                AssistantArtifact("a-file", "login", "run-login", "regression-report.pdf", "file", null, null, "v1-22ab", At, "available", "native-login", "application/pdf", 482_133),
+                AssistantArtifact("a-link", "report", "run-report", "发布看板", "link", null, "https://example.com/releases/board", "v1", At, "external")),
+            memories = listOf(AssistantMemory("m1", "提交前先跑回归测试和静态检查", "你在对话中的陈述", "personal", true, At, listOf(1, 2)),
+                AssistantMemory("m2", "pocket-shop 的发布分支是 release/*", null, "project", false, At, listOf(1))),
+            schedules = listOf(schedule, AssistantSchedule("s2", "每周一汇总上周合入的改动，按模块列出", buildJsonObject { put("Weekly", buildJsonObject { put("weekday", 0); put("hour", 10); put("minute", 30) }) },
+                "Asia/Shanghai", At + 86_400_000, true, "上次执行时电脑离线", paused = true, missedPolicy = "run_once", writes = true)),
+            scheduleRuns = listOf(AssistantScheduleRun("run-1", "s", "docs", At - 86_400_000, "done", false), AssistantScheduleRun("run-2", "s", null, At - 3_600_000, "skipped", true))))
+    }
 }

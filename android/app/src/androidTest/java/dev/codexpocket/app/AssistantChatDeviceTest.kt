@@ -276,21 +276,21 @@ class AssistantChatDeviceTest {
     private fun navigation() {
         node("assistant-tools").performClick()
         node("assistant-tools-panel").assertIsDisplayed()
-        listOf("项目", "任务", "记忆", "定时").forEach { compose.onNodeWithText(it).assertIsDisplayed() }
+        listOf("这条消息关于", "助理工作区", "附件").forEach { compose.onNodeWithText(it).assertIsDisplayed() }
         assertComposerGeometry()
         capture("02-tools")
-        node("assistant-workspace").performClick()
-        node("assistant-workspace:$PROJECT").assertIsDisplayed().performClick()
-        node("assistant-workspace").assertTextContains("Codex Pocket")
+        // Choosing a project closes the sheet and leaves its chip in the dock.
+        node("assistant-workspace-project:$PROJECT").assertIsDisplayed().performClick()
+        node("assistant-workspace-project").assertTextContains("Codex Pocket", substring = true)
         node(INPUT).performTextReplacement(DRAFT)
         hideKeyboard()
-        node("assistant-more").performClick()
-        node("assistant-tab:Memory").performClick()
+        node("assistant-title-menu").performClick()
+        node("assistant-menu:Memory").performClick()
         compose.onNodeWithText("待办按优先级整理，先给结论。").assertIsDisplayed()
         capture("03-memory")
         compose.runOnIdle { activity.onBackPressedDispatcher.onBackPressed() }
         assertDraft(DRAFT)
-        node("assistant-workspace").assertTextContains("Codex Pocket")
+        node("assistant-workspace-project").assertTextContains("Codex Pocket", substring = true)
         assertEquals(0, exits)
         assertTrue("Navigation and choosing a project never dispatch", actions.isEmpty())
     }
@@ -389,8 +389,9 @@ class AssistantChatDeviceTest {
             swipe(androidx.compose.ui.geometry.Offset(centerX,height*.4f),
                 androidx.compose.ui.geometry.Offset(centerX,height*.55f),durationMillis=600)
         }
-        node("assistant-latest").assertIsDisplayed()
-        val viewport = bounds("assistant-chat-list")
+        // Reading history offers nothing by itself; the way down appears when something new arrives.
+        node("assistant-new-progress").assertDoesNotExist()
+        val viewport = bounds("assistant-chat-viewport")
         val anchor = compose.onAllNodes(SemanticsMatcher("visible history bubble") {
             it.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("assistant-message:history-") == true
         }).fetchSemanticsNodes().firstOrNull {
@@ -403,11 +404,12 @@ class AssistantChatDeviceTest {
             state = state.copy(messages = state.messages + AssistantChatMessage("new-arrival", "Assistant",
                 "补充：已把键盘和大字检查加入待办。", NOW + 20_000))
         }
-        compose.onNodeWithText("有新消息 · 回到最新").assertIsDisplayed()
+        node("assistant-new-progress").assertIsDisplayed()
+        compose.onNodeWithText("查看新进展", useUnmergedTree = true).assertIsDisplayed()
         assertEquals("New arrivals must not move the history being read", top, bounds(tag).top, 3f)
         node("assistant-message:new-arrival").assertIsNotDisplayed()
         capture("06-history-new-message")
-        node("assistant-latest").performClick()
+        node("assistant-new-progress").performClick()
         node("assistant-message:new-arrival").assertIsDisplayed()
         node("assistant-chat-list").performScrollToNode(hasTestTag("assistant-message:markdown"))
         waitForMarkdown("待办整理说明")
@@ -435,7 +437,7 @@ class AssistantChatDeviceTest {
         waitForTail()
         val density = compose.runOnIdle { activity.resources.displayMetrics.density }
         assertEquals("Constrained viewport really measures 360dp", 360f,
-            bounds("assistant-screen").width / density, 1f)
+            bounds("assistant-workspace").width / density, 1f)
         node(INPUT).performTextReplacement("请按优先级整理\n保留第二行草稿")
         hideKeyboard()
         assertComposerGeometry()
@@ -504,8 +506,8 @@ class AssistantChatDeviceTest {
     }
 
     private fun assertComposerGeometry() {
-        val screen = bounds("assistant-screen")
-        listOf(INPUT, SEND, "assistant-tools", "assistant-back", "assistant-more").forEach { assertInside(it, screen) }
+        val screen = bounds("assistant-workspace")
+        listOf(INPUT, SEND, "assistant-tools", "assistant-back", "assistant-title-menu").forEach { assertInside(it, screen) }
         val input = bounds(INPUT)
         val send = bounds(SEND)
         val tools = bounds("assistant-tools")
@@ -522,15 +524,15 @@ class AssistantChatDeviceTest {
 
     private fun visibleTranscript(): Rect {
         val list = bounds("assistant-chat-list")
-        return Rect(list.left, maxOf(list.top, bounds("assistant-top-chrome").bottom),
-            list.right, minOf(list.bottom, bounds("assistant-bottom-dock").top))
+        val clear = bounds("assistant-chat-viewport")
+        return Rect(list.left, maxOf(list.top, clear.top), list.right, minOf(list.bottom, clear.bottom, bounds("assistant-bottom-dock").top))
     }
 
     private fun assertBubbleGeometry() {
         val viewport = visibleTranscript()
         assertInside("assistant-message:user-todo", viewport)
         assertInside("assistant-message:assistant-result", viewport)
-        assertInside("assistant-task:todo", viewport)
+        assertInside("assistant-chat-task:todo", viewport)
         val outgoing = bounds("assistant-message:user-todo")
         val incoming = bounds("assistant-message:assistant-result")
         assertTrue("User bubble should be to the right of the assistant bubble", outgoing.center.x > incoming.center.x)
@@ -543,9 +545,9 @@ class AssistantChatDeviceTest {
 
     private fun waitForTail() {
         assertTrue("The populated chat fixture must explicitly be prepared", state.snapshot!!.prepared)
-        compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-task:todo").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-chat-task:todo").fetchSemanticsNodes().isNotEmpty() }
         compose.waitForIdle()
-        assertInside("assistant-task:todo", visibleTranscript())
+        assertInside("assistant-chat-task:todo", visibleTranscript())
     }
 
     private fun waitForMarkdown(text: String) = compose.waitUntil(10_000) {
@@ -668,8 +670,8 @@ class AssistantChatDeviceTest {
         const val RUNTIME = "fixture-desktop"
         const val PROJECT = "fixture-project"
         const val THREAD = "01a1c7fb-7bda-7a71-a782-a020229c9573"
-        const val INPUT = "assistant-message-input"
-        const val SEND = "assistant-send"
+        const val INPUT = "assistant-workspace-draft"
+        const val SEND = "assistant-workspace-send"
         const val DRAFT = "先整理 Codex Pocket 的待办\n把设备验收放在第一项"
         val NOW = Instant.parse("2026-11-11T08:00:00Z").toEpochMilli()
         val LONG_MARKDOWN = """

@@ -4,14 +4,17 @@ import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
@@ -28,20 +31,25 @@ interface AssistantArtifactSource {
 val LocalAssistantArtifacts=staticCompositionLocalOf<AssistantArtifactSource?> {null}
 
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun AssistantArtifactCard(artifact:AssistantArtifact,snapshot:AssistantSnapshot,navigate:(String)->Unit,open:(String,String)->Unit) {
+    val c=Pocket.colors
     AssistantCard(Modifier.testTag("assistant-artifact:${artifact.id}")) {
-        Text(artifact.name,style=MaterialTheme.typography.titleSmall)
-        Text(when(artifact.kind) {"text"->"文字结果";"link"->"外部链接";"file"->"文件引用";else->"成果"}+
-            (artifact.createdAtMs?.let {" · ${assistantTime(it,snapshot.settings?.timezone ?: "Asia/Shanghai")}"} ?: ""),style=MaterialTheme.typography.labelSmall)
-        if(artifact.kind=="file") Text(when(artifact.availability) {
+        Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
+            PIcon(when(artifact.category) {"link"->PocketIcons.Link;"image"->PocketIcons.Image;"code"->PocketIcons.Code;else->PocketIcons.Description},null,Modifier.size(18.dp),c.inkMuted)
+            PText(artifact.name,Modifier.weight(1f),style=Pocket.type.titleSmall,maxLines=3,overflow=TextOverflow.Ellipsis)
+        }
+        PText(when(artifact.kind) {"text"->"文字结果";"link"->"外部链接";"file"->"文件引用";else->"成果"}+
+            (artifact.createdAtMs?.let {" · ${assistantTime(it,snapshot.settings?.timezone ?: "Asia/Shanghai")}"} ?: ""),style=Pocket.type.caption,color=c.inkMuted)
+        if(artifact.kind=="file") PText(when(artifact.availability) {
             "available"->"文件快照已保留${artifact.sizeBytes?.let {" · ${it/1024} KiB"}.orEmpty()}"
             "missing"->"原文件缺失，未能保存快照"
             "unavailable"->"未通过文件范围或内容核验"
             else->"文件内容尚未核验，可在原对话查看引用"
-        },style=MaterialTheme.typography.bodySmall)
-        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-            TextButton({navigate("Artifact:${artifact.id}")},Modifier.testTag("assistant-artifact-open:${artifact.id}")) {Text("查看成果")}
-            artifact.taskId?.let {task -> TextButton({navigate("Task:$task")}) {Text("来源任务")}}
+        },style=Pocket.type.bodySmall,color=if(artifact.availability in setOf("missing","unavailable")) c.warning else c.inkMuted)
+        FlowRow(horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+            AssistantCardAction("查看成果",{navigate("Artifact:${artifact.id}")},Modifier.testTag("assistant-artifact-open:${artifact.id}"))
+            artifact.taskId?.let {task -> AssistantCardAction("来源任务",{navigate("Task:$task")})}
         }
     }
 }
@@ -91,36 +99,39 @@ val LocalAssistantArtifacts=staticCompositionLocalOf<AssistantArtifactSource?> {
         }
     }
     Column(Modifier.fillMaxWidth().testTag("assistant-artifact-preview:${artifact.id}"),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-        Text(artifact.name,style=MaterialTheme.typography.titleMedium)
-        Text("版本 · ${artifact.version.take(12)}",style=MaterialTheme.typography.labelSmall)
-        if(artifact.canExportText) MarkdownText(artifact.content.orEmpty(),"assistant:artifact:${artifact.id}")
-        else Text(artifact.uri ?: "此成果暂不可预览")
-        if(artifact.kind=="file" && artifact.availability!="available") Text("这是原任务给出的文件引用，尚未获取内容。保存和分享文件需先通过电脑文件权限核验。",style=MaterialTheme.typography.bodySmall)
-        if(loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if(artifact.kind=="file" && artifact.availability=="available" && source==null) Text("电脑已保存文件快照，当前客户端尚未接通下载。",style=MaterialTheme.typography.bodySmall)
-        if(mayDownload) FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-            TextButton({download {file ->
-                runCatching {context.startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW).apply {setDataAndType(fileUri(file),artifact.mimeType);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"预览成果"))}.onFailure {feedback="未找到可预览此类型的应用，可保存后打开。"}
-            }},enabled=!loading,modifier=Modifier.testTag("assistant-file-preview")) {Text("预览")}
-            TextButton({download {saveFile.launch(artifact.name.substringAfterLast('/').substringAfterLast('\\').ifBlank {"成果"})}},enabled=!loading,modifier=Modifier.testTag("assistant-file-save")) {Text("保存")}
-            TextButton({download {file ->
-                runCatching {context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {type=artifact.mimeType;putExtra(Intent.EXTRA_STREAM,fileUri(file));addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"分享成果"))}.onFailure {feedback="无法打开分享"}
-            }},enabled=!loading,modifier=Modifier.testTag("assistant-file-share")) {Text("分享")}
+        val c=Pocket.colors
+        Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
+            SelectionContainer {PText(artifact.name,style=Pocket.type.titleLarge)}
+            PText("版本 · ${artifact.version.take(12)}",style=Pocket.type.caption,color=c.inkMuted)
         }
-        FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-            if(artifact.canExportText) TextButton({save.launch("成果-${artifact.version.take(8)}.md")},Modifier.testTag("assistant-artifact-save")) {Text("保存")}
-            if(artifact.canExportText || artifact.safeWebUri!=null) TextButton({
+        if(artifact.canExportText) AssistantCard {MarkdownText(artifact.content.orEmpty(),"assistant:artifact:${artifact.id}")}
+        else SelectionContainer {PText(artifact.uri ?: "此成果暂不可预览",style=Pocket.type.body,color=if(artifact.uri==null) c.inkMuted else c.ink)}
+        if(artifact.kind=="file" && artifact.availability!="available") PText("这是原任务给出的文件引用，尚未获取内容。保存和分享文件需先通过电脑文件权限核验。",style=Pocket.type.bodySmall,color=c.inkMuted)
+        if(loading) PLinearProgress(null)
+        if(artifact.kind=="file" && artifact.availability=="available" && source==null) PText("电脑已保存文件快照，当前客户端尚未接通下载。",style=Pocket.type.bodySmall,color=c.inkMuted)
+        if(mayDownload) FlowRow(horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+            AssistantCardAction("预览",{download {file ->
+                runCatching {context.startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW).apply {setDataAndType(fileUri(file),artifact.mimeType);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"预览成果"))}.onFailure {feedback="未找到可预览此类型的应用，可保存后打开。"}
+            }},Modifier.testTag("assistant-file-preview"),enabled=!loading)
+            AssistantCardAction("保存",{download {saveFile.launch(artifact.name.substringAfterLast('/').substringAfterLast('\\').ifBlank {"成果"})}},Modifier.testTag("assistant-file-save"),enabled=!loading)
+            AssistantCardAction("分享",{download {file ->
+                runCatching {context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {type=artifact.mimeType;putExtra(Intent.EXTRA_STREAM,fileUri(file));addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"分享成果"))}.onFailure {feedback="无法打开分享"}
+            }},Modifier.testTag("assistant-file-share"),enabled=!loading)
+        }
+        FlowRow(horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+            if(artifact.canExportText) AssistantCardAction("保存",{save.launch("成果-${artifact.version.take(8)}.md")},Modifier.testTag("assistant-artifact-save"))
+            if(artifact.canExportText || artifact.safeWebUri!=null) AssistantCardAction("分享",{
                 feedback=runCatching {
                     val intent=Intent(Intent.ACTION_SEND).apply {type="text/plain";putExtra(Intent.EXTRA_TEXT,artifact.content ?: artifact.safeWebUri);putExtra(Intent.EXTRA_TITLE,artifact.name)}
                     context.startActivity(Intent.createChooser(intent,"分享成果"));null
                 }.getOrElse {"暂时无法打开分享"}
-            },Modifier.testTag("assistant-artifact-share")) {Text("分享")}
-            artifact.safeWebUri?.let {url -> TextButton({runCatching {context.startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse(url)))}.onFailure {feedback="没有可打开此链接的应用"}}) {Text("打开链接")}}
-            artifact.threadId?.let {thread -> TextButton({open(snapshot.runtimeId.orEmpty(),thread)}) {Text("原对话")}}
+            },Modifier.testTag("assistant-artifact-share"))
+            artifact.safeWebUri?.let {url -> AssistantCardAction("打开链接",{runCatching {context.startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse(url)))}.onFailure {feedback="没有可打开此链接的应用"}})}
+            artifact.threadId?.let {thread -> AssistantCardAction("原对话",{open(snapshot.runtimeId.orEmpty(),thread)})}
+            artifact.taskId?.let {id -> AssistantCardAction("返回来源任务",{navigate("Task:$id")},Modifier.testTag("assistant-artifact-source-task"))}
         }
-        feedback?.let {Text(it,style=MaterialTheme.typography.bodySmall)}
+        feedback?.let {PText(it,style=Pocket.type.bodySmall,color=c.inkMuted)}
         artifact.taskId?.let {id ->
-            TextButton({navigate("Task:$id")},Modifier.testTag("assistant-artifact-source-task")) {Text("返回来源任务")}
             snapshot.tasks.firstOrNull {it.id==id}?.let {task -> AssistantTaskFollowup(task,state,canAct && artifact.availability in setOf("available","external"),act,"基于成果「${artifact.name}」（版本 ${artifact.version}）继续。",artifact)}
         }
     }

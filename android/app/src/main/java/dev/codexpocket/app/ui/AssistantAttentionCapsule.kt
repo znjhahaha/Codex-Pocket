@@ -68,7 +68,7 @@ internal fun AssistantAttentionCapsule(attention: AssistantAttention, onOpen: ()
                 if (waiting) PPulseGlyph(MotionGlyphs.Alert, attention.pending, Modifier.size(18.dp), c.warning)
                 else PLoopGlyph(MotionGlyphs.Spin, true, Modifier.size(18.dp), c.accent, millis = 1100)
                 PText(summary, Modifier.weight(1f), style = Pocket.type.labelSmall, color = c.ink, fontWeight = if (waiting) FontWeight.SemiBold else null,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    maxLines = 2, overflow = TextOverflow.Ellipsis)
                 PIcon(PocketIcons.ExpandMore, null, Modifier.size(16.dp), c.inkFaint)
             }
         }
