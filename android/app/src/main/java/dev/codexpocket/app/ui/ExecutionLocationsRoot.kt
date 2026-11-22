@@ -51,10 +51,12 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         if (thisPhone) {
             val account by locations.thisPhone.account.collectAsStateWithLifecycle()
             val added = catalog.targets.any { it.kind == ExecutionTargetKind.ThisPhone }
-            LaunchedEffect(added) { if (added) locations.thisPhone.refreshAccount() }
+            val projects by locations.thisPhone.projects.collectAsStateWithLifecycle()
+            LaunchedEffect(added) { if (added) { locations.thisPhone.refreshAccount(); locations.thisPhone.refreshProjects() } }
             ThisPhoneSheet(added, account, progress, { thisPhone = false }, locations::connectThisPhone,
                 locations.thisPhone::signInWithChatGpt, locations.thisPhone::signInWithApiKey, locations.thisPhone::refreshAccount,
-                onStop = { locations.stopThisPhone(); thisPhone = false })
+                onStop = { locations.stopThisPhone(); thisPhone = false },
+                projects = projects, onImport = locations.thisPhone::importProject, onExport = locations.thisPhone::exportProject)
         }
         if (addingSsh) SshLocationSheet(progress, { if (progress == null) addingSsh = false },
             onConnect = { label, config -> locations.connectSsh(label, config) })

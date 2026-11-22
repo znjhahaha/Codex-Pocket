@@ -13,14 +13,24 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import dev.codexpocket.app.data.LocalAccount
+import dev.codexpocket.app.data.LocalProjects
 import dev.codexpocket.app.ui.kit.*
 
 /** Running Codex on this phone: start it, sign it in, stop it. */
 @Composable
 internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: String?, onDismiss: () -> Unit, onStart: () -> Unit,
-    onChatGpt: () -> Unit, onApiKey: (String) -> Unit, onRefresh: () -> Unit, onStop: () -> Unit) {
+    onChatGpt: () -> Unit, onApiKey: (String) -> Unit, onRefresh: () -> Unit, onStop: () -> Unit,
+    projects: LocalProjects = LocalProjects(), onImport: (Uri) -> Unit = {}, onExport: (String, Uri) -> Unit = { _, _ -> }) {
     val context = LocalContext.current
+    var exporting by remember { mutableStateOf<String?>(null) }
+    val pickArchive = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) onImport(uri) }
+    val pickDestination = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val name = exporting; exporting = null
+        if (uri != null && name != null) onExport(name, uri)
+    }
     // A key is not placed in the Activity's unencrypted saved-state bundle.
     var apiKey by remember { mutableStateOf("") }
     var enteringKey by remember { mutableStateOf(false) }
@@ -60,6 +70,19 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
                     if (account is LocalAccount.Failed) PButton("重新读取登录状态", onRefresh, Modifier.fillMaxWidth(), kind = PButtonKind.Secondary)
                 }
             }
+            PText("项目文件", style = Pocket.type.titleSmall)
+            PText("手机上的项目放在本应用的私有目录里。用压缩包把代码带进来，或把改好的项目带出去。", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+            projects.names.forEach { name ->
+                Row(Modifier.fillMaxWidth().testTag("this-phone-project:$name"), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PText(name, Modifier.weight(1f), style = Pocket.type.body)
+                    PButton("导出", { exporting = name; pickDestination.launch("$name.zip") }, Modifier.testTag("this-phone-export:$name"),
+                        kind = PButtonKind.Secondary, enabled = !projects.busy)
+                }
+            }
+            if (projects.busy) PocketProgressStatus("正在处理项目文件", Modifier.testTag("this-phone-transfer"))
+            projects.notice?.let { PText(it, Modifier.testTag("this-phone-transfer-notice"), style = Pocket.type.bodySmall) }
+            PButton("导入项目压缩包", { pickArchive.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) },
+                Modifier.fillMaxWidth().testTag("this-phone-import"), kind = PButtonKind.Secondary, enabled = !projects.busy)
             PButton("停止在此手机上运行", onStop, Modifier.fillMaxWidth().testTag("this-phone-stop"), kind = PButtonKind.Danger)
             PText("停止会结束手机上正在进行的任务；会话记录和登录信息会保留，再次选择“此手机”即可继续。", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
         }

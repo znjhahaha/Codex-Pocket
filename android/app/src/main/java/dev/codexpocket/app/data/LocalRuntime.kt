@@ -16,6 +16,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.*
 
+/** Project directories in this phone's workspace, and what the last import or export came to. */
+internal data class LocalProjects(val names: List<String> = emptyList(), val busy: Boolean = false, val notice: String? = null)
+
 internal sealed interface LocalAccount {
     data object Unknown : LocalAccount
     data object Checking : LocalAccount
@@ -88,6 +91,8 @@ internal class LocalRuntime(private val context: Context,
     @Volatile private var signInCodex: Process? = null
     private val accountState = MutableStateFlow<LocalAccount>(LocalAccount.Unknown)
     val account = accountState.asStateFlow()
+    private val projectState = MutableStateFlow(LocalProjects())
+    val projects = projectState.asStateFlow()
     val available: Boolean get() = layout.available
 
     private fun environment(): Map<String, String> {
@@ -155,6 +160,38 @@ internal class LocalRuntime(private val context: Context,
             if (pid != android.os.Process.myPid() && executable.startsWith(prefix)) android.os.Process.killProcess(pid)
         }
         proxy?.close(); proxy = null
+    }
+
+    fun refreshProjects() { projectState.value = projectState.value.copy(names = LocalWorkspace.projects(layout.projects)) }
+    /** Copies an archive the person picked into a new project directory here. */
+    fun importProject(source: android.net.Uri) = transfer("导入") {
+        val resolver = context.contentResolver
+        val shown = resolver.query(source, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null }
+        val name = LocalWorkspace.projectName(shown.orEmpty()) ?: throw IllegalArgumentException("Invalid project name")
+        layout.projects.mkdirs()
+        (resolver.openInputStream(source) ?: error("Archive could not be opened")).use { LocalWorkspace.importZip(it, layout.projects, name) }
+        "已导入到 ${File(layout.projects, name).path}，新建项目时选择这个目录即可。"
+    }
+    /** Writes one project as an archive to the document the person picked. */
+    fun exportProject(name: String, destination: android.net.Uri) = transfer("导出") {
+        val project = File(layout.projects, requireNotNull(LocalWorkspace.projectName(name)))
+        (context.contentResolver.openOutputStream(destination, "wt") ?: error("Document could not be opened")).use { LocalWorkspace.exportZip(project, it) }
+        "已导出 $name。"
+    }
+    private fun transfer(action: String, work: () -> String) {
+        if (projectState.value.busy) return
+        projectState.value = projectState.value.copy(busy = true, notice = null)
+        scope.launch {
+            val notice = try { work() } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: IllegalArgumentException) { when (error.message) {
+                    "A project with this name already exists" -> "已有同名项目，请先改名压缩包再导入。"
+                    "Archive is too large", "Archive has too many files" -> "压缩包超过 512 MB 或 2 万个文件的上限。"
+                    else -> "${action}未完成：压缩包或项目名称无效。"
+                } }
+                catch (_: Exception) { "${action}未完成，请重试。" }
+            projectState.value = LocalProjects(LocalWorkspace.projects(layout.projects), false, notice)
+        }
     }
 
     fun refreshAccount() = signIn(null)

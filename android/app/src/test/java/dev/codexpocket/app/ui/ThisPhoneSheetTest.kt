@@ -79,6 +79,23 @@ class ThisPhoneSheetTest {
         assertEquals(listOf("stop"), events)
     }
 
+    @Test fun projectFilesAreListedForExportAndNothingCanBeStartedWhileOneIsMoving() {
+        var projects by mutableStateOf(dev.codexpocket.app.data.LocalProjects(listOf("alpha", "beta"), notice = "已导出 alpha。"))
+        content {
+            ThisPhoneSheet(true, LocalAccount.SignedIn("API Key"), null, {}, {}, {}, {}, {}, {}, projects = projects)
+        }
+        compose.onNodeWithTag("this-phone-export:alpha").performScrollTo().assertIsEnabled()
+        compose.onNodeWithTag("this-phone-project:beta", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("this-phone-transfer-notice").assertTextEquals("已导出 alpha。")
+        compose.onNodeWithTag("this-phone-import").performScrollTo().assertIsEnabled()
+        projects = projects.copy(busy = true, notice = null)
+        compose.waitForIdle()
+        compose.onNodeWithTag("this-phone-import").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("this-phone-export:alpha").performScrollTo().assertIsNotEnabled()
+        assertTrue(exists("this-phone-transfer"))
+        assertFalse(exists("this-phone-transfer-notice"))
+    }
+
     @Test fun failureSaysSoAndLetsThePersonRetryOrReadAgain() {
         sheet(added = true, account = LocalAccount.Failed("登录未完成，请重试"))
         compose.onNodeWithTag("this-phone-failed").assertTextEquals("登录未完成，请重试")
