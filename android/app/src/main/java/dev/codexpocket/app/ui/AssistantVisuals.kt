@@ -64,15 +64,6 @@ object AssistantIcons {
             "M8.5 13.1C10.3 15.3 13.7 15.3 15.5 13.1",
         )
     }
-    val More: ImageVector by lazy {
-        icon("More", "M5 12H5.01M12 12H12.01M19 12H19.01")
-    }
-    val Plus: ImageVector by lazy {
-        icon("Plus", "M12 5V19M5 12H19")
-    }
-    val Send: ImageVector by lazy {
-        icon("Send", "M4 10.5L20 4L13.5 20L10.5 13.5Z", "M10.5 13.5L20 4")
-    }
     val Tasks: ImageVector by lazy {
         icon("Tasks", "M3.5 7L5.5 9L9 5M12.5 7H20.5", "M3.5 16L5.5 18L9 14M12.5 16H20.5")
     }
@@ -100,22 +91,6 @@ object AssistantIcons {
             "M12 7.5A2.5 2.5 0 1 1 7 7.5A2.5 2.5 0 1 1 12 7.5Z",
             "M17 16.5A2.5 2.5 0 1 1 12 16.5A2.5 2.5 0 1 1 17 16.5Z",
         )
-    }
-    val Project: ImageVector by lazy {
-        icon(
-            "Project",
-            "M3.5 7V17.5C3.5 18.9 4.6 20 6 20H18C19.4 20 20.5 18.9 20.5 17.5V8.5C20.5 7.1 19.4 6 18 6H12L10 4H6C4.6 4 3.5 5.1 3.5 6.5V7Z",
-            "M3.5 9.5H20.5",
-        )
-    }
-    val Back: ImageVector by lazy {
-        icon("Back", "M14.5 5L7.5 12L14.5 19", autoMirror = true)
-    }
-    val Check: ImageVector by lazy {
-        icon("Check", "M5 12L9.5 16.5L19 7")
-    }
-    val Close: ImageVector by lazy {
-        icon("Close", "M6 6L18 18M18 6L6 18")
     }
 
     private fun icon(name: String, vararg paths: String, autoMirror: Boolean = false): ImageVector {

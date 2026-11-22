@@ -356,4 +356,70 @@ class AssistantScreenTest {
         scroll("assistant-approve:approval-details").performClick()
         assertTrue(actions.single().params.obj("response").obj("Approval").flag("approved"))
     }
+
+    private fun withCoordinator(model: String?) = snapshot().let { it.copy(settings = it.settings!!.copy(coordinatorModel = model)) }
+    private fun chooseCoordinator(option: String) {
+        scroll("assistant-coordinator-model").performClick()
+        compose.onNodeWithTag("assistant-coordinator-model:$option").performScrollTo().performClick()
+    }
+
+    @Test fun choosingACoordinatorModelSendsItAndLeavesTheTaskModelAlone() {
+        val actions = mutableListOf<AssistantAction>()
+        content({AssistantUiState(withCoordinator(null))},actions)
+        compose.openAssistantPage("Settings")
+        scroll("assistant-coordinator-model").assert(hasText("跟随默认"))
+        chooseCoordinator("model:actual-model")
+        scroll("assistant-coordinator-model").assert(hasText("电脑传入模型"))
+        scroll("assistant-save-settings").performClick()
+        val settings = actions.single().params.obj("settings")
+        assertEquals("actual-model",settings.string("coordinator_model"))
+        assertEquals("actual-model",settings.string("model"))
+        assertEquals("认真协助",settings.string("personality"))
+    }
+
+    @Test fun followingTheDefaultSendsNoCoordinatorModel() {
+        val actions = mutableListOf<AssistantAction>()
+        content({AssistantUiState(withCoordinator("actual-model"))},actions)
+        compose.openAssistantPage("Settings")
+        scroll("assistant-coordinator-model").assert(hasText("电脑传入模型"))
+        chooseCoordinator("follow-default")
+        scroll("assistant-coordinator-model").assert(hasText("跟随默认"))
+        scroll("assistant-save-settings").performClick()
+        val settings = actions.single().params.obj("settings")
+        // The settings object leaves the field out, which the computer reads as none.
+        assertFalse(settings.containsKey("coordinator_model"))
+        assertEquals("actual-model",settings.string("model"))
+    }
+
+    @Test fun savingAnotherFieldPreservesTheStoredCoordinatorModel() {
+        val actions = mutableListOf<AssistantAction>()
+        content({AssistantUiState(withCoordinator("actual-model").let { it.copy(settings = it.settings!!.copy(model = null)) })},actions)
+        compose.openAssistantPage("Settings")
+        scroll("assistant-tone").performTextReplacement("耐心")
+        scroll("assistant-notify-completed").performClick()
+        scroll("assistant-save-settings").performClick()
+        val settings = actions.single().params.obj("settings")
+        assertEquals("actual-model",settings.string("coordinator_model"))
+        assertEquals(JsonNull,settings["model"])
+        assertEquals("耐心",settings.string("tone"))
+        assertFalse(settings.obj("notifications").flag("completed"))
+    }
+
+    @Test fun offCatalogueCoordinatorModelIsShownAndSurvivesAnUnrelatedSave() {
+        val actions = mutableListOf<AssistantAction>()
+        content({AssistantUiState(withCoordinator("retired-model"))},actions)
+        compose.openAssistantPage("Settings")
+        scroll("assistant-coordinator-model").assert(hasText("retired-model（不在列表中）"))
+        scroll("assistant-personality").performTextReplacement("耐心核对")
+        compose.onNodeWithTag("assistant-settings-issue").assertDoesNotExist()
+        scroll("assistant-save-settings").assertIsEnabled().performClick()
+        val settings = actions.single().params.obj("settings")
+        assertEquals("retired-model",settings.string("coordinator_model"))
+        assertEquals("耐心核对",settings.string("personality"))
+        // It is offered only as what is stored: the list holds the default and the catalogue.
+        scroll("assistant-coordinator-model").performClick()
+        compose.onNodeWithTag("assistant-coordinator-model:follow-default").assertExists()
+        compose.onNodeWithTag("assistant-coordinator-model:model:actual-model").assertExists()
+        compose.onNodeWithTag("assistant-coordinator-model:model:retired-model").assertDoesNotExist()
+    }
 }
