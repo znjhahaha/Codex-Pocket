@@ -25,10 +25,8 @@ class SshPocketConnection(private val target: SshTarget) : PocketConnection {
             val ssh = SshSession.open(target)
             session = ssh
             if (closed) { ssh.close(); throw CancellationException("Connection closed") }
-            val operatingSystem = ssh.execute("uname -s\n").trim()
-            if (operatingSystem != "Linux") throw WireException("ssh_platform_unsupported", "This SSH host is not Linux")
-            val port = ssh.forwardLoopback(target.backendPort)
-            val connection = PocketClient(LanConnector("tls://127.0.0.1:$port"))
+            ssh.execute(sshResumeScript, 40)
+            val connection = PocketClient(ssh.loopback(target.backendPort))
             delegate = connection
             scope.launch { connection.state.collect { mutableState.value = it } }
             scope.launch { try { connection.notifications.collect { events.send(it) } } finally { close() } }

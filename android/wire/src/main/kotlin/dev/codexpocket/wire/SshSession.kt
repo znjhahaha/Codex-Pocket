@@ -2,21 +2,31 @@ package dev.codexpocket.wire
 
 import java.io.InputStream
 import java.io.ByteArrayOutputStream
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.ServerSocket
 import java.security.MessageDigest
 import java.security.PublicKey
+import java.security.Security
 import java.util.Base64
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.*
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.Buffer
-import net.schmizz.sshj.connection.channel.direct.Parameters
+import net.schmizz.sshj.connection.channel.direct.DirectConnection
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.userauth.password.PasswordUtils
 import net.schmizz.sshj.xfer.FileSystemFile
 import java.io.File
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+
+/** SSHJ asks for its algorithms from "BC" by name, and Android answers to that name with a provider that has none of them. */
+private fun requireFullBouncyCastle() = synchronized(Security::class.java) {
+    if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) !is BouncyCastleProvider) {
+        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+        Security.addProvider(BouncyCastleProvider())
+    }
+}
 
 fun sshKeyFingerprint(key: PublicKey): String = "SHA256:" + Base64.getEncoder().withoutPadding()
     .encodeToString(MessageDigest.getInstance("SHA-256").digest(Buffer.PlainBuffer().putPublicKey(key).compactData))
@@ -25,6 +35,7 @@ fun sshKeyFingerprint(key: PublicKey): String = "SHA256:" + Base64.getEncoder().
 suspend fun probeSshHostKey(host: String, port: Int): String = withContext(Dispatchers.IO) {
     require(host.isNotBlank() && host.length <= 253 && port in 1..65535)
     var observed: String? = null
+    requireFullBouncyCastle()
     SSHClient().use { ssh ->
         ssh.connectTimeout = 10_000; ssh.timeout = 15_000
         ssh.addHostKeyVerifier(object : HostKeyVerifier {
@@ -40,15 +51,12 @@ suspend fun probeSshHostKey(host: String, port: Int): String = withContext(Dispa
 }
 
 internal class SshSession private constructor(private val client: SSHClient) : AutoCloseable {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val listeners = mutableListOf<ServerSocket>()
-
     suspend fun upload(file: File, remotePath: String) = withContext(Dispatchers.IO) {
         require(remotePath.startsWith("/") && remotePath.none(Char::isISOControl))
         client.newSFTPClient().use { it.put(FileSystemFile(file), remotePath) }
     }
 
-    suspend fun execute(script: String, timeoutSeconds: Long = 20): String = withContext(Dispatchers.IO) {
+    suspend fun execute(script: String, timeoutSeconds: Long = 20, failures: Map<Int, String> = sshRemoteFailures): String = withContext(Dispatchers.IO) {
         require(script.length <= 256 * 1024 && timeoutSeconds in 1..180)
         client.startSession().use { session ->
             session.exec("sh -s").use { command ->
@@ -60,28 +68,58 @@ internal class SshSession private constructor(private val client: SSHClient) : A
                     if (!command.isEOF || command.exitStatus == null) { command.close(); throw WireException("ssh_timeout", "Remote command did not finish") }
                     val output = stdout.await()
                     stderr.await() // Drain diagnostic output without exposing paths or credentials.
-                    if (command.exitStatus != 0) throw WireException("ssh_command_failed", "Remote preparation failed")
+                    if (command.exitStatus != 0) throw WireException(failures[command.exitStatus] ?: "ssh_command_failed", "Remote preparation failed")
                     output.toString(Charsets.UTF_8)
                 }
             }
         }
     }
 
-    fun forwardLoopback(remotePort: Int): Int {
+    /** The host's loopback port as a transport of its own: nothing listens on the phone, and a lost SSH link fails it at once. */
+    fun loopback(remotePort: Int) = TransportConnector { _, listener ->
         require(remotePort in 1..65535)
-        val socket = ServerSocket().apply { bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 8) }
-        synchronized(listeners) { listeners += socket }
-        val forwarder = client.newLocalPortForwarder(Parameters("127.0.0.1", socket.localPort, "127.0.0.1", remotePort), socket)
-        scope.launch { try { forwarder.listen() } catch (_: Exception) { close() } }
-        return socket.localPort
+        val closed = AtomicBoolean(false)
+        val queue = ArrayBlockingQueue<ByteArray>(64)
+        val channel = AtomicReference<DirectConnection?>()
+        fun end(failed: Boolean) {
+            if (closed.compareAndSet(false, true)) { queue.clear(); runCatching { channel.get()?.close() }; if (failed) listener.onFailure() }
+        }
+        Thread({
+            try {
+                val direct = client.newDirectConnection("127.0.0.1", remotePort)
+                channel.set(direct)
+                if (closed.get()) { direct.close(); return@Thread }
+                Thread({
+                    try {
+                        val out = direct.outputStream
+                        while (!closed.get()) {
+                            val bytes = queue.poll(1, TimeUnit.SECONDS) ?: continue
+                            out.write(bytes); out.flush()
+                        }
+                    } catch (_: Exception) { end(true) }
+                }, "pocket-ssh-write").apply { isDaemon = true; start() }
+                listener.onOpen()
+                val input = direct.inputStream
+                val buffer = ByteArray(16384)
+                while (!closed.get()) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (count > 0) listener.onBinary(buffer.copyOf(count))
+                }
+                end(true)
+            } catch (_: Exception) { end(true) }
+        }, "pocket-ssh-read").apply { isDaemon = true; start() }
+        object : BinaryTransport {
+            override fun send(bytes: ByteArray): Boolean = bytes.size <= 65536 && !closed.get() &&
+                queue.offer(bytes.copyOf(), 5, TimeUnit.SECONDS) && !closed.get()
+            override fun close(graceful: Boolean) = end(false)
+        }
     }
-    override fun close() {
-        synchronized(listeners) { listeners.forEach { runCatching { it.close() } }; listeners.clear() }
-        runCatching { client.close() }; scope.cancel()
-    }
+    override fun close() { runCatching { client.close() } }
 
     companion object {
         suspend fun open(target: SshTarget): SshSession = withContext(Dispatchers.IO) {
+            requireFullBouncyCastle()
             val client = SSHClient()
             var mismatch = false
             try {

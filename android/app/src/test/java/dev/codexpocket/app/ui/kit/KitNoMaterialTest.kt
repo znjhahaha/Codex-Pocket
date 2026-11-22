@@ -23,7 +23,7 @@ class KitNoMaterialTest {
     }
 
     /** Screens rebuilt on the kit, by file-name prefix. Append a prefix when another screen has been moved over. */
-    private val rebuiltScreens = listOf("Usage")
+    private val rebuiltScreens = listOf("Usage", "SshLocationSheet")
 
     @Test fun rebuiltScreensNeverReferenceMaterial() {
         rebuiltScreens.forEach { prefix ->
