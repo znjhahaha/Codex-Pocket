@@ -14,6 +14,8 @@ fun jsonObject(vararg pairs: Pair<String, JsonElement>) = JsonObject(mapOf(*pair
 data class ThreadKey(val computerId: String, val configStoreId: String, val nativeId: String) {
     val encoded: String get() = JsonArray(listOf(computerId, configStoreId, nativeId).map(::JsonPrimitive)).toString()
     companion object {
+        /** What every encoded key of one computer starts with. */
+        fun prefix(computerId: String) = JsonArray(listOf(JsonPrimitive(computerId))).toString().dropLast(1) + ","
         fun decode(value: String): ThreadKey {
             val a = pocketJson.parseToJsonElement(value).jsonArray
             require(a.size == 3)

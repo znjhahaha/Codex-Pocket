@@ -12,7 +12,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collectLatest
 import dev.codexpocket.app.data.PocketRepository
 
 class WatchService : Service() {
@@ -29,17 +29,20 @@ class WatchService : Service() {
         val notification = watchNotification(getString(R.string.delivery_watch_connecting))
         if (Build.VERSION.SDK_INT >= 29) startForeground(101, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE) else startForeground(101, notification)
         scope.launch {
-            val current = (application as PocketApplication).locations.active.filterNotNull().first()
-            repository = current
-            current.setWatch(true)
-            launch { current.state.map(::watchStatusResource).distinctUntilChanged().collect { status ->
-                if (manager.areNotificationsEnabled()) manager.notify(101, watchNotification(getString(status)))
+            // Watching follows the selected location; the one left behind stops being watched.
+            (application as PocketApplication).locations.active.filterNotNull().collectLatest { current -> coroutineScope {
+                repository?.takeIf { it !== current }?.setWatch(false)
+                repository = current
+                current.setWatch(true)
+                launch { current.state.map(::watchStatusResource).distinctUntilChanged().collect { status ->
+                    if (manager.areNotificationsEnabled()) manager.notify(101, watchNotification(getString(status)))
+                } }
+                current.conversationAlerts.collect { alert ->
+                    val id = (alert.key.encoded + alert.kind).hashCode()
+                    val target = PendingIntent.getActivity(this@WatchService, id, Intent(this@WatchService, MainActivity::class.java).putExtra("pocketChat", alert.key.encoded), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                    if (manager.areNotificationsEnabled()) manager.notify(id, NotificationCompat.Builder(this@WatchService, "activity").setSmallIcon(R.drawable.ic_pocket_notification).setContentTitle(alert.title).setContentText(getString(R.string.notification_review)).setContentIntent(target).setAutoCancel(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build())
+                }
             } }
-            current.conversationAlerts.collect { alert ->
-                val id = (alert.key.encoded + alert.kind).hashCode()
-                val target = PendingIntent.getActivity(this@WatchService, id, Intent(this@WatchService, MainActivity::class.java).putExtra("pocketChat", alert.key.encoded), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-                if (manager.areNotificationsEnabled()) manager.notify(id, NotificationCompat.Builder(this@WatchService, "activity").setSmallIcon(R.drawable.ic_pocket_notification).setContentTitle(alert.title).setContentText(getString(R.string.notification_review)).setContentIntent(target).setAutoCancel(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build())
-            }
         }
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int { if (intent?.action == "stop") stopSelf(); return START_NOT_STICKY }

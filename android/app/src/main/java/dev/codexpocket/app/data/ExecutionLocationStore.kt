@@ -56,13 +56,29 @@ internal class ExecutionLocationStore(private val blob: LocationBlob, private va
     constructor(context: Context) : this(EncryptedLocationBlob(context), PairStore(context))
     private data class Record(val catalog: ExecutionTargetDirectory, val pairs: Map<String, PairedComputer>, val connectors: Map<String, JsonObject>)
     private var current: Record? = null
-    private val changes = MutableStateFlow(ExecutionTargetDirectory())
+    /** Why the saved record could not be read. Pairing again replaces it, as it always replaced an unreadable pairing. */
+    private var unreadable: Exception? = null
+    /** A phone with nothing saved still has one place to pair; it is written only once it holds a pairing. */
+    private val unsaved = ExecutionTarget("default", ExecutionTargetKind.Computer, "电脑")
+    private fun shown(catalog: ExecutionTargetDirectory) = if (catalog.targets.isEmpty()) catalog.put(unsaved) else catalog
+    private val changes = MutableStateFlow(shown(ExecutionTargetDirectory()))
     val directoryChanges = changes.asStateFlow()
 
     private fun record(): Record {
         current?.let { return it }
+        val result = try { restore() } catch (failure: Exception) {
+            unreadable = failure
+            return Record(ExecutionTargetDirectory(), emptyMap(), emptyMap())
+        }
+        unreadable = null
+        current = result
+        changes.value = shown(result.catalog)
+        return result
+    }
+
+    private fun restore(): Record {
         val saved = blob.read()
-        val result = if (saved != null) {
+        if (saved != null) {
             val json = pocketJson.parseToJsonElement(saved).jsonObject
             require(json["version"]?.jsonPrimitive?.int == 1) { "Unsupported execution locations format" }
             val catalog = ExecutionTargetDirectory.parse(json.getValue("catalog").jsonObject)
@@ -70,17 +86,11 @@ internal class ExecutionLocationStore(private val blob: LocationBlob, private va
             require(pairs.all { (id, pair) -> catalog.targets.any { it.id == id && it.endpointId == pair.computerId } })
             val connectors = json.getValue("connectors").jsonObject.mapValues { it.value.jsonObject }
             require(connectors.keys.all { id -> catalog.targets.any { it.id == id } })
-            Record(catalog, pairs, connectors)
-        } else {
-            val pair = legacy.load()
-            val imported = if (pair == null) Record(ExecutionTargetDirectory(), emptyMap(), emptyMap())
-                else Record(ExecutionTargetDirectory().withComputer(pair.computerId, pair.computerName.ifBlank { "电脑" }), mapOf(pair.computerId to pair), emptyMap())
-            commit(imported)
-            imported
+            return Record(catalog, pairs, connectors)
         }
-        current = result
-        changes.value = result.catalog
-        return result
+        val pair = legacy.load() ?: return Record(ExecutionTargetDirectory(), emptyMap(), emptyMap())
+        return Record(ExecutionTargetDirectory().withComputer(pair.computerId, pair.computerName.ifBlank { "电脑" }), mapOf(pair.computerId to pair), emptyMap())
+            .also(::commit)
     }
 
     private fun commit(value: Record) {
@@ -89,13 +99,17 @@ internal class ExecutionLocationStore(private val blob: LocationBlob, private va
             put("pairs", JsonObject(value.pairs.mapValues { it.value.persisted() }))
             put("connectors", JsonObject(value.connectors))
         }.toString())
+        unreadable = null
         current = value
-        changes.value = value.catalog
+        changes.value = shown(value.catalog)
     }
 
-    @Synchronized fun directory(): ExecutionTargetDirectory = record().catalog
+    @Synchronized fun directory(): ExecutionTargetDirectory = shown(record().catalog)
     @Synchronized fun connector(id: String): JsonObject? = record().connectors[id]
-    @Synchronized fun select(id: String) { val old = record(); commit(old.copy(catalog = old.catalog.select(id))) }
+    @Synchronized fun select(id: String) {
+        val old = record()
+        if (shown(old.catalog).selectedId != id) commit(old.copy(catalog = old.catalog.select(id)))
+    }
     @Synchronized fun add(target: ExecutionTarget) { val old = record(); commit(old.copy(catalog = old.catalog.put(target))) }
     @Synchronized fun register(target: ExecutionTarget, pair: PairedComputer, connector: JsonObject? = null) {
         val old = record()
@@ -105,11 +119,15 @@ internal class ExecutionLocationStore(private val blob: LocationBlob, private va
     }
     @Synchronized fun remove(id: String) {
         val old = record()
-        commit(Record(old.catalog.remove(id), old.pairs - id, old.connectors - id))
+        if (old.catalog.targets.any { it.id == id }) commit(Record(old.catalog.remove(id), old.pairs - id, old.connectors - id))
     }
-    @Synchronized private fun pair(id: String): PairedComputer? = record().pairs[id]
+    @Synchronized private fun pair(id: String): PairedComputer? {
+        val saved = record().pairs[id]
+        unreadable?.let { throw it }
+        return saved
+    }
     @Synchronized private fun updatePair(id: String, pair: PairedComputer) {
-        val target = record().catalog.targets.firstOrNull { it.id == id } ?: error("Execution location was removed")
+        val target = shown(record().catalog).targets.firstOrNull { it.id == id } ?: error("Execution location was removed")
         register(if (target.kind == ExecutionTargetKind.Computer) target.copy(label = pair.computerName.ifBlank { "电脑" }) else target, pair)
     }
 

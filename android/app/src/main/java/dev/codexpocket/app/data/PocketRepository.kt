@@ -898,6 +898,7 @@ class PocketRepository(
     fun setWatch(value: Boolean) { _state.update { it.copy(watch = value) }; if (value) reconnect() else if (!foreground) disconnect() }
     fun theme(value: String) { require(value in setOf("system", "light", "dark")); preferences.edit().putString("theme", value).apply(); _state.update { it.copy(theme = value) } }
     fun glassEffects(value: Boolean) { preferences.edit().putBoolean("glassEffects", value).apply(); _state.update { it.copy(glassEffects = value) } }
+    internal fun reloadAppearance() = _state.update { it.copy(theme = preferences.getString("theme", "system") ?: "system", glassEffects = preferences.getBoolean("glassEffects", true)) }
     fun clearError() = _state.update { it.copy(error = null) }
     fun reportError(message: String) = _state.update { it.copy(error = message) }
 
@@ -3625,7 +3626,11 @@ class PocketRepository(
         else { val devices = request("devices/list").asObject().array("data").map(JsonElement::asObject); _state.update { it.copy(devices = devices) } }
     }
     fun clearCache() = action {
-        db.withTransaction { dao.clearHistory(); dao.clearCursors(); dao.clearSnapshots() }
+        // Other locations share this database and hold their own cursors over it: clear only this computer's rows.
+        pair?.computerId?.let { computer ->
+            val prefix = ThreadKey.prefix(computer)
+            db.withTransaction { dao.clearHistory(prefix); dao.clearCursors(computer); dao.clearSnapshots(prefix) }
+        }
         eventLock.withLock { timelines.clear(); timelines.select(_state.value.selected?.key); conversationWindows.clear(); cursors.clear(); snapshotCursors.clear(); invalidateHistoryVerification(); _state.update { it.copy(timeline = NativeTimeline(), conversationCached = false, notice = context.getString(R.string.cache_cleared)) } }
         disconnect(); reconnect()
     }

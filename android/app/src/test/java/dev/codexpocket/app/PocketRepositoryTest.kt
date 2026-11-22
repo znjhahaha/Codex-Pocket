@@ -75,6 +75,23 @@ class PocketRepositoryTest {
 
     private suspend fun await(predicate: (PocketState) -> Boolean) = withTimeout(5_000) { repo.state.first(predicate) }
 
+    @Test fun clearingTheCacheLeavesAnotherLocationsHistoryCursorsAndSnapshotsInPlace() = runBlocking<Unit> {
+        val dao = db.dao()
+        // "computer-2" begins with this computer's id: only a whole-id match may clear a row.
+        val foreign = ThreadKey("computer-2", "store", "t"); val gone = ThreadKey("computer", "store", "no-longer-listed")
+        val item = TimelineItem("turn", "item", "agentMessage", "kept", "completed", buildJsonObject {}, true)
+        dao.putItems(listOf(ItemEntity.from(foreign, item, 0), ItemEntity.from(gone, item, 0)))
+        dao.putCursor(CursorEntity("computer-2", "runtime", "epoch", 7)); dao.putCursor(CursorEntity("computer", "runtime-unused", "epoch", 3))
+        dao.putSnapshot(SnapshotEntity(foreign, "epoch", 7)); dao.putSnapshot(SnapshotEntity(gone, "epoch", 3))
+        repo.clearCache().join()
+        assertTrue(dao.items(gone).isEmpty())
+        assertNull(dao.snapshot(gone))
+        assertTrue(dao.cursors("computer").none { it.runtimeId == "runtime-unused" })
+        assertEquals("kept", dao.items(foreign).single().text)
+        assertEquals(7L, dao.snapshot(foreign)!!.sequence)
+        assertEquals(7L, dao.cursors("computer-2").single().sequence)
+    }
+
     @Test fun persistedHistoryIsBrowsableWithoutAnOnlineNativeRuntime() = runBlocking<Unit> {
         val diskKey=ThreadKey("computer","store","disk-cli")
         update { it.copy(capabilities=it.capabilities+"threads/history/read",runtimes=emptyList()) }

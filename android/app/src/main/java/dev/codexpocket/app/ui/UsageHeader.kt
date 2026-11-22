@@ -17,6 +17,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.ui.kit.*
+import dev.codexpocket.wire.ExecutionTargetKind
 import java.time.LocalDate
 import java.time.ZoneId
 
@@ -27,19 +28,25 @@ internal fun usageAppLabel(app: String) = when (app) { "codex" -> "Codex"; "clau
 internal fun UsageSourceCapsule(busy: Boolean, canRefresh: Boolean, onRefresh: () -> Unit, modifier: Modifier = Modifier) {
     val c = Pocket.colors
     val width = rememberUsageTextWidth()
-    val place = "这台电脑"
+    // The figures belong to the selected execution location; where the app can switch it, this is the switch.
+    val target = LocalExecutionLocation.current
+    val choose = LocalExecutionLocationPicker.current
+    val place = target?.label ?: "这台电脑"
     val source = "CC Switch"
     BoxWithConstraints(modifier.fillMaxWidth()) {
         // One row takes both labels, the refresh target, the hairlines and the gaps; the glyph and the wider gaps only when there is room for them too.
-        val labels = width(place, Pocket.type.label) + width(source, Pocket.type.labelSmall)
+        val labels = width(place, Pocket.type.label) + width(source, Pocket.type.labelSmall) + if (choose != null) 20.dp else 0.dp
         val roomy = labels + 156.dp <= maxWidth
         // Text too large for one row puts the source under the location instead of cutting either short.
         val stacked = labels + 110.dp > maxWidth
         val location = @Composable { part: Modifier ->
-            Row(part.semantics(mergeDescendants = true) { contentDescription = "执行位置：$place" },
+            val press = if (choose == null) Modifier else Modifier.heightIn(min = 48.dp).clip(PocketRadii.capsule)
+                .pocketPressable(onClickLabel = "切换执行位置", haptic = PocketHaptic.Tap, onClick = choose).testTag("usage-location")
+            Row(part.then(press).semantics(mergeDescendants = true) { contentDescription = "执行位置：$place" },
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (roomy) PIcon(PocketIcons.Computer, null, Modifier.size(18.dp), tint = c.inkMuted)
-                PText(place, style = Pocket.type.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (roomy) PIcon(if (target?.kind == ExecutionTargetKind.LinuxSsh) PocketIcons.Terminal else PocketIcons.Computer, null, Modifier.size(18.dp), tint = c.inkMuted)
+                PText(place, Modifier.weight(1f, fill = false), style = Pocket.type.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (choose != null) PIcon(PocketIcons.ExpandMore, null, Modifier.size(16.dp), tint = c.inkMuted)
             }
         }
         // The only source this state offers: shown as the selected one, with nothing to switch to.

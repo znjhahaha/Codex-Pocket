@@ -730,6 +730,26 @@ class UsageScreenUiTest {
         compose.onNodeWithTag("usage-refresh").assertHasClickAction().assertIsEnabled()
     }
 
+    @Test fun sourceCapsuleNamesTheSelectedLocationAndSwitchesItWhereTheAppCan() {
+        var opened = 0
+        listOf(1f, 2f).forEach { scale ->
+            content(font = scale) {
+                CompositionLocalProvider(LocalExecutionLocationPicker provides { opened++ },
+                    LocalExecutionLocation provides dev.codexpocket.wire.ExecutionTarget("ssh", dev.codexpocket.wire.ExecutionTargetKind.LinuxSsh, "开发服务器")) {
+                    Box(Modifier.width(320.dp).fillMaxHeight()) { UsageScreen(ready(), {}, {}) }
+                }
+            }
+            compose.onNodeWithText("这台电脑").assertDoesNotExist()
+            val location = compose.onNodeWithTag("usage-location").assertIsDisplayed().assertHasClickAction()
+                .assert(hasContentDescription("执行位置：开发服务器"))
+            val bounds = location.fetchSemanticsNode().boundsInRoot
+            assertTrue("${bounds.height / dp}dp at ${scale}x", bounds.height >= 48 * dp - 1f && bounds.width >= 48 * dp - 1f)
+            location.performClick()
+        }
+        assertEquals(2, opened)
+        assertTrue(PocketHaptic.Tap in haptics)
+    }
+
     @Test fun narrowLargeFontLightAndDarkRemainInsideCards() {
         listOf("light", "dark").forEach { theme ->
           listOf(1f, 1.8f, 2f).forEach { scale ->

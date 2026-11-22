@@ -6,15 +6,12 @@ import java.util.UUID
 import java.io.File
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 /** One repository owns one location for its entire lifetime, including late replies. */
-internal class ExecutionLocations(private val context: Context) {
+internal class ExecutionLocations(private val context: Context,
+    private val store: ExecutionLocationStore = ExecutionLocationStore(context),
+    private val db: PocketDatabase = PocketDatabase.create(context)) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val store = ExecutionLocationStore(context)
-    private val db = PocketDatabase.create(context)
-    private val gate = Mutex()
     private val repositories = linkedMapOf<String, PocketRepository>()
     private val selected = MutableStateFlow<PocketRepository?>(null)
     val active = selected.asStateFlow()
@@ -24,28 +21,17 @@ internal class ExecutionLocations(private val context: Context) {
     private val preparation = MutableStateFlow<String?>(null)
     val progress = preparation.asStateFlow()
     @Volatile private var foreground = false
+    private var recovered = false
 
     init {
-        scope.launch {
-            try {
-                // Process-recovery pass occurs once, never when another live target opens.
-                db.dao().markInterruptedUnknown()
-                var catalog = store.directory()
-                if (catalog.targets.isEmpty()) {
-                    store.add(ExecutionTarget(UUID.randomUUID().toString(), ExecutionTargetKind.Computer, "电脑"))
-                    catalog = store.directory()
-                }
-                activate(catalog.selectedId ?: catalog.targets.first().id)
-                directory.collect { latest ->
-                    if (latest.targets.isEmpty()) {
-                        store.add(ExecutionTarget(UUID.randomUUID().toString(), ExecutionTargetKind.Computer, "电脑"))
-                    } else if (latest.selectedId != null && repositories[latest.selectedId] !== selected.value) {
-                        activate(checkNotNull(latest.selectedId))
-                    }
-                }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { failure.value = "执行位置暂时无法读取，已有配对与会话数据已保留。" }
-        }
+        // The selected location is ready before the first frame, as the single repository always was.
+        follow()
+        scope.launch { directory.collect { follow() } }
+    }
+    /** A change only prompts a look: what is selected is read under the lock, never taken from an older emission. */
+    @Synchronized private fun follow() {
+        try { store.directory().let { activate(it.selectedId ?: it.targets.first().id) } }
+        catch (_: Exception) { failure.value = "执行位置暂时无法读取，已有配对与会话数据已保留。" }
     }
 
     fun setForeground(value: Boolean) { foreground = value; selected.value?.setForeground(value) }
@@ -54,13 +40,20 @@ internal class ExecutionLocations(private val context: Context) {
         catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { failure.value = "暂时无法切换执行位置，请重试。" }
     }
-    private suspend fun activate(id: String) = gate.withLock {
-        val target = store.directory().targets.firstOrNull { it.id == id } ?: error("Unknown location")
+    @Synchronized private fun activate(id: String) {
+        val catalog = store.directory()
+        val target = catalog.targets.firstOrNull { it.id == id } ?: error("Unknown location")
+        // A forgotten location's repository has already disconnected and reset itself.
+        repositories.keys.retainAll(catalog.targets.mapTo(hashSetOf()) { it.id })
         val repository = repositories[id] ?: createRepository(target).also { repositories[id] = it }
         store.select(id)
+        // A place added to pair another computer and left without pairing holds nothing to keep.
+        catalog.selected?.takeIf { it.id != id && it.endpointId == null }?.let { store.remove(it.id) }
         val old = selected.value
         if (old !== repository) {
             old?.setForeground(false)
+            // Appearance is the phone's, not a location's: carry it over rather than show what this one last saw.
+            repository.reloadAppearance()
             selected.value = repository
             repository.setForeground(foreground)
         }
@@ -75,8 +68,9 @@ internal class ExecutionLocations(private val context: Context) {
             }
             else -> error("Execution location runtime has not been prepared")
         }
+        // Commands cut off by the last process end are marked once, by the first location to open.
         return PocketRepository(context, connectionFactory = connector, pairStore = store.pairing(target.id),
-            db = db, recoverInterruptedCommands = false)
+            db = db, recoverInterruptedCommands = !recovered).also { recovered = true }
     }
     fun addComputer() = scope.launch {
         try {

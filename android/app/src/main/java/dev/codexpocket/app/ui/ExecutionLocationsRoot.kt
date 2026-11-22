@@ -17,6 +17,8 @@ import dev.codexpocket.app.data.ExecutionLocations
 import dev.codexpocket.wire.*
 
 internal val LocalExecutionLocationPicker = staticCompositionLocalOf<(() -> Unit)?> { null }
+/** The selected location, for screens that say whose data they show. */
+internal val LocalExecutionLocation = staticCompositionLocalOf<ExecutionTarget?> { null }
 
 @Composable
 internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
@@ -36,7 +38,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
     }
     val state by current.state.collectAsStateWithLifecycle()
     PocketTheme(state.theme) { PocketOverlayHost {
-        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }) {
+        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }, LocalExecutionLocation provides catalog.selected) {
             pages.SaveableStateProvider(catalog.selectedId ?: "unpaired") { PocketRoot(state, current) }
         }
         if (choosing) PocketSheet("执行位置", { choosing = false }, subtitle = "项目、对话与用量跟随所选位置") {

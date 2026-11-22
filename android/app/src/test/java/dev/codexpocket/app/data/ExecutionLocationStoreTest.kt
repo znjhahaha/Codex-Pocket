@@ -70,4 +70,65 @@ class ExecutionLocationStoreTest {
         assertThrows(IllegalArgumentException::class.java) { store.pairing("computer").save(pair("different")) }
         assertEquals("computer", store.pairing("computer").load()!!.computerId)
     }
+
+    @Test fun anUnpairedPhoneHasOneLocationWithoutWritingAndSavesItOnlyOncePaired() {
+        val blob = Blob().apply { fail = true }
+        val store = ExecutionLocationStore(blob, Legacy(null))
+        val only = store.directory().selected!!
+        assertEquals(listOf(only), store.directory().targets)
+        assertEquals(ExecutionTargetKind.Computer, only.kind)
+        assertNull(store.pairing(only.id).load())
+        // Opening, selecting and forgetting it change nothing, so nothing is written.
+        store.select(only.id); store.pairing(only.id).forget()
+        assertNull(blob.text)
+        blob.fail = false
+        store.pairing(only.id).save(pair("computer"))
+        val restored = ExecutionLocationStore(blob, Legacy(null))
+        assertEquals("computer", restored.directory().selected!!.endpointId)
+        assertEquals("secret-computer", restored.pairing(only.id).load()!!.deviceSecret)
+    }
+
+    @Test fun forgettingTheLastLocationLeavesOnePlaceToPairAgain() {
+        val blob = Blob(); val store = ExecutionLocationStore(blob, Legacy(pair("computer")))
+        store.pairing("computer").forget()
+        val only = store.directory().selected!!
+        assertNull(only.endpointId)
+        assertNull(store.pairing(only.id).load())
+        assertEquals(only, store.directoryChanges.value.selected)
+    }
+
+    @Test fun selectingTheSelectedLocationDoesNotRewriteTheRecord() {
+        val blob = Blob(); val store = ExecutionLocationStore(blob, Legacy(pair("computer")))
+        assertEquals("computer", store.directory().selectedId)
+        blob.fail = true
+        store.select("computer")
+        assertEquals("computer", store.directory().selectedId)
+    }
+
+    @Test fun anUnreadableRecordReportsItsFailureWhereThePairingIsReadAndIsReplacedByPairingAgain() {
+        val blob = object : LocationBlob {
+            var text: String? = "{not json"
+            override fun read() = text
+            override fun write(value: String) { text = value }
+        }
+        val store = ExecutionLocationStore(blob, Legacy(null))
+        val only = store.directory().selected!!
+        // The repository turns this into its existing "could not unlock the pairing" state.
+        assertThrows(Exception::class.java) { store.pairing(only.id).load() }
+        assertEquals("{not json", blob.text)
+        store.pairing(only.id).save(pair("computer"))
+        assertEquals("secret-computer", ExecutionLocationStore(blob, Legacy(null)).pairing(only.id).load()!!.deviceSecret)
+    }
+
+    @Test fun anUnreadableLegacyPairingIsNeitherImportedNorOverwritten() {
+        val legacy = object : PairingStorage {
+            override fun load(): PairedComputer? = error("Keystore unavailable")
+            override fun save(pair: PairedComputer) = fail("The old pairing must not be rewritten")
+            override fun forget() = fail("The old pairing must not be removed")
+        }
+        val blob = Blob(); val store = ExecutionLocationStore(blob, legacy)
+        val only = store.directory().selected!!
+        assertThrows(IllegalStateException::class.java) { store.pairing(only.id).load() }
+        assertNull(blob.text)
+    }
 }

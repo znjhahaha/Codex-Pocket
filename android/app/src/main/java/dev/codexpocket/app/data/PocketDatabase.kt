@@ -99,10 +99,10 @@ interface PocketDao {
     @Upsert suspend fun putDraft(draft: DraftEntity)
     @Query("SELECT * FROM cursors WHERE computerId = :computer") suspend fun cursors(computer: String): List<CursorEntity>
     @Upsert suspend fun putCursor(cursor: CursorEntity)
-    @Query("DELETE FROM cursors") suspend fun clearCursors()
+    @Query("DELETE FROM cursors WHERE computerId = :computer") suspend fun clearCursors(computer: String)
     @Query("SELECT * FROM snapshots WHERE chatKey = :key") suspend fun snapshot(key: ThreadKey): SnapshotEntity?
     @Upsert suspend fun putSnapshot(snapshot: SnapshotEntity)
-    @Query("DELETE FROM snapshots") suspend fun clearSnapshots()
+    @Query("DELETE FROM snapshots WHERE instr(chatKey, :prefix) = 1") suspend fun clearSnapshots(prefix: String)
     @Upsert suspend fun putCommand(command: CommandEntity)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertAssistantCommand(command: CommandEntity): Long
     @Query("UPDATE commands SET status = :status WHERE id = :id AND status IN ('submitted','unknown','not_found')") suspend fun commandStatus(id: String, status: String)
@@ -110,7 +110,7 @@ interface PocketDao {
     @Query("SELECT * FROM commands WHERE method = 'assistant/send' AND status IN ('accepted','rejected') ORDER BY createdAt DESC LIMIT 256") fun assistantSendReceipts(): Flow<List<CommandEntity>>
     @Query("SELECT * FROM commands WHERE computerId = :computer AND status IN ('submitted','unknown','not_found')") suspend fun uncertain(computer: String): List<CommandEntity>
     @Query("UPDATE commands SET status = 'unknown' WHERE status = 'submitted'") suspend fun markInterruptedUnknown()
-    @Query("DELETE FROM items") suspend fun clearHistory()
+    @Query("DELETE FROM items WHERE instr(chatKey, :prefix) = 1") suspend fun clearHistory(prefix: String)
     @Query("DELETE FROM chats") suspend fun clearChats()
     @Query("DELETE FROM drafts") suspend fun clearDrafts()
 }
