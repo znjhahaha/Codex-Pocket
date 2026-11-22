@@ -310,14 +310,15 @@ class AssistantStageTest {
         assertTrue(actions.isEmpty())
     }
 
-    /** The stage is built on Pocket's own controls: its sources never import Material. */
-    @Test fun stageSourcesNeverReferenceMaterial() {
+    /** The assistant, stage and pages alike, is built on Pocket's own controls: none of its sources imports Material. */
+    @Test fun assistantSourcesNeverReferenceMaterial() {
         val ui = File("src/main/java/dev/codexpocket/app/ui")
-        val stage = listOf("AssistantWorkspace.kt", "AssistantScreen.kt", "AssistantVisuals.kt", "AssistantPocketButton.kt", "AssistantAttentionCapsule.kt",
-            "AssistantJobInlineCard.kt", "AssistantInputDock.kt", "AssistantChatTimeline.kt").map { File(ui, it) }
-        stage.forEach { assertTrue("${it.name} is missing", it.isFile) }
-        assertEquals(emptyList<String>(), stage.flatMap { file -> file.readLines().mapIndexedNotNull { index, line ->
-            if ("androidx.compose.material" in line) "${file.name}:${index + 1}" else null } })
-        assertFalse(File(ui, "AssistantChat.kt").exists())
+        val sources = ui.listFiles { file -> file.isFile && file.name.startsWith("Assistant") && file.extension == "kt" }.orEmpty().sortedBy { it.name }
+        assertTrue("Assistant sources were not found from ${File(".").absolutePath}", sources.size >= 15)
+        assertEquals(emptyList<String>(), sources.flatMap { file -> file.readLines().mapIndexedNotNull { index, line ->
+            if ("androidx.compose.material" in line || "MaterialTheme" in line) "${file.name}:${index + 1}" else null } })
+        listOf("AssistantChat.kt", "AssistantSecondaryPages.kt", "AssistantTaskCenter.kt", "AssistantTaskDetails.kt", "AssistantGroupCard.kt").forEach {
+            assertFalse("$it was removed and must not come back unused", File(ui, it).exists())
+        }
     }
 }

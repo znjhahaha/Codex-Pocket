@@ -40,9 +40,10 @@ internal val AssistantPageSpacing = 12.dp
 /** Details that open under their heading. Also used by the conversation's answered-question row. */
 @Composable
 internal fun AssistantExpansion(expanded: Boolean, content: @Composable () -> Unit) {
+    val motion = rememberPocketMotion()
     AnimatedVisibility(expanded,
-        enter = fadeIn(tween(pocketMotionMillis(180))) + expandVertically(tween(pocketMotionMillis(180))),
-        exit = fadeOut(tween(pocketMotionMillis(140))) + shrinkVertically(tween(pocketMotionMillis(140)))) { content() }
+        enter = fadeIn(tween(if (motion) PocketMotion.EnterMillis else 0)) + expandVertically(tween(if (motion) PocketMotion.EnterMillis else 0)),
+        exit = fadeOut(tween(if (motion) PocketMotion.ExitMillis else 0)) + shrinkVertically(tween(if (motion) PocketMotion.ExitMillis else 0))) { content() }
 }
 
 /**
