@@ -41,19 +41,20 @@ class AssistantUnknownStatusLayoutTest {
         }}}
         compose.waitForIdle()
     }
+    /** The unsettled command is named once, in full, across the row's width; preparation keeps its single action. */
     private fun assertCompactStatus(maxLines:Int) {
-        val status=compose.onNodeWithTag("assistant-unconfirmed-status").assertIsDisplayed().assertTextEquals("原操作结果待确认")
+        val status=compose.onNodeWithTag("assistant-workspace-issue").assertIsDisplayed().assertTextEquals("原操作结果尚未确认，正在核对；不会重复提交")
         val layouts=mutableListOf<TextLayoutResult>()
         status.performSemanticsAction(SemanticsActions.GetTextLayoutResult) {assertTrue(it(layouts))}
         val layout=layouts.single()
         assertTrue("Unknown status should use at most $maxLines lines, got ${layout.lineCount}",layout.lineCount<=maxLines)
         assertFalse(layout.hasVisualOverflow)
-        val width=compose.onNodeWithTag("assistant-screen").fetchSemanticsNode().boundsInRoot.width
-        assertTrue("Status must retain full row width",status.fetchSemanticsNode().boundsInRoot.width>=width*0.78f)
-        compose.onNodeWithTag("assistant-error").assertDoesNotExist()
-        compose.onAllNodesWithText("重试准备").assertCountEquals(1)
+        val width=compose.onNodeWithTag("assistant-workspace").fetchSemanticsNode().boundsInRoot.width
+        assertTrue("Status must retain the row's width",status.fetchSemanticsNode().boundsInRoot.width>=width*(if(maxLines>1) 0.78f else 0.55f))
+        compose.onAllNodesWithTag("assistant-workspace-error").assertCountEquals(1)
+        compose.onAllNodesWithText("准备助理").assertCountEquals(1)
         compose.onNodeWithTag("assistant-prepare").assertExists()
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         assertTrue(actions.isEmpty())
     }
     private fun assertRecoveryStillFenced() {
@@ -76,7 +77,7 @@ class AssistantUnknownStatusLayoutTest {
     }
     @Test fun narrowLargeFontUnknownUsesFullWidthWithoutPreparationRetry() {
         content({unknown()},fontScale=2f,theme="dark")
-        assertCompactStatus(2)
+        assertCompactStatus(3)
         screenshot("unknown-320dp-font2-dark")
         assertRecoveryStillFenced()
     }
@@ -91,14 +92,15 @@ class AssistantUnknownStatusLayoutTest {
         var state by mutableStateOf(unknown())
         content({state},fontScale=2f,theme="dark")
         compose.runOnIdle {state=state.copy(snapshot=snapshot.copy(errorCode="assistant_account_unavailable"),error=snapshot.preparationIssue)}
-        assertCompactStatus(2)
+        assertCompactStatus(3)
         assertRecoveryStillFenced()
     }
     @Test fun independentErrorRetainsExistingPreparationAction() {
         content({AssistantUiState(snapshot,error="电脑连接错误")})
-        compose.onNodeWithTag("assistant-unconfirmed-status").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-error").assertTextEquals("电脑连接错误")
-        compose.onAllNodesWithText("重试准备").assertCountEquals(2)
+        compose.onNodeWithTag("assistant-workspace-issue").assertTextEquals("电脑连接错误")
+        compose.onNodeWithText("原操作结果尚未确认，正在核对；不会重复提交").assertDoesNotExist()
+        compose.onAllNodesWithText("准备助理").assertCountEquals(1)
+        compose.onNodeWithTag("assistant-prepare").assertExists()
         assertTrue(actions.isEmpty())
     }
 }

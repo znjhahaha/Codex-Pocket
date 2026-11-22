@@ -89,11 +89,11 @@ class PocketAssistantIntegrationTest {
         compose.onNodeWithTag("assistant-pocket-button").assertWidthIsEqualTo(60.dp).assertHeightIsEqualTo(60.dp).assertHasClickAction()
         screenshot("root-attention-before")
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-workspace").assertIsDisplayed()
         compose.onNodeWithText("服务已就绪").assertDoesNotExist()
         screenshot("root-assistant-open")
-        compose.onNodeWithContentDescription("返回原页面").performClick()
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-back").performClick()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
         compose.onNodeWithTag("home-tab-attention").assertIsSelected()
         screenshot("root-attention-returned")
     }
@@ -101,9 +101,9 @@ class PocketAssistantIntegrationTest {
     @Test fun actualAndroidBackDispatcherReturnsToManagementTab()=fixture {_,_->
         compose.onNodeWithTag("home-tab-devices").performClick().assertIsSelected()
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
+        compose.onNodeWithTag("assistant-workspace").assertIsDisplayed()
         compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
         compose.onNodeWithTag("home-tab-devices").assertIsSelected()
     }
 
@@ -112,7 +112,7 @@ class PocketAssistantIntegrationTest {
         // Commit the entry composition so PocketRoot's LaunchedEffect can start its real read.
         compose.waitForIdle()
         compose.waitUntil(5_000) {repo.state.value.assistant.error!=null}
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.openAssistantPage("Memory")
         compose.onNodeWithText("实际快照记忆").assertExists()
         scroll("assistant-memory-add").assertIsNotEnabled()
@@ -133,14 +133,14 @@ class PocketAssistantIntegrationTest {
         runBlocking {readGate.lock()}
         try {
             compose.runOnIdle {state(repo).update {it.copy(online=true,assistant=it.assistant.copy(error=null))}}
-            compose.onNodeWithTag("assistant-message-input").performTextInput("保留离线草稿")
-            compose.onNodeWithTag("assistant-send").assertIsEnabled()
+            compose.onNodeWithTag(AssistantDraft).performTextInput("保留离线草稿")
+            compose.onNodeWithTag(AssistantSend).assertIsEnabled()
             compose.runOnIdle {state(repo).update {it.copy(online=false)}}
-            compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
-            compose.onNodeWithTag("assistant-message-input").assertTextEquals("保留离线草稿")
-            compose.onNodeWithTag("assistant-message-input").assertIsEnabled().performTextReplacement("离线仍可修改草稿")
-            compose.onNodeWithTag("assistant-message-input").assertTextEquals("离线仍可修改草稿")
-            compose.onNodeWithTag("assistant-send").assertIsNotEnabled().performTouchInput {click()}
+            compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
+            compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留离线草稿")
+            compose.onNodeWithTag(AssistantDraft).assertIsEnabled().performTextReplacement("离线仍可修改草稿")
+            compose.onNodeWithTag(AssistantDraft).assertTextEquals("离线仍可修改草稿")
+            compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput {click()}
             db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
             assertTrue(repo.state.value.assistant.sendReceipts.isEmpty())
         } finally {readGate.unlock()}
@@ -149,16 +149,17 @@ class PocketAssistantIntegrationTest {
     @Test fun childPageBackButtonReturnsToChatBeforeClosingToAttentionTab()=fixture(true) {_,_->
         compose.onNodeWithTag("home-tab-attention").performClick().assertIsSelected()
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("往返后继续填写")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("往返后继续填写")
         listOf("Memory","Settings").forEach {page->
             compose.openAssistantPage(page)
-            compose.onNodeWithContentDescription("返回原页面").assertDoesNotExist()
-            compose.returnToAssistantChat()
-            compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
-            compose.onNodeWithTag("assistant-message-input").assertTextEquals("往返后继续填写")
+            compose.onNodeWithTag(AssistantDraft).assertDoesNotExist()
+            // The page's Back returns to the conversation; the assistant stays open.
+            compose.onNodeWithTag("assistant-back").performClick()
+            compose.onNodeWithTag("assistant-workspace").assertIsDisplayed()
+            compose.onNodeWithTag(AssistantDraft).assertTextEquals("往返后继续填写")
         }
-        compose.onNodeWithContentDescription("返回原页面").performClick()
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-back").performClick()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
         compose.onNodeWithTag("home-tab-attention").assertIsSelected()
     }
 
@@ -173,29 +174,29 @@ class PocketAssistantIntegrationTest {
         assertEquals(snapshot,repo.state.value.assistant.snapshot)
 
         val draft="离线修改后的草稿\n回到首页后继续写"
-        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().performTextInput("离线第一稿")
-        compose.onNodeWithTag("assistant-message-input").performTextReplacement(draft)
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals(draft)
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
-        compose.onNodeWithContentDescription("返回原页面").performClick()
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
-        compose.onNodeWithTag("assistant-message-input").assertDoesNotExist()
+        compose.onNodeWithTag(AssistantDraft).assertIsEnabled().performTextInput("离线第一稿")
+        compose.onNodeWithTag(AssistantDraft).performTextReplacement(draft)
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals(draft)
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
+        compose.onNodeWithTag("assistant-back").performClick()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
+        compose.onNodeWithTag(AssistantDraft).assertDoesNotExist()
         compose.onNodeWithTag("home-tab-attention").assertIsSelected()
 
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
-        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().assertTextEquals(draft)
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag("assistant-workspace").assertIsDisplayed()
+        compose.onNodeWithTag(AssistantDraft).assertIsEnabled().assertTextEquals(draft)
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
 
         // Save the latest edit again through Android Back, rather than only retaining the first draft.
         val revised="$draft，再核对一次"
-        compose.onNodeWithTag("assistant-message-input").performTextReplacement(revised)
+        compose.onNodeWithTag(AssistantDraft).performTextReplacement(revised)
         compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
         compose.onNodeWithTag("home-tab-attention").assertIsSelected()
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-message-input").assertIsEnabled().assertTextEquals(revised)
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertIsEnabled().assertTextEquals(revised)
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
 
         assertEquals("Editing and reopening an offline draft must not call the transport",emptyList<String>(),transport.calls.toList())
         db.openHelper.readableDatabase.query("SELECT COUNT(*) FROM commands").use {cursor->cursor.moveToFirst();assertEquals(0,cursor.getInt(0))}
@@ -208,17 +209,16 @@ class PocketAssistantIntegrationTest {
     @Test fun androidBackFromChildPagesRetainsDraftThenReturnsToManagementTab()=fixture(true) {_,_->
         compose.onNodeWithTag("home-tab-devices").performClick().assertIsSelected()
         compose.onNodeWithTag("assistant-pocket-button").performClick()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("系统返回保留草稿")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("系统返回保留草稿")
         listOf("Memory","Settings").forEach {page->
             compose.openAssistantPage(page)
-            compose.onNodeWithContentDescription("返回助理对话").assertIsDisplayed()
+            compose.onNodeWithTag(AssistantDraft).assertDoesNotExist()
             compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
-            compose.onNodeWithTag("assistant-screen").assertIsDisplayed()
-            compose.onNodeWithTag("assistant-message-input").assertTextEquals("系统返回保留草稿")
-            compose.onNodeWithContentDescription("返回原页面").assertIsDisplayed()
+            compose.onNodeWithTag("assistant-workspace").assertIsDisplayed()
+            compose.onNodeWithTag(AssistantDraft).assertTextEquals("系统返回保留草稿")
         }
         compose.runOnIdle {compose.activity.onBackPressedDispatcher.onBackPressed()}
-        compose.onNodeWithTag("assistant-screen").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-workspace").assertDoesNotExist()
         compose.onNodeWithTag("home-tab-devices").assertIsSelected()
     }
 

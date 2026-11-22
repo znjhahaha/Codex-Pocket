@@ -36,52 +36,52 @@ class AssistantComposerScopeTest {
         compose.waitForIdle()
     }
     private fun send(text:String) {
-        compose.onNodeWithTag("assistant-message-input").performTextInput(text)
-        compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
+        compose.onNodeWithTag(AssistantDraft).performTextInput(text)
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled().performClick()
     }
-    private fun assertEmpty()=compose.onNodeWithTag("assistant-message-input").assert(
+    private fun assertEmpty()=compose.onNodeWithTag(AssistantDraft).assert(
         SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
 
     @Test fun firstPreparationKeepsDraftOnlyWithinTheSameComputer() {
         state=AssistantUiState(AssistantSnapshot(enabled=false),computerId="pc")
         content()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("preparation draft")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("preparation draft")
         compose.runOnIdle {state=initial}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("preparation draft")
-        compose.onNodeWithTag("assistant-send").assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("preparation draft")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         compose.runOnIdle {state=initial.copy(computerId="other-pc")}
         assertEmpty()
         compose.runOnIdle {state=initial}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("preparation draft")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("preparation draft")
         assertTrue(actions.isEmpty())
     }
 
     @Test fun runtimeAndCoordinatorPreparationStagesPreserveTheUnsentDraft() {
         state=AssistantUiState(AssistantSnapshot(enabled=false),computerId="pc")
         content()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("staged preparation")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("staged preparation")
         compose.runOnIdle {state=AssistantUiState(AssistantSnapshot(enabled=true,ready=false,runtimeId="r"),computerId="pc")}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("staged preparation")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("staged preparation")
         compose.runOnIdle {state=initial.copy(snapshot=initial.snapshot!!.copy(ready=false))}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("staged preparation")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("staged preparation")
         compose.runOnIdle {state=initial}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("staged preparation")
-        compose.onNodeWithTag("assistant-send").assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("staged preparation")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         assertTrue(actions.isEmpty())
     }
 
     @Test fun laterPreparationCannotBorrowASentDraftFromTheFirstRuntime() {
         state=AssistantUiState(AssistantSnapshot(enabled=false),computerId="pc")
         content()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("original pending")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("original pending")
         compose.runOnIdle {state=initial}
-        compose.onNodeWithTag("assistant-send").assertIsEnabled().performClick()
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled().performClick()
         val original=actions.single()
         compose.runOnIdle {state=AssistantUiState(AssistantSnapshot(enabled=false),computerId="pc")}
         assertEmpty()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("new preparation")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("new preparation")
         compose.runOnIdle {state=initial.copy(snapshot=initial.snapshot!!.copy(runtimeId="later-runtime"))}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("new preparation")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new preparation")
         compose.runOnIdle {state=initial.acceptSend(original)}
         assertEmpty()
         assertEquals(1,actions.size)
@@ -95,8 +95,8 @@ class AssistantComposerScopeTest {
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(coordinatorThreadId="successor")).acceptSend(action)}
         assertEmpty()
         assertEquals(1,actions.size)
-        compose.onNodeWithTag("assistant-message-input").performTextInput("next message")
-        compose.onNodeWithTag("assistant-send").assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("next message")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
     }
 
     @Test fun runtimeScopeDraftIsIsolatedAndOriginalReceiptReleasesOriginalPendingOnReturn() {
@@ -104,15 +104,15 @@ class AssistantComposerScopeTest {
         val original=actions.single()
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(runtimeId="another-runtime"))}
         assertEmpty()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("new runtime draft")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("new runtime draft")
         compose.runOnIdle {state=state.acceptSend(original)}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("new runtime draft")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new runtime draft")
         compose.runOnIdle {state=state.copy(snapshot=initial.snapshot!!.copy(coordinatorThreadId="successor"))}
         assertEmpty()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("original scope can send again")
-        compose.onNodeWithTag("assistant-send").assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("original scope can send again")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(runtimeId="another-runtime"))}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("new runtime draft")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new runtime draft")
         assertEquals(1,actions.size)
     }
 
@@ -121,13 +121,13 @@ class AssistantComposerScopeTest {
         val action=actions.single()
         compose.runOnIdle {state=state.copy(computerId="pc2",snapshot=state.snapshot!!.copy(assistantId="another-assistant"))}
         assertEmpty()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("other computer draft")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("other computer draft")
         compose.runOnIdle {state=state.acceptSend(action)}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("other computer draft")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("other computer draft")
         compose.runOnIdle {state=initial.copy(sendReceipts=state.sendReceipts)}
         assertEmpty()
         compose.runOnIdle {state=state.copy(computerId="pc2",snapshot=state.snapshot!!.copy(assistantId="another-assistant"))}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("other computer draft")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("other computer draft")
         assertEquals(1,actions.size)
     }
 
@@ -136,8 +136,8 @@ class AssistantComposerScopeTest {
         val action=actions.single()
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(coordinatorThreadId="successor"))}
         restoration.emulateSavedInstanceStateRestore()
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("restore pending")
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("restore pending")
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.runOnIdle {state=state.acceptSend(action)}
         assertEmpty()
         assertEquals(1,actions.size)
@@ -147,11 +147,11 @@ class AssistantComposerScopeTest {
         content();send("retain draft")
         val action=actions.single()
         compose.runOnIdle {state=state.acceptSend(action,"unknown")}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("retain draft")
-        compose.onNodeWithTag("assistant-send").assertIsNotEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("retain draft")
+        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.runOnIdle {state=state.acceptSend(action,"rejected")}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("retain draft")
-        compose.onNodeWithTag("assistant-send").assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("retain draft")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
     }
 
     @Test fun legacyCoordinatorChangeHasIsolatedStateWithoutInventingPublicIdentity() {
@@ -160,9 +160,9 @@ class AssistantComposerScopeTest {
         val action=actions.single()
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(coordinatorThreadId="successor"))}
         assertEmpty()
-        compose.onNodeWithTag("assistant-message-input").performTextInput("new legacy scope")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("new legacy scope")
         compose.runOnIdle {state=state.acceptSend(action)}
-        compose.onNodeWithTag("assistant-message-input").assertTextEquals("new legacy scope")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new legacy scope")
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(coordinatorThreadId="original"))}
         assertEmpty()
     }

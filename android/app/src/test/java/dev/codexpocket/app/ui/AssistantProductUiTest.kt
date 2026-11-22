@@ -36,9 +36,9 @@ class AssistantProductUiTest {
         compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
             AssistantScreen(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",ready=true)),emptyList(),emptyList(),emptyList(),{},{_,_->},{})
         }}}
-        compose.onNodeWithTag("assistant-nav:Tasks").performClick()
+        compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-tasks-list").assertExists()
-        compose.onNodeWithTag("assistant-nav:Artifacts").performClick()
+        compose.openAssistantPage("Artifacts")
         compose.onNodeWithTag("assistant-artifact-filter").assertExists()
     }
 }

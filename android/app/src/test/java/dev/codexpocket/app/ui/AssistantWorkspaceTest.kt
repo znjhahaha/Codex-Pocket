@@ -65,8 +65,11 @@ class AssistantWorkspaceTest {
             AssistantScreen(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true,tasks=listOf(task))),
                 emptyList(),emptyList(),emptyList(),{},{_,_->},{})
         }}}
+        // The picker is behind `＋` on the stage, and on the task's own page.
+        compose.onNodeWithTag("assistant-tools").performClick()
         compose.onNodeWithTag("assistant-attach:main").assertExists()
-        compose.onNodeWithTag("assistant-nav:Tasks").performClick()
+        compose.onNodeWithContentDescription("关闭").performClick()
+        compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-task-open:attachment-task").performClick()
         compose.onNodeWithTag("assistant-attach:attachment-task").performScrollTo().assertExists()
     }
@@ -87,12 +90,16 @@ class AssistantWorkspaceTest {
         assertEquals("assistant/read",actions.last().method)
         compose.onAllNodesWithText(issue).assertCountEquals(1)
     }
-    @Test fun fourIndependentEntrancesAndDraftSurvivesNavigation() {
+    @Test fun everyPageOpensFromTheStageAndDraftSurvivesNavigation() {
         compose.activity.runOnUiThread {compose.activity.setContent {PocketTheme("light") {
             AssistantScreen(AssistantUiState(snapshot=AssistantSnapshot(enabled=true,runtimeId="r",assistantId="a",ready=true)),emptyList(),emptyList(),emptyList(),{},{_,_->},{})
         }}}
         compose.onNodeWithTag("assistant-workspace-draft").performTextInput("保留这个目标")
-        listOf("Tasks","Artifacts","Plans","Main").forEach {compose.onNodeWithTag("assistant-nav:$it").performClick()}
+        listOf("Tasks","Artifacts","Plans","Memory","Settings").forEach {
+            compose.openAssistantPage(it)
+            compose.onNodeWithTag("assistant-workspace-draft").assertDoesNotExist()
+            compose.returnToAssistantChat()
+        }
         compose.onNodeWithTag("assistant-workspace-draft").assertTextContains("保留这个目标")
     }
     @Test fun pendingRequestHasTheSameIdentityInMainAndTaskAndStopWaitsForConfirmation() {
@@ -104,7 +111,7 @@ class AssistantWorkspaceTest {
             AssistantScreen(AssistantUiState(snapshot,computerId="approval-test"),emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}}
         compose.onNodeWithTag("assistant-approve:op").performScrollTo().performClick()
-        compose.onNodeWithTag("assistant-nav:Tasks").performClick()
+        compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-task-open:task").performClick()
         compose.onNodeWithTag("assistant-approve:op").performScrollTo().performClick()
         assertEquals(actions[0].commandId,actions[1].commandId)
@@ -133,7 +140,8 @@ class AssistantWorkspaceTest {
         compose.runOnIdle {state=state.copy(sendReceipts=listOf(AssistantSendReceipt(sent.commandId!!,"render-test","r","assistant:a","accepted")))}
         compose.onNodeWithTag("assistant-workspace-draft").assertTextContains("再加一张表",substring=true)
         saveRender("assistant-main-light.png")
-        compose.onNodeWithTag("assistant-nav:Tasks").performClick()
+        compose.onNodeWithTag("assistant-chat-task-toggle:task").assert(hasText("新进展"))
+        compose.openAssistantPage("Tasks")
         compose.onNodeWithText("新进展").assertExists()
         saveRender("assistant-tasks-light.png")
     }
@@ -151,6 +159,7 @@ class AssistantWorkspaceTest {
             AssistantScreen(state,emptyList(),emptyList(),emptyList(),{actions+=it},{_,_->},{})
         }}}
         compose.onNodeWithTag("assistant-chat-task:task").assertExists()
+        compose.expandAssistantTask("task")
         compose.onNodeWithText("子任务 1/1 已完成").assertExists()
         compose.runOnIdle {
             val snapshot=state.snapshot!!
@@ -170,7 +179,7 @@ class AssistantWorkspaceTest {
             val view=compose.activity.window.decorView
             val bitmap=android.graphics.Bitmap.createBitmap(view.width,view.height,android.graphics.Bitmap.Config.ARGB_8888)
             view.draw(android.graphics.Canvas(bitmap))
-            File("D:/codex2/.local/assistant-rebuild",name).apply {parentFile?.mkdirs()}.outputStream().use {
+            File("build/reports/assistant",name).apply {parentFile?.mkdirs()}.outputStream().use {
                 bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)
             }
         }
