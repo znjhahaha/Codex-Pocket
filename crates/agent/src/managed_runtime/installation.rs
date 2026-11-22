@@ -10,6 +10,25 @@ use std::{
 
 pub const HOST_FILENAME: &str = if cfg!(windows) { "pocket-runtime-host.exe" } else { "pocket-runtime-host" };
 pub const MANIFEST_FILENAME: &str = if cfg!(windows) { "windows-manifest.json" } else { "runtime-manifest.json" };
+const PACKAGED_AGENT_FILENAME: &str = "libpocket-agent.so";
+const PACKAGED_HOST_FILENAME: &str = "libpocket-runtime-host.so";
+const PACKAGED_MANIFEST_FILENAME: &str = "libpocket-runtime-manifest.so";
+/// An Android package installs executables only as `lib*.so` in its native library
+/// directory, so that installation carries the same files under those names.
+pub fn layout_names(executable: Option<&Path>) -> (&'static str, &'static str) {
+    let packaged = cfg!(unix)
+        && executable.and_then(Path::file_name).is_some_and(|name| name == PACKAGED_AGENT_FILENAME);
+    if packaged {
+        (PACKAGED_HOST_FILENAME, PACKAGED_MANIFEST_FILENAME)
+    } else {
+        (HOST_FILENAME, MANIFEST_FILENAME)
+    }
+}
+/// File names of the installation this process was started from.
+pub fn current_layout() -> (&'static str, &'static str) {
+    static NAMES: std::sync::OnceLock<(&str, &str)> = std::sync::OnceLock::new();
+    *NAMES.get_or_init(|| layout_names(std::env::current_exe().ok().as_deref()))
+}
 /// Expected generation comes from independently verified local installed metadata.
 /// The launcher verifies the manifest bytes and the executable on every ensure.
 #[derive(Clone, Debug)]
@@ -47,7 +66,8 @@ impl Installation {
     }
     pub fn verify(&self) -> Result<PathBuf> {
         physical(&self.bin, true)?;
-        let manifest = self.bin.join(MANIFEST_FILENAME);
+        let (host_filename, manifest_filename) = current_layout();
+        let manifest = self.bin.join(manifest_filename);
         physical(&manifest, false)?;
         let bytes = crate::storage::read_physical(&manifest, 1024 * 1024)?;
         ensure!(
@@ -79,9 +99,9 @@ impl Installation {
         let host = manifest
             .files
             .iter()
-            .find(|f| f.path == HOST_FILENAME)
+            .find(|f| f.path == host_filename)
             .context("Installation lacks the runtime host; repair the installed package")?;
-        let path = self.bin.join(HOST_FILENAME);
+        let path = self.bin.join(host_filename);
         physical(&path, false)?;
         let mut file = File::open(&path)?;
         crate::storage::verify_physical_file(&path, &file)?;
@@ -207,4 +227,24 @@ pub(super) fn binary_for_process(
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     anyhow::bail!("Selected native process image discovery unsupported on this platform")
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_packaged_agent_selects_the_packaged_names() {
+        let standard = (HOST_FILENAME, MANIFEST_FILENAME);
+        let packaged = if cfg!(unix) {
+            ("libpocket-runtime-host.so", "libpocket-runtime-manifest.so")
+        } else {
+            standard
+        };
+        assert_eq!(layout_names(Some(Path::new("/data/app/x/lib/arm64/libpocket-agent.so"))), packaged);
+        for other in ["/opt/pocket/pocket-agent", "/data/app/x/lib/arm64/libpocket-runtime-host.so", "libpocket-agent.so.bak"] {
+            assert_eq!(layout_names(Some(Path::new(other))), standard);
+        }
+        assert_eq!(layout_names(None), standard);
+    }
 }

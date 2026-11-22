@@ -164,7 +164,7 @@ impl Attempt {
             .ok()
             .and_then(|p| p.parent().map(Path::to_owned))
             .and_then(|p| {
-                crate::storage::read_physical(&p.join(if cfg!(windows) { "windows-manifest.json" } else { "runtime-manifest.json" }), 1024 * 1024).ok()
+                crate::storage::read_physical(&p.join(crate::managed_runtime::current_layout().1), 1024 * 1024).ok()
             })
             .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
         Self {
