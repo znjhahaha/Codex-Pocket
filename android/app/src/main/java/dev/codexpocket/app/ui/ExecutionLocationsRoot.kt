@@ -26,6 +26,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
     val catalog by locations.directory.collectAsStateWithLifecycle()
     val error by locations.error.collectAsStateWithLifecycle()
     val progress by locations.progress.collectAsStateWithLifecycle()
+    val notice by locations.notice.collectAsStateWithLifecycle()
     var choosing by rememberSaveable { mutableStateOf(false) }
     var addingSsh by rememberSaveable { mutableStateOf(false) }
     val pages = rememberSaveableStateHolder()
@@ -50,6 +51,9 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         LaunchedEffect(progress, catalog.selectedId) {
             if (addingSsh && progress == null && catalog.selected?.kind == ExecutionTargetKind.LinuxSsh && error == null) addingSsh = false
         }
+        if (notice != null && error == null) PocketDialog(onDismissRequest = locations::dismissNotice,
+            title = { Text("SSH 主机已添加") }, text = { Text(notice!!) },
+            confirmButton = { PocketButton("知道了", locations::dismissNotice) })
         if (error != null) PocketDialog(onDismissRequest = locations::dismissError,
             title = { Text("执行位置") }, text = { Text(error!!) },
             confirmButton = { PocketButton("知道了", locations::dismissError) })
