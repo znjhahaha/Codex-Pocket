@@ -127,9 +127,10 @@ internal fun ProjectCreationForm(
                     if (!createDirectory) {
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             CreationSectionTitle("工作目录")
+                            val pickerPress = remember { MutableInteractionSource() }
                             PocketGlassSurface(Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
-                                .clickable(enabled = !creating, role = Role.Button) { focus.clearFocus(); pickingProject = true }
-                                .testTag("project-picker-open"), shape = RoundedCornerShape(28.dp), dense = true) {
+                                .clickable(pickerPress, indication = null, enabled = !creating, role = Role.Button) { focus.clearFocus(); pickingProject = true }
+                                .testTag("project-picker-open"), shape = RoundedCornerShape(28.dp), dense = true, interactionSource = pickerPress) {
                                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                     CreationFolderBadge(true)
@@ -276,8 +277,10 @@ private fun CreationSectionTitle(title: String) {
 @Composable
 private fun ProjectChoice(path: String, selected: Boolean, enabled: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val c = MaterialTheme.colorScheme
+    val press = remember { MutableInteractionSource() }
     PocketGlassSurface(modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
-        .selectable(selected, enabled = enabled, role = Role.RadioButton, onClick = onClick), shape = RoundedCornerShape(28.dp), dense = true) {
+        .selectable(selected, press, indication = null, enabled = enabled, role = Role.RadioButton, onClick = onClick),
+        shape = RoundedCornerShape(28.dp), dense = true, interactionSource = press) {
         Row(Modifier.fillMaxWidth().background(if (selected) c.secondary.copy(alpha = .055f) else Color.Transparent)
             .padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {

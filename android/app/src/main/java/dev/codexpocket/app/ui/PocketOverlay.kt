@@ -47,6 +47,11 @@ import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
 import dev.codexpocket.app.ui.kit.PSurface
 import dev.codexpocket.app.ui.kit.Pocket
+import dev.codexpocket.app.ui.kit.PocketHaptic
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberPocketHaptics
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.backdrops.rememberCanvasBackdrop
@@ -166,6 +171,9 @@ internal fun PocketModal(
         val progress = LocalOverlayProgress.current
         val inputActive by rememberUpdatedState(LocalPocketInputActive.current)
         val interactive = inputActive()
+        val haptics by rememberUpdatedState(rememberPocketHaptics())
+        // A sheet let go short of dismissal springs back to rest; with motion off it is simply there.
+        val settle by rememberUpdatedState(PocketMotion.resize<Float>().orSnap(rememberPocketMotion()))
         LaunchedEffect(top) {
             if (top && !focus.restoreFocusedChild()) focus.requestFocus()
         }
@@ -219,14 +227,17 @@ internal fun PocketModal(
                         onDragStart = { distance = 0f },
                         onVerticalDrag = { change, amount ->
                             change.consume()
+                            val armed = distance > 72.dp.toPx()
                             distance = (distance + amount).coerceAtLeast(0f)
+                            // The finger feels the point past which letting go dismisses, and the way back.
+                            if (distance > 72.dp.toPx() != armed) haptics.perform(if (armed) PocketHaptic.Tick else PocketHaptic.Threshold)
                             scope.launch { drag.snapTo(distance) }
                         },
                         onDragEnd = {
                             if (distance > 72.dp.toPx() && inputActive()) currentDismiss()
-                            else scope.launch { drag.animateTo(0f, tween(pocketMotionMillis(160))) }
+                            else scope.launch { drag.animateTo(0f, settle) }
                         },
-                        onDragCancel = { scope.launch { drag.animateTo(0f, tween(pocketMotionMillis(160))) } },
+                        onDragCancel = { scope.launch { drag.animateTo(0f, settle) } },
                     )
                 } else Modifier
                 val panelModifier = Modifier
