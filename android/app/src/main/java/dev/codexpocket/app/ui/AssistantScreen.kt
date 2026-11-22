@@ -115,7 +115,7 @@ internal fun taskLabel(status: AssistantTaskStatus) = when(status) {
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                     PButton("同意这次",{act {AssistantActions.approve(runtime,op.id,q.requestId,true)}},Modifier.weight(1f).testTag("assistant-approve:${op.id}"),
                         enabled=allowed && (permissions==null || permissionLines!=null) && (decisions==null || JsonPrimitive("accept") in decisions),haptic=PocketHaptic.Confirm)
-                    PButton("拒绝",{act {AssistantActions.approve(runtime,op.id,q.requestId,false)}},Modifier.weight(1f).testTag("assistant-deny:${op.id}"),PButtonKind.Secondary,
+                    AssistantQuietButton("拒绝",{act {AssistantActions.approve(runtime,op.id,q.requestId,false)}},Modifier.weight(1f).testTag("assistant-deny:${op.id}"),
                         enabled=allowed && (decisions==null || JsonPrimitive("decline") in decisions || JsonPrimitive("cancel") in decisions),haptic=PocketHaptic.Reject)
                 }
             }

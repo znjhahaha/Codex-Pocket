@@ -158,7 +158,7 @@ import kotlinx.serialization.json.*
         }
         item {FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
             if(task.status in setOf(AssistantTaskStatus.Running,AssistantTaskStatus.Queued,AssistantTaskStatus.WaitingUser) && record?.state!="stop_requested")
-                PButton("停止任务",{stop=true},Modifier.testTag("assistant-task-stop:$id"),PButtonKind.Secondary,enabled=canAct)
+                AssistantQuietButton("停止任务",{stop=true},Modifier.testTag("assistant-task-stop:$id"),enabled=canAct)
             if(task.status==AssistantTaskStatus.Paused && !task.reconciliationRequired)
                 PButton("继续任务",{act {AssistantActions.task(runtime,id,true)}},enabled=canAct && !state.busy("assistant/task/resume"),haptic=PocketHaptic.Confirm)
             if(task.status==AssistantTaskStatus.Failed && !task.reconciliationRequired)

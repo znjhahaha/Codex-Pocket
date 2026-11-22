@@ -107,7 +107,16 @@ internal fun AssistantExpansion(expanded: Boolean, content: @Composable () -> Un
 
 @Composable internal fun AssistantDeleteDialog(title: String, dismiss: () -> Unit, enabled: Boolean, confirm: () -> Unit) {
     AssistantDialog(title, dismiss, confirm = { PButton("确认删除", confirm, Modifier.testTag("assistant-confirm-delete"), PButtonKind.Danger, enabled, haptic = PocketHaptic.Reject) },
-        dismiss = { PButton("取消", dismiss, kind = PButtonKind.Secondary, haptic = null) }) {
+        dismiss = { AssistantQuietButton("取消", dismiss, haptic = null) }) {
         PText("确认后交给电脑处理，收到回执后列表才会更新。", style = Pocket.type.body, color = Pocket.colors.inkMuted)
     }
+}
+
+/**
+ * The second action beside a primary one. The kit's secondary fill equals a card's surface in the dark appearance,
+ * so this one carries a fill that reads on both the page and a card.
+ */
+@Composable internal fun AssistantQuietButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
+    haptic: PocketHaptic? = PocketHaptic.Tap) {
+    PButton(text, onClick, modifier.background(Pocket.colors.fill, PocketRadii.capsule), PButtonKind.Ghost, enabled, haptic = haptic)
 }

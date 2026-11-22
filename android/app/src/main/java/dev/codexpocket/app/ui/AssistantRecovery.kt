@@ -19,8 +19,8 @@ import dev.codexpocket.app.ui.kit.*
         PText("这条消息尚未开始",style=Pocket.type.titleSmall)
         PText("电脑保留了原消息。恢复后继续处理，并保留原操作记录。",style=Pocket.type.bodySmall,color=c.inkMuted)
         if(unconfirmed) PText("恢复结果尚未确认，请勿再次提交",style=Pocket.type.bodySmall,color=c.danger)
-        PButton(if(unconfirmed) "等待恢复结果" else if(pending) "正在恢复原消息" else "恢复这条消息",{act {AssistantActions.resumeHandoff(runtime,operation.id)}},
-            Modifier.fillMaxWidth().testTag("assistant-handoff-resume:${operation.id}"),PButtonKind.Secondary,enabled=enabled,haptic=PocketHaptic.Confirm)
+        AssistantQuietButton(if(unconfirmed) "等待恢复结果" else if(pending) "正在恢复原消息" else "恢复这条消息",{act {AssistantActions.resumeHandoff(runtime,operation.id)}},
+            Modifier.fillMaxWidth().testTag("assistant-handoff-resume:${operation.id}"),enabled=enabled,haptic=PocketHaptic.Confirm)
     }
 }
 
@@ -33,9 +33,9 @@ import dev.codexpocket.app.ui.kit.*
         PText("电脑保留了一项尚未结束的请求。结束原请求并核对结果后，可以继续对话；不会重新执行。",style=Pocket.type.bodySmall,color=c.inkMuted)
         if("assistant/respond" in state.unconfirmedActions) PText("结果尚未确认，不能重复发送",
             Modifier.testTag("assistant-recovery-unconfirmed"),style=Pocket.type.bodySmall,color=c.danger)
-        PButton(if("assistant/respond" in state.unconfirmedActions) "等待原操作结果" else if(state.busy("assistant/respond",request.operationId)) "正在核对结果" else "结束原操作",
+        AssistantQuietButton(if("assistant/respond" in state.unconfirmedActions) "等待原操作结果" else if(state.busy("assistant/respond",request.operationId)) "正在核对结果" else "结束原操作",
             {act {AssistantActions.approve(runtime,request.operationId,request.requestId,false)}},
-            Modifier.fillMaxWidth().testTag("assistant-recovery-end:${request.operationId}:${request.requestId}"),PButtonKind.Secondary,
+            Modifier.fillMaxWidth().testTag("assistant-recovery-end:${request.operationId}:${request.requestId}"),
             enabled=canAct && runtime.isNotBlank() && !state.busy("assistant/respond",request.operationId),haptic=PocketHaptic.Confirm)
     }
 }

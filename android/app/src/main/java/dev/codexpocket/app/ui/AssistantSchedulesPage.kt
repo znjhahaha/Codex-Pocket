@@ -58,7 +58,7 @@ import java.time.format.DateTimeFormatter
                     run.taskId?.let {task -> AssistantCardAction("查看本次任务与成果",{navigate("Task:$task")},Modifier.testTag("assistant-schedule-task:${run.id}"))}
                 }
             }
-            PButton("删除事项",{deleteId=s.id},Modifier.fillMaxWidth().testTag("assistant-schedule-delete:${s.id}"),PButtonKind.Secondary,enabled=canAct && !state.busy("assistant/schedule/delete",s.id))
+            AssistantQuietButton("删除事项",{deleteId=s.id},Modifier.fillMaxWidth().testTag("assistant-schedule-delete:${s.id}"),enabled=canAct && !state.busy("assistant/schedule/delete",s.id))
         }}
     }
     if(creating) AssistantScheduleForm(runtime,state,workspaces,now,canAct,{creating=false},onProjectSelected,act,editing=state.snapshot?.schedules?.firstOrNull {it.id==editingId})
@@ -99,7 +99,7 @@ private fun assistantScheduleLabel(s:AssistantSchedule):String = when(val type=s
             val result=runCatching {AssistantActions.schedule(runtime,project,AssistantScheduleDraft(prompt,kind,date,time,weekday,minutes,zone,writes),now,editing,missedPolicy)}
             result.onSuccess {action -> act {action};dismiss()}.onFailure {error=it.message ?: "请检查日期和时区"}
         },Modifier.testTag("assistant-schedule-save"),enabled=canAct && prompt.isNotBlank() && !state.busy(if(editing==null) "assistant/schedule/create" else "assistant/schedule/update"),haptic=PocketHaptic.Confirm)},
-        dismiss={PButton("取消",dismiss,Modifier.testTag("assistant-schedule-cancel"),PButtonKind.Secondary,haptic=null)}) {
+        dismiss={AssistantQuietButton("取消",dismiss,Modifier.testTag("assistant-schedule-cancel"),haptic=null)}) {
         val c=Pocket.colors
         PTextField(prompt,{prompt=it},Modifier.testTag("assistant-schedule-prompt"),label="事项",minLines=2,maxLines=5)
         if(editing==null) AssistantChoice("执行范围",project?.label ?: "通用事项 · 助理工作区","assistant-schedule-workspace",listOf("general" to "通用事项 · 助理工作区")+projects.map {it.selectionKey to it.label}) {projectId=if(it=="general") null else it;writes=false;onProjectSelected(projects.firstOrNull {p->p.selectionKey==it})}

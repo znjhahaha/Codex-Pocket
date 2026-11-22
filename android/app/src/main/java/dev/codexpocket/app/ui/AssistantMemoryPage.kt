@@ -16,7 +16,7 @@ import dev.codexpocket.app.ui.kit.*
     val c=Pocket.colors
     var history by rememberSaveable {mutableStateOf(false)}
     Column {
-        Row(Modifier.padding(start=16.dp,end=16.dp,top=4.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.padding(start=16.dp,end=16.dp,top=4.dp,bottom=4.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
             PPill("当前记忆",!history,{history=false})
             PPill("修订历史",history,{history=true},Modifier.testTag("assistant-memory-history"))
         }
@@ -53,15 +53,15 @@ import dev.codexpocket.app.ui.kit.*
             m.updatedAtMs?.let {PText("最近保存 · ${assistantTime(it,state.snapshot?.settings?.timezone ?: "Asia/Shanghai")} · ${m.revisions.size.coerceAtLeast(1)} 次记录",style=Pocket.type.caption,color=c.inkFaint)}
             if(m.automatic) AssistantCardAction("撤销自动保存",{act {AssistantActions.memoryUndo(runtime,m.id)}},Modifier.testTag("assistant-memory-undo:${m.id}"),enabled=canAct && !state.busy("assistant/memory/undo"))
             Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                PButton("修改",{editId=m.id;text=m.text;editing=true},Modifier.weight(1f).testTag("assistant-memory-edit:${m.id}"),PButtonKind.Secondary,enabled=canAct && !state.busy("assistant/memory/update",m.id))
-                PButton("删除",{deleteId=m.id},Modifier.weight(1f).testTag("assistant-memory-delete:${m.id}"),PButtonKind.Secondary,enabled=canAct && !state.busy("assistant/memory/delete",m.id))
+                AssistantQuietButton("修改",{editId=m.id;text=m.text;editing=true},Modifier.weight(1f).testTag("assistant-memory-edit:${m.id}"),enabled=canAct && !state.busy("assistant/memory/update",m.id))
+                AssistantQuietButton("删除",{deleteId=m.id},Modifier.weight(1f).testTag("assistant-memory-delete:${m.id}"),enabled=canAct && !state.busy("assistant/memory/delete",m.id))
             }
         }}
     }
     if(editing) AssistantDialog(if(editId==null) "新增记忆" else "修改记忆",{editing=false},
         confirm={PButton("保存",{val id=editId;act {if(id==null) AssistantActions.memoryAdd(runtime,text) else AssistantActions.memoryEdit(runtime,id,text)};editing=false},Modifier.testTag("assistant-memory-save"),
             enabled=canAct && text.isNotBlank() && text.toByteArray().size<=16384 && !state.busy(if(editId==null) "assistant/memory/add" else "assistant/memory/update",editId),haptic=PocketHaptic.Confirm)},
-        dismiss={PButton("取消",{editing=false},Modifier.testTag("assistant-memory-cancel"),PButtonKind.Secondary,haptic=null)}) {
+        dismiss={AssistantQuietButton("取消",{editing=false},Modifier.testTag("assistant-memory-cancel"),haptic=null)}) {
         PTextField(text,{text=it},Modifier.testTag("assistant-memory-text"),placeholder="写下希望助理记住的内容",minLines=3,maxLines=9)
         PText("最多16KiB；保存后以电脑回执为准。",style=Pocket.type.caption,color=c.inkMuted)
     }

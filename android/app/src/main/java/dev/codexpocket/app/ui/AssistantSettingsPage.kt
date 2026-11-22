@@ -94,8 +94,7 @@ import java.time.ZoneId
             PText("暂时放下任务",style=Pocket.type.titleSmall)
             PText("暂停会交给电脑处理；已暂停任务需要单独继续。",style=Pocket.type.bodySmall,color=c.inkMuted)
             val paused=state.snapshot.paused==true
-            PButton(if(paused) "恢复助理" else "暂停助理",{act {if(paused) AssistantActions.resume(current) else AssistantActions.pause(current)}},Modifier.fillMaxWidth().testTag("assistant-global-pause"),
-                PButtonKind.Secondary,enabled=canAct && !state.busy(if(paused) "assistant/resume" else "assistant/pause"))
+            AssistantQuietButton(if(paused) "恢复助理" else "暂停助理",{act {if(paused) AssistantActions.resume(current) else AssistantActions.pause(current)}},Modifier.fillMaxWidth().testTag("assistant-global-pause"),enabled=canAct && !state.busy(if(paused) "assistant/resume" else "assistant/pause"))
         }}
     }
 }
