@@ -30,6 +30,7 @@ pub use inputs::AssistantInput;
 mod schedule;
 mod service;
 mod settings;
+pub mod worktree;
 pub use executor::*;
 pub use schedule::*;
 pub use service::*;
