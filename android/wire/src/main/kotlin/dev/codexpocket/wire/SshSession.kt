@@ -7,6 +7,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.security.MessageDigest
 import java.security.PublicKey
+import java.security.Security
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
@@ -17,6 +18,15 @@ import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.userauth.password.PasswordUtils
 import net.schmizz.sshj.xfer.FileSystemFile
 import java.io.File
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+
+/** SSHJ asks for its algorithms from "BC" by name, and Android answers to that name with a provider that has none of them. */
+private fun requireFullBouncyCastle() = synchronized(Security::class.java) {
+    if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) !is BouncyCastleProvider) {
+        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+        Security.addProvider(BouncyCastleProvider())
+    }
+}
 
 fun sshKeyFingerprint(key: PublicKey): String = "SHA256:" + Base64.getEncoder().withoutPadding()
     .encodeToString(MessageDigest.getInstance("SHA-256").digest(Buffer.PlainBuffer().putPublicKey(key).compactData))
@@ -25,6 +35,7 @@ fun sshKeyFingerprint(key: PublicKey): String = "SHA256:" + Base64.getEncoder().
 suspend fun probeSshHostKey(host: String, port: Int): String = withContext(Dispatchers.IO) {
     require(host.isNotBlank() && host.length <= 253 && port in 1..65535)
     var observed: String? = null
+    requireFullBouncyCastle()
     SSHClient().use { ssh ->
         ssh.connectTimeout = 10_000; ssh.timeout = 15_000
         ssh.addHostKeyVerifier(object : HostKeyVerifier {
@@ -48,7 +59,7 @@ internal class SshSession private constructor(private val client: SSHClient) : A
         client.newSFTPClient().use { it.put(FileSystemFile(file), remotePath) }
     }
 
-    suspend fun execute(script: String, timeoutSeconds: Long = 20): String = withContext(Dispatchers.IO) {
+    suspend fun execute(script: String, timeoutSeconds: Long = 20, failures: Map<Int, String> = sshRemoteFailures): String = withContext(Dispatchers.IO) {
         require(script.length <= 256 * 1024 && timeoutSeconds in 1..180)
         client.startSession().use { session ->
             session.exec("sh -s").use { command ->
@@ -60,7 +71,7 @@ internal class SshSession private constructor(private val client: SSHClient) : A
                     if (!command.isEOF || command.exitStatus == null) { command.close(); throw WireException("ssh_timeout", "Remote command did not finish") }
                     val output = stdout.await()
                     stderr.await() // Drain diagnostic output without exposing paths or credentials.
-                    if (command.exitStatus != 0) throw WireException("ssh_command_failed", "Remote preparation failed")
+                    if (command.exitStatus != 0) throw WireException(failures[command.exitStatus] ?: "ssh_command_failed", "Remote preparation failed")
                     output.toString(Charsets.UTF_8)
                 }
             }
@@ -82,6 +93,7 @@ internal class SshSession private constructor(private val client: SSHClient) : A
 
     companion object {
         suspend fun open(target: SshTarget): SshSession = withContext(Dispatchers.IO) {
+            requireFullBouncyCastle()
             val client = SSHClient()
             var mismatch = false
             try {
