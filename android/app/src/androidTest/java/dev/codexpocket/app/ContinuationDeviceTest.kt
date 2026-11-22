@@ -219,9 +219,9 @@ class ContinuationDeviceTest {
             update { it.copy(assistant = AssistantUiState(snapshot = AssistantSnapshot(enabled = true, runtimeId = runtime.id),
                 messages = listOf(AssistantChatMessage("device-message", "Assistant", "[当前会话]($url)")))) }
             compose.onNodeWithTag("assistant-pocket-button").performClick()
-            compose.onNodeWithTag("assistant-screen").assertExists()
+            compose.onNodeWithTag("assistant-workspace").assertExists()
             clickLink("当前会话")
-            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-screen").fetchSemanticsNodes().isEmpty() }
+            compose.waitUntil(10_000) { compose.onAllNodesWithTag("assistant-workspace").fetchSemanticsNodes().isEmpty() }
             assertEquals(chat.key, repo.state.value.selected?.key)
             assertEquals("保留草稿", repo.state.value.draft?.text)
             checks += "assistant_link_returns_to_conversation_preserving_draft"

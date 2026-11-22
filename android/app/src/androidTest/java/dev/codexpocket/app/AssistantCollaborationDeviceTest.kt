@@ -275,39 +275,32 @@ class AssistantCollaborationDeviceTest {
     @Test fun collapsedGroupMemberDetailsAndReturnPreserveDraftAndReadingState() = step("progressive_disclosure_and_return") {
         node(INPUT).performTextReplacement(DRAFT); hideKeyboard()
         scroll(GROUP); node(TASK).assertDoesNotExist(); capture("group-collapsed")
-        node(GROUP).performClick(); waitForNode(TASK)
-        scroll("assistant-task-expand:task"); node("assistant-task-expand:task").performClick()
-        // A task row discloses steps; only its explicit detail action opens the full task page.
-        node("assistant-task-full-prompt:task").assertDoesNotExist()
-        scroll("assistant-task-detail:task")
-        val chatTop = bounds("assistant-task-detail:task").top
-        node("assistant-task-detail:task").performClick()
-        waitForNode("assistant-task-full-prompt:task")
+        scroll(GROUP_TOGGLE); node(GROUP_TOGGLE).performClick(); waitForNode(TASK)
+        // A task's card discloses its summary and actions; only its explicit action opens the task's page.
+        node(TASK_OPEN).assertDoesNotExist()
+        scroll(TASK_TOGGLE); node(TASK_TOGGLE).performClick(); waitForNode(TASK_OPEN)
+        node("assistant-chat-task-title:task", unmerged = true).assertTextEquals("核查资料并引用可验证来源")
+        scroll(TASK_OPEN)
+        val chatTop = bounds(TASK_OPEN).top
+        node(TASK_OPEN).performClick()
+        waitForNode("assistant-task-detail-page:task")
         node(INPUT).assertDoesNotExist()
-        scroll("assistant-task-full-prompt:task"); node("assistant-task-full-prompt:task").assertTextEquals("核查资料并引用可验证来源")
-        scroll(MEMBER); node(MEMBER).performClick(); waitForNode("assistant-native-agents:$THREAD")
-        scroll("assistant-native-agents:$THREAD"); node("assistant-native-agents:$THREAD").performClick()
-        scroll("assistant-native-thread:$CHILD"); node("assistant-native-thread:$CHILD").assertIsDisplayed()
-        scroll("assistant-native-thread:$CHILD")
-        val before = bounds("assistant-native-thread:$CHILD")
-        capture("member-and-native-descendants")
+        compose.onAllNodesWithText("核查资料并引用可验证来源").onFirst().assertIsDisplayed()
+        scroll("assistant-task-section:Process"); node("assistant-task-section:Process").performClick()
+        node("assistant-task-section:Process").assertIsSelected()
+        capture("task-process")
         node("assistant-back").performClick(); assertDraft(DRAFT)
-        assertEquals("Chat reading position survives the task page", chatTop, bounds("assistant-task-detail:task").top, 2f)
-        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        assertEquals("Chat reading position survives the task page", chatTop, bounds(TASK_OPEN).top, 2f)
+        node("assistant-title-menu").performClick(); node("assistant-menu:Memory").performClick()
         compose.onNodeWithText("保留阅读位置和草稿").assertIsDisplayed(); capture("memory-details")
         node("assistant-back").performClick(); assertDraft(DRAFT)
-        assertEquals("Chat reading position survives Memory", chatTop, bounds("assistant-task-detail:task").top, 2f)
-        node("assistant-task-detail:task").performClick()
-        waitForNode("assistant-native-thread:$CHILD")
-        node("assistant-native-thread:$CHILD").assertIsDisplayed()
-        val after = bounds("assistant-native-thread:$CHILD")
-        assertEquals("Reading position survives return", before.top, after.top, 2f)
-        measurements += buildJsonObject { put("kind", "return_reading_position"); put("beforeTopPx", before.top); put("afterTopPx", after.top) }
+        assertEquals("Chat reading position survives Memory", chatTop, bounds(TASK_OPEN).top, 2f)
+        measurements += buildJsonObject { put("kind", "return_reading_position"); put("beforeTopPx", chatTop); put("afterTopPx", bounds(TASK_OPEN).top) }
         capture("returned-preserved-state")
-        node("assistant-back").performClick(); assertDraft(DRAFT)
-        scroll(GROUP); node(GROUP).performClick(); node(TASK).assertDoesNotExist()
-        node(GROUP).performClick(); waitForNode(TASK)
-        node("assistant-task-full-prompt:task").assertDoesNotExist()
+        scroll(GROUP_TOGGLE); node(GROUP_TOGGLE).performClick(); node(TASK).assertDoesNotExist()
+        node(GROUP_TOGGLE).performClick(); waitForNode(TASK)
+        // Both disclosures are remembered: the card is open as it was left.
+        node(TASK_OPEN).assertExists()
         assertTrue(actions.isEmpty()); assertTrue(opened.isEmpty())
     }
 
@@ -323,14 +316,13 @@ class AssistantCollaborationDeviceTest {
         }
         compose.runOnIdle { optics = true; theme = "light"; fontScale = 1.4f; reducedMotion = true }
         node(INPUT).performTextReplacement(DRAFT); hideKeyboard(); assertChrome(); assertDraft(DRAFT)
-        scroll(GROUP); node(GROUP).performClick(); waitForNode(TASK)
-        scroll("assistant-task-expand:task"); node("assistant-task-expand:task").performClick()
-        scroll("assistant-task-detail:task"); node("assistant-task-detail:task").performClick()
-        waitForNode("assistant-task-full-prompt:task")
-        scroll(MEMBER); node(MEMBER).performClick()
-        compose.onNodeWithText("核对来源，保留成员署名").assertExists()
+        scroll(GROUP_TOGGLE); node(GROUP_TOGGLE).performClick(); waitForNode(TASK)
+        scroll(TASK_TOGGLE); node(TASK_TOGGLE).performClick(); waitForNode(TASK_OPEN)
+        scroll(TASK_OPEN); node(TASK_OPEN).performClick()
+        waitForNode("assistant-task-detail-page:task")
+        node("assistant-task-section:Overview").assertIsDisplayed()
         node(INPUT).assertDoesNotExist()
-        capture("font-1_4-member-details")
+        capture("font-1_4-task-page")
         node("assistant-back").performClick(); assertChrome(); assertDraft(DRAFT); capture("font-1_4-reduced-motion")
         compose.runOnIdle { fontScale = 1f; reducedMotion = false }
         assertChrome(); assertDraft(DRAFT); assertTrue(actions.isEmpty())
@@ -376,11 +368,11 @@ class AssistantCollaborationDeviceTest {
             WindowInsetsControllerCompat(activity.window, activity.window.decorView).show(WindowInsetsCompat.Type.ime())
         }
         compose.waitUntil(10_000) { imeVisible() && imeHeight() >= 100 * activity.resources.displayMetrics.density }; node(INPUT).assertIsFocused()
-        compose.waitUntil(5_000) { listOf(INPUT, "assistant-send", "assistant-tools").all { bounds(it).bottom <= keyboardTop() + 2f } }
+        compose.waitUntil(5_000) { listOf(INPUT, "assistant-workspace-send", "assistant-tools").all { bounds(it).bottom <= keyboardTop() + 2f } }
         val top = keyboardTop()
-        listOf(INPUT, "assistant-send", "assistant-tools").forEach { assertTrue("$it overlaps visible IME", bounds(it).bottom <= top + 2f) }
+        listOf(INPUT, "assistant-workspace-send", "assistant-tools").forEach { assertTrue("$it overlaps visible IME", bounds(it).bottom <= top + 2f) }
         val height = imeHeight()
-        assertTrue("A positive on-screen keyboard must exist", height > 0 && top < bounds("assistant-screen").bottom)
+        assertTrue("A positive on-screen keyboard must exist", height > 0 && top < bounds("assistant-workspace").bottom)
         measurements += buildJsonObject { put("kind", "real_ime"); put("source", "test-only Android InputMethodService"); put("imeVisible", true); put("imeHeightPx", height); put("keyboardTopPx", top); put("composerBottomPx", bounds(INPUT).bottom) }
         capture("real-ime-font-1_4")
         val displayCapture = checkNotNull(instrumentation.uiAutomation.takeScreenshot()) { "Default display screenshot unavailable" }
@@ -398,7 +390,7 @@ class AssistantCollaborationDeviceTest {
                 groups = emptyList(), events = emptyList(), artifacts = emptyList()), messages = emptyList())
         }
         node(INPUT).performTextReplacement("整理本周行业动态，输出一份可分享的简报")
-        hideKeyboard(); node("assistant-send").performClick()
+        hideKeyboard(); node("assistant-workspace-send").performClick()
         val dispatched = actions.single()
         assertEquals("assistant/send", dispatched.method)
         assertFalse(dispatched.params.containsKey("taskId"))
@@ -411,17 +403,15 @@ class AssistantCollaborationDeviceTest {
         }
         compose.waitUntil(5_000) { node(INPUT).fetchSemanticsNode().config[SemanticsProperties.EditableText].text.isEmpty() }
         node(INPUT).performTextReplacement(DRAFT); hideKeyboard()
-        listOf("Tasks", "Pending", "Results").forEach {destination ->
-            node("assistant-shortcut:$destination").assertIsDisplayed()
-        }
-        node("assistant-shortcut:Pending").performClick()
-        node("assistant-center:Pending").assertIsSelected()
-        scroll("assistant-group-expand:product-goal"); node("assistant-group-expand:product-goal").assertIsDisplayed()
-        node("assistant-main-chat").performClick(); assertDraft(DRAFT)
-        node("assistant-shortcut:Tasks").performClick()
-        scroll("assistant-group-expand:product-goal"); node("assistant-group-expand:product-goal").performClick()
-        scroll("assistant-task-primary:product-task"); capture("product-parent-and-task")
-        node("assistant-task-primary:product-task").performClick()
+        // Plans are on the bar, the other pages one menu away, and what waits for the user is named by the capsule.
+        listOf("assistant-schedules", "assistant-title-menu", "assistant-attention").forEach { node(it).assertIsDisplayed() }
+        node("assistant-title-menu").performClick(); node("assistant-menu:Tasks").performClick()
+        node("assistant-tasks-pending").performClick()
+        scroll("assistant-task-open:product-task"); node("assistant-task-open:product-task").assertIsDisplayed()
+        node("assistant-back").performClick(); assertDraft(DRAFT)
+        node("assistant-title-menu").performClick(); node("assistant-menu:Tasks").performClick()
+        scroll("assistant-task-open:product-task"); capture("product-task-list")
+        node("assistant-task-open:product-task").performClick()
         scroll("assistant-approve:product-operation"); capture("product-detail-approval")
         node("assistant-approve:product-operation").performClick()
         val approval = actions.last()
@@ -468,37 +458,33 @@ class AssistantCollaborationDeviceTest {
         scroll("assistant-artifact-open:product-text"); node("assistant-artifact-open:product-text").performClick()
         scroll("assistant-artifact-save"); node("assistant-artifact-share").assertIsDisplayed()
         capture("product-artifact-preview")
-        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
-        node("assistant-memory-list").assertExists()
-        node("assistant-back").performClick()
         node("assistant-artifact-preview:product-text").assertExists()
         node("assistant-back").performClick()
         scroll("assistant-task-section:Artifacts"); node("assistant-task-section:Artifacts").assertIsSelected()
         node("assistant-back").performClick()
-        node("assistant-task-center").assertExists()
-        node("assistant-center:Results").performClick()
+        node("assistant-tasks-list").assertExists()
+        node("assistant-back").performClick(); assertDraft(DRAFT)
+        node("assistant-title-menu").performClick(); node("assistant-menu:Artifacts").performClick()
         scroll("assistant-artifact-open:product-text"); node("assistant-artifact-open:product-text").performClick()
         node("assistant-artifact-preview:product-text").assertExists()
         node("assistant-back").performClick()
-        node("assistant-center:Results").assertIsSelected()
-        node("assistant-main-chat").performClick(); assertDraft(DRAFT)
+        node("assistant-artifact-filter").assertExists()
+        node("assistant-back").performClick(); assertDraft(DRAFT)
         assertEquals(listOf("assistant/send", "assistant/respond", "assistant/read", "assistant/respond"), actions.map {it.method})
         assertTrue(opened.isEmpty()); capture("product-returned-main-draft")
     }
 
     @Test fun productSchedulesMemoryAndLargeFontReturnToOrigin() = step("product_schedule_memory_large_font") {
         compose.runOnIdle { state = productState(); fontScale = 1.4f }
-        node("assistant-main-tasks").performClick()
-        listOf("assistant-center:Tasks", "assistant-center:Pending", "assistant-center:Results", "assistant-center-schedules").forEach {tag ->
+        listOf("assistant-back", "assistant-schedules", "assistant-title-menu").forEach {tag ->
             node(tag).assertIsDisplayed()
-            val b = bounds(tag); val screen = bounds("assistant-screen")
+            val b = bounds(tag); val screen = bounds("assistant-workspace")
             assertTrue("$tag must fit inside the screen at 1.4x font", b.left >= screen.left && b.right <= screen.right)
         }
-        assertTrue("Schedule entry has its own row", bounds("assistant-center-schedules").top >= bounds("assistant-center:Results").bottom)
-        capture("product-center-large-font")
-        node("assistant-center-schedules").performClick()
-        node("assistant-back").performClick(); node("assistant-task-center").assertExists()
-        node("assistant-center-schedules").performClick()
+        capture("product-stage-large-font")
+        node("assistant-schedules").performClick()
+        node("assistant-back").performClick(); node(INPUT).assertExists()
+        node("assistant-schedules").performClick()
         scroll("assistant-schedule-edit:product-schedule"); node("assistant-schedule-edit:product-schedule").performClick()
         node("assistant-schedule-prompt").performTextReplacement("每天整理行业动态并保留来源")
         hideKeyboard()
@@ -522,7 +508,10 @@ class AssistantCollaborationDeviceTest {
         scroll("assistant-schedule-task:product-run-done"); capture("product-schedule-history")
         node("assistant-schedule-task:product-run-done").performClick()
         node("assistant-task-detail-page:product-done").assertExists()
-        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        // Pages are pushed one over another; Back unwinds them to the stage, where the menu is.
+        node("assistant-back").performClick(); node("assistant-schedules-list").assertExists()
+        node("assistant-back").performClick(); node(INPUT).assertExists()
+        node("assistant-title-menu").performClick(); node("assistant-menu:Memory").performClick()
         scroll("assistant-memory-edit:product-memory"); node("assistant-memory-edit:product-memory").performClick()
         assertEquals("简报保持精炼并保留来源", node("assistant-memory-text").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
         node("assistant-memory-cancel").performClick()
@@ -535,16 +524,15 @@ class AssistantCollaborationDeviceTest {
         assertEquals(JsonPrimitive("product-memory"), actions.last().params["memoryId"])
         compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(memories = emptyList())) }
         node("assistant-memory-undo:product-memory").assertDoesNotExist()
-        node("assistant-back").performClick(); node("assistant-task-detail-page:product-done").assertExists()
-        node("assistant-back").performClick(); node("assistant-schedules-list").assertExists()
-        node("assistant-back").performClick(); node("assistant-task-center").assertExists()
+        node("assistant-back").performClick(); node(INPUT).assertExists()
         assertEquals(listOf("assistant/schedule/update", "assistant/schedule/pause", "assistant/schedule/run", "assistant/memory/undo"), actions.map {it.method})
         assertTrue(opened.isEmpty())
     }
 
     @Test fun productTaskFollowupKeepsDraftUntilMatchingReceipt() = step("product_followup_receipt") {
         compose.runOnIdle { state = productState() }
-        node("assistant-shortcut:Tasks").performClick()
+        node("assistant-title-menu").performClick(); node("assistant-menu:Tasks").performClick()
+        scroll("assistant-task-open:product-done"); node("assistant-task-open:product-done").performClick()
         scroll("assistant-task-primary:product-done"); node("assistant-task-primary:product-done").performClick()
         scroll("assistant-task-draft:product-done"); node("assistant-task-draft:product-done").performTextReplacement("基于这份成果整理一个简短版本")
         hideKeyboard(); scroll("assistant-task-send:product-done"); node("assistant-task-send:product-done").performClick()
@@ -558,8 +546,9 @@ class AssistantCollaborationDeviceTest {
         compose.runOnIdle { state = state.copy(sendReceipts = listOf(AssistantSendReceipt(checkNotNull(action.commandId), binding.computerId, binding.runtimeId, binding.conversationId, "accepted"))) }
         node("assistant-task-send:product-done").assertIsEnabled()
         scroll("assistant-task-draft:product-done"); assertEquals("收到后再增加图表，保留这份新草稿", node("assistant-task-draft:product-done").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
-        node("assistant-more").performClick(); node("assistant-tab:Memory").performClick()
+        // Leaving the page and coming back keeps the draft that is bound to this task.
         node("assistant-back").performClick()
+        scroll("assistant-task-open:product-done"); node("assistant-task-open:product-done").performClick()
         scroll("assistant-task-draft:product-done"); assertEquals("收到后再增加图表，保留这份新草稿", node("assistant-task-draft:product-done").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
         compose.runOnIdle { state = state.copy(snapshot = state.snapshot!!.copy(fresh = false)) }
         scroll("assistant-task-send:product-done"); node("assistant-task-send:product-done").assertIsNotEnabled()
@@ -619,20 +608,20 @@ class AssistantCollaborationDeviceTest {
     }
     private fun scroll(tag: String) {
         val inChat = compose.onAllNodesWithTag("assistant-chat-list").fetchSemanticsNodes().isNotEmpty()
-        val listTag = listOf("assistant-chat-list", "assistant-detail-list", "assistant-tasks-list", "assistant-schedules-list", "assistant-memory-list")
-            .first {compose.onAllNodesWithTag(it).fetchSemanticsNodes().isNotEmpty()}
-        node(listTag).performScrollToNode(hasTestTag(tag)); compose.waitForIdle()
+        // Whichever page is on screen, its list is the one node that can scroll to an index.
+        val list = compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.ScrollToIndex)).onFirst()
+        list.performScrollToNode(hasTestTag(tag)); compose.waitForIdle()
         // The product intentionally scrolls behind floating chrome. Compose sees the full-height
         // LazyColumn viewport, so performScrollToNode alone can leave the hit point under the dock.
-        val viewport = bounds(listTag)
-        val top = maxOf(viewport.top, bounds("assistant-top-chrome").bottom) + 12f
+        val viewport = list.fetchSemanticsNode().let { Rect(it.positionInWindow, Size(it.size.width.toFloat(), it.size.height.toFloat())) }
+        val top = maxOf(viewport.top, bounds("assistant-top-bar").bottom) + 12f
         val bottom = minOf(viewport.bottom, if (inChat) bounds("assistant-bottom-dock").top else viewport.bottom) - 12f
         check(bottom > top) { "No unobscured chat viewport" }
         val center = bounds(tag).center.y
         // Land inside the visible region, not on a fractional-pixel clipping boundary.
         val delta = if (center !in top..bottom) center - (top + bottom) / 2f else 0f
         if (delta != 0f) {
-            node(listTag).performSemanticsAction(SemanticsActions.ScrollBy) { check(it(0f, delta)) }
+            list.performSemanticsAction(SemanticsActions.ScrollBy) { check(it(0f, delta)) }
             compose.waitForIdle()
         }
         val target = bounds(tag)
@@ -645,12 +634,12 @@ class AssistantCollaborationDeviceTest {
     }
     private fun assertDraft(expected: String) = assertEquals(expected, node(INPUT).fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
     private fun assertChrome() {
-        val screen = bounds("assistant-screen")
-        listOf(INPUT, "assistant-send", "assistant-tools", "assistant-back", "assistant-more", "assistant-header-glass", "assistant-composer-glass").forEach {
+        val screen = bounds("assistant-workspace")
+        listOf(INPUT, "assistant-workspace-send", "assistant-tools", "assistant-back", "assistant-title-menu", "assistant-header-glass", "assistant-composer-glass").forEach {
             node(it).assertIsDisplayed(); val b = bounds(it)
             assertTrue("$it outside Activity", b.left >= screen.left - 2 && b.right <= screen.right + 2 && b.top >= screen.top - 2 && b.bottom <= screen.bottom + 2)
         }
-        assertTrue(bounds("assistant-tools").right <= bounds(INPUT).left + 1); assertTrue(bounds(INPUT).right <= bounds("assistant-send").left + 1)
+        assertTrue(bounds("assistant-tools").right <= bounds(INPUT).left + 1); assertTrue(bounds(INPUT).right <= bounds("assistant-workspace-send").left + 1)
         measurements += buildJsonObject { put("kind", "chrome"); put("theme", theme); put("fontScale", fontScale); put("inputBottomPx", bounds(INPUT).bottom) }
     }
     private fun imeVisible() = compose.runOnIdle { ViewCompat.getRootWindowInsets(activity.window.decorView)?.isVisible(WindowInsetsCompat.Type.ime()) == true }
@@ -725,10 +714,12 @@ class AssistantCollaborationDeviceTest {
         const val THREAD = "01a1ca02-c5db-74a0-a1d5-cf3ef5eb0473"
         const val CHILD = "fixture-child"
         const val LINK = "codex://threads/$THREAD"
-        const val INPUT = "assistant-message-input"
+        const val INPUT = "assistant-workspace-draft"
         const val GROUP = "assistant-group:g"
-        const val TASK = "assistant-task:task"
-        const val MEMBER = "assistant-member:task:member"
+        const val GROUP_TOGGLE = "assistant-group-expand:g"
+        const val TASK = "assistant-chat-task:task"
+        const val TASK_TOGGLE = "assistant-chat-task-toggle:task"
+        const val TASK_OPEN = "assistant-chat-task-open:task"
         const val DRAFT = "保留草稿，返回后继续核查"
         const val READY_IMAGE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val RETRY_IMAGE = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
