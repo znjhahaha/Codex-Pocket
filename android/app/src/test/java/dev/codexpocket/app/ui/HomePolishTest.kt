@@ -173,7 +173,7 @@ class HomePolishTest {
         assertEquals(126 * 126, close.size)
     }
 
-    @Test fun headerSearchAndConnectivityKeepTheirBoxesWhileTheyAnimate() {
+    @Test fun headerSearchMorphsInPlaceAndTheConnectivityDotKeepsItsBox() {
         var online by mutableStateOf(false)
         val search = HomeSearchCoordinator()
         content {

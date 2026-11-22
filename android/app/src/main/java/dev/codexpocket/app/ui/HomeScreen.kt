@@ -185,7 +185,7 @@ private fun ColumnScope.HomeProjectSessions(
         contentPadding = PaddingValues(top = 2.dp, bottom = LocalHomeContentPadding.current.calculateBottomPadding() + 24.dp),
     ) {
         if (!s.online || showInitialLoading || s.directoryError != null) item(key = "home-state", contentType = "state") {
-            HomeSyncState(s, onRetry = { onRefresh(search, archived, false) }, modifier = homeItemMotion(motion))
+            HomeSyncState(s, onRetry = { onRefresh(search, archived, false) })
         }
         if (attentionCount > 0 && !archived && search.isBlank()) item(key = "home-attention", contentType = "attention") {
             HomeAttentionEntry(attentionCount, onAttention, homeItemMotion(motion))
@@ -221,8 +221,8 @@ private fun LazyItemScope.homeItemMotion(motion: Boolean): Modifier =
     if (motion) Modifier.animateItem(PocketMotion.enter(), PocketMotion.state(), PocketMotion.exit()) else Modifier
 
 @Composable
-private fun HomeSyncState(s: PocketState, onRetry: () -> Unit, modifier: Modifier = Modifier) {
-    Row(modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
+private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (s.restoringConnection || (s.online && s.directoryLoading && s.directoryError == null)) PocketLoader()
         else Icon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),

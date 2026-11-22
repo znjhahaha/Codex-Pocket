@@ -125,9 +125,6 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
     val context = LocalContext.current
     val restoring = s.restoringConnection
     val connection = if (restoring) "正在恢复连接" else context.stateLabel(if (s.online) "online" else "offline")
-    val connectivity by animateColorAsState(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline,
-        PocketMotion.color<Color>().orSnap(motion), label = "home-connectivity")
-    val connected = rememberGlyphPulse(s.online && !restoring)
     Column(Modifier.fillMaxWidth().statusBarsPadding().padding(start = 20.dp, end = 20.dp, top = padding, bottom = 4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PocketGlassSurface(onClick = onHost, shape = PocketOval, modifier = Modifier.weight(1f).testTag("home-host")
@@ -139,9 +136,7 @@ internal fun HomeHeader(s: PocketState, tab: HomeTab, compact: Boolean, hostExpa
                         Modifier.semantics { heading() })
                     Box(Modifier.width(26.dp).height(18.dp), contentAlignment = Alignment.Center) {
                         if (restoring) ActivityMotionIcon(ActivityMotion.Connection,true,Modifier.size(17.dp).testTag("home-reconnecting").semantics { contentDescription = "正在恢复连接" })
-                        else Box(Modifier.size(6.dp).testTag("home-connectivity")
-                            .graphicsLayer { val swell = 1f + .6f * GlyphMotion.pulse(connected.value); scaleX = swell; scaleY = swell }
-                            .background(connectivity, CircleShape))
+                        else Box(Modifier.size(6.dp).testTag("home-connectivity").background(if (s.online) Color(0xFF34C759) else MaterialTheme.colorScheme.outline, CircleShape))
                     }
                     Text(s.computerName.ifBlank { stringResource(R.string.v03_home_computer) }, Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
