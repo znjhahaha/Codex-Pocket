@@ -159,6 +159,35 @@ class KitControlsUiTest {
         compose.onNodeWithText("任务标题").assertIsDisplayed()
     }
 
+    @Test fun typingInADialogOpenedFromAPageKeepsItsOrderAndCaret() {
+        // A page is itself an overlay measured in a subcomposition, so its dialog hears of each
+        // keystroke one frame late. The field must not take that stale text for an edit.
+        var name by mutableStateOf("")
+        content {
+            PocketModal("配对", {}, sheet = false, screen = true) {
+                PText("页面")
+                PocketDialog({}, title = { PText("连接电脑") }, text = {
+                    PTextField(name, { name = it.take(8) }, Modifier.testTag("name"), label = "本机名称", singleLine = true)
+                }, confirmButton = { PButton("连接", {}, enabled = name.isNotBlank()) })
+            }
+        }
+        val field = compose.onNodeWithTag("name")
+        field.performClick()
+        "MuMu-QA".forEach { field.performTextInput(it.toString()) }
+        compose.runOnIdle { assertEquals("MuMu-QA", name) }
+        field.assert(SemanticsMatcher.expectValue(SemanticsProperties.TextSelectionRange, androidx.compose.ui.text.TextRange(7)))
+        // What the caller refuses does not stay in the field.
+        field.performTextInput("12")
+        compose.waitForIdle()
+        compose.runOnIdle { assertEquals("MuMu-QA1", name) }
+        field.assertTextEquals("本机名称", "MuMu-QA1")
+        // A value the caller sets on its own replaces the text.
+        compose.runOnIdle { name = "BRA" }
+        field.assertTextEquals("本机名称", "BRA")
+        field.performTextInput("x")
+        compose.runOnIdle { assertEquals("BRAx", name) }
+    }
+
     @Test fun sheetDialogAndMenuOpenInsideTheAppWindowAndDismiss() {
         var sheet by mutableStateOf(false)
         var dialog by mutableStateOf(false)
