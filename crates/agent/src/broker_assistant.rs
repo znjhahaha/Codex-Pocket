@@ -621,6 +621,13 @@ impl Broker {
     }
 
     async fn prepare_assistant_inner(&self) -> Result<()> {
+        // The assistant's coordinator is held read-only and its jobs to their own worktree by
+        // Codex's sandbox, which an Android application cannot create. It is not offered there
+        // rather than run without those limits.
+        if crate::managed_runtime::packaged() {
+            *self.assistant_error.lock().await = Some(ASSISTANT_UNAVAILABLE_ON_DEVICE);
+            anyhow::bail!("The assistant is not available on this device");
+        }
         self.prepare_assistant_using(
             crate::managed_runtime::discovery::from_environment,
             async |profile| self.ensure_assistant(profile).await,
@@ -1109,6 +1116,7 @@ fn validate_fenced_saved_profile(home:&Path,binary:&Path)->Result<SelectedProfil
     SelectedProfile::new(home,binary).context(RestoreFailure::NativeInvalid)
 }
 
+const ASSISTANT_UNAVAILABLE_ON_DEVICE: &str = "assistant_unavailable_on_device";
 fn runtime_restore_error(error:anyhow::Error)->anyhow::Error {
     if error.downcast_ref::<RestoreFailure>().is_some(){error}else{error.context(RestoreFailure::RuntimeStart)}
 }

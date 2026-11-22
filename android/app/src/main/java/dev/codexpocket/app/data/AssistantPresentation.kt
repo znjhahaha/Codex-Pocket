@@ -89,6 +89,7 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
         errorCode=="assistant_missing_config" || preparationStatus in setOf("config","missing_config") -> "电脑端 Codex 配置尚未就绪，请修复配置后重试"
         errorCode=="assistant_needs_login" || preparationStatus=="needs_login" -> "请在电脑端登录 Codex 后重试"
         errorCode=="assistant_restore_failed" -> "助理恢复未完成，请重试准备"
+        errorCode=="assistant_unavailable_on_device" -> "助理暂不支持在此手机上运行，请切换到电脑或 SSH 主机后使用"
         errorCode=="assistant_preparing" || preparationStatus=="preparing" -> "助理正在准备，草稿会保留"
         !errorCode.isNullOrBlank() || preparationStatus=="recoverable_error" -> "助理准备遇到问题，请检查电脑端后重试"
         !prepReady -> "助理准备状态尚未确认，请重试"
