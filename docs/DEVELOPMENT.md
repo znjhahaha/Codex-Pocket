@@ -57,7 +57,7 @@ cargo install cargo-zigbuild          # 另需 zig（PATH 或 CARGO_ZIGBUILD_ZIG
 .\scripts\linux\build-runtime.ps1 -Architecture x86_64 -SigningKey <已有的 Ed25519 更新签名私钥路径>
 ```
 
-脚本交叉编译、用现有签名私钥签署清单，并只在签名成功后替换上述目录；私钥与应用内固定的公钥不符时不会产生任何包，也不会生成或替换密钥。x86_64 的两个文件约 24 MB，APK 约增大 10 MB；`aarch64` 需要对应的 Rust 目标。
+脚本交叉编译、用现有签名私钥签署清单，并只在签名成功后替换上述目录；私钥与应用内固定的公钥不符时不会产生任何包，也不会生成或替换密钥。x86_64 的两个文件约 24 MB，调试版 APK 实测增大约 11 MB；`aarch64` 需要对应的 Rust 目标。
 
 SSH 相关的真实主机测试默认跳过，只针对一次性的本机虚拟机运行：
 
