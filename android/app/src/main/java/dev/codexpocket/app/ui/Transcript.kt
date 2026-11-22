@@ -1,12 +1,5 @@
 package dev.codexpocket.app.ui
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -34,6 +27,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.MotionGlyphs
+import dev.codexpocket.app.ui.kit.PToggleGlyph
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -145,14 +140,25 @@ internal fun CompactionStatusRow(label: String, modifier: Modifier = Modifier) {
 /** Small gray icon under an answer; the press is a soft circle, not a 48dp tile. */
 @Composable
 internal fun QuietAction(icon: ImageVector, label: String, onClick: () -> Unit) {
+    QuietAction(onClick) { Icon(icon, label, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+}
+
+@Composable
+private fun QuietAction(onClick: () -> Unit, glyph: @Composable () -> Unit) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) .88f else 1f, pocketPressSpring(), label = "quiet-press")
     Box(Modifier.size(40.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(CircleShape)
         .background(if (pressed) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        glyph()
     }
+}
+
+/** The copy glyph draws its own check and back, in the box and under the name of the icon it replaces. */
+@Composable
+internal fun CopyGlyphAction(copied: Boolean, label: String, onClick: () -> Unit) {
+    QuietAction(onClick) { PToggleGlyph(MotionGlyphs.CopyCheck, copied, Modifier.size(17.dp), MaterialTheme.colorScheme.onSurfaceVariant, label) }
 }
 
 /** Copy morphs into a check for a moment, the way iOS confirms a copy. */
@@ -161,12 +167,7 @@ internal fun CopyAction(text: String, onCopy: () -> Unit) {
     var copied by remember(text) { mutableStateOf(false) }
     LaunchedEffect(copied) { if (copied) { delay(1_400); copied = false } }
     val label = stringResource(R.string.copy)
-    AnimatedContent(copied, transitionSpec = {
-        (fadeIn(tween(pocketMotionMillis(140))) + scaleIn(tween(pocketMotionMillis(180)), initialScale = .6f)) togetherWith
-            (fadeOut(tween(pocketMotionMillis(90))) + scaleOut(tween(pocketMotionMillis(120)), targetScale = .6f))
-    }, label = "copy-confirm") { done ->
-        QuietAction(if (done) PocketIcons.Check else PocketIcons.ContentCopy, label) { onCopy(); copied = true }
-    }
+    CopyGlyphAction(copied, label) { onCopy(); copied = true }
 }
 
 @Composable

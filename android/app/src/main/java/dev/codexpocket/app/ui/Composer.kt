@@ -56,6 +56,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.MotionGlyphs
+import dev.codexpocket.app.ui.kit.MotionIcon
+import dev.codexpocket.app.ui.kit.PIconButton
+import dev.codexpocket.app.ui.kit.PToggleGlyph
+import dev.codexpocket.app.ui.kit.PocketHaptic
+import dev.codexpocket.app.ui.kit.rememberGlyphToggle
+import dev.codexpocket.app.ui.kit.rememberPocketHaptics
 import kotlinx.serialization.json.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
@@ -133,6 +140,12 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
     val menuExpanded = modelMenuExpanded ?: menuBinding.expanded
     val modelChevron by animateFloatAsState(if (menuExpanded) 180f else 0f,
         pocketPressSpring(), label = "model-chevron")
+    // Felt once per accepted tap: a disabled button never reaches these.
+    val haptics = rememberPocketHaptics()
+    val send = { haptics.perform(PocketHaptic.Confirm); onSend() }
+    val stop = { haptics.perform(PocketHaptic.Tap); onStop() }
+    // 0 while idle, 1 while a turn runs. Opening on a running turn starts at 1, so nothing plays.
+    val turnGlyph = rememberGlyphToggle(running)
     var expanded by rememberSaveable { mutableStateOf(false) }
     var addMenu by rememberSaveable { mutableStateOf(false) }
     var addAnchor by remember { mutableStateOf<Rect?>(null) }
@@ -315,11 +328,9 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 // Fixed composition slots retain the editor's focus, cursor and IME composition as the layout changes.
                 Layout(modifier = Modifier.fillMaxWidth().then(if(stableLayout) Modifier else Modifier.animateContentSize(
                     if (motion) tween(220) else snap())), content = {
-                    val addTurn by animateFloatAsState(if (addMenu) 45f else 0f, pocketPressSpring(), label = "composer-add-turn")
                     Box(Modifier.size(48.dp).onGloballyPositioned { addAnchor = it.boundsInRoot() }, contentAlignment = Alignment.Center) {
-                        Box(Modifier.graphicsLayer { rotationZ = addTurn }) {
-                            ActionIcon(PocketIcons.Add, stringResource(R.string.v02_references)) { addMenu = true }
-                        }
+                        PIconButton(PocketIcons.Add, stringResource(R.string.v02_references), { addMenu = true },
+                            glyph = { PToggleGlyph(MotionGlyphs.PlusClose, addMenu) })
                         if (attachmentCount > 0) Text(attachmentCount.toString(), Modifier.align(Alignment.TopEnd)
                             .clip(PocketCapsule).background(MaterialTheme.colorScheme.surfaceContainerHighest)
                             .padding(horizontal = 4.dp).testTag("composer-attachment-count")
@@ -374,11 +385,11 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                                 val steerLabel = stringResource(R.string.v02_steer)
                                 ComposerPill(steerLabel, PocketIcons.SubdirectoryArrowRight, availability.steer, showSteerLabel,
                                     Modifier.testTag("composer-steer").semantics { contentDescription = steerLabel }, onSteer)
-                                ComposerStopButton(availability.stop, onStop)
+                                ComposerStopButton(availability.stop, { turnGlyph.value }, stop)
                             }
                         }
-                        if (compact && running) ComposerStopButton(availability.stop, onStop)
-                        else ComposerSendButton(running, availability.send, onSend)
+                        if (compact && running) ComposerStopButton(availability.stop, { turnGlyph.value }, stop)
+                        else ComposerSendButton(running, availability.send, { turnGlyph.value }, send)
                     }
                 }) { slots, constraints ->
                     val width = constraints.maxWidth
@@ -436,9 +447,9 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 ActionIcon(PocketIcons.CloseFullscreen, stringResource(R.string.v02_collapse_composer), onClick = closeEditor)
                 if (running) {
                     PocketTextButton(onSteer, enabled = availability.steer, modifier = Modifier.testTag("composer-steer")) { Text(stringResource(R.string.v02_steer)) }
-                    ActionIcon(PocketIcons.StopCircle, stringResource(R.string.stop_turn), availability.stop, onStop)
+                    ActionIcon(PocketIcons.StopCircle, stringResource(R.string.stop_turn), availability.stop, stop)
                 }
-                ComposerSendButton(running, availability.send, onSend)
+                ComposerSendButton(running, availability.send, { turnGlyph.value }, send)
             }
         }
     }
@@ -497,9 +508,12 @@ private fun ComposerPill(label: String, icon: androidx.compose.ui.graphics.vecto
     }
 }
 
-/** Stop: a dark disc with a white square, the way Codex shows a running turn. */
+/**
+ * Stop: a dark disc with a white square, the way Codex shows a running turn. [morph] is 1 while the
+ * turn runs; as it gets there the send arrow leaves and the square turns in.
+ */
 @Composable
-private fun ComposerStopButton(enabled: Boolean, onStop: () -> Unit) {
+private fun ComposerStopButton(enabled: Boolean, morph: () -> Float, onStop: () -> Unit) {
     val c = MaterialTheme.colorScheme
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -509,13 +523,14 @@ private fun ComposerStopButton(enabled: Boolean, onStop: () -> Unit) {
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         Box(Modifier.size(34.dp).graphicsLayer { scaleX = scale; scaleY = scale }
             .background(if (enabled) c.onSurface else c.surfaceContainerHigh, CircleShape), contentAlignment = Alignment.Center) {
-            Box(Modifier.size(11.dp).background(if (enabled) c.surface else c.onSurfaceVariant, RoundedCornerShape(3.dp)))
+            // The glyph's square is 10 of 24 grid units: 26.4dp draws it at the 11dp it has always been.
+            MotionIcon(MotionGlyphs.SendStop, morph, Modifier.size(26.4.dp), if (enabled) c.surface else c.onSurfaceVariant)
         }
     }
 }
 
 @Composable
-private fun ComposerSendButton(running: Boolean, enabled: Boolean, onSend: () -> Unit) {
+private fun ComposerSendButton(running: Boolean, enabled: Boolean, morph: () -> Float, onSend: () -> Unit) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val focused by interaction.collectIsFocusedAsState()
@@ -543,12 +558,15 @@ private fun ComposerSendButton(running: Boolean, enabled: Boolean, onSend: () ->
         Box(Modifier.size(42.dp).background(color, RoundedCornerShape(21.dp))
             .border(if (focused) 2.dp else 0.dp, if (focused) MaterialTheme.colorScheme.secondary else Color.Transparent, RoundedCornerShape(21.dp)), contentAlignment = Alignment.Center) {
             androidx.compose.animation.Crossfade(running, animationSpec = tween(pocketMotionMillis(120)), label = "send-queue-morph") { queue ->
-                Icon(if (queue) PocketIcons.PlaylistAdd else PocketIcons.ArrowUpward, stringResource(if (queue) R.string.v02_queue else R.string.send_message),
-                    Modifier.size(21.dp).graphicsLayer {
-                        val l = launch.value
-                        translationY = -press * 3.dp.toPx() - l * 22.dp.toPx()
-                        alpha = 1f - kotlin.math.abs(l)
-                    }, tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant)
+                val glyph = Modifier.size(21.dp).graphicsLayer {
+                    val l = launch.value
+                    translationY = -press * 3.dp.toPx() - l * 22.dp.toPx()
+                    alpha = 1f - kotlin.math.abs(l)
+                }
+                val tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                if (queue) Icon(PocketIcons.PlaylistAdd, stringResource(R.string.v02_queue), glyph, tint = tint)
+                // Returning from a turn the square becomes the arrow; leaving for one the arrow simply fades.
+                else MotionIcon(MotionGlyphs.SendStop, { if (running) 0f else morph() }, glyph, tint, stringResource(R.string.send_message))
             }
         }
     }

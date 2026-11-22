@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
+import dev.codexpocket.app.ui.kit.PocketHaptic
+import dev.codexpocket.app.ui.kit.rememberPocketHaptics
 import kotlinx.serialization.json.*
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -48,9 +50,11 @@ internal fun ApprovalCard(a: PendingApproval, online: Boolean, onRespond: (Pendi
     val supported = a.method in setOf("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
     val command = a.params.string("command")
     val paths = a.params.array("changes").map { it.asObject().string("path") }.filter(String::isNotBlank)
+    val haptics = rememberPocketHaptics()
     fun respond(decision: String) {
         if (!enabled || sent) return
         sent = true
+        haptics.perform(if (decision == "accept" || decision == "acceptForSession") PocketHaptic.Confirm else PocketHaptic.Reject)
         onRespond(a, buildJsonObject { put("decision", decision) })
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("approval-card"),

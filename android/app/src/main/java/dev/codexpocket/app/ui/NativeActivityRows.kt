@@ -56,6 +56,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.kit.PocketMotion
+import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -601,7 +604,7 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
 
 @Composable
 internal fun ActivityExpansionIcon(expanded: Boolean) {
-    val rotation by animateFloatAsState(if (expanded) 180f else 0f, tween(pocketMotionMillis(200), easing = FastOutSlowInEasing), label = "activity-expansion")
+    val rotation by animateFloatAsState(if (expanded) 180f else 0f, PocketMotion.glyph<Float>().orSnap(rememberPocketMotion()), label = "activity-expansion")
     Icon(PocketIcons.ExpandMore, stringResource(if (expanded) R.string.collapse_details else R.string.expand_details), Modifier.size(16.dp).rotate(rotation),
         tint = toneText().copy(alpha = .8f))
 }
