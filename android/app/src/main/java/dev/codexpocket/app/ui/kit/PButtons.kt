@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -112,17 +114,22 @@ internal fun PTextAction(text: String, onClick: () -> Unit, modifier: Modifier =
     }
 }
 
-/** An icon-only action: 48dp target, round highlight, always named for accessibility. */
+/**
+ * An icon-only action: 48dp target, round highlight, always named for accessibility. When the action
+ * lands the icon answers in the way its meaning suggests; a caller's own [glyph] moves itself.
+ */
 @Composable
 internal fun PIconButton(icon: ImageVector, label: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
-    tint: Color = Color.Unspecified, haptic: PocketHaptic? = null, glyph: @Composable (() -> Unit)? = null) {
+    tint: Color = Color.Unspecified, haptic: PocketHaptic? = null, motion: PIconMotion = pocketIconMotion(icon),
+    glyph: @Composable (() -> Unit)? = null) {
     val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
+    var taps by remember { mutableIntStateOf(0) }
     Box(modifier.size(PocketSpace.touch).pocketPressScale(interaction, .92f).clip(CircleShape)
-        .pocketPressable(enabled, Role.Button, interaction, pressedScale = 1f, haptic = haptic, onClick = onClick)
+        .pocketPressable(enabled, Role.Button, interaction, pressedScale = 1f, haptic = haptic) { taps++; onClick() }
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         ProvidePInk(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (tint != Color.Unspecified) tint else c.ink) {
-            if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp))
+            if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp).pocketIconMotion(taps, motion))
         }
     }
 }

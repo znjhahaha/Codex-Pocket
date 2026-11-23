@@ -14,6 +14,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
@@ -98,10 +99,11 @@ internal fun PFrame(modifier: Modifier = Modifier, header: @Composable () -> Uni
 /** A round glass control for page chrome. [glyph] replaces the static icon with an animated one. */
 @Composable
 internal fun PGlassIconButton(icon: ImageVector, label: String, onClick: () -> Unit, modifier: Modifier = Modifier,
-    glyph: (@Composable () -> Unit)? = null) {
-    PocketGlassSurface(modifier.size(PocketSpace.touch).semantics { contentDescription = label }, CircleShape, onClick = onClick) {
+    motion: PIconMotion = pocketIconMotion(icon), glyph: (@Composable () -> Unit)? = null) {
+    var taps by remember { mutableIntStateOf(0) }
+    PocketGlassSurface(modifier.size(PocketSpace.touch).semantics { contentDescription = label }, CircleShape, onClick = { taps++; onClick() }) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            ProvidePInk(Pocket.colors.ink) { if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp)) }
+            ProvidePInk(Pocket.colors.ink) { if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp).pocketIconMotion(taps, motion)) }
         }
     }
 }

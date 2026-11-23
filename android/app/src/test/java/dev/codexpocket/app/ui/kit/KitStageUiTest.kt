@@ -229,6 +229,38 @@ class KitStageUiTest {
         compose.runOnIdle { assertFalse("A key that has been shown never arrives again", arrivals.fresh("c", true)) }
     }
 
+    @Test fun anIconAnswersItsTapInItsOwnWayAndEndsExactlyAtRest() {
+        var taps = 0
+        compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
+            view = LocalView.current
+            CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalPocketGlass provides false) {
+                Row(Modifier.padding(24.dp)) {
+                    PIconButton(dev.codexpocket.app.ui.PocketIcons.ArrowBack, "返回", { taps++ }, Modifier.testTag("back"))
+                    PIconButton(dev.codexpocket.app.ui.PocketIcons.Refresh, "刷新", { taps++ }, Modifier.testTag("refresh"))
+                }
+            }
+        } } }
+        compose.waitForIdle()
+        fun pixels(): IntArray = compose.runOnIdle {
+            val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+            view.draw(android.graphics.Canvas(bitmap))
+            IntArray(bitmap.width * bitmap.height).also { bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height); bitmap.recycle() }
+        }
+        assertEquals(PIconMotion.NudgeBack, pocketIconMotion(dev.codexpocket.app.ui.PocketIcons.ArrowBack))
+        assertEquals(PIconMotion.Spin, pocketIconMotion(dev.codexpocket.app.ui.PocketIcons.Refresh))
+        assertEquals(PIconMotion.Bounce, pocketIconMotion(dev.codexpocket.app.ui.PocketIcons.ContentCopy))
+        val rest = pixels()
+        compose.mainClock.autoAdvance = false
+        for (tag in listOf("back", "refresh")) {
+            compose.onNodeWithTag(tag).performClick()
+            advance(200)
+            assertFalse("$tag moves after its tap", rest.contentEquals(pixels()))
+            advance(1400)
+            assertArrayEquals("$tag is back exactly where it was", rest, pixels())
+        }
+        assertEquals(2, taps)
+    }
+
     @Test fun plainBackStillGoesBackOnce() {
         page = "chat"
         content()

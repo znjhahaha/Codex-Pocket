@@ -428,8 +428,9 @@ internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -
 
 @Composable
 internal fun CircleAction(icon: ImageVector, label: String, onClick: () -> Unit) {
-    PocketGlassSurface(modifier = Modifier.size(48.dp), shape = CircleShape, onClick = onClick) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PIcon(icon, label, Modifier.size(21.dp)) }
+    var taps by remember { mutableIntStateOf(0) }
+    PocketGlassSurface(modifier = Modifier.size(48.dp), shape = CircleShape, onClick = { taps++; onClick() }) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PIcon(icon, label, Modifier.size(21.dp).pocketIconMotion(taps, pocketIconMotion(icon))) }
     }
 }
 

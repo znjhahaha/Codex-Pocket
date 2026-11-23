@@ -288,17 +288,26 @@ internal fun PocketModal(
                             translationY = drag.value + when {
                                 screen -> 0f
                                 bottomSheet -> (1f - progress) * (size.height + 24.dp.toPx()) + leaving * 28.dp.toPx()
+                                // A menu stays pinned to its control while it grows; a dialog settles upward a little.
+                                anchored -> 0f
                                 else -> (1f - progress) * 10.dp.toPx()
                             }
                             // Pages push in across the whole width from the trailing edge, like UINavigationController.
                             translationX = if (screen) (1f - progress) * size.width + leaving * size.width * PageHeldTravel else 0f
                             alpha = if (screen || bottomSheet) 1f else (progress * 1.6f).coerceIn(0f, 1f)
-                            // Popovers grow out of the control that opened them, like an iOS context menu.
-                            val from = if (anchored) .62f else .92f
                             val recede = if (sheet) 1f else 1f - .05f * leaving
-                            scaleX = if (screen) 1f else (from + progress * (1f - from)) * recede
-                            scaleY = if (screen) 1f else (from + progress * (1f - from)) * recede
-                            if (anchored) transformOrigin = TransformOrigin(if (alignStart) 0f else 1f, if (below) 0f else 1f)
+                            if (anchored) {
+                                // A popover starts as the shape of the control that opened it and stretches into its own,
+                                // from the corner nearest that control; what it holds appears once it is nearly formed.
+                                val wide = anchor?.let { (it.width / size.width.coerceAtLeast(1f)).coerceIn(.34f, 1f) } ?: .62f
+                                val tall = anchor?.let { (it.height / size.height.coerceAtLeast(1f)).coerceIn(.2f, 1f) } ?: .62f
+                                scaleX = (wide + progress * (1f - wide)) * recede
+                                scaleY = (tall + progress * (1f - tall)) * recede
+                                transformOrigin = TransformOrigin(if (alignStart) 0f else 1f, if (below) 0f else 1f)
+                            } else if (!screen && !bottomSheet) {
+                                val size = (.92f + progress * .08f) * recede
+                                scaleX = size; scaleY = size
+                            }
                         }
                         // Own empty panel space without adding a click action or consuming child gestures.
                         .pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent() } }
