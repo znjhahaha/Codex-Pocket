@@ -109,6 +109,17 @@ internal object LinuxQa {
             [ -x "${'$'}HOME/.local/bin/codex" ] || ln -sfn "${'$'}HOME/codex-native/bin/codex" "${'$'}HOME/.local/bin/codex"
             id pocketqa2 >/dev/null 2>&1 || sudo useradd -m -s /bin/bash pocketqa2
             sudo passwd -l pocketqa2 >/dev/null
+            # The ordinary account is one an administrator does not let linger. Where polkit lets any
+            # account turn lingering on for itself, that is said here in both of polkit's formats.
+            if [ -d /etc/polkit-1/rules.d ]; then
+                printf '%s\n' 'polkit.addRule(function(action, subject) { if (action.id == "org.freedesktop.login1.set-self-linger" && subject.user == "pocketqa2") return polkit.Result.NO; });' |
+                    sudo tee /etc/polkit-1/rules.d/00-pocket-qa.rules >/dev/null
+            fi
+            if [ -d /etc/polkit-1/localauthority/50-local.d ]; then
+                printf '%s\n' '[Pocket QA]' 'Identity=unix-user:pocketqa2' 'Action=org.freedesktop.login1.set-self-linger' 'ResultAny=no' 'ResultInactive=no' 'ResultActive=no' |
+                    sudo tee /etc/polkit-1/localauthority/50-local.d/pocket-qa.pkla >/dev/null
+            fi
+            sudo loginctl disable-linger pocketqa2 2>/dev/null || true
         """.trimIndent())
     } }
     /** Nothing on the host reaches the internet; only the address acceptance itself logs in from keeps a way back. */

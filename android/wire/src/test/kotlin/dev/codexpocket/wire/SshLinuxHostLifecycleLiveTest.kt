@@ -185,12 +185,17 @@ class SshLinuxHostLifecycleLiveTest {
             val arriving = "\"${'$'}HOME/.local/share/codex-pocket/versions/${late.generation}/pocket-agent.upload\""
             val cut = CompletableDeferred<Long>()
             val uploading = CompletableDeferred<Unit>()
+            // Watched and cut on the host itself: over a fast link the whole file can arrive between two looks from here.
             val cutter = launch {
                 uploading.await()
-                while (true) {
-                    val arrived = admin.execute("stat -c %s $arriving 2>/dev/null || echo 0\n", 20, emptyMap()).trim().toLong()
-                    if (arrived >= 1_000_000) { admin.execute("kill ${(sessions() - others).joinToString(" ")}\n", 20, emptyMap()); cut.complete(arrived); break }
-                }
+                cut.complete(admin.execute("""
+                    while [ "${'$'}(stat -c %s $arriving 2>/dev/null || echo 0)" -lt 1000000 ]; do sleep 0.01; done
+                    arrived=${'$'}(stat -c %s $arriving 2>/dev/null || echo 0)
+                    for pid in ${'$'}(pgrep -u pocket -x sshd); do
+                        case " ${others.joinToString(" ")} " in *" ${'$'}pid "*) ;; *) kill "${'$'}pid" ;; esac
+                    done
+                    echo "${'$'}arrived"
+                """.trimIndent(), 120, emptyMap()).trim().lines().last().toLong())
             }
             val interrupted = failure { LinuxQa.prepare(directory = late.directory, progress = { if ("上传" in it) uploading.complete(Unit) }) }
             cutter.cancelAndJoin()
