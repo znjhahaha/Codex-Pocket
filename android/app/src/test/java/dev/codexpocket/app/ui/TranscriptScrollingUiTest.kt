@@ -37,6 +37,7 @@ class TranscriptScrollingUiTest {
         status = "completed", raw = buildJsonObject { put("command", "echo"); put("aggregatedOutput", "recorded output\n".repeat(30)) }, complete = true)
     private var timeline by mutableStateOf(NativeTimeline())
     private var headerHeight by mutableIntStateOf(48)
+    private var edit by mutableStateOf<MessageEditState?>(null)
 
     private fun content(deferHistory: Boolean = false, savedDraft: DraftEntity? = null, historyNotice: Boolean = false) = runBlocking {
         db = Room.inMemoryDatabaseBuilder(compose.activity, PocketDatabase::class.java).build()
@@ -62,7 +63,7 @@ class TranscriptScrollingUiTest {
                         val current by repo.state.collectAsState()
                         val displayed=if(historyNotice) current.copy(selected=current.selected?.copy(runtimeId="history:store"),
                             online=true,error="所选运行环境尚未就绪，请稍后重试",conversationReadSource="persisted",conversationLoadState=ConversationLoadState.Ready) else current
-                        ChatScreen(displayed.copy(timeline = timeline, conversationCached = true), repo, {}, {}, {},
+                        ChatScreen(displayed.copy(timeline = timeline, conversationCached = true, messageEdit = edit), repo, {}, {}, {},
                             header = { Spacer(Modifier.height(headerHeight.dp)) })
                     } }
                 }
@@ -252,6 +253,26 @@ class TranscriptScrollingUiTest {
         compose.runOnIdle { headerHeight += 24 }
         compose.waitForIdle()
         assertFalse("A transient no-scroll boundary is not a request to follow", repo.state.value.draft!!.followEnd)
+    }
+
+    @Test fun theTranscriptFollowsItsEndAgainOnceAnEditInABubbleIsOver() {
+        content()
+        val sent = TimelineItem.from("turn-sent", Json.parseToJsonElement("""{"id":"sent","type":"userMessage","content":[{"type":"text","text":"Make the button blue"}]}""").jsonObject, true)
+        compose.runOnIdle { timeline = timeline.copy(items = timeline.items + (sent.key to sent)) }
+        compose.waitUntil(5_000) { compose.onNodeWithTag("transcript-row:${sent.key}").isDisplayed() }
+        // Editing holds the bubble where it stands; that is the editor's doing, not the reader's.
+        compose.runOnIdle { edit = MessageEditState(key, "runtime", sent.turnId, sent.itemId, "Make the button blue", "Make the button blue", MessageEditPhase.Ready, version = "v1", token = "t1") }
+        compose.waitForIdle()
+        compose.onNodeWithTag("message-edit-bubble").assertIsDisplayed()
+        compose.runOnIdle { edit = null }
+        compose.waitForIdle()
+        val next = TimelineItem("new", "message", "agentMessage", "New recorded response\n".repeat(40), complete = true)
+        compose.runOnIdle { timeline = timeline.copy(items = timeline.items + (next.key to next)) }
+        compose.waitForIdle()
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("transcript-row:${next.key}").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitForIdle()
+        val list = compose.onNodeWithTag("chat-transcript").fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        assertEquals("What arrives after the edit is followed to its end", list.maxValue(), list.value(), 1f)
     }
 
     @Test fun realDragToTailResumesButMinimapSeekDoesNot() {

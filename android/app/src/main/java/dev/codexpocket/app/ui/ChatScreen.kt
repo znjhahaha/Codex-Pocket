@@ -102,8 +102,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         var transcriptContact by remember { mutableStateOf(false) }
         val transcriptGesture = remember(list) { TranscriptGestureState() }
         var jumpJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        // An edit made in a bubble holds the transcript still; when it ends the end is followed again, unless the reader moved away meanwhile.
+        var followAfterEdit by remember { mutableStateOf(false) }
         val pauseFollowing = {
             jumpJob?.cancel()
+            followAfterEdit = false
             if (following) {
                 following = false
                 // Persist intent immediately, including a drag consumed by a nested tool body.
@@ -221,11 +224,13 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         FollowTranscriptEnd(list, { following }, { transcriptContact || minimapState.expanded || minimapState.isInteracting })
         // The bubble being edited stays clear of the keyboard: it is brought up as the keyboard arrives.
         LaunchedEffect(editingKey, composerHeight) {
-            val target = editingKey ?: return@LaunchedEffect
+            val target = editingKey ?: run { if (followAfterEdit) { followAfterEdit = false; following = true }; return@LaunchedEffect }
             if (target == "message-edit") { following = true; return@LaunchedEffect }
             val index = keys.indexOf(target)
             if (index < 0) return@LaunchedEffect
+            val resume = following || followAfterEdit
             pauseFollowing()
+            followAfterEdit = resume
             val shown = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key == target }
             if (shown == null) { list.scrollToItem(index); return@LaunchedEffect }
             val over = shown.offset + shown.size - (list.layoutInfo.viewportEndOffset - list.layoutInfo.afterContentPadding)
