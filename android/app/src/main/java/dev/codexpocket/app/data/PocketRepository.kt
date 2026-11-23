@@ -1575,14 +1575,18 @@ class PocketRepository(
         val reusable = !forceRefresh && window?.reusable(chat, _state.value.online,
             verifiedHistoryLinks[chat.key], connectionGeneration.get(), inMemory != null) == true
         val cachedContext = dao.contextUsage(chat.key)?.let { runCatching { ContextSnapshot.from(pocketJson.parseToJsonElement(it.snapshot).jsonObject).copy(status = "stale") }.getOrNull() } ?: ContextSnapshot()
-        _state.update { it.copy(selected = chat, messageEdit = readMessageEdit(chat), timeline = timeline, draft = draft, attachments = parseAttachments(draft.attachments), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, modes = emptyList(), mode = null, nextTurns = window?.nextTurns, historyExhausted = window?.exhausted ?: false, historyLoading = chat.key in loadingHistory, unknownHistoryInspected = false, stopping = stopKey(chat.key, timeline.activeTurn) in stoppingTurns, nativeQueue = emptyList(), queueSupported = null, advanced = AdvancedConversationState(asyncQuestions = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)))) }
-        _state.update { it.copy(conversationLoadState = if (reusable) ConversationLoadState.Ready else if (it.online) ConversationLoadState.Loading else window?.loadState?.takeIf { load -> load == ConversationLoadState.Failed } ?: ConversationLoadState.Idle, conversationLoadError = window?.error,
+        // Room can return after a newer selection has finished loading, even for the same chat.
+        // Publish the selection and its loading state together, only for the current generation.
+        _state.update { if (generation != selectionGeneration.get()) it else it.copy(
+            selected = chat, messageEdit = readMessageEdit(chat), timeline = timeline, draft = draft, attachments = parseAttachments(draft.attachments), models = emptyList(), modelCatalogState = if (it.online) ModelCatalogState.Idle else ModelCatalogState.Offline, modelCatalogError = null, model = null, effort = null, modes = emptyList(), mode = null, nextTurns = window?.nextTurns, historyExhausted = window?.exhausted ?: false, historyLoading = chat.key in loadingHistory, unknownHistoryInspected = false, stopping = stopKey(chat.key, timeline.activeTurn) in stoppingTurns, nativeQueue = emptyList(), queueSupported = null,
+            conversationLoadState = if (reusable) ConversationLoadState.Ready else if (it.online) ConversationLoadState.Loading else window?.loadState?.takeIf { load -> load == ConversationLoadState.Failed } ?: ConversationLoadState.Idle, conversationLoadError = window?.error,
             conversationCached = window != null || timeline.items.isNotEmpty(), conversationReadSource = window?.readSource ?: "native",
             nativeSettings = NativeSettings(), settingsFresh = false, pendingSettings = emptySet(), contextSnapshot = cachedContext,
             permissions = PermissionState(), resolvedPlans = preferences.getStringSet("resolvedPlans:${chat.key.encoded}", emptySet()).orEmpty().toSet(),
             dismissedPlans = preferences.getStringSet("dismissedPlans:${chat.key.encoded}", emptySet()).orEmpty().toSet(),
             planFeedback = readPlanFeedback(chat),
-            advanced = it.advanced.copy(usage = cachedContext.usage)) }
+            advanced = AdvancedConversationState(asyncQuestions = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)), usage = cachedContext.usage)) }
+        if (generation != selectionGeneration.get()) return@action
         restoreSelectedSettings(chat)
         markRead(chat)
         if (_state.value.online) scope.launch { runCatching { sendPresence() } }

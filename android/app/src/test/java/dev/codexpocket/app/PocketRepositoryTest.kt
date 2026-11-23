@@ -1898,6 +1898,74 @@ class PocketRepositoryTest {
         assertTrue(repo.state.value.models.isNotEmpty())
     }
 
+    @Test fun supersededSelectionContextReadCannotStrandSameChatInIdle() = runBlocking<Unit> {
+        assertSupersededSelectionContextRead(key)
+    }
+
+    @Test fun supersededSelectionContextReadCannotReplaceAnotherChat() = runBlocking<Unit> {
+        assertSupersededSelectionContextRead(otherKey)
+    }
+
+    private suspend fun assertSupersededSelectionContextRead(newKey: ThreadKey) {
+        val olderChat = repo.state.value.chats.first { it.key == key }
+        val newerChat = repo.state.value.chats.first { it.key == newKey }
+        repo.editDraft("Draft captured by the older selection")
+        val queryCaptured = CompletableDeferred<Unit>()
+        val unblockQuery = CompletableDeferred<Unit>()
+        val contextReads = AtomicInteger()
+        val daoField = PocketRepository::class.java.getDeclaredField("dao").apply { isAccessible = true }
+        val originalDao = daoField.get(repo) as PocketDao
+        val pausingDao = object : PocketDao by originalDao {
+            override suspend fun contextUsage(key: ThreadKey): ContextEntity? {
+                val captured = originalDao.contextUsage(key)
+                // Suspend after the real Room query releases its worker. The newer select
+                // must be able to finish its own context/history reads while this one waits.
+                if (key == olderChat.key && contextReads.incrementAndGet() == 1) {
+                    queryCaptured.complete(Unit)
+                    unblockQuery.await()
+                }
+                return captured
+            }
+        }
+        daoField.set(repo, pausingDao)
+        val older = repo.select(olderChat, forceRefresh = true)
+        var newer: Job? = null
+        try {
+            withTimeout(5_000) { queryCaptured.await() }
+            val currentSelection = repo.select(newerChat, forceRefresh = true)
+            newer = currentSelection
+            withTimeout(5_000) { currentSelection.join() }
+            await { it.selected?.key == newKey && it.conversationLoadState == ConversationLoadState.Ready &&
+                it.modelCatalogState == ModelCatalogState.Ready && it.settingsFresh && it.nativeSettings.model.known }
+            repo.editDraft("Draft edited after the newer selection completed")
+            val ready = repo.state.value
+            fun hydrationReads() = server.calls.count {
+                it.nativeMethod in setOf("thread/read", "thread/turns/list", "model/list")
+            }
+            val completedReads = hydrationReads()
+            // Both selections have the same connection; even the same chat has a new
+            // selection generation. Returning the old cache result must not publish Idle.
+            unblockQuery.complete(Unit)
+            withTimeout(5_000) { older.join() }
+            val actual = repo.state.value
+            val detail = "selected=${actual.selected?.key}, catalog=${actual.modelCatalogState}, " +
+                "history=${actual.conversationLoadState}, hydrationReads=$completedReads->${hydrationReads()}"
+            assertEquals("A stale context read must not replace the current selection: $detail", newKey, actual.selected?.key)
+            assertEquals("A completed catalog must not return to Idle without a reader: $detail", ModelCatalogState.Ready, actual.modelCatalogState)
+            assertEquals("A completed history must not return to Loading without a reader: $detail", ConversationLoadState.Ready, actual.conversationLoadState)
+            assertEquals(ready.models, actual.models)
+            assertEquals(ready.nativeSettings, actual.nativeSettings)
+            assertEquals(ready.settingsFresh, actual.settingsFresh)
+            assertEquals("A stale context read must not replace the current draft", ready.draft, actual.draft)
+            assertEquals("Discard the stale selection before starting another hydration", completedReads, hydrationReads())
+        } finally {
+            unblockQuery.complete(Unit)
+            older.cancelAndJoin()
+            newer?.cancelAndJoin()
+            daoField.set(repo, originalDao)
+        }
+    }
+
     @Test fun missingExplicitModelDoesNotBorrowDefaultNameOrCapabilities() = runBlocking<Unit> {
         val chosen=repo.state.value.models.first()
         repo.chooseModel(chosen,null)
