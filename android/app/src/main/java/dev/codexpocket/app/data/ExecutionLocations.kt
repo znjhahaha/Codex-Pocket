@@ -20,6 +20,9 @@ internal interface SshGateway {
     }
 }
 
+/** The identity and data source displayed together, published only after activation is ready. */
+internal data class ActiveExecutionLocation(val target: ExecutionTarget, val repository: PocketRepository)
+
 /** One repository owns one location for its entire lifetime, including late replies. */
 internal class ExecutionLocations(private val context: Context,
     private val store: ExecutionLocationStore = ExecutionLocationStore(context),
@@ -29,6 +32,8 @@ internal class ExecutionLocations(private val context: Context,
     private val repositories = linkedMapOf<String, PocketRepository>()
     private val selected = MutableStateFlow<PocketRepository?>(null)
     val active = selected.asStateFlow()
+    private val activated = MutableStateFlow<ActiveExecutionLocation?>(null)
+    val activeLocation = activated.asStateFlow()
     val directory = store.directoryChanges
     private val failure = MutableStateFlow<String?>(null)
     val error = failure.asStateFlow()
@@ -79,6 +84,9 @@ internal class ExecutionLocations(private val context: Context,
             selected.value = repository
             repository.setForeground(foreground)
         }
+        // Directory selection is persisted earlier and can emit while activation is still busy.
+        // UI consumers must take the target and repository from this one publication instead.
+        activated.value = ActiveExecutionLocation(target, repository)
         failure.value = null
     }
     private fun createRepository(target: ExecutionTarget): PocketRepository {

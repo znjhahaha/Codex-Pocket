@@ -22,7 +22,7 @@ internal val LocalExecutionLocation = staticCompositionLocalOf<ExecutionTarget?>
 
 @Composable
 internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
-    val repository by locations.active.collectAsStateWithLifecycle()
+    val activeLocation by locations.activeLocation.collectAsStateWithLifecycle()
     val catalog by locations.directory.collectAsStateWithLifecycle()
     val error by locations.error.collectAsStateWithLifecycle()
     val progress by locations.progress.collectAsStateWithLifecycle()
@@ -31,23 +31,27 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
     var addingSsh by rememberSaveable { mutableStateOf(false) }
     var thisPhone by rememberSaveable { mutableStateOf(false) }
     val pages = rememberSaveableStateHolder()
-    val current = repository
+    val current = activeLocation
     if (current == null) {
         PocketTheme("system") { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             if (error != null) PText(error!!, Modifier.padding(24.dp)) else PocketProgressStatus("正在准备执行位置")
         } }
         return
     }
-    val state by current.state.collectAsStateWithLifecycle()
+    val target = current.target
+    val repository = current.repository
+    // A collector belongs to one repository; a new source must start with its own current value.
+    val state by key(repository) { repository.state.collectAsStateWithLifecycle() }
+    val shownCatalog = catalog.copy(selectedId = target.id.takeIf { id -> catalog.targets.any { it.id == id } })
     // Shown once after installing, and again whenever it is asked for from settings.
     val tutorial = rememberPocketTutorial()
     PocketTheme(state.theme) { PocketTutorialHost(tutorial) { PocketOverlayHost {
-        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }, LocalExecutionLocation provides catalog.selected,
+        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }, LocalExecutionLocation provides target,
             LocalPocketTutorial provides tutorial) {
-            pages.SaveableStateProvider(catalog.selectedId ?: "unpaired") { PocketRoot(state, current) }
+            pages.SaveableStateProvider(target.id) { PocketRoot(state, repository) }
         }
         if (choosing) PocketSheet("执行位置", { choosing = false }, subtitle = "项目、对话与用量跟随所选位置") {
-            ExecutionLocationChoices(catalog, state.online, { id -> locations.select(id); choosing = false },
+            ExecutionLocationChoices(shownCatalog, state.online, { id -> locations.select(id); choosing = false },
                 { locations.addComputer(); choosing = false }, { choosing = false; addingSsh = true },
                 onThisPhone = if (locations.thisPhone.available) ({ choosing = false; thisPhone = true }) else null)
         }
@@ -69,15 +73,15 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         }
         // Codex on this phone can do nothing until it has an account or a service to use; say so once instead of failing in a conversation.
         var askedForAccess by rememberSaveable { mutableStateOf(false) }
-        LaunchedEffect(catalog.selected?.kind, state.online) {
-            if (!askedForAccess && state.online && catalog.selected?.kind == ExecutionTargetKind.ThisPhone && !locations.thisPhone.hasAccess) {
+        LaunchedEffect(target.kind, state.online) {
+            if (!askedForAccess && state.online && target.kind == ExecutionTargetKind.ThisPhone && !locations.thisPhone.hasAccess) {
                 askedForAccess = true; thisPhone = true
             }
         }
         if (addingSsh) SshLocationSheet(progress, { if (progress == null) addingSsh = false },
             onConnect = { label, config -> locations.connectSsh(label, config) })
-        LaunchedEffect(progress, catalog.selectedId) {
-            if (addingSsh && progress == null && catalog.selected?.kind == ExecutionTargetKind.LinuxSsh && error == null) addingSsh = false
+        LaunchedEffect(progress, target.id) {
+            if (addingSsh && progress == null && target.kind == ExecutionTargetKind.LinuxSsh && error == null) addingSsh = false
         }
         if (notice != null && error == null) PocketDialog(onDismissRequest = locations::dismissNotice,
             title = { PText("SSH 主机已添加") }, text = { PText(notice!!) },

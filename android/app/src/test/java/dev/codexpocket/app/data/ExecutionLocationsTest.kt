@@ -32,7 +32,7 @@ class ExecutionLocationsTest {
     private lateinit var db: PocketDatabase
     private val opened = mutableListOf<Any>()
 
-    private fun pair(id: String) = PairedComputer(ConnectionConfig("wss://fixture.invalid", "room", "fixture-token", "00".repeat(32)), "phone", "secret-$id", id, id)
+    private fun pair(id: String, name: String = id) = PairedComputer(ConnectionConfig("wss://fixture.invalid", "room", "fixture-token", "00".repeat(32)), "phone", "secret-$id", id, name)
     private fun twoComputers(blob: Blob = Blob()) = ExecutionLocationStore(blob, NoLegacy).apply {
         register(ExecutionTarget("a", ExecutionTargetKind.Computer, "A"), pair("pc-a"))
         register(ExecutionTarget("b", ExecutionTargetKind.Computer, "B"), pair("pc-b"))
@@ -72,6 +72,37 @@ class ExecutionLocationsTest {
         locations.select("b").join()
         assertSame(b, locations.awaitComputer("pc-b"))
         assertNull(locations.error.value)
+    }
+
+    @Test fun activeLocationBindsTheTargetToTheSameRepositoryUsedByExistingCallers() = runBlocking<Unit> {
+        val store = twoComputers().apply {
+            register(ExecutionTarget("phone", ExecutionTargetKind.ThisPhone, "此手机"), pair("local"))
+            register(ExecutionTarget("ssh", ExecutionTargetKind.LinuxSsh, "开发服务器"), pair("linux"))
+        }
+        val locations = locations(store)
+        assertNotNull("Identity and repository must be ready together on the first frame", locations.activeLocation.value)
+        val original = locations.awaitComputer("pc-a")
+        for (id in listOf("phone", "ssh", "b", "a")) {
+            locations.select(id).join()
+            val target = checkNotNull(store.directory().selected)
+            val binding = checkNotNull(locations.activeLocation.value)
+            assertEquals(target, binding.target)
+            assertSame(locations.active.value, binding.repository)
+            assertSame(binding.repository, locations.awaitComputer(checkNotNull(target.endpointId)))
+        }
+        assertSame("Returning keeps the original repository and its pending work", original, locations.activeLocation.value!!.repository)
+    }
+
+    @Test fun updatingTheActivePairingLabelKeepsItsRepositoryAndRefreshesThePublishedIdentity() = runBlocking<Unit> {
+        val store = twoComputers()
+        val locations = locations(store)
+        val original = locations.awaitComputer("pc-a")
+        store.pairing("a").save(pair("pc-a", "工作电脑新名称"))
+        val renamed = withTimeout(5_000) { locations.activeLocation.filterNotNull().first { it.target.label == "工作电脑新名称" } }
+        assertEquals("a", renamed.target.id)
+        assertEquals("pc-a", renamed.target.endpointId)
+        assertSame(original, renamed.repository)
+        assertSame(original, locations.active.value)
     }
 
     @Test fun anUnpairedPhoneOpensItsPairingPageEvenWhenNothingCanBeWritten() = runBlocking<Unit> {
