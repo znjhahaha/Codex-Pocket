@@ -133,17 +133,21 @@ internal fun DrawScope.drawGlyph(pen: GlyphScope, glyph: MotionGlyph, t: Float, 
 internal fun rememberGlyphToggle(on: Boolean, spec: FiniteAnimationSpec<Float> = PocketMotion.glyph()): State<Float> =
     animateFloatAsState(if (on) 1f else 0f, spec.orSnap(rememberPocketMotion()), label = "glyph-toggle")
 
-/** Plays once from 0 to 1 whenever [trigger] changes. At rest, and when first shown, it is 1. */
+/** Plays from 0 to 1 on [trigger]; a new trigger in flight continues the current pass. At rest it is 1. */
 @Composable
 internal fun rememberGlyphPulse(trigger: Any?, millis: Int = 560): State<Float> {
     val motion = rememberPocketMotion()
     val progress = remember { Animatable(1f) }
-    val first = remember { booleanArrayOf(true) }
-    LaunchedEffect(trigger) {
-        if (first[0]) { first[0] = false; return@LaunchedEffect }
+    val previousTrigger = remember { arrayOf(trigger) }
+    LaunchedEffect(trigger, motion) {
+        val triggered = previousTrigger[0] != trigger
+        previousTrigger[0] = trigger
         if (!motion) { progress.snapTo(1f); return@LaunchedEffect }
-        progress.snapTo(0f)
-        progress.animateTo(1f, tween(millis, easing = LinearEasing))
+        // Initial display and re-enabling motion alone must not replay an earlier trigger.
+        if (!triggered) return@LaunchedEffect
+        if (progress.value >= 1f) progress.snapTo(0f)
+        val remainingMillis = (millis * (1f - progress.value)).toInt()
+        progress.animateTo(1f, PocketMotion.glyphPulse(remainingMillis).orSnap(motion))
     }
     return progress.asState()
 }

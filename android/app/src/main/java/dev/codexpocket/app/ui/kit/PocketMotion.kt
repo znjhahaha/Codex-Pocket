@@ -2,6 +2,7 @@ package dev.codexpocket.app.ui.kit
 
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FiniteAnimationSpec
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.SpringSpec
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
@@ -42,6 +43,8 @@ internal object PocketMotion {
     fun <T> state(): FiniteAnimationSpec<T> = spring(dampingRatio = .85f, stiffness = 420f)
     /** A small overshoot for glyphs confirming an action. */
     fun <T> glyph(): FiniteAnimationSpec<T> = spring(dampingRatio = .62f, stiffness = 520f)
+    /** Constant-speed progress along a glyph's own trajectory. */
+    fun glyphPulse(millis: Int): FiniteAnimationSpec<Float> = tween(millis, easing = LinearEasing)
     fun <T> enter(): FiniteAnimationSpec<T> = tween(EnterMillis, easing = EaseOut)
     fun <T> exit(): FiniteAnimationSpec<T> = tween(ExitMillis, easing = EaseOut)
     fun <T> color(): FiniteAnimationSpec<T> = tween(ColorMillis, easing = EaseOut)
