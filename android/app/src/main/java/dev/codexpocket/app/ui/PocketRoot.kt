@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
+import dev.codexpocket.app.ui.kit.PStage
 import kotlinx.coroutines.launch
 
 @Composable
@@ -126,6 +127,8 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     LaunchedEffect(home) { if (home) { repo.clearSourcePreview(); repo.closeAgentReader() } }
     val backToParent: () -> Unit = { repo.clearSourcePreview(); repo.closeAgentReader(); if(assistantReturn) {assistantOpen=true;assistantReturn=false} else home=true }
     val openAgent: (String) -> Unit = { id -> repo.clearSourcePreview(); repo.openAgentReader(id); detail = null }
+    val openSettings: () -> Unit = { settings = true }
+    val closeSettings: () -> Unit = { settings = false }
     val holder = rememberSaveableStateHolder()
     val homeHolder = rememberSaveableStateHolder()
     val assistantHolder = rememberSaveableStateHolder()
@@ -164,12 +167,33 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
         }
         previousSelection = s.selected?.key
     }
-    BackHandler(assistantOpen || repairPairing || !home || settings || projectFiles || detail != null || s.advanced.sourcePreview != null) {
+    val goBack: () -> Unit = {
         when { assistantOpen -> assistantOpen = false; repairPairing -> repairPairing = false; s.advanced.sourcePreview != null -> repo.clearSourcePreview(); projectFiles -> { repo.clearSourcePreview(); projectFiles = false }; detail != null -> { repo.clearSourcePreview(); detail = null }; settings -> settings = false; else -> backToParent() }
     }
-    run {
-        when {
-            assistantOpen -> assistantHolder.SaveableStateProvider("assistant:${s.computerId}") { PocketPageEntrance("assistant") {
+    val canGoBack = assistantOpen || repairPairing || !home || settings || projectFiles || detail != null || s.advanced.sourcePreview != null
+    // A detail on its way out is still drawn from the item it showed.
+    val shownDetail = remember { mutableStateOf<TimelineItem?>(null) }
+    detail?.let { shownDetail.value = it }
+    fun pageFor(assistant: Boolean = assistantOpen, repair: Boolean = repairPairing, files: Boolean = projectFiles,
+        detailOpen: Boolean = detail != null, inSettings: Boolean = settings, atHome: Boolean = home) =
+        pocketPage(assistant, repair, files, detailOpen, inSettings, atHome || s.selected == null, s.initialized, s.paired)
+    val page = pageFor()
+    // Where Back leads, shown beneath the page while a back gesture is held.
+    val backPage = when {
+        assistantOpen -> pageFor(assistant = false)
+        repairPairing -> pageFor(repair = false)
+        s.advanced.sourcePreview != null -> null
+        projectFiles -> pageFor(files = false)
+        detail != null -> pageFor(detailOpen = false)
+        settings -> pageFor(inSettings = false)
+        assistantReturn -> PocketPage.Assistant
+        else -> pageFor(atHome = true)
+    }?.takeIf { it != page }
+    PStage(page, depth = { it.depth }, back = backPage, onBack = goBack.takeIf { canGoBack }) { shown ->
+        val settings = shown == PocketPage.Settings
+        val conversation = shown == PocketPage.Conversation
+        when (shown) {
+            PocketPage.Assistant -> assistantHolder.SaveableStateProvider("assistant:${s.computerId}") { Box(Modifier.fillMaxSize()) {
                 val assistantRuntime=s.assistant.snapshot?.runtimeId
                 val store=s.runtimes.firstOrNull { it.id==assistantRuntime }?.configStoreId
                 val threadLinks = ThreadLinkBinding(repo, if (store == null || assistantRuntime == null) null
@@ -189,18 +213,19 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 }
             }
             }
-            repairPairing -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { repairPairing = false })
-            projectFiles -> PocketPageEntrance("files") { ProjectFilesScreen(s.advanced.projectFiles, s.advanced.projectFilesLoading, s.advanced.projectFilesError,
+            PocketPage.Repair -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { repairPairing = false })
+            PocketPage.Files -> Box(Modifier.fillMaxSize()) { ProjectFilesScreen(s.advanced.projectFiles, s.advanced.projectFilesLoading, s.advanced.projectFilesError,
                 onNavigate = navigateFiles, onOpen = openSource, onBack = { repo.clearSourcePreview(); projectFiles = false },
                 canList = canListFiles, canRead = canReadFiles) }
-            detail != null -> PocketPageEntrance("detail:${detail!!.key}") { DetailScreen(detail!!, { repo.clearSourcePreview(); detail = null }, onSource = openSource,
+            PocketPage.Detail -> Box(Modifier.fillMaxSize()) { val item = detail ?: shownDetail.value
+                if (item != null) DetailScreen(item, { repo.clearSourcePreview(); detail = null }, onSource = openSource,
                 onComment = repo::commentOnFile, onDraftComment = draftComment, canRead = canReadFiles,
-                availableAgentIds = if (s.online) NativeActivityPresentation.describe(detail!!).agents.map { it.threadId }.toSet() else emptySet(),
+                availableAgentIds = if (s.online) NativeActivityPresentation.describe(item).agents.map { it.threadId }.toSet() else emptySet(),
                 onAgent = openAgent) }
-            s.initialized && s.paired && !settings && !conversation -> PocketPageEntrance("home", back = true) { PocketHomeFrame(s, tab,
+            PocketPage.Home -> Box(Modifier.fillMaxSize()) { PocketHomeFrame(s, tab,
                 s.approvals.count { !it.submitted && !ConversationPresentation.hookType(it.method) } + s.pendingQuestions.values.sumOf { values -> values.count { !it.flag("submitted") } },
                 homeScrolled && tab == HomeTab.Chats, hostSheet, { hostSheet = true }, { newChat = true },
-                { settings = true; if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }, onAssistant = { assistantOpen=true }) {
+                { openSettings(); if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }, onAssistant = { assistantOpen=true }) {
                 val insets = LocalHomeContentPadding.current
                 val hasNotice = s.error != null
                 Box(Modifier.fillMaxSize()) {
@@ -227,21 +252,25 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 }
                 }
             } }
-            else -> Scaffold(containerColor = Color.Transparent, topBar = {
-                if (!conversation && (s.paired || settings)) Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = homeInset), verticalAlignment = Alignment.CenterVertically) {
-                    if (settings) CircleAction(PocketIcons.ArrowBack, stringResource(R.string.back_conversation)) { settings = false }
+            else -> Column(Modifier.fillMaxSize()) {
+                val bar = !conversation && (s.paired || settings)
+                if (bar) Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = homeInset), verticalAlignment = Alignment.CenterVertically) {
+                    if (settings) CircleAction(PocketIcons.ArrowBack, stringResource(R.string.back_conversation)) { closeSettings() }
                     Text(if (settings) stringResource(R.string.settings) else if (!s.paired) "Codex Pocket" else stringResource(tab.label), Modifier.weight(1f).padding(horizontal = 6.dp), style = MaterialTheme.typography.titleLarge)
-                    if (!settings) CircleAction(PocketIcons.Settings, stringResource(R.string.settings)) { settings = true; if (s.online) repo.devices() }
+                    if (!settings) CircleAction(PocketIcons.Settings, stringResource(R.string.settings)) { openSettings(); if (s.online) repo.devices() }
                 }
-            }) { padding ->
-                Column(Modifier.fillMaxSize().padding(if (conversation) PaddingValues(0.dp) else padding)) {
+                // The bar, where there is one, has already cleared the status bar.
+                Column(Modifier.fillMaxSize().then(if (conversation) Modifier else Modifier.windowInsetsPadding(
+                    if (bar) WindowInsets.systemBars.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom) else WindowInsets.systemBars))) {
                     if (!conversation && (s.paired || settings)) s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
+                    val selected = s.selected
                     when {
-                        settings -> PocketPageEntrance("settings") { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, usageState = s.usage, onUsageRefresh = { repo.loadUsage(refresh = true) }, onUsageFilter = { repo.loadUsage(it) }) }
-                        !s.initialized -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PocketProgressStatus("正在准备") }
-                        !s.paired -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { settings = true })
-                        conversation -> holder.SaveableStateProvider(s.selected!!.key.encoded) {
-                            PocketPageEntrance(s.selected!!.key.encoded) {
+                        settings -> Box(Modifier.fillMaxSize()) { SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, usageState = s.usage, onUsageRefresh = { repo.loadUsage(refresh = true) }, onUsageFilter = { repo.loadUsage(it) }) }
+                        shown == PocketPage.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PocketProgressStatus("正在准备") }
+                        shown == PocketPage.Pairing -> PairScreen(s.busy, repo::pair, phase = s.pairingPhase, error = s.error, onDismiss = { openSettings() })
+                        selected != null -> holder.SaveableStateProvider(selected.key.encoded) {
+                            // The stage brings the page in; this replays only when the conversation itself changes.
+                            PocketPageEntrance(selected.key.encoded, initial = false) {
                                 CompositionLocalProvider(LocalComposerMenuBinding provides ComposerMenuBinding(
                                     expanded = modelSheet, onAnchor = { if (!modelSheet) modelAnchor = it },
                                 ), LocalNativeAgentNames provides s.agentChats.associate { it.key.nativeId to it.title }, LocalNativeAgentReader provides openAgent,
@@ -347,6 +376,23 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
             confirmButton = { PocketButton(stringResource(R.string.save), enabled = text.isNotBlank() && canMutate(s, "thread/name/set"), onClick = { repo.rename(text); rename = false }) },
             dismissButton = { PocketButton(stringResource(R.string.cancel), onClick = { rename = false }, secondary = true) })
     }
+}
+
+/** The destinations of the root stage. Deeper pages push over shallower ones; equals fade. */
+internal enum class PocketPage(val depth: Int) { Loading(0), Pairing(0), Home(0), Settings(1), Assistant(1), Conversation(2), Repair(3), Files(3), Detail(3) }
+
+/** The page the root shows for these flags, in the order the screens take precedence. */
+internal fun pocketPage(assistant: Boolean, repair: Boolean, files: Boolean, detail: Boolean, settings: Boolean, home: Boolean,
+    initialized: Boolean, paired: Boolean): PocketPage = when {
+    assistant -> PocketPage.Assistant
+    repair -> PocketPage.Repair
+    files -> PocketPage.Files
+    detail -> PocketPage.Detail
+    initialized && paired && !settings && home -> PocketPage.Home
+    settings -> PocketPage.Settings
+    !initialized -> PocketPage.Loading
+    !paired -> PocketPage.Pairing
+    else -> PocketPage.Conversation
 }
 
 @Composable

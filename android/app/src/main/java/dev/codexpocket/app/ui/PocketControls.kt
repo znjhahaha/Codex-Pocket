@@ -109,8 +109,10 @@ internal fun PocketMenuItem(label: String, icon: ImageVector?, onClick: () -> Un
 internal fun PocketRefreshGlyph(turns: Int) = PPulseGlyph(MotionGlyphs.Refresh, turns, Modifier.size(19.dp))
 
 @Composable
-internal fun PocketPageEntrance(key: String, back: Boolean = false, content: @Composable () -> Unit) {
-    val progress = remember(key) { Animatable(if (pocketMotionMillis(1) == 0) 1f else 0f) }
+internal fun PocketPageEntrance(key: String, back: Boolean = false, initial: Boolean = true, content: @Composable () -> Unit) {
+    // With [initial] off the first key is simply shown: something else has already brought the page in.
+    val first = remember { arrayOf<String?>(if (initial) null else key) }
+    val progress = remember(key) { Animatable(if (pocketMotionMillis(1) == 0 || first[0] == key) 1f else 0f) }
     // Push comes in from the right; returning to a parent page settles in from a short parallax on the left (iOS).
     val distance = with(LocalDensity.current) { (if (back) -18 else 28).dp.toPx() }
     // Spring, not a fixed tween: fast start, gentle settle, no visible end "stop".

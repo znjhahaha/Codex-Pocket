@@ -49,11 +49,14 @@ import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kyant.backdrop.Backdrop
+import dev.codexpocket.app.ui.kit.PBackHandler
 import dev.codexpocket.app.ui.kit.PSurface
 import dev.codexpocket.app.ui.kit.Pocket
 import dev.codexpocket.app.ui.kit.PocketHaptic
 import dev.codexpocket.app.ui.kit.PocketMotion
 import dev.codexpocket.app.ui.kit.orSnap
+import dev.codexpocket.app.ui.kit.rubberBand
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import dev.codexpocket.app.ui.kit.rememberPocketHaptics
 import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import com.kyant.backdrop.backdrops.layerBackdrop
@@ -64,6 +67,8 @@ import kotlin.math.roundToInt
 
 private class OverlayEntry(val content: @Composable (Boolean) -> Unit) {
     var present by mutableStateOf(true)
+    /** Sheets and pages cross the screen to leave; menus and dialogs fade where they are. */
+    var travels by mutableStateOf(false)
 }
 private class OverlayRegistry {
     val entries = mutableStateListOf<OverlayEntry>()
@@ -117,8 +122,9 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
                         transitionSpec = {
                             when {
                                 pocketMotionMillis(1) == 0 -> snap()
-                                targetState -> spring(dampingRatio = .86f, stiffness = 520f)
-                                else -> tween(140, easing = FastOutLinearInEasing)
+                                targetState -> if (entry.travels) PocketMotion.page() else PocketMotion.morph()
+                                // Leaving is quicker than arriving, and accelerates away rather than easing to a stop.
+                                else -> tween(if (entry.travels) 230 else 140, easing = FastOutLinearInEasing)
                             }
                         },
                         label = "modal-progress",
@@ -136,46 +142,18 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
     }
 }
 
-/**
- * BackHandler that also hears the back gesture's progress where the system reports it (Android 14 and
- * later, for an activity that opts in). Committing stays the same synchronous call on every release;
- * without progress events this is exactly BackHandler.
- */
-@Composable
-private fun PocketBackHandler(enabled: Boolean, onProgress: (BackEventCompat) -> Unit, onCancel: () -> Unit, onBack: () -> Unit) {
-    val progress by rememberUpdatedState(onProgress)
-    val cancel by rememberUpdatedState(onCancel)
-    val back by rememberUpdatedState(onBack)
-    val callback = remember {
-        object : OnBackPressedCallback(enabled) {
-            override fun handleOnBackStarted(backEvent: BackEventCompat) = progress(backEvent)
-            override fun handleOnBackProgressed(backEvent: BackEventCompat) = progress(backEvent)
-            override fun handleOnBackCancelled() = cancel()
-            override fun handleOnBackPressed() = back()
-        }
-    }
-    SideEffect { callback.isEnabled = enabled }
-    val dispatcher = checkNotNull(LocalOnBackPressedDispatcherOwner.current) {
-        "No OnBackPressedDispatcherOwner was provided via LocalOnBackPressedDispatcherOwner"
-    }.onBackPressedDispatcher
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, dispatcher) {
-        dispatcher.addCallback(lifecycleOwner, callback)
-        onDispose { callback.remove() }
-    }
-}
-
 /** Register in composition order and retain identity until disposed, including nested sheets. */
 @Composable
-private fun PocketOverlay(content: @Composable (Boolean) -> Unit) {
+private fun PocketOverlay(travels: Boolean = false, content: @Composable (Boolean) -> Unit) {
     val registry = LocalOverlayRegistry.current
     if (registry == null) {
         // Standalone previews and isolated tests get the same window architecture.
-        PocketOverlayHost { PocketOverlay(content) }
+        PocketOverlayHost { PocketOverlay(travels, content) }
         return
     }
     val latest by rememberUpdatedState(content)
-    val entry = remember { OverlayEntry { top -> latest(top) } }
+    val entry = remember { OverlayEntry { top -> latest(top) }.also { it.travels = travels } }
+    SideEffect { entry.travels = travels }
     DisposableEffect(registry, entry) {
         registry.entries.add(entry)
         onDispose { entry.present = false }
@@ -197,7 +175,7 @@ internal fun PocketModal(
     maxHeightFraction: Float = .55f,
     content: @Composable ColumnScope.(Modifier) -> Unit,
 ) {
-    PocketOverlay { top ->
+    PocketOverlay(travels = screen || (sheet && !anchored)) { top ->
         val focus = remember { FocusRequester() }
         val focusManager = LocalFocusManager.current
         val scope = rememberCoroutineScope()
@@ -217,7 +195,7 @@ internal fun PocketModal(
         // How far a back gesture has pulled this layer toward leaving: 0 at rest, 1 at the gesture's end.
         val pull = remember { Animatable(0f) }
         // Keep owning Back and pointer input until the exit animation removes this entry.
-        PocketBackHandler(top,
+        PBackHandler(top,
             onProgress = { event -> if (motion && inputActive()) scope.launch { pull.snapTo(event.progress.coerceIn(0f, 1f)) } },
             onCancel = { scope.launch { pull.animateTo(0f, settle) } }) {
             if (inputActive()) currentDismiss()
@@ -254,7 +232,10 @@ internal fun PocketModal(
                 }
             }) {
             // Scrim and hit interception remain entirely outside the capture layer.
-            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (screen) 0f else .18f * progress.coerceIn(0f, 1f)))
+            Box(Modifier.matchParentSize().drawBehind {
+                    val shown = progress.coerceIn(0f, 1f)
+                    drawRect(Color.Black, alpha = if (screen) .14f * shown * (1f - pull.value.coerceIn(0f, 1f)) else .18f * shown)
+                }
                 .focusProperties { canFocus = false }
                 .clickable(remember { MutableInteractionSource() }, indication = null, enabled = top) {
                     if (inputActive()) currentDismiss()
@@ -264,25 +245,35 @@ internal fun PocketModal(
             // A back gesture thins that page so the one underneath shows where this one has moved aside.
             val pageColor = Pocket.colors.bg
             BoxWithConstraints(Modifier.fillMaxSize()
-                .then(if (screen) Modifier.drawBehind { drawRect(pageColor, alpha = 1f - pull.value.coerceIn(0f, 1f)) } else Modifier)
+                // The page colour travels with the page, so what it covers stays visible until it arrives.
+                .then(if (screen) Modifier.drawBehind {
+                    val aside = (1f - progress.coerceIn(0f, 1f)) * size.width + pull.value.coerceIn(0f, 1f) * size.width * PageHeldTravel
+                    drawRect(pageColor, topLeft = Offset(aside, 0f))
+                } else Modifier)
                 .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else if (maxWidthDp > 360f) 16.dp else 12.dp),
                 // Sheets rise from the bottom edge like iOS action sheets; dialogs stay centered.
                 contentAlignment = if (sheet && !screen && !anchored) Alignment.BottomCenter else Alignment.Center) {
                 val handle = if (sheet && !screen && !anchored && interactive) Modifier.pointerInput(Unit) {
                     var distance = 0f
+                    val velocity = VelocityTracker()
                     detectVerticalDragGestures(
-                        onDragStart = { distance = 0f },
+                        onDragStart = { distance = 0f; velocity.resetTracking() },
                         onVerticalDrag = { change, amount ->
                             change.consume()
+                            velocity.addPosition(change.uptimeMillis, change.position)
                             val armed = distance > 72.dp.toPx()
-                            distance = (distance + amount).coerceAtLeast(0f)
+                            distance += amount
                             // The finger feels the point past which letting go dismisses, and the way back.
                             if (distance > 72.dp.toPx() != armed) haptics.perform(if (armed) PocketHaptic.Tick else PocketHaptic.Threshold)
-                            scope.launch { drag.snapTo(distance) }
+                            // Downward it follows the finger; upward it has nowhere to go and only gives a little.
+                            val shown = if (distance >= 0f) distance else rubberBand(distance, 120.dp.toPx())
+                            scope.launch { drag.snapTo(shown) }
                         },
                         onDragEnd = {
-                            if (distance > 72.dp.toPx() && inputActive()) currentDismiss()
-                            else scope.launch { drag.animateTo(0f, settle) }
+                            // A flick down dismisses however short it was; a slow drag has to pass the threshold.
+                            val flung = velocity.calculateVelocity().y > 900.dp.toPx() && distance > 8.dp.toPx()
+                            if ((distance > 72.dp.toPx() || flung) && inputActive()) currentDismiss()
+                            else scope.launch { drag.animateTo(0f, PocketMotion.rebound<Float>().orSnap(motion)) }
                         },
                         onDragCancel = { scope.launch { drag.animateTo(0f, settle) } },
                     )
@@ -292,13 +283,18 @@ internal fun PocketModal(
                         .heightIn(max = if (screen || anchored) maxHeight else maxHeight * maxHeightFraction.coerceIn(.1f, 1f)).graphicsLayer {
                             // A back gesture previews the way out: sheets sink, pages start toward the trailing edge, the rest recede.
                             val leaving = pull.value.coerceIn(0f, 1f)
-                            translationY = drag.value + (if (screen) 0f else (1f - progress) * (if (sheet) 28 else 8).dp.toPx()) +
-                                if (sheet && !screen && !anchored) leaving * 28.dp.toPx() else 0f
-                            // Pages push in from the trailing edge (a third of a screen), like UINavigationController.
-                            translationX = if (screen) (1f - progress) * size.width * .32f + leaving * size.width * .14f else 0f
-                            alpha = progress.coerceIn(0f, 1f)
+                            val bottomSheet = sheet && !screen && !anchored
+                            // A sheet rises from below the screen by its whole height and leaves the same way; it never fades in place.
+                            translationY = drag.value + when {
+                                screen -> 0f
+                                bottomSheet -> (1f - progress) * (size.height + 24.dp.toPx()) + leaving * 28.dp.toPx()
+                                else -> (1f - progress) * 10.dp.toPx()
+                            }
+                            // Pages push in across the whole width from the trailing edge, like UINavigationController.
+                            translationX = if (screen) (1f - progress) * size.width + leaving * size.width * PageHeldTravel else 0f
+                            alpha = if (screen || bottomSheet) 1f else (progress * 1.6f).coerceIn(0f, 1f)
                             // Popovers grow out of the control that opened them, like an iOS context menu.
-                            val from = if (anchored) .86f else .97f
+                            val from = if (anchored) .62f else .92f
                             val recede = if (sheet) 1f else 1f - .05f * leaving
                             scaleX = if (screen) 1f else (from + progress * (1f - from)) * recede
                             scaleY = if (screen) 1f else (from + progress * (1f - from)) * recede
@@ -328,6 +324,9 @@ internal fun PocketModal(
         }
     }
 }
+
+/** How far across the screen a back gesture can drag a page before it is let go. */
+private const val PageHeldTravel = .86f
 
 /** Measure the menu before placing it so the first visible frame is already above its anchor. */
 @Composable

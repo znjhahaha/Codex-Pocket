@@ -20,6 +20,9 @@ import androidx.core.view.WindowCompat
 import dev.codexpocket.app.ui.kit.PocketColors
 import dev.codexpocket.app.ui.kit.PocketDarkColors
 import dev.codexpocket.app.ui.kit.PocketLightColors
+import dev.codexpocket.app.ui.kit.PocketPressIndication
+import androidx.compose.foundation.LocalIndication
+import dev.codexpocket.app.ui.kit.ProvidePocketOverscroll
 import dev.codexpocket.app.ui.kit.ProvidePocketTokens
 
 /** Codex-neutral surfaces; violet is reserved for selected controls. */
@@ -73,7 +76,9 @@ fun PocketTheme(theme: String, content: @Composable () -> Unit) {
         labelLarge = TextStyle(fontFamily = PocketReadingFont, fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium),
         labelMedium = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
         labelSmall = TextStyle(fontFamily = PocketReadingFont, fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.Normal),
-    )) { ProvidePocketTokens(pocketTokens(dark, colors)) { CompositionLocalProvider(LocalContentColor provides colors.onSurface, content = content) } }
+    )) { ProvidePocketTokens(pocketTokens(dark, colors)) { CompositionLocalProvider(LocalContentColor provides colors.onSurface,
+        // Every plain clickable answers a touch the way Pocket's own controls do, not with a ripple.
+        LocalIndication provides PocketPressIndication(pressedScale = .985f)) { ProvidePocketOverscroll(content) } } }
 }
 
 /** Pocket's own tokens for this appearance. Screens still on Material read the same values from [scheme]. */
