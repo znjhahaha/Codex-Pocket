@@ -8,6 +8,7 @@ use std::{
 
 struct Call {
     turn: String,
+    execution_turn: Option<String>,
     id: String,
     aliases: BTreeSet<String>,
     arguments: Value,
@@ -170,6 +171,7 @@ fn completed(path: &Path, thread: &str) -> Option<Vec<Call>> {
                 id.into(),
                 Call {
                     turn: turn.into(),
+                    execution_turn: active.clone(),
                     id: id.into(),
                     aliases,
                     arguments,
@@ -179,7 +181,14 @@ fn completed(path: &Path, thread: &str) -> Option<Vec<Call>> {
                 },
             );
         } else if let Some(call) = calls.get_mut(id) {
-            if turn(payload, active.as_deref()) != Some(call.turn.as_str()) {
+            let result_turn = turn(payload, active.as_deref());
+            // Desktop display metadata can put a question in its own UI turn,
+            // while the result keeps the enclosing execution turn. Accept that
+            // pair only within the same observed execution and unique call ID.
+            let same_execution = call.execution_turn.as_deref().is_some_and(|execution| {
+                active.as_deref() == Some(execution) && result_turn == Some(execution)
+            });
+            if result_turn != Some(call.turn.as_str()) && !same_execution {
                 call.invalid = true;
                 continue;
             }
@@ -231,6 +240,38 @@ fn aliases(item: &Value) -> BTreeSet<String> {
         .into_iter()
         .filter_map(|key| identity(&item[key]).map(str::to_owned))
         .collect()
+}
+fn restore_missing_answer(item: &mut Value, call: &Call) {
+    if item["status"] != "completed" || item["success"] == false {
+        return;
+    }
+    if !item["arguments"].is_null()
+        && arguments(&item["arguments"]).as_ref() != Some(&call.arguments)
+    {
+        return;
+    }
+    // A native answer, cancellation or malformed answer envelope is never
+    // replaced by supplemental history. Other output blocks stay in place.
+    if ["contentItems", "toolOutputBlocks"].iter().any(|key| {
+        item[*key].as_array().into_iter().flatten().any(|part| {
+            object(&part["text"]).is_some_and(|value| value.get("answers").is_some())
+        })
+    }) {
+        return;
+    }
+    let Some(answer) = call.answer.as_ref().or(call.verified.as_ref()) else { return; };
+    let mut content = item["contentItems"].as_array().cloned().unwrap_or_default();
+    content.push(json!({"type":"inputText","text":answer.to_string()}));
+    item["arguments"] = call.arguments.clone();
+    item["contentItems"] = json!(content);
+    // Media projection treats these blocks as authoritative when the field is
+    // present. Keep both representations in sync, retaining other tool output.
+    if item.get("toolOutputBlocks").is_some() {
+        let mut blocks = item["toolOutputBlocks"].as_array().cloned().unwrap_or_default();
+        blocks.push(json!({"type":"text","text":answer.to_string()}));
+        item["toolOutputBlocks"] = json!(blocks);
+    }
+    item["pocketHistorySupplement"] = json!(true);
 }
 fn sanitize(item: &mut Value, proven: Option<&Call>) {
     let args = proven
@@ -313,6 +354,9 @@ pub(super) fn project(
             if seen.len() < 1024 {
                 seen.extend(identities);
             }
+            if let Some(call) = call {
+                restore_missing_answer(item, call);
+            }
             sanitize(item, call);
         }
         if !append || seen.len() >= 1024 {
@@ -389,6 +433,123 @@ mod tests {
             &mut BTreeMap::new(),
         );
         view
+    }
+    #[test]
+    fn desktop_question_display_turn_can_differ_from_its_result_execution_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        let mut data = records(false);
+        data[2]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = json!("display-turn");
+        write(&path, &data);
+        let mut native = json!({"thread":{"id":"thread","turns":[{"id":"display-turn","items":[]}]}});
+        project(&mut native, Some(&path), "thread", "thread/read", "", &BTreeSet::new(), &mut BTreeMap::new());
+        let items = native["thread"]["turns"][0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "The unique call and result share the same enclosing execution turn");
+        let answer: Value = serde_json::from_str(items[0]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(answer["answers"]["q"]["answers"][0], "SECRET-SENTINEL");
+    }
+    #[test]
+    fn completed_rollout_supplies_missing_answer_on_the_existing_native_card() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        write(&path, &records(false));
+        let mut native = json!({"thread":{"id":"thread","turns":[{"id":"turn","items":[{
+            "id":"fc-id","callId":"call-id","type":"dynamicToolCall","tool":"request_user_input",
+            "status":"completed","success":true,"arguments":{"questions":[{"id":"q","question":"Choose","isSecret":false}]},"contentItems":[]
+        }]}]}});
+        project(&mut native, Some(&path), "thread", "thread/read", "", &BTreeSet::new(), &mut BTreeMap::new());
+        let items = native["thread"]["turns"][0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "fc-id");
+        assert_eq!(items[0]["contentItems"].as_array().unwrap().len(), 1);
+        let answer: Value = serde_json::from_str(items[0]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(answer["answers"]["q"]["answers"][0], "SECRET-SENTINEL");
+    }
+    #[test]
+    fn restored_answer_survives_media_projection_with_existing_output_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        write(&path, &records(false));
+        let media = crate::media::MediaStore::new(root.path()).unwrap();
+        for blocks in [json!([]), json!([{"type":"text","text":"Existing tool note"}]), Value::Null] {
+            let mut native = json!({"thread":{"id":"thread","turns":[{"id":"turn","items":[{
+                "id":"fc-id","callId":"call-id","type":"dynamicToolCall","tool":"request_user_input",
+                "status":"completed","success":true,"arguments":{"questions":[{"id":"q","question":"Choose","isSecret":false}]},
+                "contentItems":[],"toolOutputBlocks":blocks
+            }]}]}});
+            for _ in 0..2 {
+                project(&mut native, Some(&path), "thread", "thread/read", "", &BTreeSet::new(), &mut BTreeMap::new());
+                sanitize_history(&mut native);
+                native = media.project(&native, "runtime", "connection", "thread");
+            }
+            let items = native["thread"]["turns"][0]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["id"], "fc-id");
+            let content = items[0]["contentItems"].as_array().unwrap();
+            let found: Vec<_> = content.iter().filter_map(|part| answers(&part["text"], &items[0]["arguments"])).collect();
+            assert_eq!(found.len(), 1, "Media projection must retain exactly one proven answer");
+            assert_eq!(found[0]["answers"]["q"]["answers"][0], "SECRET-SENTINEL");
+            if blocks.as_array().is_some_and(|parts| !parts.is_empty()) {
+                assert!(content.iter().any(|part| part["text"] == "Existing tool note"));
+            }
+        }
+    }
+    #[test]
+    fn desktop_result_cannot_borrow_another_execution_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        let mut data = records(false);
+        data[2]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = json!("display-turn");
+        data.insert(3, json!({"type":"turn_context","payload":{"turn_id":"another-execution"}}));
+        write(&path, &data);
+        assert!(completed(&path, "thread").unwrap().is_empty());
+    }
+    #[test]
+    fn canonical_answers_cancellations_and_changed_questions_are_not_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        write(&path, &records(false));
+        for mode in 0..4 {
+            let mut item = json!({"id":"fc-id","callId":"call-id","type":"dynamicToolCall","tool":"request_user_input",
+                "status":"completed","success":true,"arguments":{"questions":[{"id":"q","question":"Choose","isSecret":false}]},"contentItems":[]});
+            match mode {
+                0 => item["contentItems"] = json!([{"type":"inputText","text":json!({"answers":{"q":{"answers":["Native choice"]}}}).to_string()}]),
+                1 => item["contentItems"] = json!([{"type":"inputText","text":"{\"answers\":{}}"}]),
+                2 => item["arguments"]["questions"][0]["question"] = json!("Different question"),
+                _ => item["success"] = json!(false),
+            }
+            let original = item.clone();
+            let mut native = json!({"thread":{"id":"thread","turns":[{"id":"turn","items":[item]}]}});
+            project(&mut native, Some(&path), "thread", "thread/read", "", &BTreeSet::new(), &mut BTreeMap::new());
+            assert_eq!(native["thread"]["turns"][0]["items"][0], original, "mode {mode}");
+        }
+    }
+    #[test]
+    #[ignore = "Explicit read-only rollout probe; reports counts, never questions or answers"]
+    fn configured_rollout_recovers_answered_calls_without_duplicate_cards() {
+        let path = std::env::var("POCKET_QUESTION_ROLLOUT").expect("Set the explicit local rollout path");
+        let thread = std::env::var("POCKET_QUESTION_THREAD").expect("Set the matching thread ID");
+        let expected = std::env::var("POCKET_QUESTION_CALLS").expect("Set the call IDs being inspected");
+        let calls = completed(Path::new(&path), &thread).expect("Question history unavailable");
+        let selected: Vec<_> = expected.split(',').map(|id| {
+            calls.iter().find(|call| call.id == id).expect("An answered call was omitted")
+        }).collect();
+        let mut native = json!({"thread":{"id":thread,"turns":selected.iter().map(|call| json!({
+            "id":call.turn,"items":[{"id":call.id,"callId":call.id,"type":"dynamicToolCall","tool":"request_user_input",
+            "status":"completed","success":true,"arguments":call.arguments,"contentItems":[]}]
+        })).collect::<Vec<_>>()}});
+        for _ in 0..2 {
+            project(&mut native, Some(Path::new(&path)), &thread, "thread/read", "", &BTreeSet::new(), &mut BTreeMap::new());
+        }
+        for turn in native["thread"]["turns"].as_array().unwrap() {
+            let items = turn["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1);
+            let parts = items[0]["contentItems"].as_array().unwrap();
+            assert_eq!(parts.len(), 1);
+            let result: Value = serde_json::from_str(parts[0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(result["answers"].as_object().unwrap().len(), items[0]["arguments"]["questions"].as_array().unwrap().len());
+        }
+        println!("Verified {} answered calls without duplicate history cards", selected.len());
     }
     #[test]
     fn unparseable_question_metadata_cannot_bypass_secret_redaction() {
