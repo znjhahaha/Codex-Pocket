@@ -120,12 +120,13 @@ private fun QuickTile(label: String, icon: ImageVector, onClick: () -> Unit, mod
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .92f else 1f, pocketPressSpring(), label = "quick-tile")
+    val taps = rememberPTaps()
     Column(modifier.heightIn(min = 60.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketOval)
         .background(if (pressed) c.fillStrongest else c.fillStrong.copy(alpha = .75f))
-        .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
+        .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = taps.then(onClick))
         .padding(horizontal = 6.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically)) {
         val tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .5f)
-        PIcon(icon, null, Modifier.size(19.dp), tint = tint)
+        PTapIcon(icon, taps.count, Modifier.size(19.dp), tint = tint)
         PText(label, style = Pocket.type.labelSmall, color = tint, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }

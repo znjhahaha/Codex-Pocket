@@ -178,13 +178,14 @@ internal fun UsageChipButton(text: String, onClick: () -> Unit, modifier: Modifi
     val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val ink = if (active) c.onAccentSoft else c.ink
+    val taps = rememberPTaps()
     Row(modifier.heightIn(min = PocketSpace.touch).widthIn(min = PocketSpace.touch).pocketPressScale(interaction, .96f).clip(PocketRadii.capsule)
         .background(if (active) c.accentSoft else c.fill)
-        .pocketPressable(interactionSource = interaction, pressedScale = 1f, haptic = PocketHaptic.Tap, tint = ink, onClick = onClick)
+        .pocketPressable(interactionSource = interaction, pressedScale = 1f, haptic = PocketHaptic.Tap, tint = ink, onClick = taps.then(onClick))
         .padding(horizontal = 14.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically) {
         ProvidePInk(ink, Pocket.type.labelSmall) {
-            if (leading != null) PIcon(leading, null, Modifier.size(16.dp))
+            if (leading != null) PTapIcon(leading, taps.count, Modifier.size(16.dp))
             PText(text, maxLines = 1, softWrap = false)
         }
     }

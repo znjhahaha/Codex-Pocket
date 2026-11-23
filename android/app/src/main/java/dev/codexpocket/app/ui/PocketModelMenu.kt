@@ -271,10 +271,11 @@ internal fun FastLightning(s: PocketState, onFast: (Boolean) -> Unit) {
 @Composable
 private fun ModeRow(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, on: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Pocket.colors
+    val taps = rememberPTaps()
     Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
-        .pocketPressable(enabled, Role.Switch, pressedScale = .985f, onClick = onClick)
+        .pocketPressable(enabled, Role.Switch, pressedScale = .985f, onClick = taps.then(onClick))
         .padding(start = 10.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        PIcon(icon, null, Modifier.size(17.dp), tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .6f))
+        PTapIcon(icon, taps.count, Modifier.size(17.dp), tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .6f))
         PText(label, Modifier.weight(1f), style = Pocket.type.body, color = if (enabled) c.ink else c.inkMuted.copy(alpha = .7f),
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Box(Modifier.graphicsLayer { scaleX = .82f; scaleY = .82f }) { PocketToggle(on, null, enabled = enabled) }

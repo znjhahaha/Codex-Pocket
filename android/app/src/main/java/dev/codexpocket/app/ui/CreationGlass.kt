@@ -89,8 +89,9 @@ internal class CreationTideShape(private val progress: Float) : Shape {
 
 @Composable
 internal fun CreationIconButton(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    CreationCapsule(onClick, Modifier.size(48.dp).semantics { contentDescription = label }, enabled) {
-        PIcon(icon, null, Modifier.size(20.dp))
+    val taps = rememberPTaps()
+    CreationCapsule(taps.then(onClick), Modifier.size(48.dp).semantics { contentDescription = label }, enabled) {
+        PTapIcon(icon, taps.count, Modifier.size(20.dp))
     }
 }
 

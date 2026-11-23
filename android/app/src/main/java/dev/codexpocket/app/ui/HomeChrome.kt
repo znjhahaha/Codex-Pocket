@@ -45,20 +45,9 @@ private enum class HomeFrameSlot { Header, Dock, Content }
 /** Home's own moving glyphs, on the kit's grid. Each rests in the pose of the static icon it replaces. */
 internal object HomeGlyphs {
     /** The bubble hops while its two lines are written again. */
-    val Chat = MotionGlyph { t ->
-        val first = 1f - .75f * GlyphMotion.pulse(GlyphMotion.window(t, 0f, .7f))
-        val second = 1f - .75f * GlyphMotion.pulse(GlyphMotion.window(t, .25f, 1f))
-        move(0f, -1.2f * GlyphMotion.pulse(t)) {
-            path("M7 4.5h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H10l-5.5 3V7.5a3 3 0 0 1 3-3")
-            line(8.5f, 9f, 8.5f + 7f * first, 9f); line(8.5f, 13f, 8.5f + 4.5f * second, 13f)
-        }
-    }
+    val Chat = IconGlyphs.Chat
     /** The phone steps out from the monitor and back. */
-    val Devices = MotionGlyph { t ->
-        val step = GlyphMotion.pulse(t)
-        path("M12.5 16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2M8 16v4M5.5 20h6")
-        move(1.1f * step, -1.1f * step) { path("M16 10h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1M17.5 18.5h1") }
-    }
+    val Devices = IconGlyphs.Devices
     /** 0 is search, 1 is close: the handle grows into one stroke of the cross as the lens gives way to the other. */
     val SearchClose = MotionGlyph { t ->
         val lens = 1f - GlyphMotion.window(t, 0f, .55f)

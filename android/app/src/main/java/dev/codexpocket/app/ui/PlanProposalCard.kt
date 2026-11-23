@@ -56,8 +56,9 @@ internal fun planPress(onClick: () -> Unit, enabled: Boolean = true): Modifier {
 
 @Composable
 internal fun PlanIconAction(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    Box(Modifier.size(48.dp).then(planPress(onClick, enabled)), contentAlignment = Alignment.Center) {
-        PIcon(icon, label, Modifier.size(19.dp), tint = Pocket.colors.inkMuted)
+    val taps = rememberPTaps()
+    Box(Modifier.size(48.dp).then(planPress(taps.then(onClick), enabled)), contentAlignment = Alignment.Center) {
+        PTapIcon(icon, taps.count, Modifier.size(19.dp), tint = Pocket.colors.inkMuted, contentDescription = label)
     }
 }
 

@@ -438,7 +438,7 @@ internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -
 internal fun CircleAction(icon: ImageVector, label: String, onClick: () -> Unit) {
     var taps by remember { mutableIntStateOf(0) }
     PocketGlassSurface(modifier = Modifier.size(48.dp), shape = CircleShape, onClick = { taps++; onClick() }) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PIcon(icon, label, Modifier.size(21.dp).pocketIconMotion(taps, pocketIconMotion(icon))) }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PTapIcon(icon, taps, Modifier.size(21.dp), contentDescription = label) }
     }
 }
 

@@ -138,7 +138,8 @@ internal fun CompactionStatusRow(label: String, modifier: Modifier = Modifier) {
 /** Small gray icon under an answer; the press is a soft circle, not a 48dp tile. */
 @Composable
 internal fun QuietAction(icon: ImageVector, label: String, onClick: () -> Unit) {
-    QuietAction(onClick) { PIcon(icon, label, Modifier.size(17.dp), tint = Pocket.colors.inkMuted) }
+    val taps = rememberPTaps()
+    QuietAction(taps.then(onClick)) { PTapIcon(icon, taps.count, Modifier.size(17.dp), tint = Pocket.colors.inkMuted, contentDescription = label) }
 }
 
 @Composable

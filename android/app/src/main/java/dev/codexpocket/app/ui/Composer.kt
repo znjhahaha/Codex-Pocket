@@ -491,11 +491,12 @@ private fun ComposerPill(label: String, icon: androidx.compose.ui.graphics.vecto
     val scale by animateFloatAsState(if (pressed) .94f else 1f, pocketPressSpring(), label = "composer-pill")
     val fill by animateColorAsState(if (pressed) c.fillStrongest else c.fillStrong.copy(alpha = .75f), tween(pocketMotionMillis(120)), label = "composer-pill-fill")
     val tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .55f)
-    Box(modifier.heightIn(min = 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick),
+    val taps = rememberPTaps()
+    Box(modifier.heightIn(min = 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = taps.then(onClick)),
         contentAlignment = Alignment.Center) {
         Row(Modifier.height(34.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketCapsule).background(fill)
             .padding(horizontal = if (showLabel) 12.dp else 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            PIcon(icon, null, Modifier.size(16.dp), tint = tint)
+            PTapIcon(icon, taps.count, Modifier.size(16.dp), tint = tint)
             if (showLabel) PText(label, maxLines = 1, style = Pocket.type.label, color = tint)
         }
     }
@@ -588,9 +589,10 @@ private fun QueueIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, lab
     val pressed by interaction.collectIsPressedAsState()
     val tint by animateColorAsState(when { !enabled -> c.inkMuted.copy(alpha = .45f); pressed -> c.ink; else -> c.inkMuted },
         tween(pocketMotionMillis(120)), label = "queue-icon")
-    Box(Modifier.size(40.dp, 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
+    val taps = rememberPTaps()
+    Box(Modifier.size(40.dp, 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = taps.then(onClick))
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
-        PIcon(icon, null, Modifier.size(17.dp), tint = tint)
+        PTapIcon(icon, taps.count, Modifier.size(17.dp), tint = tint)
     }
 }
 

@@ -169,7 +169,8 @@ internal fun DiffFallbackNotice(fallback: InlineDiffFallback, modifier: Modifier
 
 @Composable
 private fun InlineDiffAction(icon: ImageVector, label: String, onClick: () -> Unit) {
-    Box(Modifier.size(32.dp).clickable(role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-        PIcon(icon, label, Modifier.size(16.dp), tint = Pocket.colors.inkMuted)
+    val taps = rememberPTaps()
+    Box(Modifier.size(32.dp).clickable(role = Role.Button, onClick = taps.then(onClick)), contentAlignment = Alignment.Center) {
+        PTapIcon(icon, taps.count, Modifier.size(16.dp), tint = Pocket.colors.inkMuted, contentDescription = label)
     }
 }

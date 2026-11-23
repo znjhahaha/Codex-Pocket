@@ -103,7 +103,7 @@ internal fun PGlassIconButton(icon: ImageVector, label: String, onClick: () -> U
     var taps by remember { mutableIntStateOf(0) }
     PocketGlassSurface(modifier.size(PocketSpace.touch).semantics { contentDescription = label }, CircleShape, onClick = { taps++; onClick() }) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            ProvidePInk(Pocket.colors.ink) { if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp).pocketIconMotion(taps, motion)) }
+            ProvidePInk(Pocket.colors.ink) { if (glyph != null) glyph() else PTapIcon(icon, taps, Modifier.size(20.dp), motion = motion) }
         }
     }
 }

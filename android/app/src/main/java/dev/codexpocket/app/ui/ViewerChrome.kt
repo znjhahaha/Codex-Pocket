@@ -115,11 +115,12 @@ internal fun ViewerToggle(label: String, icon: ImageVector, on: Boolean, onClick
     val scale by animateFloatAsState(if (pressed) .92f else 1f, pocketPressSpring(), label = "viewer-toggle")
     val fill by animateColorAsState(if (on) c.accentSoft else c.fillStrong, tween(pocketMotionMillis(160)), label = "viewer-toggle-fill")
     val tint by animateColorAsState(if (on) c.onAccentSoft else c.inkMuted, tween(pocketMotionMillis(160)), label = "viewer-toggle-tint")
+    val taps = rememberPTaps()
     Row(modifier.height(36.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketCapsule).background(fill)
-        .clickable(interactionSource = interaction, indication = null, role = Role.Switch, onClick = onClick)
+        .clickable(interactionSource = interaction, indication = null, role = Role.Switch, onClick = taps.then(onClick))
         .semantics { contentDescription = description; selected = on }.padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        PIcon(icon, null, Modifier.size(16.dp), tint = tint)
+        PTapIcon(icon, taps.count, Modifier.size(16.dp), tint = tint)
         if (label.isNotBlank()) PText(label, style = Pocket.type.labelSmall, color = tint, maxLines = 1)
     }
 }

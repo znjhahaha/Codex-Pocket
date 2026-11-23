@@ -60,6 +60,7 @@ internal fun PButton(text: String, onClick: () -> Unit, modifier: Modifier = Mod
     val motion = rememberPocketMotion()
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
+    var taps by remember { mutableIntStateOf(0) }
     val fill by animateColorAsState(when {
         !enabled -> c.fillStrong
         kind == PButtonKind.Primary -> c.solid
@@ -76,13 +77,13 @@ internal fun PButton(text: String, onClick: () -> Unit, modifier: Modifier = Mod
     val ink by animateColorAsState(label, PocketMotion.color<Color>().orSnap(motion), label = "button-ink")
     val working by animateFloatAsState(if (busy) 1f else 0f, PocketMotion.state<Float>().orSnap(motion), label = "button-busy")
     Box(modifier.heightIn(min = 50.dp).pocketPressScale(interaction).then(focusRing(focused)).clip(PocketRadii.capsule).background(fill)
-        .pocketPressable(enabled && !busy, Role.Button, interaction, pressedScale = 1f, haptic = haptic, tint = label, onClick = onClick)
+        .pocketPressable(enabled && !busy, Role.Button, interaction, pressedScale = 1f, haptic = haptic, tint = label) { taps++; onClick() }
         .semantics { if (busy) stateDescription = "进行中" }
         .padding(horizontal = 20.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
         ProvidePInk(ink, Pocket.type.label) {
             Row(Modifier.graphicsLayer { alpha = 1f - working; scaleX = 1f - .06f * working; scaleY = scaleX },
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (leading != null) PIcon(leading, null, Modifier.size(18.dp))
+                if (leading != null) PTapIcon(leading, taps, Modifier.size(18.dp))
                 PText(text, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (busy || working > .01f) PDots(Modifier.graphicsLayer { alpha = working }, dot = 5.dp, color = ink)
@@ -108,8 +109,9 @@ internal fun PTextAction(onClick: () -> Unit, modifier: Modifier = Modifier, ena
 @Composable
 internal fun PTextAction(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
     tint: Color = Color.Unspecified, leading: ImageVector? = null, haptic: PocketHaptic? = null) {
-    PTextAction(onClick, modifier, enabled, tint, haptic = haptic) {
-        if (leading != null) PIcon(leading, null, Modifier.padding(end = 6.dp).size(18.dp))
+    var taps by remember { mutableIntStateOf(0) }
+    PTextAction({ taps++; onClick() }, modifier, enabled, tint, haptic = haptic) {
+        if (leading != null) PTapIcon(leading, taps, Modifier.padding(end = 6.dp).size(18.dp))
         PText(text, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
@@ -129,7 +131,7 @@ internal fun PIconButton(icon: ImageVector, label: String, onClick: () -> Unit, 
         .pocketPressable(enabled, Role.Button, interaction, pressedScale = 1f, haptic = haptic) { taps++; onClick() }
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         ProvidePInk(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (tint != Color.Unspecified) tint else c.ink) {
-            if (glyph != null) glyph() else PIcon(icon, null, Modifier.size(20.dp).pocketIconMotion(taps, motion))
+            if (glyph != null) glyph() else PTapIcon(icon, taps, Modifier.size(20.dp), motion = motion)
         }
     }
 }
@@ -187,13 +189,14 @@ internal fun PRow(title: String, onClick: () -> Unit, modifier: Modifier = Modif
     val fill by animateColorAsState(if (!selected) Color.Transparent else if (accentSelection) c.accentSoft.copy(alpha = .42f) else c.fillStrong.copy(alpha = .7f),
         PocketMotion.color<Color>().orSnap(motion), label = "row-fill")
     val ink = when { destructive -> c.danger; enabled -> c.ink; else -> c.inkMuted.copy(alpha = .7f) }
+    var taps by remember { mutableIntStateOf(0) }
     Row(modifier.fillMaxWidth().heightIn(min = PocketSpace.touch).clip(PocketRadii.control).background(fill)
         .then(if (selected) Modifier.semantics { this.selected = true } else Modifier)
-        .pocketPressable(enabled, Role.Button, pressedScale = .985f, haptic = haptic, onClick = onClick)
+        .pocketPressable(enabled, Role.Button, pressedScale = .985f, haptic = haptic) { taps++; onClick() }
         .padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         ProvidePInk(ink) {
-            if (glyph != null) glyph() else if (icon != null) PIcon(icon, null, Modifier.size(19.dp))
+            if (glyph != null) glyph() else if (icon != null) PTapIcon(icon, taps, Modifier.size(19.dp))
             Column(Modifier.weight(1f)) {
                 PText(title, style = Pocket.type.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (!subtitle.isNullOrBlank()) PText(subtitle, style = Pocket.type.caption, color = c.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)

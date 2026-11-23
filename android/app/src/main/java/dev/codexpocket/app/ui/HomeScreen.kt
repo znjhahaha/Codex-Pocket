@@ -469,12 +469,13 @@ internal fun HomeIconAction(icon: ImageVector, label: String, onClick: () -> Uni
     val focused by interaction.collectIsFocusedAsState()
     val pressColor by animateColorAsState(if (pressed || focused) Pocket.colors.fillStrong else Color.Transparent, tween(pocketMotionMillis(120)), label = "home-icon-press")
     val iconScale by animateFloatAsState(if (pressed) .88f else 1f, tween(pocketMotionMillis(160)), label = "home-icon-scale")
+    val taps = rememberPTaps()
     Box(
         modifier.size(48.dp).clip(CircleShape).background(pressColor)
-            .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
+            .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = taps.then(onClick))
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
-    ) { PIcon(icon, null, Modifier.size(20.dp).graphicsLayer { scaleX = iconScale; scaleY = iconScale }, tint = Pocket.colors.inkMuted) }
+    ) { PTapIcon(icon, taps.count, Modifier.size(20.dp).graphicsLayer { scaleX = iconScale; scaleY = iconScale }, tint = Pocket.colors.inkMuted) }
 }
 
 @Composable

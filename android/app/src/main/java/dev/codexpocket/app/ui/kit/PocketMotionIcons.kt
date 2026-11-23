@@ -89,6 +89,8 @@ internal class GlyphScope {
     inline fun rotate(degrees: Float, px: Float = 12f, py: Float = 12f, block: () -> Unit) = scope.rotate(degrees, Offset(px, py)) { block() }
     inline fun move(dx: Float, dy: Float, block: () -> Unit) = scope.translate(dx, dy) { block() }
     inline fun scale(factor: Float, px: Float = 12f, py: Float = 12f, block: () -> Unit) = scope.scale(factor, Offset(px, py)) { block() }
+    /** Scales each axis on its own: a page closing toward its spine, a meridian turning edge-on. */
+    inline fun stretch(x: Float, y: Float, px: Float = 12f, py: Float = 12f, block: () -> Unit) = scope.scale(x, y, Offset(px, py)) { block() }
 
     internal companion object {
         const val GridStroke = 1.65f
@@ -111,15 +113,18 @@ internal fun MotionIcon(glyph: MotionGlyph, progress: () -> Float, modifier: Mod
     val ink = if (tint != Color.Unspecified) tint else Pocket.ink
     val pen = remember { GlyphScope() }
     val described = if (contentDescription != null) Modifier.semantics { this.contentDescription = contentDescription; role = Role.Image } else Modifier
-    Canvas(modifier.then(described)) {
-        val unit = size.minDimension / 24f
-        withTransform({
-            translate((size.width - 24f * unit) / 2f, (size.height - 24f * unit) / 2f)
-            scale(unit, unit, Offset.Zero)
-        }) {
-            pen.scope = this; pen.ink = ink
-            with(glyph) { pen.draw(progress()) }
-        }
+    Canvas(modifier.then(described)) { drawGlyph(pen, glyph, progress(), ink) }
+}
+
+/** Draws [glyph] at [t], centred and fitted to this area on the 24-unit grid. */
+internal fun DrawScope.drawGlyph(pen: GlyphScope, glyph: MotionGlyph, t: Float, ink: Color) {
+    val unit = size.minDimension / 24f
+    withTransform({
+        translate((size.width - 24f * unit) / 2f, (size.height - 24f * unit) / 2f)
+        scale(unit, unit, Offset.Zero)
+    }) {
+        pen.scope = this; pen.ink = ink
+        with(glyph) { pen.draw(t) }
     }
 }
 
