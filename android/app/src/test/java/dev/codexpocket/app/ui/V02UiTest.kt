@@ -145,7 +145,7 @@ class V02UiTest {
         compose.onNodeWithText("分支聊天").assertDoesNotExist()
         compose.onNodeWithText("暂不可用", substring = true).performClick()
         compose.onNodeWithText("分支聊天").assertIsNotEnabled()
-        compose.onAllNodesWithText("当前 Codex 版本未提供此能力").fetchSemanticsNodes().also { assertTrue(it.isNotEmpty()) }
+        compose.onAllNodesWithText("原生运行时尚未提供此操作").fetchSemanticsNodes().also { assertTrue(it.isNotEmpty()) }
         compose.onNodeWithText("取消置顶").performClick()
         assertTrue(pinned); assertFalse(forked)
     }

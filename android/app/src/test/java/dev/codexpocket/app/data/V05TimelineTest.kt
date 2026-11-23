@@ -133,15 +133,17 @@ class V05TimelineTest {
         assertTrue(ConversationPresentation.rows(loaded).any { it.kind == TranscriptKind.Process })
     }
 
-    @Test fun expandedProcessIncludesEveryReasoningSegmentExactlyOnce() {
+    @Test fun expandedProcessKeepsReasoningInDataWithoutRepeatingItInHistory() {
         val reasoning = TimelineItem.from("t", pocketJson.parseToJsonElement("""{"id":"r","type":"reasoning","summary":["first","second"]}""").jsonObject)
         val state = completed(TimelineItem("t", "u", "userMessage", "start", complete = true), reasoning,
             message("work", "commentary"), message("final"))
         val folded = ConversationPresentation.rows(state)
         val expanded = expandTaskRows(folded, folded.filter { it.kind == TranscriptKind.Process }.map { it.key }.toSet())
-        assertEquals(listOf("first", "second"), expanded.single { it.kind == TranscriptKind.Activity }.items.single().summaryParts)
+        assertEquals(listOf("first", "second"), state.items.getValue(reasoning.key).summaryParts)
+        assertFalse(expanded.flatMap { it.items }.any { it.type == "reasoning" })
+        assertNull(ConversationPresentation.liveReasoning(state))
         assertEquals(expanded.size, expanded.map { it.key }.toSet().size)
-        assertEquals(listOf("u", "r", "work", "final"), expanded.filter { it.kind != TranscriptKind.Process }.flatMap { it.items }.map { it.itemId })
+        assertEquals(listOf("u", "work", "final"), expanded.filter { it.kind != TranscriptKind.Process }.flatMap { it.items }.map { it.itemId })
     }
 
     @Test fun rootChangesPaginationAndExpansionNeverProduceDuplicateKeys() {
