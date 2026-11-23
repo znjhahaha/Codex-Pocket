@@ -1822,7 +1822,7 @@ class PocketRepository(
                 verifiedHistoryLinks[chat.key] = link
                 _state.update { if (current()) it.copy(timeline = withOutgoing(chat.key, timeline), nextTurns = older, historyExhausted = exhausted,
                     conversationLoadState = ConversationLoadState.Ready, conversationLoadError = null,
-                    conversationCached = true, conversationReadSource = "persisted") else it }
+                    conversationCached = true, conversationReadSource = "persisted").withAsyncQuestions(chat.key, timeline) else it }
                 conversationWindows[chat.key] = ConversationWindow(chat.runtimeId, chat.conflict, older, exhausted, ConversationLoadState.Ready, readSource = "persisted")
                 persistedHistoryEpochs[chat.key] = epoch
             }
@@ -3816,6 +3816,11 @@ class PocketRepository(
                 if (status == "accepted") acknowledgePlanSettings(command.chatKey, command.draftText)
             }
             dao.commandStatus(command.id, status)
+            val asyncQuestions = asyncQuestionIds(command)
+            if (asyncQuestions.isNotEmpty() && current() && dao.command(command.id)?.status == status) {
+                if (status == "accepted") mergeAsyncAnswerReceipt(command.chatKey!!, response.obj("result"), ::current)
+                else if (status == "rejected") releaseAsyncSubmission(command.chatKey!!, asyncQuestions, ::current)
+            }
             val ordinarySend = reconcileOutgoingCommand(command, status, response)
             val editMarker = runCatching { pocketJson.parseToJsonElement(command.draftText).jsonObject.string("pocketEdit") }.getOrNull()
             if (editMarker in setOf("revert", "send") && command.chatKey != null && status in setOf("accepted", "rejected")) {
@@ -3835,7 +3840,7 @@ class PocketRepository(
                     if ((approvalGenerations[command.draftText] ?: 0L) == generation) rejectedApprovalRefresh[command.draftText] = generation
                 }
             }
-            if (!ordinarySend && status == "accepted" && planRevision == null && editMarker.isNullOrBlank() && command.method in setOf("turn/start", "turn/steer", "thread/queue/add")) {
+            if (asyncQuestions.isEmpty() && !ordinarySend && status == "accepted" && planRevision == null && editMarker.isNullOrBlank() && command.method in setOf("turn/start", "turn/steer", "thread/queue/add")) {
                 command.chatKey?.let { key ->
                     val snapshot = runCatching { pocketJson.parseToJsonElement(command.draftText).jsonObject }.getOrNull()?.takeIf { it.number("pocketDraft") == 1L }
                     clearAcceptedDraft(key, snapshot?.string("text") ?: command.draftText,
@@ -4622,7 +4627,15 @@ class PocketRepository(
     }
     fun answerAsyncBatch(answers: List<Pair<JsonObject, String>>): Job {
         val chat = selected()
+        val transport = client
+        val paired = pair
+        val link = connectionGeneration.get()
+        val selection = selectionGeneration.get()
+        fun current() = paired != null && pair?.computerId == chat.key.computerId && pair?.deviceId == paired.deviceId &&
+            client === transport && connectionGeneration.get() == link && _state.value.online
         return action {
+            require(transport != null && paired != null && current() && isSelected(chat, selection))
+            val sendScope = AssistantSendScope(paired, transport) { current() && isSelected(chat, selection) }
             val timeline = timelineBase(chat.key)
             val pending = AsyncQuestions.pending(timeline, submittedQuestions(chat.key)).associateBy { it.string("id") }
             require(answers.isNotEmpty() && answers.size <= 32)
@@ -4641,6 +4654,7 @@ class PocketRepository(
             val running = timeline.activeTurn
             val method = if (running == null) "turn/start" else "turn/steer"
             validateMutation(chat, method)
+            sendScope.requireCurrent()
             val submitted = submittedQuestions(chat.key) + ids
             check(preferences.edit().putStringSet("questions:${chat.key.encoded}", submitted).commit())
             updateAsyncState(chat.key, timeline)
@@ -4650,20 +4664,57 @@ class PocketRepository(
                     put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", text) }) })
                     put("clientUserMessageId", UUID.randomUUID().toString())
                     running?.let { put("expectedTurnId", it) }
-                }, true, chat.key).asObject()
-                if (running != null) recordSteerRelation(chat, running, response)
+                }, true, chat.key, buildJsonObject {
+                    // Versioned identity-only journal metadata; never persist question/answer prose here.
+                    put("pocketAsyncQuestions", 1); put("questionIds", JsonArray(ids.map(::JsonPrimitive)))
+                }.toString(), sendScope = sendScope).asObject()
+                mergeAsyncAnswerReceipt(chat.key, response, ::current)
+                if (running != null && current()) recordSteerRelation(chat, running, response)
             } catch (e: WireException) {
-                preferences.edit().putStringSet("questions:${chat.key.encoded}", submitted - ids).commit()
-                updateAsyncState(chat.key, timelineBase(chat.key)); throw e
+                releaseAsyncSubmission(chat.key, ids) { true }; throw e
             }
         }
     }
-    private fun submittedQuestions(key: ThreadKey) = preferences.getStringSet("questions:${key.encoded}", emptySet()).orEmpty().toSet()
-    private fun updateAsyncState(key: ThreadKey, timeline: NativeTimeline) {
-        val questions = AsyncQuestions.pending(timeline, submittedQuestions(key))
-        _state.update { it.copy(pendingQuestions = if (questions.isEmpty()) it.pendingQuestions - key.encoded else it.pendingQuestions + (key.encoded to questions),
-            advanced = if (it.selected?.key == key) it.advanced.copy(asyncQuestions = questions) else it.advanced) }
+    /** Old journals have no marker and retain their existing interpretation. */
+    private fun asyncQuestionIds(command: CommandEntity): Set<String> = runCatching {
+        if (command.chatKey == null || command.method !in setOf("turn/start", "turn/steer")) return emptySet()
+        val marker = pocketJson.parseToJsonElement(command.draftText) as? JsonObject ?: return emptySet()
+        if (marker["pocketAsyncQuestions"] != JsonPrimitive(1)) return emptySet()
+        val values = marker["questionIds"] as? JsonArray ?: return emptySet()
+        if (values.isEmpty() || values.size > 32) return emptySet()
+        val ids = values.map { (it as? JsonPrimitive)?.takeIf { value -> value.isString }?.content ?: return emptySet() }
+        if (ids.any { it.isBlank() } || ids.distinct().size != ids.size) emptySet() else ids.toSet()
+    }.getOrDefault(emptySet())
+
+    private suspend fun mergeAsyncAnswerReceipt(key: ThreadKey, result: JsonObject, current: () -> Boolean) = eventLock.withLock {
+        if (!current()) return@withLock
+        val before = timelineBase(key)
+        if (!current()) return@withLock
+        // A generic receipt has no native user item and therefore cannot answer anything.
+        val next = applyOutgoingReceiptItems(before, result)
+        if (next == before) return@withLock
+        persistTimeline(key, next, replace = false)
+        _state.update { state -> if (!current()) state else {
+            val visible = if (state.selected?.key == key) state.copy(timeline = withOutgoing(key, next)) else state
+            visible.withAsyncQuestions(key, next)
+        } }
     }
+
+    private suspend fun releaseAsyncSubmission(key: ThreadKey, ids: Set<String>, current: () -> Boolean) = eventLock.withLock {
+        if (!current()) return@withLock
+        val timeline = timelineBase(key)
+        if (!current()) return@withLock
+        check(preferences.edit().putStringSet("questions:${key.encoded}", submittedQuestions(key) - ids).commit())
+        _state.update { if (current()) it.withAsyncQuestions(key, timeline) else it }
+    }
+
+    private fun submittedQuestions(key: ThreadKey) = preferences.getStringSet("questions:${key.encoded}", emptySet()).orEmpty().toSet()
+    private fun PocketState.withAsyncQuestions(key: ThreadKey, timeline: NativeTimeline): PocketState {
+        val questions = AsyncQuestions.pending(timeline, submittedQuestions(key))
+        return copy(pendingQuestions = if (questions.isEmpty()) pendingQuestions - key.encoded else pendingQuestions + (key.encoded to questions),
+            advanced = if (selected?.key == key) advanced.copy(asyncQuestions = questions) else advanced)
+    }
+    private fun updateAsyncState(key: ThreadKey, timeline: NativeTimeline) = _state.update { it.withAsyncQuestions(key, timeline) }
     private val referenceGeneration = AtomicLong()
     fun loadReferences(query: String = ""): Job {
         val chat = _state.value.selected ?: return scope.launch {}
