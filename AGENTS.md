@@ -7,6 +7,7 @@
 - Two tests fail on the baseline and are not regressions: `V02UiTest.conversationMenuKeepsUnavailableActionsDiscoverableWithoutFakeButtons`, `V05TimelineTest.expandedProcessIncludesEveryReasoningSegmentExactlyOnce`.
 - Compose tests with a frozen clock must step in 16 ms frames with `waitForIdle()` between them; one large `advanceTimeBy` does not let a state change reach its effects.
 - Shell commands longer than about 8 KB are truncated: write long scripts to a file first.
+- A test that watches a loop (`rememberGlyphLoop`, `PDots`, any infinite transition) must set `compose.mainClock.autoAdvance = false` before `setContent`: a loop that starts while the test clock runs by itself is cancelled by the test framework and never moves.
 
 ## Android UI rules
 
@@ -25,7 +26,10 @@
 | Surface, card, divider | `PSurface`, `PCard`, `PDivider` |
 | Page frame with glass chrome, plain page with a top bar | `PFrame` + `PGlassBar` / `PGlassIconButton`, `PScaffold` |
 | Sheet, dialog, anchored menu, long-press hint | `PSheet`, `PDialog`, `PMenu` + `rememberPAnchor()` / `Modifier.pocketAnchor`, `PTooltip` |
-| Progress | `PSpinner`, `PRing`, `PLinearProgress`, `PDots`, `Modifier.pocketSkeleton()` |
+| Progress | `PSpinner`, `PRing`, `PLinearProgress`, `PDots`, `Modifier.pocketSkeleton()`, `PBrandLoader` (Pocket's own mark at work) |
+| Chat: someone is writing, a message on its way out, a conversation being read | `PTypingBubble`, `PSendingBubble`, `PChatSkeleton`; `Modifier.pocketBubblePop()` for anything that should pop out of a bubble's corner |
+| Pages side by side with dots (onboarding, galleries) | `rememberPPager(count)` + `PPager(state) { page, offset -> }` + `PPageDots(state)` |
+| The app's mark | `PBrandMark` (full colour, assembles with `progress`), `BrandGlyphs.Mark` / `.Working` / `.Entrance` (line glyphs) |
 | Changing number or text | `PRollingNumber`, `PSwap`, `PSwapText` |
 
 Motion building blocks:
@@ -39,5 +43,15 @@ Motion building blocks:
 - A new glyph in `IconGlyphs` is drawn from the static icon's own path strings so it rests in the icon's pose at progress 0 and 1; `KitIconGlyphTest` fails if it does not, or if it does not move. Two-pose and looping glyphs are in `MotionGlyphs` with `PToggleGlyph`, `PPulseGlyph`, `PLoopGlyph`, `PEntranceGlyph`.
 - Effects: `Modifier.pocketBounce(trigger)`, `pocketJelly { velocity }`, `pocketResize()`, `pocketBlur { radius }`, `rubberBand(overshoot, dimension)`.
 - Haptics: pass a `PocketHaptic` to the control or call `rememberPocketHaptics().perform(...)`.
+- A sent message leaves its field (iMessage-style): `val flight = rememberPSendFlight(scope)`, `Modifier.pocketSendSource(flight)` on the element holding the typed text (or read `LocalPSendFlight`), `flight.arm(keysAlreadyShown)` as the message is sent, then for each new item `val from = remember(key) { flight.take(key, eligible) }` and `Modifier.pocketSendLanding(from, flight)` on its bubble; `pocketSendTrail(from)` on what accompanies it. One arming carries one message, and gives up after 8 s. `ChatScreen` + `Composer` + `Transcript` are wired this way.
+- Tools at work: `ToolGlyphs.working(icon)` is the loop an activity icon plays while its tool runs (`PLoopGlyph(glyph, running, millis = ToolGlyphs.period(icon))`); it rests on the static icon. `NativeActivityIcon` uses it for every tool line. A new loop goes in `ToolGlyphs.byName` under the icon's name; `KitIconGlyphTest` checks it starts and ends on the icon and moves in between.
+- Pager parallax: `PPager` gives each page `offset()` (-1 one page left, 0 centred), read while drawing. Move parts of a page at their own rate in `graphicsLayer`, never by re-laying them out.
 
 Overlays (`PocketOverlay.kt`) need a `PocketOverlayHost` above them; tests wrap content in `PocketBackdrop { }`.
+
+## Screens built on the kit in this pass
+
+- Tutorial: `PocketTutorial.kt` (chapters, controller, host) and `PocketTutorialScenes.kt` (one drawn, looping scene per chapter on a 280x200 grid via `TourCanvas`). A chapter is one `TourChapter` entry in `PocketTourChapters` plus one `TourScene`; `PocketTutorialTest` fails if a scene has no chapter or a topic goes unmentioned. It opens once per install (`PocketTutorialController.Version`; raise it to show it again), never by itself under instrumentation, and from Settings > 应用设置 > 使用教程 through `LocalPocketTutorial`. Scenes must end each loop on the finished picture (`kept(t, start, end)`), because that is the still shown with motion off.
+- Message editing happens in the message's own bubble: `MessageEditBubble` + `LocalMessageEdit` (`MessageEditHost`). There is no edit dock or dialog; do not add one. If the edited turn has been withdrawn the editor is the `message-edit` item at the tail of the transcript.
+- Assistant entry: `AssistantPocketButton` (60dp, morph source `"assistant"`) and `AssistantFace` (blinks while `lively`, smiles while `held`, hops on `cheer`). `AssistantGlyphs.face(idle, hop, held)` is the drawing; at rest (1, 1, 0) it is `AssistantIcons.Mark`.
+- Launcher icon: `res/drawable/ic_pocket_{background,foreground,monochrome,notification}.xml` are drawn from the outlines in `kit/PocketBrand.kt`; change both together. `KitBrandTest` compares the in-app mark with the launcher layers and writes PNGs to `android/app/build/reports/kit/brand-*.png`.
