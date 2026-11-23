@@ -1,7 +1,7 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -23,17 +23,17 @@ internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded
     }
     val plan = remember(item.raw, item.type) { nativePlan(item) }
     val open = expanded
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     Column(Modifier.fillMaxWidth().testTag("execution-plan")) {
         Row(Modifier.fillMaxWidth().heightIn(min = 32.dp)
             .semantics { stateDescription = if (open) "已展开" else "已收起" }
             .then(planPress(onExpand))
             .padding(horizontal = 4.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Icon(PocketIcons.Checklist, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
-            Text(plan?.activeStep?.text ?: "执行计划", Modifier.weight(1f, fill = false),
-                fontSize = 14.sp, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            plan?.let { Text("${it.completed}/${it.steps.size}", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
+            PIcon(PocketIcons.Checklist, null, Modifier.size(16.dp), tint = c.inkMuted)
+            PText(plan?.activeStep?.text ?: "执行计划", Modifier.weight(1f, fill = false),
+                fontSize = 14.sp, color = c.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            plan?.let { PText("${it.completed}/${it.steps.size}", style = Pocket.type.caption, color = c.inkMuted) }
             ActivityExpansionIcon(open)
         }
         if (open) {
@@ -43,13 +43,13 @@ internal fun NativeActivityCard(item: TimelineItem, messageKey: String, expanded
                     val status = NativeActivityPresentation.status(step.status)
                     Row(Modifier.fillMaxWidth().heightIn(min = 32.dp).padding(vertical = 5.dp), verticalAlignment = Alignment.Top,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(when (status) {
+                        PIcon(when (status) {
                             ActivityStatus.Completed -> PocketIcons.Check
                             ActivityStatus.Running -> PocketIcons.PlayCircle
                             ActivityStatus.Failed -> PocketIcons.ErrorOutline
                             else -> PocketIcons.RadioButtonUnchecked
-                        }, activityStatusLabel(status), Modifier.size(16.dp), tint = if (status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
-                        Text(step.text, fontSize = 14.sp, lineHeight = 20.sp, color = if (status == ActivityStatus.Completed) c.onSurfaceVariant else c.onSurface)
+                        }, activityStatusLabel(status), Modifier.size(16.dp), tint = if (status == ActivityStatus.Failed) c.danger else c.inkMuted)
+                        PText(step.text, fontSize = 14.sp, lineHeight = 20.sp, color = if (status == ActivityStatus.Completed) c.inkMuted else c.ink)
                     }
                 }
             }

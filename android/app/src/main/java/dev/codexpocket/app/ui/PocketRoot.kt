@@ -1,6 +1,6 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
@@ -21,7 +21,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -45,7 +44,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
-import dev.codexpocket.app.ui.kit.PStage
 import kotlinx.coroutines.launch
 
 @Composable
@@ -256,7 +254,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 val bar = !conversation && (s.paired || settings)
                 if (bar) Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = homeInset), verticalAlignment = Alignment.CenterVertically) {
                     if (settings) CircleAction(PocketIcons.ArrowBack, stringResource(R.string.back_conversation)) { closeSettings() }
-                    Text(if (settings) stringResource(R.string.settings) else if (!s.paired) "Codex Pocket" else stringResource(tab.label), Modifier.weight(1f).padding(horizontal = 6.dp), style = MaterialTheme.typography.titleLarge)
+                    PText(if (settings) stringResource(R.string.settings) else if (!s.paired) "Codex Pocket" else stringResource(tab.label), Modifier.weight(1f).padding(horizontal = 6.dp), style = Pocket.type.titleLarge)
                     if (!settings) CircleAction(PocketIcons.Settings, stringResource(R.string.settings)) { openSettings(); if (s.online) repo.devices() }
                 }
                 // The bar, where there is one, has already cleared the status bar.
@@ -349,13 +347,13 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
             chooseLocation?.let { choose -> PocketButton("切换执行位置", { hostSheet = false; choose() }, Modifier.fillMaxWidth().testTag("execution-location-picker"), secondary = true) }
             s.runtimes.forEach { runtime ->
                 Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { runtimeFilter = runtime.id; hostSheet = false; home = true; tab = HomeTab.Chats }, verticalAlignment = Alignment.CenterVertically) {
-                    Icon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer, null)
-                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) { Text(context.sourceLabel(runtime.source)); Text(runtimeVersionLabel(runtime.version), style = MaterialTheme.typography.bodySmall) }
-                    Box(Modifier.size(7.dp).background(if (runtime.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
+                    PIcon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer, null)
+                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) { PText(context.sourceLabel(runtime.source)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall) }
+                    Box(Modifier.size(7.dp).background(if (runtime.online) Pocket.colors.accent else Pocket.colors.inkFaint, CircleShape))
                 }
             }
-            PocketTextButton(onClick = { runtimeFilter = null; hostSheet = false; home = true; tab = HomeTab.Chats }) { Text(stringResource(R.string.all_projects)) }
-            PocketTextButton(onClick = { hostSheet = false; home = true; tab = HomeTab.Devices }) { Text("设备与管理") }
+            PocketTextButton(onClick = { runtimeFilter = null; hostSheet = false; home = true; tab = HomeTab.Chats }) { PText(stringResource(R.string.all_projects)) }
+            PocketTextButton(onClick = { hostSheet = false; home = true; tab = HomeTab.Devices }) { PText("设备与管理") }
         }
     }
     CompositionLocalProvider(LocalPocketSheetAsScreen provides true) {
@@ -365,13 +363,13 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     }
     if (conversationMenu) ConversationPanel(s, repo, conversationMenuAnchor, { conversationMenu = false },
         onFiles = if (canListFiles) ({ projectFiles = true; repo.browseProjectFiles() }) else null, initialEditor = conversationInitialEditor)
-    if (confirmCompact) PocketDialog({ confirmCompact = false }, title = { Text("压缩上下文") },
-        text = { Text("压缩当前会话后继续工作。已有草稿会保留。") },
+    if (confirmCompact) PocketDialog({ confirmCompact = false }, title = { PText("压缩上下文") },
+        text = { PText("压缩当前会话后继续工作。已有草稿会保留。") },
         confirmButton = { PocketButton("压缩", { confirmCompact = false; repo.compact() }, enabled = canMutate(s, "thread/compact/start")) },
         dismissButton = { PocketButton("取消", { confirmCompact = false }, secondary = true) })
     if (rename) {
         var text by remember { mutableStateOf(s.selected?.title.orEmpty()) }
-        PocketDialog(onDismissRequest = { rename = false }, title = { Text(stringResource(R.string.rename_chat)) },
+        PocketDialog(onDismissRequest = { rename = false }, title = { PText(stringResource(R.string.rename_chat)) },
             text = { PocketTextField(text, { text = it }, singleLine = true, label = "会话标题") },
             confirmButton = { PocketButton(stringResource(R.string.save), enabled = text.isNotBlank() && canMutate(s, "thread/name/set"), onClick = { repo.rename(text); rename = false }) },
             dismissButton = { PocketButton(stringResource(R.string.cancel), onClick = { rename = false }, secondary = true) })
@@ -404,19 +402,19 @@ internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -
         PocketGlassSurface(onClick = onHost, shape = PocketOval, modifier = Modifier.weight(1f), dense = true) {
             Column(Modifier.heightIn(min = 48.dp).padding(horizontal = 13.dp, vertical = 7.dp), verticalArrangement = Arrangement.Center) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(s.selected?.title ?: "Codex", modifier = Modifier.weight(1f).testTag("conversation-title"), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    PText(s.selected?.title ?: "Codex", modifier = Modifier.weight(1f).testTag("conversation-title"), style = Pocket.type.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (compact && syncLabel != null) ConversationSyncStatus(syncLabel, compact = true)
                 }
                 AnimatedVisibility(!compact) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     // Fixed subtitle slot: refresh events never change the transcript's top padding.
-                    val lineHeight = with(LocalDensity.current) { MaterialTheme.typography.labelMedium.lineHeight.toDp() }
+                    val lineHeight = with(LocalDensity.current) { Pocket.type.labelSmall.lineHeight.toDp() }
                     androidx.compose.animation.Crossfade(targetState = syncLabel, modifier = Modifier.weight(1f).height(lineHeight),
                         animationSpec = tween(pocketMotionMillis(140)), label = "header-sync-status") { label ->
                         if (label != null) ConversationSyncStatus(label)
                         else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Box(Modifier.size(5.dp).background(if (s.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
-                            Text(s.computerName, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Box(Modifier.size(5.dp).background(if (s.online) Pocket.colors.accent else Pocket.colors.inkFaint, CircleShape))
+                            PText(s.computerName, style = Pocket.type.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     TaskElapsedLabel(s.timeline.activeTurn?.let { s.timeline.turns[it] })
@@ -431,7 +429,7 @@ internal fun ConversationHeader(s: PocketState, onBack: () -> Unit, onHost: () -
 @Composable
 internal fun CircleAction(icon: ImageVector, label: String, onClick: () -> Unit) {
     PocketGlassSurface(modifier = Modifier.size(48.dp), shape = CircleShape, onClick = onClick) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(icon, label, Modifier.size(21.dp)) }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { PIcon(icon, label, Modifier.size(21.dp)) }
     }
 }
 
@@ -447,11 +445,11 @@ internal fun Notice(text: String, error: Boolean = false, action: String? = null
             Modifier.padding(horizontal = 12.dp, vertical = 4.dp), action, onAction)
         return
     }
-    Surface(color = if (error) MaterialTheme.colorScheme.errorContainer.copy(alpha = .7f) else MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(10.dp), modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+    PSurface(color = if (error) Pocket.colors.dangerSoft.copy(alpha = .7f) else Pocket.colors.fillStrong, shape = RoundedCornerShape(10.dp), modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(if (error) PocketIcons.ErrorOutline else PocketIcons.Info, null, Modifier.padding(end = 10.dp).size(18.dp), tint = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(text, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = if (error) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurfaceVariant)
-            if (action != null) PocketTextButton(onClick = onAction) { Text(action) }
+            PIcon(if (error) PocketIcons.ErrorOutline else PocketIcons.Info, null, Modifier.padding(end = 10.dp).size(18.dp), tint = if (error) Pocket.colors.danger else Pocket.colors.inkMuted)
+            PText(text, Modifier.weight(1f), style = Pocket.type.bodySmall, color = if (error) Pocket.colors.onDangerSoft else Pocket.colors.inkMuted)
+            if (action != null) PocketTextButton(onClick = onAction) { PText(action) }
         }
     }
 }

@@ -84,7 +84,7 @@ class ThreadReferenceLayoutTest {
         content {
             val baseDensity = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(baseDensity.density, fontScale)) {
-                Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(start = 20.dp, top = 32.dp)) {
+                Box(Modifier.fillMaxSize().background(dev.codexpocket.app.ui.kit.Pocket.colors.bg).padding(start = 20.dp, top = 32.dp)) {
                     Surface(Modifier.width(width).testTag("link-bubble"), shape = RoundedCornerShape(16.dp), color = assistantPalette().outgoing) {
                         SelectionContainer { ReferenceText(message, emptyList(), Modifier.padding(14.dp).testTag("link-prose")) }
                     }

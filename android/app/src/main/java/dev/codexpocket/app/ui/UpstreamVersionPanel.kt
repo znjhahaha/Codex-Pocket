@@ -1,9 +1,7 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.Surface
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -17,43 +15,43 @@ import java.util.Date
 @Composable
 internal fun UpstreamVersionPanel(s: PocketState, repo: PocketRepository) {
     Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("线路与上游版本", style = MaterialTheme.typography.titleMedium)
-        Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
+        PText("线路与上游版本", style = Pocket.type.title)
+        PSurface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = Pocket.colors.fill) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 val actual = if (!s.online) "当前离线" else when (s.activeRouteKind) { "lan" -> "局域网直连"; "p2p" -> "公网直连"; "relay", "cloudflare" -> "服务器中转"; else -> "路线尚未确认" }
-                Text(actual, style = MaterialTheme.typography.titleSmall)
-                if (s.online) Text(if (s.routePhase == "direct_negotiating") "中转可用 · 正在尝试直连" else "身份验证通过 · 手机会话已建立", style = MaterialTheme.typography.bodySmall)
-                s.routeFallback?.let { Text(when (it) { "direct_timeout" -> "直连尝试超时，继续使用可用线路"; "direct_not_stable" -> "直连尚未稳定，保留原线路"; else -> "暂未建立直连，继续使用可用线路" }, style = MaterialTheme.typography.bodySmall) }
+                PText(actual, style = Pocket.type.titleSmall)
+                if (s.online) PText(if (s.routePhase == "direct_negotiating") "中转可用 · 正在尝试直连" else "身份验证通过 · 手机会话已建立", style = Pocket.type.bodySmall)
+                s.routeFallback?.let { PText(when (it) { "direct_timeout" -> "直连尝试超时，继续使用可用线路"; "direct_not_stable" -> "直连尚未稳定，保留原线路"; else -> "暂未建立直连，继续使用可用线路" }, style = Pocket.type.bodySmall) }
                 val versions = s.upstreamVersions
                 for ((key, title) in listOf("installed" to "电脑已安装", "helper" to "电脑助手运行", "supervisor" to "后台监督报告")) {
                     val value = versions?.get(key) as? JsonObject
                     val version = (value?.get("version") as? JsonPrimitive)?.contentOrNull ?: "未知"
                     val generation = (value?.get("generation") as? JsonPrimitive)?.contentOrNull
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(title, style = MaterialTheme.typography.bodyMedium)
-                        Text(version + (generation?.let { " · ${it.take(10)}" } ?: ""), style = MaterialTheme.typography.bodySmall)
+                        PText(title, style = Pocket.type.body)
+                        PText(version + (generation?.let { " · ${it.take(10)}" } ?: ""), style = Pocket.type.bodySmall)
                     }
                 }
                 val bridges = versions?.get("bridges") as? JsonArray
                 if (bridges.isNullOrEmpty()) {
-                    Text("桌面桥接：尚未取得版本", style = MaterialTheme.typography.bodySmall)
+                    PText("桌面桥接：尚未取得版本", style = Pocket.type.bodySmall)
                 } else bridges.forEach { entry ->
                     val bridge = entry as? JsonObject
                     val id = (bridge?.get("runtime_id") as? JsonPrimitive)?.contentOrNull
                     val runtime = s.runtimes.firstOrNull { it.id == id }
                     val version = (bridge?.get("version") as? JsonPrimitive)?.contentOrNull ?: "未知"
                     val label = if (runtime?.source == "cli") "CLI 连接" else "桌面桥接"
-                    Text("$label：$version" + (id?.let { " · ${it.take(12)}" } ?: ""), style = MaterialTheme.typography.bodySmall)
-                    if (runtime?.bridgeUpdatePending == true) Text("桥接版本与助手不同，等待电脑端更新生效", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PText("$label：$version" + (id?.let { " · ${it.take(12)}" } ?: ""), style = Pocket.type.bodySmall)
+                    if (runtime?.bridgeUpdatePending == true) PText("桥接版本与助手不同，等待电脑端更新生效", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
                 val host = versions?.get("host") as? JsonObject
                 val hostVersion = (host?.get("version") as? JsonPrimitive)?.contentOrNull
-                Text("独立宿主：${hostVersion ?: "尚未取得版本"}", style = MaterialTheme.typography.bodySmall)
+                PText("独立宿主：${hostVersion ?: "尚未取得版本"}", style = Pocket.type.bodySmall)
                 val relay = if (s.online) s.relayVersion else null
-                Text("当前中继：" + when { !s.online -> "离线，未核验"; s.activeRouteKind in setOf("lan", "p2p") -> "未使用"; relay == null -> "上游未报告版本"; else -> "${relay.version} · 协议 ${relay.protocol}" + (relay.build?.let { " · ${it.take(10)}" } ?: "") }, style = MaterialTheme.typography.bodySmall)
-                Text(if (!s.online && versions != null) "显示上次认证连接记录；不代表当前进程在线。" else "安装代次与运行代次分别显示；监督进程的报告需结合电脑端进程核验。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (s.versionsObservedAt > 0) Text("最近获取：" + DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.versionsObservedAt)), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                PocketTextButton({ repo.inspectConnection() }, enabled = s.online) { Text("刷新版本与诊断") }
+                PText("当前中继：" + when { !s.online -> "离线，未核验"; s.activeRouteKind in setOf("lan", "p2p") -> "未使用"; relay == null -> "上游未报告版本"; else -> "${relay.version} · 协议 ${relay.protocol}" + (relay.build?.let { " · ${it.take(10)}" } ?: "") }, style = Pocket.type.bodySmall)
+                PText(if (!s.online && versions != null) "显示上次认证连接记录；不代表当前进程在线。" else "安装代次与运行代次分别显示；监督进程的报告需结合电脑端进程核验。", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                if (s.versionsObservedAt > 0) PText("最近获取：" + DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.versionsObservedAt)), style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                PocketTextButton({ repo.inspectConnection() }, enabled = s.online) { PText("刷新版本与诊断") }
             }
         }
         PocketActionRow("自动尝试公网直连", PocketIcons.Wifi, { repo.configureDirectConnection(!s.p2pEnabled, s.publicStunEnabled) },

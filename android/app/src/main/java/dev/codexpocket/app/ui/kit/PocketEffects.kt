@@ -21,8 +21,18 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
+import androidx.compose.runtime.withFrameNanos
 import kotlin.math.abs
+
+/**
+ * Waits by counting frames rather than wall time, so a pause belongs to the same clock as the
+ * animation it precedes and nothing is left half-way when frames are being stepped by hand.
+ */
+internal suspend fun pocketPause(millis: Long) {
+    if (millis <= 0) return
+    val start = withFrameNanos { it }
+    while (withFrameNanos { it } - start < millis * 1_000_000) Unit
+}
 
 /**
  * Squashes and springs back each time [trigger] changes: the acknowledgement a glyph gives when its
@@ -77,7 +87,7 @@ internal class PEntrance(open: Boolean) {
 internal fun rememberPocketEntrance(key: Any? = Unit, windowMillis: Long = 420): PEntrance {
     val motion = rememberPocketMotion()
     val entrance = remember(key) { PEntrance(motion) }
-    LaunchedEffect(entrance) { if (entrance.open) { delay(windowMillis); entrance.open = false } }
+    LaunchedEffect(entrance) { if (entrance.open) { pocketPause(windowMillis); entrance.open = false } }
     return entrance
 }
 
@@ -90,7 +100,7 @@ internal fun Modifier.pocketEntrance(entrance: PEntrance, index: Int, rise: Dp =
     val progress = remember { Animatable(if (entrance.open) 0f else 1f) }
     LaunchedEffect(Unit) {
         if (progress.value >= 1f) return@LaunchedEffect
-        delay(index.coerceIn(0, 9) * stepMillis.toLong())
+        pocketPause(index.coerceIn(0, 9) * stepMillis.toLong())
         progress.animateTo(1f, PocketSprings.smooth(.46f))
     }
     return graphicsLayer {
@@ -113,3 +123,49 @@ internal fun Modifier.pocketBlur(radius: Density.() -> Float): Modifier =
         val amount = radius()
         renderEffect = if (amount > .5f) BlurEffect(amount, amount, TileMode.Decal) else null
     }
+
+/**
+ * Tells what has just appeared from what was already there. Nothing arrives until the first frames
+ * have been drawn, so a page that opens with content shows it as it is, and a key that has been
+ * shown once never arrives again, however often it scrolls out and back.
+ */
+@Stable
+internal class PArrivals {
+    private val seen = HashSet<Any>()
+    internal var armed = false
+    /** True the first time [key] is shown after the page has settled. */
+    fun fresh(key: Any, eligible: Boolean): Boolean { val new = seen.add(key); return new && armed && eligible }
+}
+
+/** A new set of arrivals for each [scope], such as a conversation. */
+@Composable
+internal fun rememberPocketArrivals(scope: Any? = Unit): PArrivals {
+    val motion = rememberPocketMotion()
+    val arrivals = remember(scope) { PArrivals() }
+    LaunchedEffect(arrivals, motion) {
+        arrivals.armed = false
+        if (motion) { pocketPause(320); arrivals.armed = true }
+    }
+    return arrivals
+}
+
+/**
+ * An item that has just appeared rises into place as it fades in, growing from [origin]: the corner
+ * a sent message leaves from, or the leading edge for a reply. [eligible] limits this to the items
+ * that can be new, such as the tail of a list; anything else is simply shown.
+ */
+@Composable
+internal fun Modifier.pocketArrival(arrivals: PArrivals, key: Any, eligible: Boolean = true, rise: Dp = 12.dp, fromScale: Float = .96f,
+    origin: TransformOrigin = TransformOrigin(0f, 1f)): Modifier {
+    val progress = remember(key) { Animatable(if (arrivals.fresh(key, eligible)) 0f else 1f) }
+    LaunchedEffect(key) { if (progress.value < 1f) progress.animateTo(1f, PocketSprings.snappy(.42f)) }
+    return graphicsLayer {
+        val shown = progress.value
+        if (shown >= 1f && !progress.isRunning) return@graphicsLayer
+        alpha = (shown * 1.4f).coerceIn(0f, 1f)
+        translationY = (1f - shown) * rise.toPx()
+        val size = fromScale + (1f - fromScale) * shown
+        scaleX = size; scaleY = size
+        transformOrigin = origin
+    }
+}

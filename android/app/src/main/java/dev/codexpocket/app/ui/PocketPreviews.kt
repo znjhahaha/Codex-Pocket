@@ -1,7 +1,7 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
@@ -65,7 +65,7 @@ internal object PocketPreviewStates {
 @Composable internal fun AttentionPreview() {
     val request = PendingApproval("preview-runtime", JsonPrimitive("preview-approval"), "item/commandExecution/requestApproval", buildJsonObject { put("threadId", "preview-chat"); put("command", "./gradlew test"); put("reason", "运行刚添加的回归测试"); put("cwd", "D:/Projects/Pocket") })
     PocketTheme("light") { PocketBackdrop { Column(Modifier.fillMaxSize().padding(22.dp)) {
-        Text("待处理", style = MaterialTheme.typography.headlineLarge)
+        PText("待处理", style = Pocket.type.display)
         Spacer(Modifier.height(24.dp))
         ApprovalCard(request, true) { _, _ -> }
         Spacer(Modifier.weight(1f))

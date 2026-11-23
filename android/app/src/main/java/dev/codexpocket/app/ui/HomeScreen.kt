@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -21,7 +22,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -51,9 +51,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.PocketMotion
-import dev.codexpocket.app.ui.kit.orSnap
-import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collect
@@ -180,6 +177,8 @@ private fun ColumnScope.HomeProjectSessions(
     if (!searchExpanded && search.isNotBlank()) Box(Modifier.padding(horizontal = 20.dp).padding(bottom = 4.dp)) {
         PocketPill("搜索：$search", true, { searchExpanded = true })
     }
+    // The first screenful arrives in sequence when the list opens; rows scrolled to later are simply there.
+    val entrance = rememberPocketEntrance()
     LazyColumn(
         Modifier.weight(1f).fillMaxWidth().testTag("chats-home"), state = listState,
         contentPadding = PaddingValues(top = 2.dp, bottom = LocalHomeContentPadding.current.calculateBottomPadding() + 24.dp),
@@ -205,7 +204,7 @@ private fun ColumnScope.HomeProjectSessions(
                 ChatHomeRow(chat, statuses[chat.key.encoded].orEmpty(), chat.key.encoded in s.unreadKeys, s.online,
                     { onSelect(chat) }, { onPin(chat) }, { onArchive(chat) },
                     archiveEnabled = s.archiveUnavailableReason(chat) == null, showDivider = index < group.chats.lastIndex,
-                    modifier = homeItemMotion(motion))
+                    modifier = homeItemMotion(motion).pocketEntrance(entrance, index))
             }
         }
         if (s.nextThreads != null && s.online) item(key = "home-load-more", contentType = "footer") {
@@ -225,11 +224,11 @@ private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (s.restoringConnection || (s.online && s.directoryLoading && s.directoryError == null)) PocketLoader()
-        else Icon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
-            tint = if (s.directoryError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(when { s.restoringConnection -> "正在恢复连接 · 已保留本机记录"; s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
-            Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (s.online && s.directoryError != null) PocketTextButton(onRetry, enabled = !s.directoryRefreshing) { Text(stringResource(R.string.v03_home_retry)) }
+        else PIcon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
+            tint = if (s.directoryError != null) Pocket.colors.danger else Pocket.colors.inkMuted)
+        PText(when { s.restoringConnection -> "正在恢复连接 · 已保留本机记录"; s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
+            Modifier.weight(1f), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+        if (s.online && s.directoryError != null) PocketTextButton(onRetry, enabled = !s.directoryRefreshing) { PText(stringResource(R.string.v03_home_retry)) }
     }
 }
 @Composable
@@ -240,14 +239,14 @@ internal fun HomeScopeTab(text: String, selected: Boolean, onClick: () -> Unit, 
     val indicator by animateFloatAsState(if (selected) 1f else 0f, tween(pocketMotionMillis(180)), label = "home-scope-selection")
     Box(
         modifier.heightIn(min = 48.dp).widthIn(min = 64.dp).clip(RoundedCornerShape(8.dp))
-            .background(if (pressed || focused) MaterialTheme.colorScheme.surfaceContainerLow else Color.Transparent)
+            .background(if (pressed || focused) Pocket.colors.sunken else Color.Transparent)
             .selectable(selected, interactionSource = interaction, indication = null, role = Role.Tab, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         PocketTabLabel(text, selected, Modifier.padding(horizontal = 2.dp, vertical = 12.dp),
-            style = MaterialTheme.typography.labelLarge,
-            color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
-        Box(Modifier.align(Alignment.BottomCenter).width(26.dp).height(2.dp).graphicsLayer { alpha = indicator; scaleX = .6f + .4f * indicator }.background(MaterialTheme.colorScheme.onSurface, CircleShape))
+            style = Pocket.type.label,
+            color = if (selected) Pocket.colors.ink else Pocket.colors.inkMuted)
+        Box(Modifier.align(Alignment.BottomCenter).width(26.dp).height(2.dp).graphicsLayer { alpha = indicator; scaleX = .6f + .4f * indicator }.background(Pocket.colors.ink, CircleShape))
     }
 }
 
@@ -256,8 +255,8 @@ private fun HomeGroupHeader(group: HomeChatGroup, expanded: Boolean, onToggle: (
     val rotation by animateFloatAsState(if (expanded) 90f else 0f, PocketMotion.glyph<Float>().orSnap(rememberPocketMotion()), label = "home-group-${group.id}")
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val c = MaterialTheme.colorScheme
-    val tint by animateColorAsState(if (pressed) c.onSurface else c.onSurfaceVariant, tween(pocketMotionMillis(120)), label = "home-group-tint")
+    val c = Pocket.colors
+    val tint by animateColorAsState(if (pressed) c.ink else c.inkMuted, tween(pocketMotionMillis(120)), label = "home-group-tint")
     // A section label like the Codex sidebar: folder, project name, count. The full path stays in accessibility only.
     Row(modifier.padding(horizontal = 10.dp).fillMaxWidth().heightIn(min = 44.dp).padding(top = 6.dp)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onToggle)
@@ -265,13 +264,13 @@ private fun HomeGroupHeader(group: HomeChatGroup, expanded: Boolean, onToggle: (
         .semantics { heading(); stateDescription = if (expanded) "已展开，${group.chats.size} 个会话" else "已收起，${group.chats.size} 个会话"
             group.subtitle?.let { contentDescription = "${group.title}，$it" } }
         .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (group.subtitle != null) Icon(PocketIcons.Folder, null, Modifier.size(15.dp), tint = tint)
+        if (group.subtitle != null) PIcon(PocketIcons.Folder, null, Modifier.size(15.dp), tint = tint)
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(group.title, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = tint,
+            PText(group.title, Modifier.weight(1f, fill = false), style = Pocket.type.label, fontWeight = FontWeight.SemiBold, color = tint,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(group.chats.size.toString(), color = c.onSurfaceVariant.copy(alpha = .7f), style = MaterialTheme.typography.labelMedium)
+            PText(group.chats.size.toString(), color = c.inkMuted.copy(alpha = .7f), style = Pocket.type.labelSmall)
         }
-        Icon(PocketIcons.ChevronRight, null, Modifier.size(14.dp).rotate(rotation), tint = tint)
+        PIcon(PocketIcons.ChevronRight, null, Modifier.size(14.dp).rotate(rotation), tint = tint)
     }
 }
 
@@ -302,13 +301,13 @@ private fun HomeAttentionEntry(count: Int, onClick: () -> Unit, modifier: Modifi
     PocketTextButton(
         onClick = onClick,
         modifier = modifier.padding(horizontal = 20.dp, vertical = 8.dp).fillMaxWidth().testTag("home-attention")
-            .border(.7.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f), RoundedCornerShape(14.dp)),
+            .border(.7.dp, Pocket.colors.line.copy(alpha = .55f), RoundedCornerShape(14.dp)),
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
     ) {
-        Icon(PocketIcons.PendingActions, null, Modifier.size(19.dp), tint = MaterialTheme.colorScheme.secondary)
-        Text("需要你确认", Modifier.weight(1f).padding(horizontal = 10.dp), style = MaterialTheme.typography.bodyMedium)
-        Text(count.toString(), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Icon(PocketIcons.ChevronRight, null, Modifier.padding(start = 8.dp).size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        PIcon(PocketIcons.PendingActions, null, Modifier.size(19.dp), tint = Pocket.colors.accent)
+        PText("需要你确认", Modifier.weight(1f).padding(horizontal = 10.dp), style = Pocket.type.body)
+        PText(count.toString(), style = Pocket.type.label, color = Pocket.colors.inkMuted)
+        PIcon(PocketIcons.ChevronRight, null, Modifier.padding(start = 8.dp).size(16.dp), tint = Pocket.colors.inkMuted)
     }
 }
 
@@ -337,11 +336,11 @@ private fun HomeProjectsSheet(projects: List<HomeProject>, selected: HomeProject
                 )
             }
             if (matches.isEmpty()) item {
-                Text(
+                PText(
                     if (query.isBlank()) "已同步对话的项目会显示在这里" else stringResource(R.string.v02_no_results),
                     Modifier.padding(horizontal = 16.dp, vertical = 24.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = Pocket.type.body,
+                    color = Pocket.colors.inkMuted,
                 )
             }
         }
@@ -378,11 +377,11 @@ internal fun ChatHomeRow(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val focused by interaction.collectIsFocusedAsState()
-    val pressColor by animateColorAsState(if (pressed || focused) MaterialTheme.colorScheme.surfaceContainerLow else Color.Transparent,
+    val pressColor by animateColorAsState(if (pressed || focused) Pocket.colors.sunken else Color.Transparent,
         tween(pocketMotionMillis(120)), label = "home-row-press")
     val scale by animateFloatAsState(if (pressed) .985f else 1f, pocketPressSpring(), label = "home-row-scale")
     val relative = remember(chat.updatedAt, timestamp) { homeRelativeTime(homeUpdatedAtMillis(chat.updatedAt), System.currentTimeMillis()) ?: timestamp }
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     // Two quiet lines: title + time, then a one-line preview. State shows only when it needs attention;
     // actions are a long press away (also exposed to accessibility as the long-click action).
     Column(modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
@@ -394,19 +393,19 @@ internal fun ChatHomeRow(
             .testTag("home-chat-${chat.key.encoded}").padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.Center) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 HomeRowStatus(status, unread, chat.pinned)
-                if (chat.source == "cli") Icon(PocketIcons.CliOrigin, "CLI 会话",
+                if (chat.source == "cli") PIcon(PocketIcons.CliOrigin, "CLI 会话",
                     Modifier.size(14.dp).testTag("home-cli-${chat.key.encoded}"),
-                    tint = c.onSurfaceVariant.copy(alpha = .65f))
-                Text(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.bodyLarge, fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Medium)
-                if (relative.isNotBlank()) Text(relative, maxLines = 1, style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
+                    tint = c.inkMuted.copy(alpha = .65f))
+                PText(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = Pocket.type.body, fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Medium)
+                if (relative.isNotBlank()) PText(relative, maxLines = 1, style = Pocket.type.labelSmall, color = c.inkMuted)
             }
             val line = when (status) {
                 "failed", "pending", "inProgress" -> rowStatus + if (preview.isNotBlank()) " · $preview" else ""
                 else -> preview
             }
-            if (line.isNotBlank()) Text(line, Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyMedium, color = if (status == "failed") c.error else c.onSurfaceVariant)
+            if (line.isNotBlank()) PText(line, Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = Pocket.type.body, color = if (status == "failed") c.danger else c.inkMuted)
         }
     }
     if (menu) {
@@ -448,14 +447,14 @@ private fun HomeRowStatus(status: String, unread: Boolean, pinned: Boolean) {
     val shown = icon.takeIf { status in setOf("inProgress", "pending", "failed") || (pinned && status !in setOf("unknown", "offline")) }
     if (!unread && shown == null) return
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        if (unread) Box(Modifier.size(7.dp).background(MaterialTheme.colorScheme.secondary, CircleShape).testTag("unread"))
-        if (shown != null) Icon(
+        if (unread) Box(Modifier.size(7.dp).background(Pocket.colors.accent, CircleShape).testTag("unread"))
+        if (shown != null) PIcon(
             shown, null, Modifier.size(15.dp),
             tint = when (status) {
-                "pending" -> MaterialTheme.colorScheme.secondary
-                "failed" -> MaterialTheme.colorScheme.error
-                "inProgress" -> MaterialTheme.colorScheme.onSurface
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                "pending" -> Pocket.colors.accent
+                "failed" -> Pocket.colors.danger
+                "inProgress" -> Pocket.colors.ink
+                else -> Pocket.colors.inkMuted
             },
         )
     }
@@ -468,37 +467,37 @@ internal fun HomeIconAction(icon: ImageVector, label: String, onClick: () -> Uni
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val focused by interaction.collectIsFocusedAsState()
-    val pressColor by animateColorAsState(if (pressed || focused) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent, tween(pocketMotionMillis(120)), label = "home-icon-press")
+    val pressColor by animateColorAsState(if (pressed || focused) Pocket.colors.fillStrong else Color.Transparent, tween(pocketMotionMillis(120)), label = "home-icon-press")
     val iconScale by animateFloatAsState(if (pressed) .88f else 1f, tween(pocketMotionMillis(160)), label = "home-icon-scale")
     Box(
         modifier.size(48.dp).clip(CircleShape).background(pressColor)
             .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
-    ) { Icon(icon, null, Modifier.size(20.dp).graphicsLayer { scaleX = iconScale; scaleY = iconScale }, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+    ) { PIcon(icon, null, Modifier.size(20.dp).graphicsLayer { scaleX = iconScale; scaleY = iconScale }, tint = Pocket.colors.inkMuted) }
 }
 
 @Composable
 private fun HomeEmptyState(search: String, project: String?, archived: Boolean, online: Boolean, canCreate: Boolean, onClearFilters: () -> Unit, onShowRecent: () -> Unit, onNew: () -> Unit) {
     val filtered = search.isNotBlank() || project != null
     Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 40.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Box(Modifier.size(52.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(18.dp)), contentAlignment = Alignment.Center) {
-            Icon(if (filtered) PocketIcons.Search else if (archived) PocketIcons.Inventory2 else PocketIcons.ChatBubbleOutline, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Box(Modifier.size(52.dp).background(Pocket.colors.sunken, RoundedCornerShape(18.dp)), contentAlignment = Alignment.Center) {
+            PIcon(if (filtered) PocketIcons.Search else if (archived) PocketIcons.Inventory2 else PocketIcons.ChatBubbleOutline, null, Modifier.size(24.dp), tint = Pocket.colors.inkMuted)
         }
-        Text(
+        PText(
             if (filtered) stringResource(R.string.no_matches) else if (archived) "还没有归档的聊天" else stringResource(R.string.no_chats),
-            style = MaterialTheme.typography.titleMedium,
+            style = Pocket.type.title,
             textAlign = TextAlign.Center,
         )
-        Text(
+        PText(
             when {
                 filtered -> "试试其他关键词，或清除项目筛选。"
                 !online -> stringResource(R.string.no_cache)
                 archived -> "归档后的对话会保留在这里，随时可以移回。"
                 else -> "从一个问题开始，或继续电脑上的工作。"
             },
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = Pocket.type.body,
+            color = Pocket.colors.inkMuted,
             textAlign = TextAlign.Center,
         )
         when {
@@ -514,21 +513,21 @@ internal fun PocketSearch(value: String, onValue: (String) -> Unit, hint: String
     val focus = LocalFocusManager.current
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
-    val borderColor by animateColorAsState(if (focused) MaterialTheme.colorScheme.outline.copy(alpha = .6f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .25f), tween(pocketMotionMillis(160)), label = "home-search-focus")
-    Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = .45f), border = BorderStroke(.7.dp, borderColor), modifier = Modifier.fillMaxWidth()) {
+    val borderColor by animateColorAsState(if (focused) Pocket.colors.inkFaint.copy(alpha = .6f) else Pocket.colors.line.copy(alpha = .25f), tween(pocketMotionMillis(160)), label = "home-search-focus")
+    PSurface(shape = RoundedCornerShape(14.dp), color = Pocket.colors.sunken.copy(alpha = .45f), border = BorderStroke(.7.dp, borderColor), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.heightIn(min = 48.dp).padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Icon(PocketIcons.Search, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            PIcon(PocketIcons.Search, null, Modifier.size(20.dp), tint = Pocket.colors.inkMuted)
             BasicTextField(
                 value, onValue,
                 Modifier.weight(1f).padding(vertical = 12.dp).semantics { contentDescription = hint },
                 singleLine = true,
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                textStyle = Pocket.type.body.copy(color = Pocket.colors.ink),
+                cursorBrush = SolidColor(Pocket.colors.solid),
                 interactionSource = interaction,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { focus.clearFocus() }),
                 decorationBox = { inner ->
-                    Box { if (value.isEmpty()) Text(hint, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge); inner() }
+                    Box { if (value.isEmpty()) PText(hint, color = Pocket.colors.inkMuted, style = Pocket.type.body); inner() }
                 },
             )
             if (value.isNotEmpty()) HomeIconAction(PocketIcons.Close, "清空搜索", { onValue("") }) else Spacer(Modifier.width(10.dp))
@@ -539,8 +538,8 @@ internal fun PocketSearch(value: String, onValue: (String) -> Unit, hint: String
 @Composable
 internal fun EmptyState(title: String, detail: String) {
     Column(Modifier.fillMaxWidth().padding(vertical = 40.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, style = MaterialTheme.typography.titleLarge)
-        Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        PText(title, style = Pocket.type.titleLarge)
+        PText(detail, style = Pocket.type.body, color = Pocket.colors.inkMuted)
     }
 }
 
@@ -549,25 +548,25 @@ internal fun DeviceOverview(s: PocketState, onInspect: () -> Unit, onSettings: (
     val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(LocalHomeContentPadding.current).padding(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            Icon(PocketIcons.Computer, null, Modifier.size(32.dp))
-            Column { Text(s.computerName, style = MaterialTheme.typography.titleLarge); Text(context.stateLabel(s.connectionPhase.ifBlank { s.connection }), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            PIcon(PocketIcons.Computer, null, Modifier.size(32.dp))
+            Column { PText(s.computerName, style = Pocket.type.titleLarge); PText(context.stateLabel(s.connectionPhase.ifBlank { s.connection }), color = Pocket.colors.inkMuted) }
         }
-        if (s.connectionDetail.isNotBlank()) Text(s.connectionDetail, style = MaterialTheme.typography.bodyMedium)
-        if (s.lastSyncAt > 0) Text(stringResource(R.string.v02_sync, DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.lastSyncAt))), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        HorizontalDivider()
+        if (s.connectionDetail.isNotBlank()) PText(s.connectionDetail, style = Pocket.type.body)
+        if (s.lastSyncAt > 0) PText(stringResource(R.string.v02_sync, DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.lastSyncAt))), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+        PDivider()
         s.runtimes.forEach { runtime ->
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Box(Modifier.size(7.dp).background(if (runtime.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline, CircleShape))
-                Column(Modifier.weight(1f)) { Text(context.sourceLabel(runtime.source)); Text(runtimeVersionLabel(runtime.version), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                Text(context.stateLabel(if (runtime.online) "online" else "offline"), style = MaterialTheme.typography.labelMedium)
+                Box(Modifier.size(7.dp).background(if (runtime.online) Pocket.colors.accent else Pocket.colors.inkFaint, CircleShape))
+                Column(Modifier.weight(1f)) { PText(context.sourceLabel(runtime.source)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted) }
+                PText(context.stateLabel(if (runtime.online) "online" else "offline"), style = Pocket.type.labelSmall)
             }
         }
-        if (s.runtimes.isEmpty()) Text(stringResource(R.string.v02_no_runtime), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (s.runtimes.isEmpty()) PText(stringResource(R.string.v02_no_runtime), color = Pocket.colors.inkMuted)
         if(s.connectionPhase == "authorization_required" && onPair != null) {
             PocketButton("重新扫码配对", onPair, modifier = Modifier.fillMaxWidth().testTag("repair-pairing"))
-            Text("在电脑上生成新的配对码。当前会话缓存和草稿会保留。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else Row { PocketTextButton(onClick = onInspect, enabled = s.online) { Text(stringResource(R.string.v02_inspect)) }; PocketTextButton(onClick = onReconnect) { Text(stringResource(R.string.reconnect)) } }
-        HorizontalDivider()
-        PocketTextButton(onClick = onSettings) { Icon(PocketIcons.Tune, null); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.settings)) }
+            PText("在电脑上生成新的配对码。当前会话缓存和草稿会保留。", style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+        } else Row { PocketTextButton(onClick = onInspect, enabled = s.online) { PText(stringResource(R.string.v02_inspect)) }; PocketTextButton(onClick = onReconnect) { PText(stringResource(R.string.reconnect)) } }
+        PDivider()
+        PocketTextButton(onClick = onSettings) { PIcon(PocketIcons.Tune, null); Spacer(Modifier.width(8.dp)); PText(stringResource(R.string.settings)) }
     }
 }

@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,14 +16,6 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.TooltipBox
-import androidx.compose.material3.TooltipDefaults
-import androidx.compose.material3.PlainTooltip
-import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -45,9 +38,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.pocketPressScale
-import dev.codexpocket.app.ui.kit.pocketPressable
-import dev.codexpocket.app.ui.kit.pocketSelectable
 
 /** Root coordinates, already reduced by system/IME insets. Never overlaps the input capsule. */
 internal fun modelMenuBounds(viewport: Rect, anchor: Rect?, density: Float, widthDp: Float = 300f, alignStart: Boolean = false, below: Boolean = false): Rect {
@@ -103,32 +93,32 @@ internal fun PocketEffortSelector(efforts: List<String>, effort: String?, enable
 
 @Composable
 private fun EffortPill(label: String, selected: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     Box(modifier.heightIn(min = 48.dp).pocketPressScale(interaction, .96f)
-        .clip(PocketCapsule).background(if (selected) effortAccent().copy(alpha = .15f) else c.surfaceContainerHigh)
-        .border(1.dp, if (selected) effortAccent() else c.outlineVariant.copy(alpha = .5f), PocketCapsule)
+        .clip(PocketCapsule).background(if (selected) effortAccent().copy(alpha = .15f) else c.fillStrong)
+        .border(1.dp, if (selected) effortAccent() else c.line.copy(alpha = .5f), PocketCapsule)
         .pocketSelectable(selected, enabled, Role.RadioButton, interaction, pressedScale = 1f, highlight = true, haptic = null, onClick = onClick)
         .padding(horizontal = 12.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
-        Text(label, style = MaterialTheme.typography.labelLarge,
-            color = if (!enabled) c.onSurfaceVariant else if (selected) effortAccent() else c.onSurface)
+        PText(label, style = Pocket.type.label,
+            color = if (!enabled) c.inkMuted else if (selected) effortAccent() else c.ink)
     }
 }
 
 @Composable
 private fun EffortRow(label: String, selected: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     Row(modifier.fillMaxWidth().heightIn(min = 44.dp).clip(RoundedCornerShape(14.dp))
         .pocketSelectable(selected, enabled, Role.RadioButton, pressedScale = .985f, highlight = true, haptic = null, onClick = onClick)
         .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, color = if (enabled) c.onSurface else c.onSurfaceVariant)
-        if (selected) Icon(PocketIcons.Check, null, Modifier.size(17.dp), tint = c.onSurface)
+        PText(label, Modifier.weight(1f), style = Pocket.type.body, color = if (enabled) c.ink else c.inkMuted)
+        if (selected) PIcon(PocketIcons.Check, null, Modifier.size(17.dp), tint = c.ink)
     }
 }
 
 /** Codex's effort accent: the one colored element of the model popover. */
 @Composable
-internal fun effortAccent(): Color = if (MaterialTheme.colorScheme.background.luminance() < .5f) Color(0xFF6AA2F8) else Color(0xFF4F8EF7)
+internal fun effortAccent(): Color = if (Pocket.colors.bg.luminance() < .5f) Color(0xFF6AA2F8) else Color(0xFF4F8EF7)
 
 internal data class ModelFamily(val name: String, val models: List<Pair<NativeModel, String>>)
 
@@ -152,7 +142,7 @@ internal fun modelFamilies(models: List<NativeModel>): List<ModelFamily> {
 
 @Composable
 private fun ModelRow(label: String, model: NativeModel, selected: Boolean, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     // Codex lists models as plain lines with a trailing check; only a press tints the row.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("model-row-${model.id}")
         .clip(RoundedCornerShape(14.dp))
@@ -160,16 +150,16 @@ private fun ModelRow(label: String, model: NativeModel, selected: Boolean, onCli
         .padding(start = 14.dp, end = 12.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.bodyLarge, color = c.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            PText(label, style = Pocket.type.body, color = c.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
             // Full native identifiers distinguish providers even when display names are identical.
             val identifier = model.model.takeIf { it != label } ?: model.id.takeIf { it != label }
-            if (identifier != null) Text(identifier, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant,
+            if (identifier != null) PText(identifier, style = Pocket.type.caption, color = c.inkMuted,
                 maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
-        if (model.images) Icon(PocketIcons.Image, "支持图片", Modifier.size(15.dp), tint = c.onSurfaceVariant)
+        if (model.images) PIcon(PocketIcons.Image, "支持图片", Modifier.size(15.dp), tint = c.inkMuted)
         androidx.compose.animation.AnimatedVisibility(selected, enter = androidx.compose.animation.scaleIn(pocketPressSpring()) + androidx.compose.animation.fadeIn(),
             exit = androidx.compose.animation.scaleOut() + androidx.compose.animation.fadeOut()) {
-            Icon(PocketIcons.Check, null, Modifier.size(17.dp), tint = c.onSurface)
+            PIcon(PocketIcons.Check, null, Modifier.size(17.dp), tint = c.ink)
         }
     }
 }
@@ -200,7 +190,7 @@ internal fun ModelSheet(s: PocketState, onSelect: (NativeModel, String?) -> Unit
 @Composable
 private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeModel, String?) -> Unit)?, onFast: ((Boolean) -> Unit)?, onModels: () -> Unit) {
     val context = LocalContext.current
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val explicitEffort = s.effort
     val choices = supportedEffortChoices(model.efforts)
     val effective = explicitEffort ?: model.defaultEffort.takeIf { s.nativeSettings.effort.known && it in choices }
@@ -214,11 +204,11 @@ private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeMod
         Box(Modifier.fillMaxWidth()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = if (onFast != null) 40.dp else 0.dp).heightIn(min = 48.dp).clip(PocketCapsule).pocketPressable(role = null, onClick = onModels)
             .testTag("model-picker-open").padding(vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(if(model.efforts.isEmpty()) "模型" else shown, Modifier.testTag("effort-title"), style = MaterialTheme.typography.labelLarge, color = effortAccent())
+            PText(if(model.efforts.isEmpty()) "模型" else shown, Modifier.testTag("effort-title"), style = Pocket.type.label, color = effortAccent())
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(model.name.ifBlank { model.model }, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelMedium,
-                    color = c.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Icon(PocketIcons.ChevronRight, null, Modifier.size(14.dp), tint = c.onSurfaceVariant)
+                PText(model.name.ifBlank { model.model }, Modifier.weight(1f, fill = false), style = Pocket.type.labelSmall,
+                    color = c.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                PIcon(PocketIcons.ChevronRight, null, Modifier.size(14.dp), tint = c.inkMuted)
             }
         }
         if (onFast != null) Box(Modifier.align(Alignment.TopEnd)) { FastLightning(s, onFast) }
@@ -231,10 +221,10 @@ private fun EffortCard(s: PocketState, model: NativeModel, onEffort: ((NativeMod
 
 @Composable
 private fun ModeToggles(s: PocketState, onMode: (String?) -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val plan = s.modes.firstOrNull { it.mode == "plan" }.takeIf { s.supports("collaborationMode/list") }
     if (plan == null) return
-    HorizontalDivider(Modifier.padding(horizontal = 10.dp, vertical = 2.dp), color = c.outlineVariant.copy(alpha = .5f))
+    PDivider(Modifier.padding(horizontal = 10.dp, vertical = 2.dp), color = c.line.copy(alpha = .5f))
     if (plan != null) {
         val enabled = nativeComposerControlsEnabled(s, "collaborationMode/list")
         ModeRow("Plan 模式", PocketIcons.Checklist, s.mode == "plan", enabled, Modifier.testTag("composer-plan")) { onMode(if (s.mode == "plan") null else "plan") }
@@ -255,25 +245,23 @@ internal fun fastUnavailableReason(s: PocketState): String? = when {
     else -> null
 }
 
-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 internal fun FastLightning(s: PocketState, onFast: (Boolean) -> Unit) {
     val reason = fastUnavailableReason(s)
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) .94f else 1f, pocketPressSpring(), label = "fast-press")
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val on = s.advanced.fastMode
-    TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-        tooltip = { PlainTooltip { Text(reason ?: if (on) "关闭 Fast" else "开启 Fast") } }, state = rememberTooltipState()) {
+    PTooltip(reason ?: if (on) "关闭 Fast" else "开启 Fast") {
         Box(Modifier.size(48.dp).testTag("composer-fast")
             .graphicsLayer { scaleX = scale; scaleY = scale; alpha = if (reason == null) 1f else .45f }
             .semantics { stateDescription = reason ?: if (on) "已开启" else "已关闭"; toggleableState = if (on) ToggleableState.On else ToggleableState.Off }
             .clickable(interactionSource = interaction, indication = null, enabled = reason == null, role = Role.Switch) { onFast(!on) },
             contentAlignment = Alignment.Center) {
             androidx.compose.animation.Crossfade(on, animationSpec = androidx.compose.animation.core.tween(pocketMotionMillis(120)), label = "fast-glyph") { selected ->
-                Icon(if (selected) PocketIcons.LightningFilled else PocketIcons.Lightning, "Fast", Modifier.size(21.dp),
-                    tint = if (selected) effortAccent() else c.onSurfaceVariant)
+                PIcon(if (selected) PocketIcons.LightningFilled else PocketIcons.Lightning, "Fast", Modifier.size(21.dp),
+                    tint = if (selected) effortAccent() else c.inkMuted)
             }
         }
     }
@@ -282,12 +270,12 @@ internal fun FastLightning(s: PocketState, onFast: (Boolean) -> Unit) {
 /** A 40dp toggle line: smaller than a menu item, still a full-width touch target. */
 @Composable
 private fun ModeRow(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, on: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
         .pocketPressable(enabled, Role.Switch, pressedScale = .985f, onClick = onClick)
         .padding(start = 10.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Icon(icon, null, Modifier.size(17.dp), tint = if (enabled) c.onSurface else c.onSurfaceVariant.copy(alpha = .6f))
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = if (enabled) c.onSurface else c.onSurfaceVariant.copy(alpha = .7f),
+        PIcon(icon, null, Modifier.size(17.dp), tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .6f))
+        PText(label, Modifier.weight(1f), style = Pocket.type.body, color = if (enabled) c.ink else c.inkMuted.copy(alpha = .7f),
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Box(Modifier.graphicsLayer { scaleX = .82f; scaleY = .82f }) { PocketToggle(on, null, enabled = enabled) }
     }
@@ -298,11 +286,11 @@ private fun effortEnabled(s: PocketState) = s.paired && s.online && s.activeRunt
 
 @Composable
 private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit, onRetry: () -> Unit, selected: NativeModel?, onFast: ((Boolean) -> Unit)?) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     // A single model-first page: no second confirmation or effort-first drill-down.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
         .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("选择模型", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant)
+        PText("选择模型", Modifier.weight(1f), style = Pocket.type.label, color = c.inkMuted)
         if (onFast != null) FastLightning(s, onFast)
     }
     val ready = s.online && s.modelCatalogState == ModelCatalogState.Ready && s.models.isNotEmpty()
@@ -321,10 +309,10 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
         }
         Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
             if (status == ModelCatalogState.Loading) PocketProgressStatus(message)
-            else Text(message, style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant)
+            else PText(message, style = Pocket.type.body, color = c.inkMuted)
         }
         s.modelCatalogError?.takeIf { status == ModelCatalogState.Failed && it.isNotBlank() }?.let {
-            Text(it, Modifier.padding(horizontal = 12.dp), style = MaterialTheme.typography.bodySmall, color = c.error)
+            PText(it, Modifier.padding(horizontal = 12.dp), style = Pocket.type.bodySmall, color = c.danger)
         }
         if (status != ModelCatalogState.Loading && status != ModelCatalogState.Unsupported)
             PocketMenuItem("重新读取", PocketIcons.Refresh, { retries++; onRetry() }, enabled = s.online, glyph = { PocketRefreshGlyph(retries) })
@@ -332,16 +320,16 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
     }
     run {
         Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(PocketOval)
-            .background(c.surfaceContainerHigh.copy(alpha = .8f)).padding(horizontal = 12.dp),
+            .background(c.fillStrong.copy(alpha = .8f)).padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Icon(PocketIcons.Search, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
+            PIcon(PocketIcons.Search, null, Modifier.size(16.dp), tint = c.inkMuted)
             BasicTextField(query, { query = it }, Modifier.weight(1f).testTag("model-search").semantics { contentDescription = "搜索模型" },
-                singleLine = true, textStyle = MaterialTheme.typography.bodyMedium.copy(color = c.onSurface), cursorBrush = SolidColor(c.secondary),
-                decorationBox = { inner -> Box { if (query.isEmpty()) Text("搜索模型", style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant); inner() } })
+                singleLine = true, textStyle = Pocket.type.body.copy(color = c.ink), cursorBrush = SolidColor(c.accent),
+                decorationBox = { inner -> Box { if (query.isEmpty()) PText("搜索模型", style = Pocket.type.body, color = c.inkMuted); inner() } })
         }
     }
     val matches = remember(s.models, query) { s.models.filter { it.matchesModelQuery(query) }.distinctBy { it.id to it.model } }
-    if (matches.isEmpty()) Text("没有匹配的模型", Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant)
+    if (matches.isEmpty()) PText("没有匹配的模型", Modifier.padding(12.dp), style = Pocket.type.body, color = c.inkMuted)
     val listState = rememberLazyListState()
     LaunchedEffect(query) { listState.scrollToItem(0) }
     // Stable keys and state preserve scroll across effort and mode updates; only a new query resets it.
@@ -358,7 +346,7 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
 internal fun NativeModeSelector(s: PocketState, onMode: (String?) -> Unit) {
     val context = LocalContext.current
     if (s.modes.isNotEmpty() && s.supports("collaborationMode/list")) {
-        Text(context.getString(R.string.mode), style = MaterialTheme.typography.titleMedium)
+        PText(context.getString(R.string.mode), style = Pocket.type.title)
         Column(Modifier.selectableGroup()) {
             EffortRow(context.getString(R.string.native_default), s.mode == null, nativeComposerControlsEnabled(s, "collaborationMode/list"), Modifier) { onMode(null) }
             s.modes.forEach { mode -> EffortRow(context.modeLabel(mode.mode, mode.name), s.mode == mode.mode, nativeComposerControlsEnabled(s, "collaborationMode/list"), Modifier) { onMode(mode.mode) } }

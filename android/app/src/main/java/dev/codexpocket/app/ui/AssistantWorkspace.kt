@@ -1,6 +1,5 @@
 package dev.codexpocket.app.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -59,20 +58,22 @@ internal fun assistantPageTitle(page: String) = when {
         val owner = state.computerId
         var page by rememberSaveable(owner) { mutableStateOf("Main") }
         var stack by rememberSaveable(owner) { mutableStateOf(emptyList<String>()) }
-        var returning by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
         val holder = rememberSaveableStateHolder()
         val canAct = connected && snapshot?.enabled == true && snapshot.fresh != false && state.readError == null && !state.loading
         fun act(make: () -> AssistantAction) { runCatching(make).onSuccess { error = null; onAction(it) }.onFailure { error = it.message } }
         fun navigate(destination: String) {
             val next = assistantDestination(destination)
-            if (next != page) { stack = stack + page; page = next; returning = false }
+            if (next != page) { stack = stack + page; page = next }
         }
         fun back() {
-            if (stack.isNotEmpty()) { page = stack.last(); stack = stack.dropLast(1); returning = true }
-            else if (page != "Main") { page = "Main"; returning = true } else onBack()
+            if (stack.isNotEmpty()) { page = stack.last(); stack = stack.dropLast(1) }
+            else if (page != "Main") page = "Main" else onBack()
         }
-        BackHandler { back() }
+        // How deep each page sits, kept for a page that has just been left so the stage knows which way it goes.
+        val depths = remember(owner) { HashMap<String, Int>() }
+        depths[page] = if (page == "Main") 0 else stack.size.coerceAtLeast(1)
+        val previous = stack.lastOrNull() ?: "Main".takeIf { page != "Main" }
         // A command whose outcome is unsettled is named for as long as it is, whatever a later refresh reports.
         val issue = error ?: state.readError ?: state.unconfirmedFeedback?.takeUnless { snapshot?.protocolVersion == 2 } ?: state.error?.takeUnless {
             (it == state.unconfirmedFeedback && snapshot?.protocolVersion == 2) || (page == "Main" && snapshot?.prepared != true && it == snapshot?.preparationIssue)
@@ -83,7 +84,8 @@ internal fun assistantPageTitle(page: String) = when {
         // The overlay layer hands focus back to the page when a menu, sheet or dialog closes. Taking it here keeps it
         // from landing on the first text field, which would raise the keyboard on a page that was only opened.
         Box(modifier.fillMaxSize().background(Pocket.colors.bg).testTag("assistant-workspace").focusTarget()) {
-            AssistantPageEntrance(page, returning) {
+            // On the first page there is nothing here to go back to: whoever opened the assistant previews the way out.
+            PStage(page, depth = { depths[it] ?: 1 }, back = previous, onBack = ::back) { page ->
                 holder.SaveableStateProvider("$owner:$page") {
                     if (page == "Main") AssistantStage(state, workspaces, canAct, connected, ::act, ::navigate, onOpenThread, ::back, onProjectSelected, notice)
                     else AssistantSubpage(assistantPageTitle(page), ::back, notice) {
@@ -105,20 +107,6 @@ internal fun assistantPageTitle(page: String) = when {
             }
         }
     }
-}
-
-/** A pushed page slides in from the trailing edge and a return settles from the leading one; nothing moves with motion off. */
-@Composable
-private fun AssistantPageEntrance(page: String, returning: Boolean, content: @Composable () -> Unit) {
-    if (!rememberPocketMotion()) { Box(Modifier.fillMaxSize()) { content() }; return }
-    val progress = remember { Animatable(1f) }
-    val first = remember { booleanArrayOf(true) }
-    LaunchedEffect(page) {
-        if (first[0]) { first[0] = false; return@LaunchedEffect }
-        progress.snapTo(0f); progress.animateTo(1f, PocketMotion.state())
-    }
-    val distance = with(LocalDensity.current) { (if (returning) -18 else 28).dp.toPx() }
-    Box(Modifier.fillMaxSize().graphicsLayer { alpha = progress.value.coerceIn(0f, 1f); translationX = distance * (1f - progress.value) }) { content() }
 }
 
 /**

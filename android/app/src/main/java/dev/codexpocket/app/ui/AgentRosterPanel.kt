@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -8,7 +9,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -52,7 +52,7 @@ internal fun AgentRosterChip(
     val running = currentAgentWork(agents).running.size
     val label = "子代理 ${agents.size} · ${running}进行中"
     PocketGlassSurface(
-        modifier = modifier.minimumInteractiveComponentSize()
+        modifier = modifier.pocketMinTouch()
             .onGloballyPositioned { if (!expanded) anchor = it.boundsInRoot() }
             .testTag("agent-roster-chip")
             .semantics {
@@ -70,9 +70,9 @@ internal fun AgentRosterChip(
     ) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            PText(label, style = Pocket.type.caption, color = Pocket.colors.inkMuted,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Icon(PocketIcons.ExpandMore, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            PIcon(PocketIcons.ExpandMore, null, Modifier.size(12.dp), tint = Pocket.colors.inkMuted)
         }
     }
     if (expanded && onShow == null) AgentRosterPanel(agents, online, loading, anchor, { expanded = false }, { id ->
@@ -94,7 +94,7 @@ internal fun AgentRosterPanel(
     onOpen: (String) -> Unit,
     names: Map<String, String> = emptyMap(),
 ) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     var othersExpanded by rememberSaveable { mutableStateOf(false) }
     PocketAnchoredMenu("子代理", onDismiss, anchor, widthDp = 320f, alignStart = true, below = true) {
         Column(Modifier.fillMaxWidth().heightIn(max = 320.dp).verticalScroll(rememberScrollState())
@@ -105,18 +105,18 @@ internal fun AgentRosterPanel(
                 loading -> "正在读取 · 显示已知记录"
                 else -> "状态来自原生记录"
             }
-            Text(notice, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant,
+            PText(notice, style = Pocket.type.caption, color = c.inkMuted,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
             val sections = remember(agents) { agentRosterSections(agents) }
             val current = sections.current
             val historical = sections.folded
             if (current.isNotEmpty()) AgentRosterGroup("本轮子代理", current, names, online && !loading, onOpen)
             if (historical.isNotEmpty()) {
-                if (current.isNotEmpty()) HorizontalDivider(color = c.outlineVariant.copy(alpha = .5f))
+                if (current.isNotEmpty()) PDivider(color = c.line.copy(alpha = .5f))
                 PocketTextButton({ othersExpanded = !othersExpanded }, modifier = Modifier.testTag("agent-roster-others-toggle")
                     .semantics { stateDescription = if(othersExpanded) "已展开" else "已折叠" }) {
-                    Text("其他子代理 · ${historical.size}")
-                    Icon(if(othersExpanded) PocketIcons.ExpandLess else PocketIcons.ExpandMore,null,Modifier.size(16.dp))
+                    PText("其他子代理 · ${historical.size}")
+                    PIcon(if(othersExpanded) PocketIcons.ExpandLess else PocketIcons.ExpandMore,null,Modifier.size(16.dp))
                 }
                 if(othersExpanded) historical.forEach { agent -> key(agent.threadId) {
                     AgentRosterItem(agent,names,online && !loading,onOpen)
@@ -139,7 +139,7 @@ internal fun AgentRosterList(
     onOpen: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val unique = remember(agents) { agents.distinctBy { it.threadId }.filter { it.threadId.isNotBlank() } }
     val sections = remember(unique) { agentRosterSections(unique) }
     val current = sections.current
@@ -148,20 +148,20 @@ internal fun AgentRosterList(
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)) {
         item(key = "roster-notice", contentType = "notice") {
-            Text(when {
+            PText(when {
                 !online -> "离线 · 可查看已缓存内容"
                 loading -> "正在读取 · 显示已知记录"
                 else -> "状态来自原生记录"
-            }, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant,
+            }, style = Pocket.type.caption, color = c.inkMuted,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
         }
         item(key = "roster-current", contentType = "section") {
-            Text("本轮子代理", style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant,
+            PText("本轮子代理", style = Pocket.type.labelSmall, color = c.inkMuted,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp))
         }
         if (current.isEmpty()) item(key = "roster-current-empty", contentType = "notice") {
-            Text(if (loading && unique.isEmpty()) "正在读取子代理" else "暂无进行中的子代理",
-                style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
+            PText(if (loading && unique.isEmpty()) "正在读取子代理" else "暂无进行中的子代理",
+                style = Pocket.type.bodySmall, color = c.inkMuted,
                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 10.dp))
         }
         items(current, key = { "child:${it.threadId}" }, contentType = { "child" }) { agent ->
@@ -175,10 +175,10 @@ internal fun AgentRosterList(
                     .semantics { stateDescription = if (historyExpanded) "已展开" else "已折叠" }
                     .clickable(role = Role.Button, onClick = onHistoryExpanded)
                     .padding(horizontal = 6.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("其他子代理 · ${historical.size}", Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
-                    Icon(PocketIcons.ExpandMore, null, Modifier.size(16.dp).graphicsLayer { rotationZ = angle },
-                        tint = c.onSurfaceVariant)
+                    PText("其他子代理 · ${historical.size}", Modifier.weight(1f),
+                        style = Pocket.type.labelSmall, color = c.inkMuted)
+                    PIcon(PocketIcons.ExpandMore, null, Modifier.size(16.dp).graphicsLayer { rotationZ = angle },
+                        tint = c.inkMuted)
                 }
             }
             if (historyExpanded) items(historical, key = { "child:${it.threadId}" }, contentType = { "child" }) { agent ->
@@ -196,31 +196,31 @@ private fun AgentRosterGroup(
     enabled: Boolean,
     onOpen: (String) -> Unit,
 ) {
-    val c = MaterialTheme.colorScheme
-    Text(title, style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant,
+    val c = Pocket.colors
+    PText(title, style = Pocket.type.labelSmall, color = c.inkMuted,
         modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp))
     agents.forEach { agent -> key(agent.threadId) { AgentRosterItem(agent, names, enabled, onOpen) } }
 }
 
 @Composable
 private fun AgentRosterItem(agent: AgentRosterEntry, names: Map<String, String>, enabled: Boolean, onOpen: (String) -> Unit, animate: Boolean = enabled) {
-        val c = MaterialTheme.colorScheme
+        val c = Pocket.colors
         val name = names[agent.threadId]?.trim().orEmpty().ifBlank { agent.name }.ifBlank { "子代理 ${agent.threadId.take(8)}" }
         val state = agentRosterStatusLabel(agent)
         val color = when (agent.status) {
-            ActivityStatus.Failed -> c.error
-            ActivityStatus.Running -> if (agent.isCurrent) c.primary else c.onSurfaceVariant
-            else -> c.onSurfaceVariant
+            ActivityStatus.Failed -> c.danger
+            ActivityStatus.Running -> if (agent.isCurrent) c.solid else c.inkMuted
+            else -> c.inkMuted
         }
         Column(Modifier.fillMaxWidth().heightIn(min = 48.dp)
             .testTag("agent-roster-open:${agent.threadId}")
             .semantics { contentDescription = "$name · $state · 查看子会话" }
             .clickable(enabled = enabled, role = Role.Button) { onOpen(agent.threadId) }
             .padding(horizontal = 6.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(name, Modifier.reasoningSweep(animate && agent.isCurrent && agent.status == ActivityStatus.Running),
-                style = MaterialTheme.typography.labelLarge, color = c.onSurface,
+            PText(name, Modifier.reasoningSweep(animate && agent.isCurrent && agent.status == ActivityStatus.Running),
+                style = Pocket.type.label, color = c.ink,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(state, style = MaterialTheme.typography.labelSmall, color = color)
+            PText(state, style = Pocket.type.caption, color = color)
             val preview = agent.resultPreview.ifBlank { agent.taskPreview }
             if (preview.isNotBlank()) {
                 val kind = when {
@@ -228,9 +228,9 @@ private fun AgentRosterItem(agent: AgentRosterEntry, names: Map<String, String>,
                     agent.status == ActivityStatus.Completed -> "结果"
                     else -> "消息"
                 }
-                Text("$kind · $preview", style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
+                PText("$kind · $preview", style = Pocket.type.bodySmall, color = c.inkMuted,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
-            } else Text("查看子会话", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+            } else PText("查看子会话", style = Pocket.type.caption, color = c.inkMuted)
         }
 }
 

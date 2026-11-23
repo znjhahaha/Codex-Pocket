@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.graphics.ImageDecoder
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -9,7 +10,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,8 +59,8 @@ internal fun ToolOutputContent(blocks: List<ToolOutputBlock>) {
         var index = 0
         while (index < blocks.size) {
             when (val block = blocks[index]) {
-                is ToolOutputBlock.Text -> { SelectionContainer { Text(block.text, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant) }; index++ }
+                is ToolOutputBlock.Text -> { SelectionContainer { PText(block.text, style = Pocket.type.bodySmall,
+                    color = Pocket.colors.inkMuted) }; index++ }
                 is ToolOutputBlock.Image -> {
                     val media = mutableListOf<ToolMediaRef>()
                     while (index < blocks.size && blocks[index] is ToolOutputBlock.Image) { media.add((blocks[index] as ToolOutputBlock.Image).media); index++ }
@@ -87,14 +87,14 @@ internal fun AttachmentStrip(attachments: List<LocalAttachment>, fileFor: (Local
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         attachments.forEach { attachment ->
             key(attachment.id) {
-                Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                PSurface(shape = RoundedCornerShape(14.dp), color = Pocket.colors.fillStrong) {
                     Column(Modifier.width(128.dp)) {
                         Box(Modifier.fillMaxWidth().height(72.dp).clickable(enabled = attachment.mime.startsWith("image/"), onClickLabel = context.getString(R.string.delivery_preview_image, attachment.name)) { preview = attachment }, contentAlignment = Alignment.Center) {
                             if (attachment.mime.startsWith("image/")) LocalImage(fileFor(attachment), attachment.name, 320, Modifier.fillMaxSize())
-                            else Icon(PocketIcons.Description, attachment.name, Modifier.size(28.dp))
+                            else PIcon(PocketIcons.Description, attachment.name, Modifier.size(28.dp))
                         }
                         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(attachment.name, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            PText(attachment.name, Modifier.weight(1f), style = Pocket.type.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (onRemove != null) ActionIcon(PocketIcons.Close, context.getString(R.string.remove_image, attachment.name)) { onRemove(attachment) }
                         }
                     }
@@ -127,19 +127,21 @@ private fun LocalImage(file: File, name: String, maxSide: Int, modifier: Modifie
         val image = bitmap
         if (image != null) Image(image, contentDescription = name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
         else if (failed) Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(8.dp)) {
-            Icon(PocketIcons.Image, null)
-            Text(LocalContext.current.getString(R.string.delivery_image_unavailable), style = MaterialTheme.typography.labelSmall)
+            PIcon(PocketIcons.Image, null)
+            PText(LocalContext.current.getString(R.string.delivery_image_unavailable), style = Pocket.type.caption)
         } else PocketLoader()
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ImagePreview(file: File, name: String, onDismiss: () -> Unit) {
     val context = LocalContext.current
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Scaffold(modifier = Modifier.fillMaxSize(), topBar = {
-            TopAppBar(title = { Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, navigationIcon = { ActionIcon(PocketIcons.Close, context.getString(R.string.delivery_close_preview), onClick = onDismiss) })
+        PScaffold(modifier = Modifier.fillMaxSize(), topBar = {
+            Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 64.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                ActionIcon(PocketIcons.Close, context.getString(R.string.delivery_close_preview), onClick = onDismiss)
+                PText(name, Modifier.weight(1f).padding(horizontal = 8.dp), style = Pocket.type.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }) { padding -> LocalImage(file, name, 1600, Modifier.fillMaxSize().padding(padding).padding(16.dp)) }
     }
 }
@@ -203,7 +205,7 @@ internal fun chipName(name: String, budget: Int = 30): String {
 @OptIn(ExperimentalLayoutApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 internal fun AttachmentChips(key: String, files: List<MentionedFile>, alignEnd: Boolean) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val fallback = LocalContext.current.getString(R.string.v02_image)
     val grouped = files.size > 2
     var open by rememberSaveable(key) { mutableStateOf(false) }
@@ -216,35 +218,35 @@ internal fun AttachmentChips(key: String, files: List<MentionedFile>, alignEnd: 
         horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (grouped) {
             val images = files.all { it.image }
-            Row(Modifier.clip(PocketOval).background(c.surfaceContainer).clickable(role = Role.Button) { open = !open }
+            Row(Modifier.clip(PocketOval).background(c.fill).clickable(role = Role.Button) { open = !open }
                 .testTag("desktop-images-toggle").semantics { stateDescription = if (open) "已展开" else "已收起" }
                 .padding(start = 10.dp, end = 10.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Icon(if (images) PocketIcons.Image else PocketIcons.Description, null, Modifier.size(15.dp), tint = c.onSurfaceVariant)
-                Text(stringResource(if (images) R.string.v04_desktop_images else R.string.v04_attachments, files.size), style = MaterialTheme.typography.labelMedium, maxLines = 1)
-                Icon(PocketIcons.KeyboardArrowDown, null, Modifier.size(15.dp).graphicsLayer { rotationZ = chevron }, tint = c.onSurfaceVariant)
+                PIcon(if (images) PocketIcons.Image else PocketIcons.Description, null, Modifier.size(15.dp), tint = c.inkMuted)
+                PText(stringResource(if (images) R.string.v04_desktop_images else R.string.v04_attachments, files.size), style = Pocket.type.labelSmall, maxLines = 1)
+                PIcon(PocketIcons.KeyboardArrowDown, null, Modifier.size(15.dp).graphicsLayer { rotationZ = chevron }, tint = c.inkMuted)
             }
         }
         if (!grouped || open) FlowRow(horizontalArrangement = arrangement, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             files.forEach { file -> key(file.path.ifBlank { file.name }) {
-                Row(Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(10.dp)).background(c.surfaceContainer.copy(alpha = .7f))
+                Row(Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(10.dp)).background(c.fill.copy(alpha = .7f))
                     .combinedClickable(role = Role.Button, onClickLabel = "只读预览", onLongClickLabel = "文件路径详情",
                         onClick = { if (onPreview != null && file.path.isNotBlank()) onPreview(file.path) else detailsPath = file.path.ifBlank { file.name } },
                         onLongClick = { detailsPath = file.path.ifBlank { file.name } })
                     .testTag("attachment-chip:${file.path.ifBlank { file.name }}")
                     .padding(start = 10.dp, end = 12.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Icon(attachmentTypeIcon(file), null, Modifier.size(15.dp), tint = c.onSurfaceVariant)
+                    PIcon(attachmentTypeIcon(file), null, Modifier.size(15.dp), tint = c.inkMuted)
                     // Long names keep their extension visible so report.docx and report.pdf stay distinguishable.
                     val name = file.name.ifBlank { baseName(file.path) }.ifBlank { fallback }
-                    Text(remember(name) { chipName(name) }, Modifier.weight(1f, fill = false),
-                        style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    PText(remember(name) { chipName(name) }, Modifier.weight(1f, fill = false),
+                        style = Pocket.type.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             } }
         }
     }
-    detailsPath?.let { path -> AlertDialog(onDismissRequest = { detailsPath = null }, title = { Text(baseName(path)) },
-        text = { SelectionContainer { Text(path, Modifier.testTag("attachment-full-path"), style = MaterialTheme.typography.bodySmall) } },
-        confirmButton = { TextButton(onClick = { clipboard.setText(AnnotatedString(path)); detailsPath = null }) { Text("复制完整路径") } },
-        dismissButton = { TextButton(enabled = onPreview != null && files.any { it.path == path }, onClick = { detailsPath = null; onPreview?.invoke(path) }) { Text("只读预览") } }) }
+    detailsPath?.let { path -> PocketDialog(onDismissRequest = { detailsPath = null }, title = { PText(baseName(path)) },
+        text = { SelectionContainer { PText(path, Modifier.testTag("attachment-full-path"), style = Pocket.type.bodySmall) } },
+        confirmButton = { PocketTextButton(onClick = { clipboard.setText(AnnotatedString(path)); detailsPath = null }) { PText("复制完整路径") } },
+        dismissButton = { PocketTextButton(enabled = onPreview != null && files.any { it.path == path }, onClick = { detailsPath = null; onPreview?.invoke(path) }) { PText("只读预览") } }) }
 }
 
 /** Bounded native image decoding. No arbitrary desktop file paths or authenticated fetches. */
@@ -285,12 +287,12 @@ internal fun RemoteTranscriptImage(source: String) {
     val label = LocalContext.current.getString(R.string.v02_image)
     Box(Modifier.fillMaxWidth().heightIn(min = 100.dp, max = 240.dp).clickable { if (bitmap != null) preview = true else requested = true }, contentAlignment = Alignment.Center) {
         bitmap?.let { Image(it, label, Modifier.fillMaxWidth().heightIn(max = 240.dp), contentScale = ContentScale.Fit) }
-        if (bitmap == null) Text(if (!requested) LocalContext.current.getString(R.string.v02_load_external_image, runCatching { java.net.URI(source).host }.getOrNull().orEmpty()) else LocalContext.current.getString(if (failed) R.string.delivery_image_unavailable else R.string.v02_image_loading), style = MaterialTheme.typography.bodySmall)
+        if (bitmap == null) PText(if (!requested) LocalContext.current.getString(R.string.v02_load_external_image, runCatching { java.net.URI(source).host }.getOrNull().orEmpty()) else LocalContext.current.getString(if (failed) R.string.delivery_image_unavailable else R.string.v02_image_loading), style = Pocket.type.bodySmall)
     }
     if (preview && bitmap != null) Dialog({ preview = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.fillMaxSize()) { Box(Modifier.fillMaxSize()) {
+        PSurface(Modifier.fillMaxSize()) { Box(Modifier.fillMaxSize()) {
             Image(bitmap!!, label, Modifier.fillMaxSize().padding(20.dp), contentScale = ContentScale.Fit)
-            IconButton(onClick = { preview = false }, Modifier.align(Alignment.TopEnd).statusBarsPadding()) { Icon(PocketIcons.Close, LocalContext.current.getString(R.string.delivery_close_preview)) }
+            PIconButton(PocketIcons.Close, LocalContext.current.getString(R.string.delivery_close_preview), { preview = false }, Modifier.align(Alignment.TopEnd).statusBarsPadding())
         } }
     }
 }

@@ -1,11 +1,11 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -32,8 +32,8 @@ internal fun EffortTrack(choices: List<String?>, selected: String?, known: Boole
     val fraction by animateFloatAsState(if (index == null || choices.size < 2) 0f else index.toFloat() / choices.lastIndex,
         pocketPressSpring(), label = "effort-thumb")
     val accent = effortAccent()
-    val base = MaterialTheme.colorScheme.surfaceContainerHighest
-    val dot = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .3f)
+    val base = Pocket.colors.fillStrongest
+    val dot = Pocket.colors.inkMuted.copy(alpha = .3f)
     val density = LocalDensity.current
     val inset = with(density) { 17.dp.toPx() }
     val callback by rememberUpdatedState(onSelect)

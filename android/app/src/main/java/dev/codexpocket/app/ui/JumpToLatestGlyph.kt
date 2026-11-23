@@ -1,10 +1,9 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -17,7 +16,7 @@ import kotlin.math.sin
 @Composable
 internal fun JumpToLatestGlyph(running: Boolean) {
     if (!running) {
-        Icon(PocketIcons.ArrowDownward, null, Modifier.size(18.dp).testTag("jump-latest-idle"))
+        PIcon(PocketIcons.ArrowDownward, null, Modifier.size(18.dp).testTag("jump-latest-idle"))
         return
     }
     val preferences = rememberPocketGlassPreferences()
@@ -25,7 +24,7 @@ internal fun JumpToLatestGlyph(running: Boolean) {
     val phase = if (animate) rememberInfiniteTransition(label = "jump-latest-working").animateFloat(
         0f, 1f, infiniteRepeatable(tween(1200, easing = LinearEasing)), label = "three-dot-bounce"
     ) else rememberUpdatedState(0f)
-    val color = MaterialTheme.colorScheme.onSurface
+    val color = Pocket.colors.ink
     Canvas(Modifier.size(24.dp).testTag("jump-latest-running")) {
         val unit = size.width / 24f
         repeat(3) { index ->

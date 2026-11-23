@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,7 +14,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -57,14 +57,14 @@ internal fun planPress(onClick: () -> Unit, enabled: Boolean = true): Modifier {
 @Composable
 internal fun PlanIconAction(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
     Box(Modifier.size(48.dp).then(planPress(onClick, enabled)), contentAlignment = Alignment.Center) {
-        Icon(icon, label, Modifier.size(19.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        PIcon(icon, label, Modifier.size(19.dp), tint = Pocket.colors.inkMuted)
     }
 }
 
 /** Native text and identity remain intact; opening this reader never submits a command. */
 @Composable
 internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPlan: (() -> Unit)? = null, writing: Boolean = false) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
@@ -91,13 +91,13 @@ internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPl
     val save: () -> Unit = { pendingExport = plan.markdownText; export.launch(plan.markdownFilename) }
     val copy: () -> Unit = { clipboard.setText(AnnotatedString(plan.content)); copied = true }
     LaunchedEffect(copied) { if (copied) { kotlinx.coroutines.delay(1500); copied = false } }
-    Surface(Modifier.fillMaxWidth().testTag("proposed-plan"), shape = RoundedCornerShape(18.dp), color = c.surface,
-        border = BorderStroke(1.dp, c.outlineVariant.copy(alpha = .65f))) {
+    PSurface(Modifier.fillMaxWidth().testTag("proposed-plan"), shape = RoundedCornerShape(18.dp), color = c.surface,
+        border = BorderStroke(1.dp, c.line.copy(alpha = .65f))) {
         Column {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(PocketIcons.Lightbulb, null, Modifier.size(19.dp), tint = c.onSurface)
-                Text(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
-                    .testTag("plan-title").reasoningSweep(writing), style = MaterialTheme.typography.titleSmall)
+                PIcon(PocketIcons.Lightbulb, null, Modifier.size(19.dp), tint = c.ink)
+                PText(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
+                    .testTag("plan-title").reasoningSweep(writing), style = Pocket.type.titleSmall)
                 PlanIconAction(PocketIcons.ArrowDownToLine, "保存计划 Markdown", pendingExport == null, save)
                 PlanIconAction(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, "复制完整计划", onClick = copy)
                 PlanIconAction(PocketIcons.OpenInFull, "展开完整计划") { readerOpen = true }
@@ -115,8 +115,8 @@ internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPl
             }
             if (onReopenPlan != null) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("plan-reopen")
                 .then(planPress(onReopenPlan)).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("实施此计划？", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
-                Icon(PocketIcons.ArrowForward, null, Modifier.size(18.dp))
+                PText("实施此计划？", Modifier.weight(1f), style = Pocket.type.label)
+                PIcon(PocketIcons.ArrowForward, null, Modifier.size(18.dp))
             }
         }
     }
@@ -130,12 +130,12 @@ internal fun PlanProposalCard(plan: ProposedPlan, messageKey: String, onReopenPl
                 snapshotFlow { scroll.value }.collect { readerPosition = it }
             }
         }
-        Surface(Modifier.fillMaxSize().testTag("plan-reader"), color = c.background) {
+        PSurface(Modifier.fillMaxSize().testTag("plan-reader"), color = c.bg) {
             Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                 Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(PocketIcons.Lightbulb, null, Modifier.size(19.dp))
-                    Text(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
-                        .reasoningSweep(writing), style = MaterialTheme.typography.titleMedium)
+                    PIcon(PocketIcons.Lightbulb, null, Modifier.size(19.dp))
+                    PText(if (writing) "编写计划" else "计划", Modifier.weight(1f).padding(start = 8.dp)
+                        .reasoningSweep(writing), style = Pocket.type.title)
                     PlanIconAction(PocketIcons.ArrowDownToLine, "保存计划 Markdown", pendingExport == null, save)
                     PlanIconAction(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, "复制完整计划", onClick = copy)
                     PlanIconAction(PocketIcons.Close, "关闭计划阅读") { readerOpen = false }
@@ -166,15 +166,15 @@ internal fun rememberPlanRendering(identity: String, source: String, rendererKey
 @Composable
 private fun PlanDocumentText(rendered: RenderedMarkdown?) {
     val renderer = checkNotNull(LocalMarkdownCache.current)
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     if (rendered == null) Box(Modifier.fillMaxWidth().height(72.dp).testTag("plan-initial-render")) {
-        Text("正在排版计划…", color = c.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        PText("正在排版计划…", color = c.inkMuted, style = Pocket.type.bodySmall)
     }
     else Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         rendered.parts.forEach { part ->
             if (part.table != null) MarkdownTable(part.table)
             else if (part.code != null) CodeBlock(part.code, part.language)
-            else part.spans?.let { MarkdownSpans(it, renderer, c.onSurface.toArgb(), c.primary.toArgb(), tableColumns = part.tableColumns) }
+            else part.spans?.let { MarkdownSpans(it, renderer, c.ink.toArgb(), c.solid.toArgb(), tableColumns = part.tableColumns) }
         }
         rendered.images.forEach { RemoteTranscriptImage(it) }
     }

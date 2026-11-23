@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -7,10 +8,6 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,16 +65,16 @@ internal fun QuestionDock(
     val availability = questionAvailability(s, entry)
     val session = entry.batch?.let(memory::session)
     val phase = session?.presentationPhase(availability) ?: availability
-    Surface(modifier.fillMaxWidth().testTag("question-dock"), shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surface, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+    PSurface(modifier.fillMaxWidth().testTag("question-dock"), shape = RoundedCornerShape(20.dp),
+        color = Pocket.colors.surface, border = BorderStroke(1.dp, Pocket.colors.line)) {
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Icon(if (entry.batch != null) PocketIcons.ChatBubbleOutline else PocketIcons.ShieldCheck, null,
-                    Modifier.padding(end = 8.dp).size(18.dp), tint = MaterialTheme.colorScheme.secondary)
+                PIcon(if (entry.batch != null) PocketIcons.ChatBubbleOutline else PocketIcons.ShieldCheck, null,
+                    Modifier.padding(end = 8.dp).size(18.dp), tint = Pocket.colors.accent)
                 Column(Modifier.weight(1f)) {
-                    Text("待处理 · ${entries.size}", Modifier.testTag("question-batch-count"), style = MaterialTheme.typography.labelLarge)
-                    Text("${index + 1}/${entries.size} · " + if (entry.asynchronous) "异步问题" else if (entry.batch != null) "需要回答" else "权限审批",
-                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PText("待处理 · ${entries.size}", Modifier.testTag("question-batch-count"), style = Pocket.type.label)
+                    PText("${index + 1}/${entries.size} · " + if (entry.asynchronous) "异步问题" else if (entry.batch != null) "需要回答" else "权限审批",
+                        style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
                 if (entries.size > 1) {
                     ActionIcon(PocketIcons.ChevronLeft, "上一批", index > 0) { selectedKey = entries[index - 1].key }
@@ -96,7 +93,7 @@ internal fun QuestionDock(
                 }, enabled = !s.busy && !s.sendBusy, revealState = memory.reveal(entry.batch))
             } else if (entry.receipt != null && entry.approval == null) {
                 QuestionStatus(phase)
-                Text("回答已保留 · 核对状态不会再次发送", style = MaterialTheme.typography.bodySmall)
+                PText("回答已保留 · 核对状态不会再次发送", style = Pocket.type.bodySmall)
             } else {
                 // Command/file approval decisions keep their own native allow/decline/cancel interface.
                 Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
@@ -132,16 +129,16 @@ internal fun QuestionCard(
         key(batch.id, question?.id) {
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(question?.header?.takeIf { it.isNotBlank() } ?: if (batch.asynchronous) stringResource(R.string.v02_async) else stringResource(R.string.your_answer),
-                        Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(if (question == null) "0/0" else "${session.page + 1}/${batch.questions.size}", Modifier.testTag("question-page"),
-                        style = MaterialTheme.typography.labelLarge)
+                    PText(question?.header?.takeIf { it.isNotBlank() } ?: if (batch.asynchronous) stringResource(R.string.v02_async) else stringResource(R.string.your_answer),
+                        Modifier.weight(1f), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
+                    PText(if (question == null) "0/0" else "${session.page + 1}/${batch.questions.size}", Modifier.testTag("question-page"),
+                        style = Pocket.type.label)
                 }
                 QuestionStatus(phase, enabled)
                 if (question != null) {
                     val scroll = key(batch.id, question.id) { rememberScrollState() }
                     Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(question.prompt, style = MaterialTheme.typography.bodyLarge)
+                        PText(question.prompt, style = Pocket.type.body)
                         if (phase == QuestionPhase.Waiting || phase == QuestionPhase.Offline || phase == QuestionPhase.Stale || phase == QuestionPhase.Submitting) {
                             question.options.forEachIndexed { index, option ->
                                 QuestionOptionRow(option.label, option.description, option.recommended,
@@ -163,16 +160,16 @@ internal fun QuestionCard(
                                         visualTransformation = if (question.secret) PasswordVisualTransformation() else VisualTransformation.None,
                                         keyboardOptions = if (question.secret) KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false,
                                             platformImeOptions = PlatformImeOptions(privateImeOptions = "com.google.android.inputmethod.latin.noPersonalizedLearning=true")) else KeyboardOptions.Default)
-                                    if (question.secret) Text("敏感回答仅在当前界面内存中保留", style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (question.secret) PText("敏感回答仅在当前界面内存中保留", style = Pocket.type.caption,
+                                        color = Pocket.colors.inkMuted)
                                 }
                             }
                         }
                         if (!interactive && phase != QuestionPhase.Unsupported) {
-                            if (question.secret) Text("敏感回答不会保存", style = MaterialTheme.typography.bodySmall)
+                            if (question.secret) PText("敏感回答不会保存", style = Pocket.type.bodySmall)
                             else session.answer(question.id)?.let { answer ->
-                                Text("提交的回答：$answer", Modifier.testTag("question-submitted-answer:${question.id}"),
-                                    style = MaterialTheme.typography.bodyMedium)
+                                PText("提交的回答：$answer", Modifier.testTag("question-submitted-answer:${question.id}"),
+                                    style = Pocket.type.body)
                             }
                         }
                     }
@@ -196,20 +193,20 @@ internal fun QuestionCard(
 @Composable
 private fun QuestionOptionRow(label: String, description: String, recommended: Boolean, selected: Boolean,
     enabled: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    Surface(modifier.fillMaxWidth().heightIn(min = 48.dp)
+    PSurface(modifier.fillMaxWidth().heightIn(min = 48.dp)
         .selectable(selected, enabled = enabled, role = Role.RadioButton, onClick = onClick),
-        shape = RoundedCornerShape(12.dp), color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerLow) {
+        shape = RoundedCornerShape(12.dp), color = if (selected) Pocket.colors.accentSoft else Pocket.colors.sunken) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Icon(if (selected) PocketIcons.CheckCircle else PocketIcons.RadioButtonUnchecked, null, Modifier.size(18.dp),
-                tint = if (enabled) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)
+            PIcon(if (selected) PocketIcons.CheckCircle else PocketIcons.RadioButtonUnchecked, null, Modifier.size(18.dp),
+                tint = if (enabled) Pocket.colors.accent else Pocket.colors.inkMuted)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(label, style = MaterialTheme.typography.labelLarge)
-                if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PText(label, style = Pocket.type.label)
+                if (description.isNotBlank()) PText(description, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
             }
-            if (recommended) Surface(shape = RoundedCornerShape(6.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                Text("推荐", Modifier.padding(horizontal = 6.dp, vertical = 3.dp), style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer)
+            if (recommended) PSurface(shape = RoundedCornerShape(6.dp), color = Pocket.colors.accentSoft) {
+                PText("推荐", Modifier.padding(horizontal = 6.dp, vertical = 3.dp), style = Pocket.type.caption,
+                    color = Pocket.colors.onAccentSoft)
             }
         }
     }
@@ -217,7 +214,7 @@ private fun QuestionOptionRow(label: String, description: String, recommended: B
 
 @Composable
 internal fun QuestionStatus(phase: QuestionPhase, enabled: Boolean = true) {
-    Text(when (phase) {
+    PText(when (phase) {
         QuestionPhase.Waiting -> if (enabled) "等待回答 · 完成后提交全部答案" else "等待当前操作完成"
         QuestionPhase.Submitting -> "正在提交 · 等待电脑确认"
         QuestionPhase.Submitted -> "已提交 · 等待问题处理完成"
@@ -230,5 +227,5 @@ internal fun QuestionStatus(phase: QuestionPhase, enabled: Boolean = true) {
         QuestionPhase.Stale -> "待重新同步 · 确认问题仍有效后提交"
         QuestionPhase.Unsupported -> "此问题包含敏感字段，当前异步协议会保存为聊天消息，请在电脑端处理"
     }, Modifier.testTag("question-status").semantics { liveRegion = LiveRegionMode.Polite },
-        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        style = Pocket.type.caption, color = Pocket.colors.inkMuted)
 }

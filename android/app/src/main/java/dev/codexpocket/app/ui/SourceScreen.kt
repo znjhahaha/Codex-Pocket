@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.*
 import androidx.compose.ui.draw.drawBehind
@@ -8,7 +9,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -45,7 +45,7 @@ internal fun SourceScreen(
         var preview by rememberSaveable(source.path) { mutableStateOf(markdown) }
         var progress by remember(source.path) { mutableStateOf(0f) }
         val (name, folder) = remember(source.path) { splitPath(source.path) }
-        Scaffold(topBar = { Column {
+        PScaffold(topBar = { Column {
             ReviewHeader(name, "返回", onBack, scrolled, subtitle = folder, badgePath = source.path) {
                 ActionIcon(PocketIcons.ContentCopy, if (source.truncated) "复制已加载内容" else "复制源码") { clipboard.setText(AnnotatedString(source.text)) }
             }
@@ -100,8 +100,8 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ViewerToggle("自动换行", PocketIcons.WrapText, wrap, { wrap = !wrap })
             ViewerToggle("搜索", PocketIcons.Search, search, { search = !search }, description = "搜索已加载源码")
-            Text(data?.let { "${it.size} 行 · ${sourceLanguage(source.path) ?: "纯文本"}" } ?: "正在准备源码", style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            PText(data?.let { "${it.size} 行 · ${sourceLanguage(source.path) ?: "纯文本"}" } ?: "正在准备源码", style = Pocket.type.labelSmall,
+                color = Pocket.colors.inkMuted)
         }
         androidx.compose.animation.AnimatedVisibility(search) { Column(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -109,10 +109,10 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
                 ActionIcon(PocketIcons.ArrowUpward, "上一个匹配行", matches.isNotEmpty()) { go(matches.lastOrNull { it < state.firstVisibleItemIndex } ?: matches.last()) }
                 ActionIcon(PocketIcons.ArrowDownward, "下一个匹配行", matches.isNotEmpty()) { go(matches.firstOrNull { it > state.firstVisibleItemIndex } ?: matches.first()) }
             }
-            Text("${matches.size} 个匹配行 · 仅搜索已加载内容", style = MaterialTheme.typography.labelSmall)
+            PText("${matches.size} 个匹配行 · 仅搜索已加载内容", style = Pocket.type.caption)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 PocketTextField(jump, { jump = it.filter(Char::isDigit).take(9) }, Modifier.weight(1f), placeholder = "跳转到行", singleLine = true)
-                PocketTextButton(onClick = { data?.jumpIndex(jump)?.let(::go) }, enabled = data?.jumpIndex(jump) != null) { Text("跳转") }
+                PocketTextButton(onClick = { data?.jumpIndex(jump)?.let(::go) }, enabled = data?.jumpIndex(jump) != null) { PText("跳转") }
             }
         } }
         if (data == null) ReviewLoading(Modifier.weight(1f).fillMaxWidth())
@@ -123,7 +123,7 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
                     items(data.size, key = { it }, contentType = { "code-line" }) { number ->
                         val text = data.line(number)
                         val annotated = if (highlightReady) highlighted.subSequence(data.starts[number], data.end(number)) else AnnotatedString(text)
-                        val matchColor = MaterialTheme.colorScheme.tertiaryContainer
+                        val matchColor = Pocket.colors.accentSoft
                         val shown = remember(annotated, query, matchColor) {
                             AnnotatedString.Builder(annotated).apply {
                                 if (query.isNotEmpty()) {
@@ -136,17 +136,17 @@ private fun SourceCodeLines(source: SourcePreview, modifier: Modifier, initialLi
                             }.toAnnotatedString()
                         }
                         val hit = query.isNotEmpty() && number in matches
-                        val gutter = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f)
+                        val gutter = Pocket.colors.line.copy(alpha = .5f)
                         Row(Modifier.widthIn(min = width).then(if (wrap) Modifier.fillMaxWidth() else Modifier)
                             .background(if (hit) matchColor.copy(alpha = .25f) else androidx.compose.ui.graphics.Color.Transparent).padding(end = 16.dp)) {
                             // Quiet gutter with a hairline divider, as in VS Code / GitHub blob view.
-                            Text((number + 1).toString(), Modifier.width(56.dp).heightIn(min = 32.dp)
+                            PText((number + 1).toString(), Modifier.width(56.dp).heightIn(min = 32.dp)
                                 .then(if (source.readOnly) Modifier else Modifier.clickable { commentLine = number + 1 })
                                 .semantics { contentDescription = if (source.readOnly) "第 ${number + 1} 行" else "第 ${number + 1} 行，添加草稿评论" }
                                 .drawBehind { drawLine(gutter, androidx.compose.ui.geometry.Offset(size.width - 1f, 0f), androidx.compose.ui.geometry.Offset(size.width - 1f, size.height), 1f) }
                                 .padding(start = 6.dp, end = 10.dp, top = 5.dp, bottom = 5.dp), textAlign = TextAlign.End, fontFamily = FontFamily.Monospace, fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .7f))
-                            Text(shown, Modifier.then(if (wrap) Modifier.weight(1f) else Modifier).padding(start = 12.dp, top = 5.dp, bottom = 5.dp), fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 22.sp, softWrap = wrap)
+                                color = Pocket.colors.inkMuted.copy(alpha = .7f))
+                            PText(shown, Modifier.then(if (wrap) Modifier.weight(1f) else Modifier).padding(start = 12.dp, top = 5.dp, bottom = 5.dp), fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 22.sp, softWrap = wrap)
                         }
                     }
                 }
@@ -174,28 +174,28 @@ private fun MarkdownFilePreview(source: SourcePreview, modifier: Modifier, onOpe
         snapshotFlow { state.layoutInfo.let { info -> if (info.totalItemsCount <= 1) 0f else (info.visibleItemsInfo.lastOrNull()?.index ?: 0) / (info.totalItemsCount - 1f) } }
             .collect { progress(it) }
     }
-    val foreground = MaterialTheme.colorScheme.onSurface.toArgb()
-    val linkColor = MaterialTheme.colorScheme.primary.toArgb()
+    val foreground = Pocket.colors.ink.toArgb()
+    val linkColor = Pocket.colors.solid.toArgb()
     // The heading the reader is in, so the outline marks "you are here".
     val currentHeading by remember(data) { derivedStateOf { data?.headings?.lastOrNull { it.partIndex <= state.firstVisibleItemIndex } } }
     Column(modifier.fillMaxWidth()) {
         if (data?.headings?.isNotEmpty() == true) Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ViewerToggle(if (toc) "收起目录" else "目录", PocketIcons.ListTree, toc, { toc = !toc })
-            currentHeading?.let { Text(it.title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            currentHeading?.let { PText(it.title, Modifier.weight(1f), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted,
                 maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
         }
         androidx.compose.animation.AnimatedVisibility(toc && data != null) {
-            Surface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.surfaceContainer) {
+            PSurface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                color = Pocket.colors.fill) {
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 260.dp).padding(vertical = 6.dp)) {
                     itemsIndexed(data?.headings.orEmpty()) { _, heading ->
                         val here = heading == currentHeading
                         Row(Modifier.fillMaxWidth().clickable { scope.launch { state.animateScrollToItem(heading.partIndex) }; toc = false }
                             .padding(start = (14 + (heading.level - 1) * 14).dp, end = 14.dp, top = 9.dp, bottom = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.size(6.dp).background(if (here) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Transparent, PocketCapsule))
+                            Box(Modifier.size(6.dp).background(if (here) Pocket.colors.solid else androidx.compose.ui.graphics.Color.Transparent, PocketCapsule))
                             Spacer(Modifier.width(8.dp))
-                            Text(heading.title, style = if (heading.level <= 1) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
-                                color = if (here) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                            PText(heading.title, style = if (heading.level <= 1) Pocket.type.body else Pocket.type.bodySmall,
+                                color = if (here) Pocket.colors.ink else Pocket.colors.inkMuted, maxLines = 1,
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         }
                     }
@@ -203,8 +203,8 @@ private fun MarkdownFilePreview(source: SourcePreview, modifier: Modifier, onOpe
             }
         }
         notice?.let { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(it, Modifier.weight(1f).padding(16.dp), style = MaterialTheme.typography.bodySmall)
-            PocketTextButton(onClick = { notice = null }) { Text("关闭") }
+            PText(it, Modifier.weight(1f).padding(16.dp), style = Pocket.type.bodySmall)
+            PocketTextButton(onClick = { notice = null }) { PText("关闭") }
         } }
         if (data == null) ReviewLoading(Modifier.weight(1f).fillMaxWidth())
         // Reading layout: wider margins and paragraph rhythm, like GitHub's rendered README.
@@ -227,7 +227,7 @@ private fun MarkdownFilePreview(source: SourcePreview, modifier: Modifier, onOpe
                     }
                 }
             }
-            if (data.images.isNotEmpty()) item { Text("文件预览不加载外部图片。", style = MaterialTheme.typography.bodySmall) }
+            if (data.images.isNotEmpty()) item { PText("文件预览不加载外部图片。", style = Pocket.type.bodySmall) }
         }
     }
 }

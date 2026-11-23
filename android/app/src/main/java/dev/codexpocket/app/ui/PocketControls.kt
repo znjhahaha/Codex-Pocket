@@ -1,6 +1,7 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.animation.ValueAnimator
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
@@ -20,7 +21,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,18 +36,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import dev.codexpocket.app.ui.kit.PButton
-import dev.codexpocket.app.ui.kit.PButtonKind
-import dev.codexpocket.app.ui.kit.MotionGlyphs
-import dev.codexpocket.app.ui.kit.PCheck
-import dev.codexpocket.app.ui.kit.PPill
-import dev.codexpocket.app.ui.kit.PPulseGlyph
-import dev.codexpocket.app.ui.kit.PRow
-import dev.codexpocket.app.ui.kit.PSheetClose
-import dev.codexpocket.app.ui.kit.PSwitch
-import dev.codexpocket.app.ui.kit.PTextAction
-import dev.codexpocket.app.ui.kit.PTextField
-import dev.codexpocket.app.ui.kit.Pocket
 
 /** Shared interaction surfaces. Foundation semantics remain native; the visual language is Pocket. */
 internal fun pocketMotionMillis(value: Int) = if (ValueAnimator.areAnimatorsEnabled()) value else 0
@@ -75,8 +63,8 @@ internal fun PocketScreen(title: String, onDismiss: () -> Unit, subtitle: String
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             ActionIcon(PocketIcons.ArrowBack, "关闭", onClick = onDismiss)
             Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
-                Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.semantics { heading() })
-                if (!subtitle.isNullOrBlank()) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PText(title, style = Pocket.type.titleLarge, modifier = Modifier.semantics { heading() })
+                if (!subtitle.isNullOrBlank()) PText(subtitle, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
             }
         }
         headerContent?.invoke()
@@ -130,13 +118,13 @@ internal fun PocketSheet(title: String, onDismiss: () -> Unit, subtitle: String?
         Column(handle.fillMaxWidth()) {
             // Grabber: the sheet can be pulled down to dismiss.
             Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp), contentAlignment = Alignment.Center) {
-                Box(Modifier.size(36.dp, 4.dp).clip(CircleShape).background(MaterialTheme.colorScheme.outlineVariant))
+                Box(Modifier.size(36.dp, 4.dp).clip(CircleShape).background(Pocket.colors.line))
             }
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 6.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.semantics { heading() }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (!subtitle.isNullOrBlank()) Text(subtitle, style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    PText(title, style = Pocket.type.title, modifier = Modifier.semantics { heading() }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (!subtitle.isNullOrBlank()) PText(subtitle, style = Pocket.type.labelSmall,
+                        color = Pocket.colors.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 SheetCloseButton(onDismiss)
             }
@@ -151,7 +139,7 @@ private fun SheetCloseButton(onClick: () -> Unit) = PSheetClose(onClick)
 
 @Composable
 internal fun PocketSectionLabel(text: String) {
-    Text(text, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    PText(text, style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted,
         modifier = Modifier.padding(start = 16.dp, top = 18.dp, bottom = 8.dp).semantics { heading() })
 }
 
@@ -160,8 +148,8 @@ internal fun PocketTextButton(onClick: () -> Unit, modifier: Modifier = Modifier
     contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 8.dp), content: @Composable RowScope.() -> Unit) {
     PTextAction(onClick, modifier, enabled, contentPadding = contentPadding) {
         // Callers still composing Material text inherit the same ink and label style.
-        CompositionLocalProvider(LocalContentColor provides Pocket.ink) {
-            ProvideTextStyle(MaterialTheme.typography.labelLarge) { content() }
+        CompositionLocalProvider(LocalPInk provides Pocket.ink) {
+            ProvidePTextStyle(Pocket.type.label) { content() }
         }
     }
 }
@@ -206,7 +194,7 @@ internal fun PocketDialog(onDismissRequest: () -> Unit, title: @Composable () ->
     PocketModal("确认操作", onDismissRequest, sheet = false) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.weight(1f)) { ProvideTextStyle(MaterialTheme.typography.titleLarge) { title() } }
+                Box(Modifier.weight(1f)) { ProvidePTextStyle(Pocket.type.titleLarge) { title() } }
                 ActionIcon(PocketIcons.Close, "关闭", onClick = onDismissRequest)
             }
             if (text != null) Box(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) { text() }

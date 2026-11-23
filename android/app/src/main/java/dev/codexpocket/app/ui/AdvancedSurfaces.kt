@@ -1,13 +1,11 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -47,9 +45,9 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
         items(approvals, key = { it.key }, contentType = { "approval" }) { approval ->
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 s.chats.firstOrNull { it.runtimeId == approval.runtimeId && it.key.nativeId == approval.threadId }?.let { chat ->
-                    PocketActionRow(chat.title, PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, trailing = { Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) })
+                    PocketActionRow(chat.title, PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) })
                 }
-                if (!s.approvalsFresh) Text("待重新同步 · 连接电脑后确认是否仍需审批", style = MaterialTheme.typography.bodySmall)
+                if (!s.approvalsFresh) PText("待重新同步 · 连接电脑后确认是否仍需审批", style = Pocket.type.bodySmall)
                 ApprovalCard(approval, s.online && s.approvalsFresh && !s.busy && s.runtimes.any { it.id == approval.runtimeId && it.online }, repo::respond)
             }
         }
@@ -58,7 +56,7 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
                 if (chat.key == s.selected?.key) AsyncQuestionForm(question, s, repo::answerAsync)
                 else PocketActionRow(
                     question.string("title"), PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, subtitle = chat.title,
-                    trailing = { Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
+                    trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
                 )
             }
         }
@@ -69,7 +67,7 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
                 icon = if (chat.status == "failed") PocketIcons.ErrorOutline else PocketIcons.CheckCircle,
                 onClick = { onOpenChat(chat) },
                 subtitle = stringResource(if (chat.status == "failed") R.string.v02_failed_result else R.string.v02_unread_result),
-                trailing = { Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
+                trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
             )
         }
     }
@@ -81,7 +79,7 @@ internal fun AttachmentActionSheet(images: Boolean, onDismiss: () -> Unit, onCam
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp).padding(bottom = 16.dp)) {
             PocketActionRow(stringResource(R.string.v02_camera), PocketIcons.PhotoCamera, onCamera, enabled = images)
             PocketActionRow(stringResource(R.string.v02_pick_images), PocketIcons.Image, onImages, enabled = images)
-            if (!images) Text(stringResource(R.string.v02_images_unsupported), Modifier.padding(horizontal = 12.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            if (!images) PText(stringResource(R.string.v02_images_unsupported), Modifier.padding(horizontal = 12.dp, vertical = 8.dp), color = Pocket.colors.inkMuted, style = Pocket.type.bodySmall)
             PocketActionRow(stringResource(R.string.v02_text_context), PocketIcons.Description, onText, subtitle = stringResource(R.string.v02_text_context_detail))
         }
     }
@@ -116,9 +114,9 @@ internal fun UsageSheet(s: PocketState, onDismiss: () -> Unit) {
         val tokenCount = total.string("totalTokens", usage?.string("totalTokens").orEmpty())
         val window = usage?.string("modelContextWindow").orEmpty()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            if (tokenCount.isNotBlank()) Text(stringResource(R.string.v02_tokens, tokenCount), style = MaterialTheme.typography.titleMedium)
-            if (window.isNotBlank()) Text(stringResource(R.string.v02_context, window), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (tokenCount.isBlank() && window.isBlank()) Text(stringResource(R.string.v02_usage_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (tokenCount.isNotBlank()) PText(stringResource(R.string.v02_tokens, tokenCount), style = Pocket.type.title)
+            if (window.isNotBlank()) PText(stringResource(R.string.v02_context, window), style = Pocket.type.body, color = Pocket.colors.inkMuted)
+            if (tokenCount.isBlank() && window.isBlank()) PText(stringResource(R.string.v02_usage_empty), color = Pocket.colors.inkMuted)
         }
     }
 }
@@ -134,7 +132,7 @@ internal fun ReferenceSheet(s: PocketState, repo: PocketRepository, onDismiss: (
             PocketActionRow(stringResource(R.string.v02_workspace), PocketIcons.FolderOpen, { workspace = true; repo.browseWorkspace() }, enabled = s.online && s.supports("workspace/list"), selected = workspace)
             val entries = if (workspace) s.advanced.workspaceEntries else s.advanced.references
             LazyColumn(Modifier.heightIn(max = 420.dp), contentPadding = PaddingValues(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                if (entries.isEmpty()) item { Text(stringResource(R.string.v02_no_results), Modifier.padding(horizontal = 12.dp, vertical = 20.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                if (entries.isEmpty()) item { PText(stringResource(R.string.v02_no_results), Modifier.padding(horizontal = 12.dp, vertical = 20.dp), color = Pocket.colors.inkMuted) }
                 items(entries) { entry ->
                     val directory = entry.string("kind") == "directory"
                     val supported = s.online && (!workspace || s.supports(if (directory) "workspace/list" else "workspace/read"))
@@ -149,7 +147,7 @@ internal fun ReferenceSheet(s: PocketState, repo: PocketRepository, onDismiss: (
                         },
                         trailing = {
                             if (!workspace && entry.string("type") == "file") ActionIcon(PocketIcons.Code, stringResource(R.string.v02_open_source), s.online && s.supports("workspace/read")) { repo.readSource(entry.string("path")); onDismiss() }
-                            else if (directory) Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp))
+                            else if (directory) PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp))
                         },
                     )
                 }

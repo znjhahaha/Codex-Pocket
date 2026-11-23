@@ -1,12 +1,9 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,9 +113,9 @@ internal fun InlineDiffPreview(
         if (fallback != null) 280.dp else (37f + lines * fontScale).coerceIn(92f, 280f).dp
     }
     Column(modifier.fillMaxWidth().height(previewHeight).testTag("inline-diff:${file.id}")
-        .background(MaterialTheme.colorScheme.surfaceContainerLow)) {
+        .background(Pocket.colors.sunken)) {
         InlineDiffHeader(file, { resize(true) }, copy, false, fallback)
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
+        PDivider(color = Pocket.colors.line.copy(alpha = .5f))
         if (!fullScreen) {
             if (fallback != null) DiffFallbackNotice(fallback, Modifier.weight(1f).fillMaxWidth())
             else DiffLines(file.diff, true, Modifier.weight(1f).fillMaxWidth(), file.path,
@@ -146,9 +143,9 @@ private fun InlineDiffHeader(file: ActivityFile, resize: () -> Unit, copy: () ->
     val (add, remove) = pocketDiffColors()
     Row(Modifier.fillMaxWidth().heightIn(min = 32.dp).padding(start = 10.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(compactFileName(file.path).ifBlank { "文件差异" }, Modifier.weight(1f), fontSize = 14.sp,
-            maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (fallback == null) Text(buildAnnotatedString {
+        PText(compactFileName(file.path).ifBlank { "文件差异" }, Modifier.weight(1f), fontSize = 14.sp,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, color = Pocket.colors.inkMuted)
+        if (fallback == null) PText(buildAnnotatedString {
             withStyle(SpanStyle(color = add)) { append("+${file.additions}") }
             append(" ")
             withStyle(SpanStyle(color = remove)) { append("−${file.deletions}") }
@@ -162,17 +159,17 @@ private fun InlineDiffHeader(file: ActivityFile, resize: () -> Unit, copy: () ->
 @Composable
 internal fun DiffFallbackNotice(fallback: InlineDiffFallback, modifier: Modifier) {
     Box(modifier.padding(16.dp).testTag("inline-diff-fallback:${fallback.name}"), contentAlignment = Alignment.CenterStart) {
-        Text(when (fallback) {
+        PText(when (fallback) {
             InlineDiffFallback.Empty -> "暂无可显示的差异"
             InlineDiffFallback.Binary -> "二进制文件差异无法按行预览"
             InlineDiffFallback.Truncated -> "原生差异已截断 · 仅显示已收到的内容"
-        }, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }, fontSize = 14.sp, color = Pocket.colors.inkMuted)
     }
 }
 
 @Composable
 private fun InlineDiffAction(icon: ImageVector, label: String, onClick: () -> Unit) {
     Box(Modifier.size(32.dp).clickable(role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        PIcon(icon, label, Modifier.size(16.dp), tint = Pocket.colors.inkMuted)
     }
 }

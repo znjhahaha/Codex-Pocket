@@ -172,6 +172,63 @@ class KitStageUiTest {
         assertEquals(1, backs)
     }
 
+    @Test fun aStageWithNothingBehindItLetsTheOneAroundItPreviewTheWayOut() {
+        var outerPage by mutableStateOf("assistant")
+        var innerBacks = 0
+        lateinit var outer: PStageState<String>
+        compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
+            CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalPocketGlass provides false) {
+                outer = rememberPStageState(outerPage)
+                PStage(outerPage, depth = { if (it == "home") 0 else 1 }, back = "home".takeIf { outerPage != "home" },
+                    onBack = ({ outerPage = "home" }).takeIf { outerPage != "home" }, state = outer) { shown ->
+                    if (shown == "home") PText("首页", Modifier.testTag("outer-home"))
+                    else PStage("main", onBack = { innerBacks++; outerPage = "home" }) { PText("助理", Modifier.testTag("inner-main")) }
+                }
+            }
+        } } }
+        compose.waitForIdle()
+        val dispatcher = compose.activity.onBackPressedDispatcher
+        compose.runOnIdle { dispatcher.dispatchOnBackStarted(BackEventCompat(0f, 400f, 0f, BackEventCompat.EDGE_LEFT)) }
+        compose.runOnIdle { dispatcher.dispatchOnBackProgressed(BackEventCompat(0f, 400f, .5f, BackEventCompat.EDGE_LEFT)) }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertTrue("The outer stage holds the page for the inner one", outer.held)
+            assertEquals("home", outer.to)
+            assertTrue(outer.progress.value > .3f)
+            assertEquals(0, innerBacks)
+        }
+        compose.runOnIdle { dispatcher.dispatchOnBackCancelled() }
+        compose.waitForIdle()
+        compose.runOnIdle { assertFalse(outer.held); assertEquals("assistant", outer.to) }
+        compose.onNodeWithTag("inner-main").assertIsDisplayed()
+        compose.runOnIdle { dispatcher.onBackPressed(); assertEquals("The inner stage still makes the call", 1, innerBacks) }
+        compose.waitForIdle()
+        compose.onNodeWithTag("outer-home").assertIsDisplayed()
+        compose.onNodeWithTag("inner-main").assertDoesNotExist()
+    }
+
+    @Test fun onlyWhatAppearsAfterThePageHasSettledArrivesAndOnlyOnce() {
+        var rows by mutableStateOf(listOf("a", "b"))
+        lateinit var arrivals: PArrivals
+        compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
+            CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalPocketGlass provides false) {
+                arrivals = rememberPocketArrivals()
+                Column { rows.forEach { row -> key(row) { PText("行 $row", Modifier.pocketArrival(arrivals, row).testTag("row-$row")) } } }
+            }
+        } } }
+        compose.waitForIdle()
+        val rest = bounds("row-b").top
+        compose.mainClock.autoAdvance = false
+        compose.runOnIdle { rows = rows + "c" }
+        advance(64)
+        val arriving = bounds("row-c").top
+        assertEquals("What was there when the page opened did not move", rest, bounds("row-b").top, .5f)
+        advance(1200)
+        val settled = bounds("row-c").top
+        assertTrue("The new row rose into place: $arriving then $settled", arriving > settled + 4f)
+        compose.runOnIdle { assertFalse("A key that has been shown never arrives again", arrivals.fresh("c", true)) }
+    }
+
     @Test fun plainBackStillGoesBackOnce() {
         page = "chat"
         content()

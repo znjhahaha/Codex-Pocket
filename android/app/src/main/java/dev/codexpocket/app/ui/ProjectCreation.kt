@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -21,7 +22,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.material3.*
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -47,11 +47,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.MotionGlyphs
-import dev.codexpocket.app.ui.kit.PLoopGlyph
-import dev.codexpocket.app.ui.kit.PocketMotion
-import dev.codexpocket.app.ui.kit.orSnap
-import dev.codexpocket.app.ui.kit.rememberPocketMotion
 
 /** Presentation state is independent of the advanced section's visibility. */
 @Composable
@@ -104,23 +99,23 @@ internal fun ProjectCreationForm(
                         horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         CreationEmblem(createDirectory)
                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text(if (createDirectory) "创建新项目" else "选择一个项目", style = MaterialTheme.typography.headlineMedium,
+                            PText(if (createDirectory) "创建新项目" else "选择一个项目", style = Pocket.type.headline,
                                 fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
-                            Text(if (createDirectory) "在电脑上创建目录并开始对话" else "从最近项目开始，或选择其他目录", style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            PText(if (createDirectory) "在电脑上创建目录并开始对话" else "从最近项目开始，或选择其他目录", style = Pocket.type.bodySmall,
+                                color = Pocket.colors.inkMuted)
                         }
                     }
                     PocketGlassSurface(Modifier.fillMaxWidth().height(48.dp).testTag("project-computer"), shape = RoundedCornerShape(50)) {
                         Row(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Icon(PocketIcons.Computer, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(s.computerName.ifBlank { "当前电脑" }, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium,
+                            PIcon(PocketIcons.Computer, null, Modifier.size(17.dp), tint = Pocket.colors.inkMuted)
+                            PText(s.computerName.ifBlank { "当前电脑" }, Modifier.weight(1f), style = Pocket.type.labelSmall,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            val connectivity by animateColorAsState(if (s.online) Color(0xFF62A88A) else MaterialTheme.colorScheme.error,
+                            val connectivity by animateColorAsState(if (s.online) Color(0xFF62A88A) else Pocket.colors.danger,
                                 PocketMotion.color<Color>().orSnap(motion), label = "project-connectivity")
                             Box(Modifier.size(6.dp).clip(RoundedCornerShape(50)).background(connectivity))
-                            Text(if (s.online) "已连接" else "未连接", style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            PText(if (s.online) "已连接" else "未连接", style = Pocket.type.labelSmall,
+                                color = Pocket.colors.inkMuted)
                         }
                     }
                     CreationDirectorySwitch(createDirectory, !creating) { createDirectory = it; focus.clearFocus() }
@@ -135,24 +130,24 @@ internal fun ProjectCreationForm(
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                     CreationFolderBadge(true)
                                     Column(Modifier.weight(1f)) {
-                                        Text(if (existingPath.isBlank()) "默认目录" else creationProjectName(existingPath),
-                                            style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(if (existingPath.isBlank()) "也可以从最近项目中选择" else projectPathLabel(existingPath),
-                                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        PText(if (existingPath.isBlank()) "默认目录" else creationProjectName(existingPath),
+                                            style = Pocket.type.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        PText(if (existingPath.isBlank()) "也可以从最近项目中选择" else projectPathLabel(existingPath),
+                                            style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted,
                                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
-                                    Icon(PocketIcons.ChevronRight, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp), tint = Pocket.colors.inkMuted)
                                 }
                             }
                             if (projects.isNotEmpty()) {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     CreationCapsule({ focus.clearFocus(); pickingProject = true }, Modifier.weight(1f), !creating) {
-                                        Icon(PocketIcons.Search, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
-                                        Text("所有项目", style = MaterialTheme.typography.labelMedium)
+                                        PIcon(PocketIcons.Search, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
+                                        PText("所有项目", style = Pocket.type.labelSmall)
                                     }
                                     CreationCapsule({ editingPath = !editingPath }, Modifier.weight(1f).testTag("project-manual"), !creating) {
-                                        Icon(PocketIcons.Edit, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
-                                        Text(if (editingPath) "收起路径" else "输入路径", style = MaterialTheme.typography.labelMedium)
+                                        PIcon(PocketIcons.Edit, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
+                                        PText(if (editingPath) "收起路径" else "输入路径", style = Pocket.type.labelSmall)
                                     }
                                 }
                             }
@@ -165,16 +160,16 @@ internal fun ProjectCreationForm(
                                 Modifier.testTag("project-path"), label = if (createDirectory) "新目录完整路径" else "已有目录路径",
                                 placeholder = if (createDirectory) "D:\\Projects\\新项目" else "留空使用默认目录", enabled = !creating)
                             if (createDirectory) {
-                                Text("输入电脑上的完整路径，创建时会生成目录。", style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 4.dp))
+                                PText("输入电脑上的完整路径，创建时会生成目录。", style = Pocket.type.bodySmall,
+                                    color = Pocket.colors.inkMuted, modifier = Modifier.padding(horizontal = 4.dp))
                                 PocketGlassSurface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(28.dp), dense = true) {
                                     Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                                         CreationFolderBadge(true)
                                         Column(Modifier.weight(1f)) {
-                                            Text(if (newPath.isBlank()) "你的新项目" else creationProjectName(newPath), style = MaterialTheme.typography.titleSmall,
+                                            PText(if (newPath.isBlank()) "你的新项目" else creationProjectName(newPath), style = Pocket.type.titleSmall,
                                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Text("${s.computerName.ifBlank { "当前电脑" }} · 创建后开始新对话", style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            PText("${s.computerName.ifBlank { "当前电脑" }} · 创建后开始新对话", style = Pocket.type.bodySmall,
+                                                color = Pocket.colors.inkMuted)
                                         }
                                     }
                                 }
@@ -192,29 +187,29 @@ internal fun ProjectCreationForm(
                     }
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         CreationCapsule({ advanced = !advanced }, Modifier.fillMaxWidth().testTag("project-advanced"), !creating) {
-                            Icon(PocketIcons.Tune, null, Modifier.size(17.dp)); Spacer(Modifier.width(10.dp))
-                            Text(if (advanced) "收起高级选项" else "高级选项", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
-                            Text(mode.label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            PIcon(PocketIcons.Tune, null, Modifier.size(17.dp)); Spacer(Modifier.width(10.dp))
+                            PText(if (advanced) "收起高级选项" else "高级选项", Modifier.weight(1f), style = Pocket.type.labelSmall)
+                            PText(mode.label, style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
                             val rotation by animateFloatAsState(if (advanced) 180f else 0f, PocketMotion.glyph<Float>().orSnap(motion), label = "advanced-chevron")
-                            Icon(PocketIcons.ExpandMore, null, Modifier.padding(start = 8.dp).size(17.dp).graphicsLayer { rotationZ = rotation })
+                            PIcon(PocketIcons.ExpandMore, null, Modifier.padding(start = 8.dp).size(17.dp).graphicsLayer { rotationZ = rotation })
                         }
                         if (advanced) {
                             if (s.sessionModes.size > 1) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.selectableGroup()) {
                                 s.sessionModes.forEach { value ->
                                     CreationCapsule({ mode = value }, Modifier.weight(1f).testTag("session-mode:${value.wire}")
                                         .semantics { this.selected = mode == value }, !creating, primary = mode == value) {
-                                        Text(value.label, style = MaterialTheme.typography.labelMedium)
+                                        PText(value.label, style = Pocket.type.labelSmall)
                                     }
                                 }
                             }
-                            if (available.isEmpty()) Text(when {
+                            if (available.isEmpty()) PText(when {
                                 !s.canPrepareRuntime(mode) -> context.getString(R.string.no_runtime)
                                 mode == SessionMode.Cli -> "创建时连接 Codex CLI"
                                 else -> "创建时准备桌面运行环境"
-                            }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
                             else if (available.size > 1) available.forEach { runtime ->
                                 CreationCapsule({ runtimeId = runtime.id }, Modifier.fillMaxWidth(), !creating, primary = runtimeId == runtime.id) {
-                                    Text("${context.sourceLabel(runtime.source)} · ${runtimeVersionLabel(runtime.version)}", style = MaterialTheme.typography.labelMedium)
+                                    PText("${context.sourceLabel(runtime.source)} · ${runtimeVersionLabel(runtime.version)}", style = Pocket.type.labelSmall)
                                 }
                             }
                         }
@@ -222,10 +217,10 @@ internal fun ProjectCreationForm(
                 }
                 Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 16.dp, top = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    s.actionStatus["create"]?.phase?.let { Text(it, style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 12.dp)) }
+                    s.actionStatus["create"]?.phase?.let { PText(it, style = Pocket.type.bodySmall,
+                        color = Pocket.colors.inkMuted, modifier = Modifier.padding(horizontal = 12.dp)) }
                     s.actionStatus["create"]?.error?.let {
-                        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
+                        PText(it, color = Pocket.colors.danger, style = Pocket.type.bodySmall,
                             modifier = Modifier.heightIn(max = 100.dp).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp).testTag("project-create-error"))
                     }
                     CreationCapsule(onClick = {
@@ -235,11 +230,11 @@ internal fun ProjectCreationForm(
                         onCreate(mode, path, runtimeId, createDirectory)
                     }, modifier = Modifier.fillMaxWidth().testTag("project-submit"), enabled = canCreate, primary = true) {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(if (creating) "正在创建…" else if (createDirectory) "创建项目并开始" else "开始对话", Modifier.weight(1f),
-                                style = MaterialTheme.typography.labelLarge)
+                            PText(if (creating) "正在创建…" else if (createDirectory) "创建项目并开始" else "开始对话", Modifier.weight(1f),
+                                style = Pocket.type.label)
                             // Turns only while the request is in flight; the arrow is back as soon as it ends.
-                            if (creating) PLoopGlyph(MotionGlyphs.Spin, true, Modifier.size(20.dp), LocalContentColor.current, millis = 900)
-                            else Icon(PocketIcons.ArrowForward, null, Modifier.size(20.dp))
+                            if (creating) PLoopGlyph(MotionGlyphs.Spin, true, Modifier.size(20.dp), Pocket.ink, millis = 900)
+                            else PIcon(PocketIcons.ArrowForward, null, Modifier.size(20.dp))
                         }
                     }
                 }
@@ -264,34 +259,34 @@ internal fun ProjectCreationForm(
 private fun CreationHeader(title: String, enabled: Boolean, onClose: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(start = 28.dp, end = 20.dp, top = 10.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(title, Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.titleMedium)
+        PText(title, Modifier.weight(1f).semantics { heading() }, style = Pocket.type.title)
         CreationIconButton(PocketIcons.Close, "关闭", enabled, onClose)
     }
 }
 
 @Composable
 private fun CreationSectionTitle(title: String) {
-    Text(title, Modifier.padding(horizontal = 4.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    PText(title, Modifier.padding(horizontal = 4.dp), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
 }
 
 @Composable
 private fun ProjectChoice(path: String, selected: Boolean, enabled: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val press = remember { MutableInteractionSource() }
     PocketGlassSurface(modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
         .selectable(selected, press, indication = null, enabled = enabled, role = Role.RadioButton, onClick = onClick),
         shape = RoundedCornerShape(28.dp), dense = true, interactionSource = press) {
-        Row(Modifier.fillMaxWidth().background(if (selected) c.secondary.copy(alpha = .055f) else Color.Transparent)
+        Row(Modifier.fillMaxWidth().background(if (selected) c.accent.copy(alpha = .055f) else Color.Transparent)
             .padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             CreationFolderBadge(selected)
             Column(Modifier.weight(1f)) {
-                Text(creationProjectName(path), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(projectPathLabel(path), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
+                PText(creationProjectName(path), style = Pocket.type.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                PText(projectPathLabel(path), style = Pocket.type.bodySmall, color = c.inkMuted,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Icon(if (selected) PocketIcons.Check else PocketIcons.ChevronRight, null, Modifier.size(16.dp),
-                tint = if (selected) c.secondary else c.onSurfaceVariant)
+            PIcon(if (selected) PocketIcons.Check else PocketIcons.ChevronRight, null, Modifier.size(16.dp),
+                tint = if (selected) c.accent else c.inkMuted)
         }
     }
 }
@@ -299,25 +294,25 @@ private fun ProjectChoice(path: String, selected: Boolean, enabled: Boolean, mod
 @Composable
 private fun CompactProjectField(value: String, onValue: (String) -> Unit, modifier: Modifier,
     label: String, placeholder: String, enabled: Boolean, search: Boolean = false) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val focus = LocalFocusManager.current
     val interactions = remember { MutableInteractionSource() }
     val focused by interactions.collectIsFocusedAsState()
     PocketGlassSurface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(28.dp), dense = true) {
         BasicTextField(value, onValue, modifier.fillMaxWidth().semantics { contentDescription = label },
-            enabled = enabled, singleLine = true, textStyle = MaterialTheme.typography.bodyMedium.copy(color = c.onSurface),
-            interactionSource = interactions, cursorBrush = SolidColor(c.secondary),
+            enabled = enabled, singleLine = true, textStyle = Pocket.type.body.copy(color = c.ink),
+            interactionSource = interactions, cursorBrush = SolidColor(c.accent),
             keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrectEnabled = false,
                 imeAction = if (search) ImeAction.Search else ImeAction.Done),
             keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }, onSearch = { focus.clearFocus() }),
             decorationBox = { inner ->
                 Row(Modifier.fillMaxWidth().heightIn(min = 56.dp)
-                    .border(1.dp, if (focused) c.secondary.copy(alpha = .7f) else Color.Transparent, RoundedCornerShape(28.dp))
+                    .border(1.dp, if (focused) c.accent.copy(alpha = .7f) else Color.Transparent, RoundedCornerShape(28.dp))
                     .padding(horizontal = 18.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Icon(if (search) PocketIcons.Search else PocketIcons.FolderOpen, null, Modifier.size(18.dp), tint = c.onSurfaceVariant)
+                    PIcon(if (search) PocketIcons.Search else PocketIcons.FolderOpen, null, Modifier.size(18.dp), tint = c.inkMuted)
                     Box(Modifier.weight(1f)) {
-                        if (value.isEmpty()) Text(placeholder, style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant)
+                        if (value.isEmpty()) PText(placeholder, style = Pocket.type.body, color = c.inkMuted)
                         inner()
                     }
                 }
@@ -336,7 +331,7 @@ private fun ProjectPicker(projects: List<String>, selectedPath: String, query: S
         Column(Modifier.fillMaxSize().testTag("project-picker")) {
             CreationHeader("选择项目", enabled, onDismiss)
             Column(Modifier.padding(horizontal = 24.dp).padding(top = 12.dp, bottom = 18.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text("选择工作目录", style = MaterialTheme.typography.headlineMedium)
+                PText("选择工作目录", style = Pocket.type.headline)
                 CompactProjectField(query, onQuery, Modifier.testTag("project-search"),
                     label = "搜索项目", placeholder = "搜索名称或路径", enabled = enabled, search = true)
             }
@@ -345,15 +340,15 @@ private fun ProjectPicker(projects: List<String>, selectedPath: String, query: S
                 contentPadding = PaddingValues(start = 24.dp, end = 24.dp, bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (query.isBlank()) item(key = "default") {
                     CreationCapsule({ onSelect("") }, Modifier.fillMaxWidth().semantics { selected = selectedPath.isBlank() }, enabled) {
-                        Icon(PocketIcons.Computer, null, Modifier.size(18.dp)); Spacer(Modifier.width(10.dp))
-                        Text("使用默认目录", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        if (selectedPath.isBlank()) Icon(PocketIcons.Check, null, Modifier.size(16.dp))
+                        PIcon(PocketIcons.Computer, null, Modifier.size(18.dp)); Spacer(Modifier.width(10.dp))
+                        PText("使用默认目录", Modifier.weight(1f), style = Pocket.type.body)
+                        if (selectedPath.isBlank()) PIcon(PocketIcons.Check, null, Modifier.size(16.dp))
                     }
                 }
                 item(key = "heading") { CreationSectionTitle(if (query.isBlank()) "最近项目 · ${projects.size}" else "搜索结果 · ${matches.size}") }
                 if (matches.isEmpty()) item(key = "empty") {
-                    Text(if (query.isBlank()) "暂无最近项目，可返回输入目录路径。" else "没有匹配的项目",
-                        Modifier.padding(10.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PText(if (query.isBlank()) "暂无最近项目，可返回输入目录路径。" else "没有匹配的项目",
+                        Modifier.padding(10.dp), style = Pocket.type.body, color = Pocket.colors.inkMuted)
                 }
                 items(matches, key = { "path:$it" }) { path ->
                     ProjectChoice(path, selectedKey == nativeProjectPathKey(path), enabled) { onSelect(path) }

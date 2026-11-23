@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.os.SystemClock
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.focusable
@@ -8,8 +9,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -179,8 +178,8 @@ internal fun ConversationMinimap(
     val density = LocalDensity.current
     val insetPx = with(density) { MinimapInset.toPx() }
     val minimumThumbPx = with(density) { MinimapMinimumThumb.toPx() }
-    val colors = MaterialTheme.colorScheme
-    val railBackground = colors.background
+    val colors = Pocket.colors
+    val railBackground = colors.bg
     val inkBackdrop = rememberLayerBackdrop { drawRect(railBackground); drawContent() }
     var railHeight by remember { mutableIntStateOf(0) }
     val expandedMarks = remember(map, railHeight, density) {
@@ -330,7 +329,7 @@ internal fun ConversationMinimap(
         val heightPx = with(density) { maxHeight.toPx() }
         val widthPx = with(density) { maxWidth.toPx() }
         val expansion = state.expansion.value.coerceIn(0f, 1f)
-        val dark = colors.background.luminance() < .3f
+        val dark = colors.bg.luminance() < .3f
         val accent = if (dark) Color(0xFFD5AF76) else Color(0xFFA57E44)
         val activeThumb = state.held && state.expanded
         val thumb = minimapThumb(viewport, heightPx, insetPx, minimumThumbPx)
@@ -361,11 +360,11 @@ internal fun ConversationMinimap(
                         mark.ink == MinimapInk.Faint -> .24f
                         else -> .36f
                     }
-                    val ink = if (!expanded || preferences.highContrast) colors.onSurface else when (mark.ink) {
+                    val ink = if (!expanded || preferences.highContrast) colors.ink else when (mark.ink) {
                         MinimapInk.Question -> accent
                         MinimapInk.Added -> if (dark) Color(0xFF75C791) else Color(0xFF34834E)
                         MinimapInk.Removed -> if (dark) Color(0xFFE58E8E) else Color(0xFFBB5757)
-                        else -> colors.onSurface
+                        else -> colors.ink
                     }
                     val emphasis = if (expanded && inWindow && mark.ink != MinimapInk.Question) 1.04f else 1f
                     val left = mark.left * widthScale
@@ -422,9 +421,9 @@ private fun MinimapPressPreview(preview: MinimapPreview, fraction: Float, backdr
         PocketGlassSurface(Modifier.width(240.dp).testTag("conversation-minimap-preview"),
             shape = RoundedCornerShape(12.dp), backdrop = backdrop, dense = true) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                Text("提问：${preview.question}", style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("邻近：${preview.neighbor}", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(preview.position, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                PText("提问：${preview.question}", style = Pocket.type.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                PText("邻近：${preview.neighbor}", style = Pocket.type.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                PText(preview.position, style = Pocket.type.caption, color = Pocket.colors.inkMuted,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }

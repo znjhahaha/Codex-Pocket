@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.horizontalScroll
 
 import androidx.compose.animation.AnimatedVisibility
@@ -29,7 +30,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -56,9 +56,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.PocketMotion
-import dev.codexpocket.app.ui.kit.orSnap
-import dev.codexpocket.app.ui.kit.rememberPocketMotion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -143,17 +140,17 @@ private val LocalTraceTone = compositionLocalOf<TraceTone?> { null }
 
 @Composable
 private fun traceTone(active: Boolean): TraceTone {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val spec = tween<Color>(pocketMotionMillis(140), easing = FastOutSlowInEasing)
-    val text by androidx.compose.animation.animateColorAsState(if (active) c.onSurface else c.onSurfaceVariant, spec, label = "trace-tone")
-    val subject by androidx.compose.animation.animateColorAsState(if (active) c.onSurface.copy(alpha = .78f) else c.onSurfaceVariant.copy(alpha = .62f), spec, label = "trace-subject")
+    val text by androidx.compose.animation.animateColorAsState(if (active) c.ink else c.inkMuted, spec, label = "trace-tone")
+    val subject by androidx.compose.animation.animateColorAsState(if (active) c.ink.copy(alpha = .78f) else c.inkMuted.copy(alpha = .62f), spec, label = "trace-subject")
     return TraceTone(text, subject)
 }
 
 @Composable
-private fun toneText() = LocalTraceTone.current?.text ?: MaterialTheme.colorScheme.onSurfaceVariant
+private fun toneText() = LocalTraceTone.current?.text ?: Pocket.colors.inkMuted
 @Composable
-private fun toneSubject() = LocalTraceTone.current?.subject ?: MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .62f)
+private fun toneSubject() = LocalTraceTone.current?.subject ?: Pocket.colors.inkMuted.copy(alpha = .62f)
 
 @Composable
 private fun TraceHeader(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector?, failed: Boolean, open: Boolean, modifier: Modifier, onClick: () -> Unit) {
@@ -165,9 +162,9 @@ private fun TraceHeader(label: String, icon: androidx.compose.ui.graphics.vector
             .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
             .padding(start = 4.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (failed) Icon(PocketIcons.ErrorOutline, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
+            if (failed) PIcon(PocketIcons.ErrorOutline, null, Modifier.size(16.dp), tint = Pocket.colors.danger)
             else if (icon != null) TraceGlyph(icon)
-            Text(label, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = tone.text,
+            PText(label, Modifier.weight(1f, fill = false), style = Pocket.type.body, fontSize = 14.sp, color = tone.text,
                 maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
             ActivityExpansionIcon(open)
         }
@@ -213,7 +210,7 @@ private fun traceLabel(summary: ActivitySummary, confirmed: Boolean): String {
 }
 
 @Composable
-internal fun pocketDiffColors(): Pair<Color, Color> = if (MaterialTheme.colorScheme.background.luminance() < .5f)
+internal fun pocketDiffColors(): Pair<Color, Color> = if (Pocket.colors.bg.luminance() < .5f)
     Color(0xFF3FB950) to Color(0xFFF85149) else Color(0xFF1A7F37) to Color(0xFFCF222E)
 
 @Composable
@@ -232,7 +229,7 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
     val status = activityStatusLabel(state)
     val expansionState = stringResource(if (expanded) R.string.v03_expanded else R.string.v03_collapsed)
     val running = state == ActivityStatus.Running || state == ActivityStatus.Waiting
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     var selectedFile by rememberSaveable(scope, item.key) { mutableStateOf<String?>(null) }
     val fileStates = rememberSaveableStateHolder()
     Column(Modifier.fillMaxWidth().testTag("native-activity:${item.key}")) {
@@ -253,7 +250,7 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
                 }
             } }
             if (!expanded && files.size > VISIBLE_FILES) TraceLine(onClick = onExpand) {
-                Text(stringResource(R.string.v04_trace_more, files.size - VISIBLE_FILES), style = MaterialTheme.typography.bodyMedium,
+                PText(stringResource(R.string.v04_trace_more, files.size - VISIBLE_FILES), style = Pocket.type.body,
                     fontSize = 14.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, color = toneText())
             }
             return@Column
@@ -280,13 +277,13 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
                     .semantics { stateDescription = "$status · $expansionState" }) {
                     StatusGlyph(running, stepIcon(step.kind))
                     ActivityTextFlow(running,item.liveStarted,Modifier.weight(1f,fill=false)) {
-                    Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
-                        style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
-                    if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
-                        style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneSubject())
+                    PText(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
+                        style = Pocket.type.body, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                    if (subject.isNotBlank()) PText(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+                        style = Pocket.type.body, fontSize = 14.sp, color = toneSubject())
                     }
-                    if (state == ActivityStatus.Failed) Text(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
-                        maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
+                    if (state == ActivityStatus.Failed) PText(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
+                        maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = c.danger)
                     ActivityExpansionIcon(expanded)
                 }
             } }
@@ -307,15 +304,15 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             if (value?.kind == ActivityKind.Agents) TraceGlyph(PocketIcons.RobotOutline)
             else StatusGlyph(running, kindIcon(value?.kind, value?.webAction))
             ActivityTextFlow(running,item.liveStarted,Modifier.weight(1f,fill=false)) {
-            Text(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
-                style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
-            if (subject.isNotBlank()) Text(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp),
+            PText(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
+                style = Pocket.type.body, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+            if (subject.isNotBlank()) PText(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+                style = Pocket.type.body.copy(fontSize = 14.sp),
                 color = toneSubject())
             }
-            if (state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) Text(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
-                maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = c.error)
-            else if (state == ActivityStatus.Interrupted) Text(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = MaterialTheme.typography.labelSmall, color = toneText())
+            if (state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) PText(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
+                maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = c.danger)
+            else if (state == ActivityStatus.Interrupted) PText(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = toneText())
             if (!empty && (value?.kind != ActivityKind.Agents || expanded)) ActivityExpansionIcon(expanded)
         }
         // Image activities have one disclosure owner; a collapsed preview would keep
@@ -345,7 +342,7 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
 
 @Composable
 private fun TraceGlyph(icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    Icon(icon, null, Modifier.size(16.dp), tint = toneText().copy(alpha = .85f))
+    PIcon(icon, null, Modifier.size(16.dp), tint = toneText().copy(alpha = .85f))
 }
 
 /** Keep the action recognisable while its own glyph animates; completion never moves the row. */
@@ -458,11 +455,11 @@ internal fun NativeAgentWorkingStrip(agents: List<AgentRosterEntry>, modifier: M
                     AgentAvatarGlyph.Brain -> PocketIcons.AgentBrain to Color(0xFF63B99B)
                     AgentAvatarGlyph.Arc -> PocketIcons.AgentWave to Color(0xFF89CBB7)
                 }
-                Icon(glyph, null, Modifier.size(17.dp), tint = tint)
+                PIcon(glyph, null, Modifier.size(17.dp), tint = tint)
             } }
         }
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+        PText(label, Modifier.weight(1f), style = Pocket.type.body, fontSize = 14.sp,
+            color = Pocket.colors.inkMuted, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -483,26 +480,26 @@ private fun TraceLine(onClick: () -> Unit, modifier: Modifier = Modifier, active
 @Composable
 private fun FileLine(file: ActivityFile, state: ActivityStatus, expanded: Boolean, truncated: Boolean, onOpen: () -> Unit) {
     val (add, remove) = pocketDiffColors()
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val name = compactFileName(file.path).ifBlank { stringResource(R.string.v03_file_unknown) }
     TraceLine(onClick = onOpen, active = expanded, modifier = Modifier.testTag("activity-file:${file.id}")
         .semantics { contentDescription = file.path; stateDescription = if (expanded) "已展开" else "已折叠" }) {
         StatusGlyph(state == ActivityStatus.Running, PocketIcons.Edit)
-        Text(fileActionLabel(file.kind, state), style = MaterialTheme.typography.bodyMedium, fontSize = 14.sp,
-            color = if (state == ActivityStatus.Failed) c.error else toneText(), maxLines = 1, softWrap = false)
-        Text(name, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.bodyMedium.copy(textDecoration = TextDecoration.Underline), fontSize = 14.sp, color = c.onSurface)
+        PText(fileActionLabel(file.kind, state), style = Pocket.type.body, fontSize = 14.sp,
+            color = if (state == ActivityStatus.Failed) c.danger else toneText(), maxLines = 1, softWrap = false)
+        PText(name, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            style = Pocket.type.body.copy(textDecoration = TextDecoration.Underline), fontSize = 14.sp, color = c.ink)
         val fallback = remember(file.diff, truncated) { inlineDiffFallback(file.diff, truncated) }
-        if (fallback != null) Text(when (fallback) {
+        if (fallback != null) PText(when (fallback) {
             InlineDiffFallback.Binary -> "二进制"
             InlineDiffFallback.Truncated -> "差异已截断"
             InlineDiffFallback.Empty -> "无差异"
         }, fontSize = 14.sp, maxLines = 1, softWrap = false, color = toneSubject())
-        else Text(buildAnnotatedString {
+        else PText(buildAnnotatedString {
             withStyle(SpanStyle(color = add)) { append("+${file.additions}") }
             append("  ")
             withStyle(SpanStyle(color = remove)) { append("−${file.deletions}") }
-        }, style = MaterialTheme.typography.labelMedium, fontSize = 14.sp, maxLines = 1, softWrap = false)
+        }, style = Pocket.type.labelSmall, fontSize = 14.sp, maxLines = 1, softWrap = false)
         ActivityExpansionIcon(expanded)
     }
 }
@@ -510,7 +507,7 @@ private fun FileLine(file: ActivityFile, state: ActivityStatus, expanded: Boolea
 /** Soft breathing dot instead of a spinner; stays still when animations are off. */
 @Composable
 private fun RunningDot() {
-    val color = MaterialTheme.colorScheme.onSurfaceVariant
+    val color = Pocket.colors.inkMuted
     val alpha = if (pocketMotionMillis(1) == 0) .7f else {
         val transition = rememberInfiniteTransition(label = "trace-running")
         transition.animateFloat(.25f, 1f, infiniteRepeatable(tween(700, easing = LinearEasing), RepeatMode.Reverse), label = "trace-running-alpha").value
@@ -521,7 +518,7 @@ private fun RunningDot() {
 @Composable
 private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: String, state: ActivityStatus, onDetail: () -> Unit) {
     val openAgent = LocalNativeAgentReader.current
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val names = LocalNativeAgentNames.current
     Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 4.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (value.kind == ActivityKind.Reasoning) {
@@ -533,15 +530,15 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
             Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { if (openAgent != null) openAgent(agent.threadId) else onDetail() }
                 .testTag("agent-summary:${agent.threadId}").padding(vertical = 6.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(PocketIcons.RobotOutline, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
-                    Text(name, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = c.onSurfaceVariant,
+                    PIcon(PocketIcons.RobotOutline, null, Modifier.size(16.dp), tint = c.inkMuted)
+                    PText(name, Modifier.weight(1f), style = Pocket.type.body, color = c.inkMuted,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(activityStatusLabel(agent.status), style = MaterialTheme.typography.labelSmall, color = if (agent.status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
-                    Icon(PocketIcons.ChevronRight, "查看智能体详情", Modifier.size(14.dp), tint = c.onSurfaceVariant)
+                    PText(activityStatusLabel(agent.status), style = Pocket.type.caption, color = if (agent.status == ActivityStatus.Failed) c.danger else c.inkMuted)
+                    PIcon(PocketIcons.ChevronRight, "查看智能体详情", Modifier.size(14.dp), tint = c.inkMuted)
                 }
                 if (agent.message.text.isNotBlank()) SelectionContainer {
-                    Text(agent.message.text, Modifier.padding(start = 23.dp), style = MaterialTheme.typography.bodySmall,
-                        color = if (agent.status == ActivityStatus.Failed) c.error else c.onSurfaceVariant)
+                    PText(agent.message.text, Modifier.padding(start = 23.dp), style = Pocket.type.bodySmall,
+                        color = if (agent.status == ActivityStatus.Failed) c.danger else c.inkMuted)
                 }
             }
         } }
@@ -557,47 +554,47 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
             ToolResultFrame(if (command != null) "Shell" else value.title.ifBlank { "工具输出" },
                 nativeActivityDetailText(item), wrap, { wrap = !wrap }) {
                     if (showCommand) SelectionContainer {
-                        Text(buildAnnotatedString {
-                            withStyle(SpanStyle(color = c.onSurfaceVariant)) { append("$ ") }
+                        PText(buildAnnotatedString {
+                            withStyle(SpanStyle(color = c.inkMuted)) { append("$ ") }
                             append(shownCommand)
                         }, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())),
-                            softWrap = wrap, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = c.onSurface)
+                            softWrap = wrap, fontFamily = FontFamily.Monospace, style = Pocket.type.bodySmall, color = c.ink)
                     }
-                    if (command != null && command.cwd.isNotBlank()) Text(stringResource(R.string.v04_transcript_cwd, command.cwd),
-                        fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    if (command != null && command.cwd.isNotBlank()) PText(stringResource(R.string.v04_transcript_cwd, command.cwd),
+                        fontFamily = FontFamily.Monospace, style = Pocket.type.caption, color = c.inkMuted)
                     if (command != null) {
                         val result = listOfNotNull(command.exitCode?.let { stringResource(R.string.v03_exit_code, it) },
                             command.durationMs?.let { NativeActivityPresentation.duration(it) }).joinToString(" · ")
-                        if (result.isNotBlank()) Text(result, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                        if (result.isNotBlank()) PText(result, style = Pocket.type.caption, color = c.inkMuted)
                     }
                     if (commandError.isNotBlank()) SelectionContainer {
-                        Text(commandError, style = MaterialTheme.typography.bodySmall, color = c.error)
+                        PText(commandError, style = Pocket.type.bodySmall, color = c.danger)
                     }
-                    if (value.command == null && value.subtitle.isNotBlank() && value.kind != ActivityKind.Web) Text(value.subtitle,
-                        style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
+                    if (value.command == null && value.subtitle.isNotBlank() && value.kind != ActivityKind.Web) PText(value.subtitle,
+                        style = Pocket.type.bodySmall, color = c.inkMuted)
                     if (hasOutput) {
-                        if (value.kind == ActivityKind.Agents) Text(if (value.title == "spawnAgent") "任务" else "消息",
-                            style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
-                        if (showCommand || command?.cwd?.isNotBlank() == true) HorizontalDivider(color = c.outlineVariant.copy(alpha = .5f))
+                        if (value.kind == ActivityKind.Agents) PText(if (value.title == "spawnAgent") "任务" else "消息",
+                            style = Pocket.type.caption, color = c.inkMuted)
+                        if (showCommand || command?.cwd?.isNotBlank() == true) PDivider(color = c.line.copy(alpha = .5f))
                         Box(Modifier.fillMaxWidth()) {
                             SelectionContainer {
-                                Text(value.output.text, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())), softWrap = wrap,
-                                    style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant,
+                                PText(value.output.text, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())), softWrap = wrap,
+                                    style = Pocket.type.bodySmall, color = c.inkMuted,
                                     fontFamily = if (value.kind == ActivityKind.Command) FontFamily.Monospace else FontFamily.Default)
                             }
                         }
                     }
                     if (hasBlocks) {
-                        item.raw.obj("error").string("message").takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = c.error) }
+                        item.raw.obj("error").string("message").takeIf(String::isNotBlank)?.let { PText(it, style = Pocket.type.bodySmall, color = c.danger) }
                         ToolOutputContent(value.outputBlocks)
                     }
             }
-        } else if (!hasBlocks && value.files.isEmpty() && value.agents.isEmpty()) Text(
+        } else if (!hasBlocks && value.files.isEmpty() && value.agents.isEmpty()) PText(
             stringResource(if (state == ActivityStatus.Running) R.string.v03_output_waiting else R.string.v03_output_unavailable),
-            Modifier.padding(start = 8.dp), style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
-        if (value.output.truncated) Text(stringResource(R.string.v03_output_truncated), style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+            Modifier.padding(start = 8.dp), style = Pocket.type.bodySmall, color = c.inkMuted)
+        if (value.output.truncated) PText(stringResource(R.string.v03_output_truncated), style = Pocket.type.caption, color = c.inkMuted)
         PocketTextButton(onClick = onDetail, modifier = Modifier.align(Alignment.End), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
-            Text(stringResource(R.string.full_details), style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
+            PText(stringResource(R.string.full_details), style = Pocket.type.labelSmall, color = c.inkMuted)
         }
     }
 }
@@ -605,7 +602,7 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
 @Composable
 internal fun ActivityExpansionIcon(expanded: Boolean) {
     val rotation by animateFloatAsState(if (expanded) 180f else 0f, PocketMotion.glyph<Float>().orSnap(rememberPocketMotion()), label = "activity-expansion")
-    Icon(PocketIcons.ExpandMore, stringResource(if (expanded) R.string.collapse_details else R.string.expand_details), Modifier.size(16.dp).rotate(rotation),
+    PIcon(PocketIcons.ExpandMore, stringResource(if (expanded) R.string.collapse_details else R.string.expand_details), Modifier.size(16.dp).rotate(rotation),
         tint = toneText().copy(alpha = .8f))
 }
 

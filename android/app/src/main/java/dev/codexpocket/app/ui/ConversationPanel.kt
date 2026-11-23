@@ -1,8 +1,8 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -33,7 +33,7 @@ internal fun ContextIndicator(s: PocketState, onCompact: () -> Unit, onRefresh: 
     var open by remember(s.selected?.key) { mutableStateOf(false) }
     var details by remember(s.selected?.key) { mutableStateOf(false) }
     var anchor by remember { mutableStateOf<Rect?>(null) }
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val percent = usage.fraction?.let { "${(it * 100).toInt()}%" } ?: "—"
     Row(Modifier.heightIn(min = 48.dp).onGloballyPositioned { if (!open) anchor = it.boundsInRoot() }
         .clickable { open = true; onRefresh() }.padding(horizontal = 6.dp).testTag("context-indicator")
@@ -41,70 +41,70 @@ internal fun ContextIndicator(s: PocketState, onCompact: () -> Unit, onRefresh: 
         horizontalArrangement = Arrangement.spacedBy(5.dp)) {
         Canvas(Modifier.size(20.dp)) {
             val stroke = 3.dp.toPx()
-            drawCircle(c.outlineVariant, radius = (size.minDimension - stroke) / 2, style = Stroke(stroke))
-            usage.fraction?.let { drawArc(c.onSurfaceVariant, -90f, 360f * it, false,
+            drawCircle(c.line, radius = (size.minDimension - stroke) / 2, style = Stroke(stroke))
+            usage.fraction?.let { drawArc(c.inkMuted, -90f, 360f * it, false,
                 topLeft = androidx.compose.ui.geometry.Offset(stroke / 2, stroke / 2),
                 size = androidx.compose.ui.geometry.Size(size.width - stroke, size.height - stroke),
                 style = Stroke(stroke, cap = StrokeCap.Round)) }
         }
-        Text(percent, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+        PText(percent, style = Pocket.type.caption, color = c.inkMuted)
     }
     if (open) PocketAnchoredMenu("上下文", { open = false }, anchor, widthDp = 240f, below = true) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 2.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("上下文", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
-                Text(percent, style = MaterialTheme.typography.titleSmall)
+                PText("上下文", Modifier.weight(1f), style = Pocket.type.label)
+                PText(percent, style = Pocket.type.titleSmall)
                 Box(Modifier.size(40.dp).testTag("context-refresh").clickable(enabled = s.online && !s.contextSnapshot.loading, onClick = onRefresh)
                     .semantics { contentDescription = "刷新上下文" }, contentAlignment = Alignment.Center) {
-                    if (s.contextSnapshot.loading) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                    else Icon(PocketIcons.Refresh, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
+                    if (s.contextSnapshot.loading) PSpinner(Modifier.size(14.dp), 2.dp, Pocket.colors.solid)
+                    else PIcon(PocketIcons.Refresh, null, Modifier.size(16.dp), tint = c.inkMuted)
                 }
             }
             val snapshot = s.contextSnapshot
             if (usage.used != null) {
-                Text("${compactContextCount(usage.used)} / ${usage.capacity?.let(::compactContextCount) ?: "—"} tokens",
-                    Modifier.testTag("context-used-window"), style = MaterialTheme.typography.bodyMedium)
-                Text("最近一轮 · 已使用 / 窗口", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
-            } else Text(when {
+                PText("${compactContextCount(usage.used)} / ${usage.capacity?.let(::compactContextCount) ?: "—"} tokens",
+                    Modifier.testTag("context-used-window"), style = Pocket.type.body)
+                PText("最近一轮 · 已使用 / 窗口", style = Pocket.type.caption, color = c.inkMuted)
+            } else PText(when {
                 snapshot.loading -> "正在读取上下文用量"
                 !s.online -> "电脑离线，暂无已保存的用量"
                 snapshot.status == "unsupported" -> "当前助手不支持上下文回读"
                 snapshot.status == "failed" -> "上下文读取失败，可重试"
                 else -> "暂无可验证的用量记录"
-            }, style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant)
+            }, style = Pocket.type.bodySmall, color = c.inkMuted)
             usage.fraction?.let { fraction ->
                 Canvas(Modifier.fillMaxWidth().height(4.dp).padding(horizontal = 1.dp)) {
                     val corner = androidx.compose.ui.geometry.CornerRadius(size.height / 2)
-                    drawRoundRect(c.outlineVariant, cornerRadius = corner)
-                    drawRoundRect(c.onSurfaceVariant, size = androidx.compose.ui.geometry.Size(size.width * fraction, size.height), cornerRadius = corner)
+                    drawRoundRect(c.line, cornerRadius = corner)
+                    drawRoundRect(c.inkMuted, size = androidx.compose.ui.geometry.Size(size.width * fraction, size.height), cornerRadius = corner)
                 }
             }
-            if (usage.used != null && (!s.online || snapshot.status != "ok" || snapshot.error != null)) Text(
+            if (usage.used != null && (!s.online || snapshot.status != "ok" || snapshot.error != null)) PText(
                 when { !s.online -> "离线 · 上次记录"; snapshot.error != null -> "刷新失败 · 保留上次记录"; else -> "用量待更新" },
-                style = MaterialTheme.typography.labelSmall, color = if (snapshot.error != null) c.error else c.onSurfaceVariant)
+                style = Pocket.type.caption, color = if (snapshot.error != null) c.danger else c.inkMuted)
             Row(Modifier.fillMaxWidth().heightIn(min = 32.dp).clickable { details = !details }.testTag("context-details-toggle"),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Text("详细用量", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                PText("详细用量", style = Pocket.type.caption, color = c.inkMuted)
                 ActivityExpansionIcon(details)
             }
             if (details) Column(Modifier.testTag("context-details"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 s.advanced.usage?.obj("last")?.let { last ->
-                    Text("输入 ${last.number("inputTokens")} · 输出 ${last.number("outputTokens")}", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    PText("输入 ${last.number("inputTokens")} · 输出 ${last.number("outputTokens")}", style = Pocket.type.caption, color = c.inkMuted)
                 }
-                usage.used?.let { Text("最近一轮 $it tokens", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
-                usage.capacity?.let { Text("窗口 $it tokens", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
-                usage.cumulative?.let { Text("累计使用 $it tokens", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
-                if (snapshot.updatedAt > 0) Text("更新于 " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(snapshot.updatedAt)),
-                    style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                usage.used?.let { PText("最近一轮 $it tokens", style = Pocket.type.caption, color = c.inkMuted) }
+                usage.capacity?.let { PText("窗口 $it tokens", style = Pocket.type.caption, color = c.inkMuted) }
+                usage.cumulative?.let { PText("累计使用 $it tokens", style = Pocket.type.caption, color = c.inkMuted) }
+                if (snapshot.updatedAt > 0) PText("更新于 " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(snapshot.updatedAt)),
+                    style = Pocket.type.caption, color = c.inkMuted)
             }
-            HorizontalDivider(color = c.outlineVariant.copy(alpha = .55f))
+            PDivider(color = c.line.copy(alpha = .55f))
             Row(Modifier.fillMaxWidth().heightIn(min = 44.dp)
                 .clickable(enabled = actionUnavailableReason(s, "thread/compact/start", true) == null) { open = false; onCompact() }
                 .testTag("context-compact").padding(horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(PocketIcons.FoldVertical, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
-                Text("压缩上下文", style = MaterialTheme.typography.bodySmall)
+                PIcon(PocketIcons.FoldVertical, null, Modifier.size(16.dp), tint = c.inkMuted)
+                PText("压缩上下文", style = Pocket.type.bodySmall)
             }
         }
     }
@@ -158,8 +158,8 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
             } else if (editor != ConversationEditor.None) {
                 PocketMenuItem("返回会话操作", PocketIcons.ArrowBack, { editor = ConversationEditor.None }, enabled = !submitting)
                 val title = when (editor) { ConversationEditor.Rename -> "重命名"; ConversationEditor.Goal -> "目标"; ConversationEditor.Fork -> "分支聊天"; else -> "旁支讨论" }
-                Text(title, Modifier.padding(horizontal = 10.dp), style = MaterialTheme.typography.titleMedium)
-                if (editor in setOf(ConversationEditor.Fork, ConversationEditor.SideChat)) Text("创建独立对话，补充内容会留作草稿。", Modifier.padding(horizontal = 10.dp), style = MaterialTheme.typography.bodySmall)
+                PText(title, Modifier.padding(horizontal = 10.dp), style = Pocket.type.title)
+                if (editor in setOf(ConversationEditor.Fork, ConversationEditor.SideChat)) PText("创建独立对话，补充内容会留作草稿。", Modifier.padding(horizontal = 10.dp), style = Pocket.type.bodySmall)
                 PocketTextField(text, { text = it }, Modifier.fillMaxWidth().padding(6.dp), singleLine = editor == ConversationEditor.Rename,
                     label = if (editor in setOf(ConversationEditor.Fork, ConversationEditor.SideChat)) "补充说明（选填）" else title, enabled = !submitting)
                 val method = when (editor) { ConversationEditor.Rename -> "thread/name/set"; ConversationEditor.Goal -> "thread/goal/set"; else -> "thread/fork" }
@@ -207,7 +207,7 @@ internal fun ConversationPanel(s: PocketState, repo: PocketRepository, anchor: R
                 val archiveReason = s.archiveUnavailableReason()
                 PocketMenuItem(if (archived) "取消归档" else "归档会话", PocketIcons.Inventory2, { s.selected?.let(repo::archive); onDismiss() },
                     enabled = archiveReason == null, hint = archiveReason)
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                PDivider(Modifier.padding(vertical = 8.dp), color = Pocket.colors.line)
                 QuotaPanel(s, repo)
             }
         }
@@ -225,13 +225,13 @@ internal fun CopyConversationLinkItem(chat: ChatEntity?, onCopy: (String) -> Uni
 private fun QuotaPanel(s: PocketState, repo: PocketRepository) {
     val q = s.quota.takeIf { it.matches(s.computerId, s.selected?.runtimeId) } ?: QuotaState()
     var choosing by remember(s.computerId, s.selected?.runtimeId) { mutableStateOf(false) }
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("账户额度", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+            PText("账户额度", Modifier.weight(1f), style = Pocket.type.titleSmall)
             val currentSource = q.sources.firstOrNull { it.string("id") == q.selectedSourceId }
             val canRead = currentSource != null && s.supports("quota/read") && q.status !in setOf("unavailable", "unsupported")
-            PocketTextButton(onClick = { if (canRead) repo.refreshQuota(q.selectedSourceId!!, true) else repo.refreshQuotaSources() }, enabled = s.online && !q.loading) { Text("刷新", style = MaterialTheme.typography.labelSmall) }
+            PocketTextButton(onClick = { if (canRead) repo.refreshQuota(q.selectedSourceId!!, true) else repo.refreshQuotaSources() }, enabled = s.online && !q.loading) { PText("刷新", style = Pocket.type.caption) }
         }
         val source = q.sources.firstOrNull { it.string("id") == q.selectedSourceId }
         PocketMenuItem(source?.string("label") ?: "选择额度来源", null, { choosing = !choosing }, enabled = q.sources.isNotEmpty(),
@@ -242,20 +242,20 @@ private fun QuotaPanel(s: PocketState, repo: PocketRepository) {
         if (q.loading && s.online) PocketProgressStatus("正在查询额度")
         val state = if (!s.online) "offline" else q.status
         val stale = q.result?.flag("stale") == true || state !in setOf("ready", "ok", "idle", "cooldown", "rate_limited")
-        quotaStatusMessage(state, stale)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = c.onSurfaceVariant) }
+        quotaStatusMessage(state, stale)?.let { PText(it, style = Pocket.type.bodySmall, color = c.inkMuted) }
         q.result?.array("items")?.forEach { element ->
             val item = element.asObject()
             fun number(key: String) = (item[key] as? JsonPrimitive)?.doubleOrNull?.takeIf(Double::isFinite)
             val used = number("used"); val total = number("total"); val remaining = number("remaining")
             val fraction = number("usedPercent")?.div(100) ?: if (used != null && total != null && total > 0) used / total else null
-            Text(item.string("label", "额度"), style = MaterialTheme.typography.labelMedium)
-            if (fraction != null) LinearProgressIndicator(progress = { fraction.coerceIn(0.0, 1.0).toFloat() }, Modifier.fillMaxWidth().height(4.dp))
+            PText(item.string("label", "额度"), style = Pocket.type.labelSmall)
+            if (fraction != null) PLinearProgress(fraction.coerceIn(0.0, 1.0).toFloat(), Modifier.height(4.dp), color = Pocket.colors.solid)
             fun format(v: Double) = java.text.DecimalFormat("#,##0.##").format(v)
             val unit = item.string("unit")
-            Text(when { remaining != null -> "剩余 ${format(remaining)} $unit"; used != null && total != null -> "${format(used)} / ${format(total)} $unit"; fraction != null -> "已使用 ${format(fraction * 100)}%"; else -> "未提供数值" }, style = MaterialTheme.typography.bodySmall)
+            PText(when { remaining != null -> "剩余 ${format(remaining)} $unit"; used != null && total != null -> "${format(used)} / ${format(total)} $unit"; fraction != null -> "已使用 ${format(fraction * 100)}%"; else -> "未提供数值" }, style = Pocket.type.bodySmall)
             val reset = number("resetsAt")
-            if (reset != null && reset > 0) Text("重置 ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(reset.toLong()))}", style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+            if (reset != null && reset > 0) PText("重置 ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(reset.toLong()))}", style = Pocket.type.caption, color = c.inkMuted)
         }
-        q.result?.number("updatedAt")?.takeIf { it > 0 }?.let { Text((if (stale) "上次结果 · " else "更新于 ") + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(it)), style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant) }
+        q.result?.number("updatedAt")?.takeIf { it > 0 }?.let { PText((if (stale) "上次结果 · " else "更新于 ") + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(it)), style = Pocket.type.caption, color = c.inkMuted) }
     }
 }

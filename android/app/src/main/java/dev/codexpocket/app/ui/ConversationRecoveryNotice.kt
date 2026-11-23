@@ -1,7 +1,7 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -28,13 +28,13 @@ internal fun ConversationRecoveryNotice(s: PocketState, onRecover: () -> Unit) {
             Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
                 ActivityMotionIcon(ActivityMotion.Connection,s.online&&(busy||recovery.connecting),Modifier.size(22.dp))
                 Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(4.dp)) {
-                    PocketDestinationTitle(title,style=MaterialTheme.typography.labelLarge)
-                    Text(message,Modifier.heightIn(min=36.dp),style=MaterialTheme.typography.bodySmall,
-                        color=if(error!=null&&!busy) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                    PocketDestinationTitle(title,style=Pocket.type.label)
+                    PText(message,Modifier.heightIn(min=36.dp),style=Pocket.type.bodySmall,
+                        color=if(error!=null&&!busy) Pocket.colors.danger else Pocket.colors.inkMuted)
                 }
                 if ("threads/takeover" in s.capabilities) PocketTextButton(onRecover,
                     modifier=Modifier.widthIn(min=86.dp).testTag("recovery-action"),enabled=s.online&&!busy) {
-                    PocketDestinationTitle(if(busy) "检查中" else recovery.action,style=MaterialTheme.typography.labelLarge)
+                    PocketDestinationTitle(if(busy) "检查中" else recovery.action,style=Pocket.type.label)
                 }
             }
         }

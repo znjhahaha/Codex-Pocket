@@ -44,7 +44,8 @@ class ManagementSettingsUiTest {
                     val density = LocalDensity.current
                     CompositionLocalProvider(LocalPocketGlass provides false,
                         LocalDensity provides Density(density.density, fontScale)) {
-                        block()
+                        // Menus and sheets open in the app's own overlay layer, as they do on a device.
+                        PocketBackdrop { block() }
                     }
                 }
             }

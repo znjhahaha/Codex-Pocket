@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.expandVertically
@@ -13,7 +14,6 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,7 +67,7 @@ internal fun ConversationActionsList(s: PocketState, onDismiss: () -> Unit, onFi
     onCompact: () -> Unit, onFast: () -> Unit, onResume: () -> Unit, onPin: () -> Unit, onArchive: () -> Unit) {
     var showUnavailable by remember { mutableStateOf(false) }
     fun done(action: () -> Unit): () -> Unit = { onDismiss(); action() }
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val actions = listOf(
         ConversationAction("重命名", PocketIcons.Edit, actionUnavailableReason(s, "thread/name/set"), onRename),
         ConversationAction("分支聊天", PocketIcons.CallSplit, actionUnavailableReason(s, "thread/fork"), onFork),
@@ -99,7 +99,7 @@ internal fun ConversationActionsList(s: PocketState, onDismiss: () -> Unit, onFi
             MenuDivider()
             PocketMenuItem("暂不可用 · ${unavailable.size}", null, { showUnavailable = !showUnavailable }, trailing = {
                 val turn by animateFloatAsState(if (showUnavailable) 180f else 0f, pocketPressSpring(), label = "unavailable-chevron")
-                Icon(PocketIcons.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = turn }, tint = c.onSurfaceVariant)
+                PIcon(PocketIcons.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = turn }, tint = c.inkMuted)
             })
             AnimatedVisibility(showUnavailable, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
                 Column { unavailable.forEach { action -> PocketMenuItem(action.title, action.icon, {}, enabled = false, hint = action.reason) } }
@@ -110,22 +110,22 @@ internal fun ConversationActionsList(s: PocketState, onDismiss: () -> Unit, onFi
 
 @Composable
 private fun MenuDivider() {
-    HorizontalDivider(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
+    PDivider(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), color = Pocket.colors.line.copy(alpha = .45f))
 }
 
 /** iOS context-menu style quick action: icon over a short label, oval tile. */
 @Composable
 private fun QuickTile(label: String, icon: ImageVector, onClick: () -> Unit, modifier: Modifier, enabled: Boolean = true) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .92f else 1f, pocketPressSpring(), label = "quick-tile")
     Column(modifier.heightIn(min = 60.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketOval)
-        .background(if (pressed) c.surfaceContainerHighest else c.surfaceContainerHigh.copy(alpha = .75f))
+        .background(if (pressed) c.fillStrongest else c.fillStrong.copy(alpha = .75f))
         .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
         .padding(horizontal = 6.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically)) {
-        val tint = if (enabled) c.onSurface else c.onSurfaceVariant.copy(alpha = .5f)
-        Icon(icon, null, Modifier.size(19.dp), tint = tint)
-        Text(label, style = MaterialTheme.typography.labelMedium, color = tint, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        val tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .5f)
+        PIcon(icon, null, Modifier.size(19.dp), tint = tint)
+        PText(label, style = Pocket.type.labelSmall, color = tint, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }

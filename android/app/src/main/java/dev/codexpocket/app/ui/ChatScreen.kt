@@ -1,6 +1,7 @@
 @file:OptIn(kotlinx.coroutines.FlowPreview::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.ui.draw.clip
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,13 +20,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -139,7 +141,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             capture = null
         }
         val pending = s.approvals.filter { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method) }
-        val background = MaterialTheme.colorScheme.background
+        val background = Pocket.colors.bg
         val transcriptBackdrop = rememberLayerBackdrop { drawRect(background); drawContent() }
         val density = LocalDensity.current
         var composerHeight by remember { mutableIntStateOf(0) }
@@ -210,6 +212,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                 val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
                 val transcriptInset = maxOf(16.dp, (maxWidth - gutter - 720.dp) / 2)
+                val arrivals = rememberPocketArrivals(chat.key.encoded)
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
                 LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter, top = statusInset).testTag("chat-transcript")
                     .transcriptUserGesture(list, transcriptGesture, pauseFollowing, { transcriptContact = it; if (it) jumpJob?.cancel() })
@@ -218,12 +221,16 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                         ConversationReadStatus(read.copy(failed = false, refreshing = false), null, onRetry = {})
                         if (rows.isNotEmpty() && s.online && (s.supports("thread/turns/list") || s.conversationReadSource == "persisted") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                             PocketTextButton(onClick = { transcriptGesture.cancelResume(); pauseFollowing(); repo.older() }, enabled = !s.historyLoading) {
-                                Text(stringResource(if (s.historyLoading) R.string.delivery_history_loading else R.string.earlier_messages), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                PText(stringResource(if (s.historyLoading) R.string.delivery_history_loading else R.string.earlier_messages), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
                             }
                         }
                     }
-                    items(rows, key = { it.key }, contentType = { it.kind }) { row ->
-                        Column(Modifier.fillMaxWidth().testTag("transcript-row:${row.key}").padding(top = when (row.kind) {
+                    itemsIndexed(rows, key = { _, row -> row.key }, contentType = { _, row -> row.kind }) { index, row ->
+                        // Only the tail can be new: a sent message leaves from the composer's corner, a reply rises from the margin.
+                        val tail = rows.size - index <= 2
+                        Column(Modifier.fillMaxWidth().testTag("transcript-row:${row.key}")
+                            .pocketArrival(arrivals, row.key, tail, origin = if (row.kind == TranscriptKind.User) TransformOrigin(1f, 1f) else TransformOrigin(0f, 1f))
+                            .padding(top = when (row.kind) {
                             TranscriptKind.User -> 16.dp
                             TranscriptKind.Answer -> 10.dp
                             else -> 2.dp
@@ -242,8 +249,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     if (live != null) item(key = "live-status", contentType = "live-status") {
                         LiveTurnStatus(live.first, live.second, reasoning = reasoning, timing = timing, online = nativeLive)
                     } else if (showSending) item(key = "live-status", contentType = "live-status") {
-                        Text("正在发送", Modifier.padding(vertical = 12.dp).testTag("live-sending-placeholder"),
-                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        PText("正在发送", Modifier.padding(vertical = 12.dp).testTag("live-sending-placeholder"),
+                            style = Pocket.type.body, color = Pocket.colors.inkMuted)
                     }
                     item(key = "agent-working", contentType = "agent-working") { NativeAgentWorkingStrip(agents, onOpen = { repo.showAgentReader() }) }
                     item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
@@ -332,8 +339,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             }
             if (s.uncertainSend) Row(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 20.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("正在确认上次发送，草稿已保留", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                PocketTextButton({ repo.checkCommands() }, enabled = s.online) { Text("查看状态") }
+                PText("正在确认上次发送，草稿已保留", style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+                PocketTextButton({ repo.checkCommands() }, enabled = s.online) { PText("查看状态") }
             }
             if (dockPlan == null && s.messageEdit == null) composerState.SaveableStateProvider("normal-composer") { PocketComposer(s.draft?.text.orEmpty(), s.modelSelectionLabel,
                 listOfNotNull(s.effort?.let(context::effortLabel), s.mode?.takeUnless { it == "default" }?.let { context.modeLabel(it, it) }).filter(String::isNotBlank).joinToString(" · "),
@@ -400,17 +407,17 @@ internal fun ConversationReadStatus(read: ConversationReadPresentation, error: S
 /** Opaque floating card: the transcript never shows through, and one message is shown at a time. */
 @Composable
 private fun ReadFailureCard(message: String, onRetry: () -> Unit) {
-    Surface(Modifier.fillMaxWidth().padding(top = 6.dp).testTag("conversation-read-failed"), shape = RoundedCornerShape(20.dp),
+    PSurface(Modifier.fillMaxWidth().padding(top = 6.dp).testTag("conversation-read-failed"), shape = RoundedCornerShape(20.dp),
         // Hairline instead of an elevation shadow: the 6dp shadow drew a dark band along the card's left edge.
-        color = MaterialTheme.colorScheme.surfaceContainerLowest, shadowElevation = 0.dp, tonalElevation = 0.dp,
-        border = androidx.compose.foundation.BorderStroke(.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .7f))) {
+        color = Pocket.colors.surface,
+        border = androidx.compose.foundation.BorderStroke(.5.dp, Pocket.colors.line.copy(alpha = .7f))) {
         Row(Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(28.dp).clip(PocketOval).background(MaterialTheme.colorScheme.errorContainer), contentAlignment = Alignment.Center) {
-                Icon(PocketIcons.ErrorOutline, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
+            Box(Modifier.size(28.dp).clip(PocketOval).background(Pocket.colors.dangerSoft), contentAlignment = Alignment.Center) {
+                PIcon(PocketIcons.ErrorOutline, null, Modifier.size(16.dp), tint = Pocket.colors.danger)
             }
-            Text(message, Modifier.weight(1f).padding(horizontal = 10.dp), style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            PocketTextButton(onClick = onRetry) { Text(stringResource(R.string.v04_transcript_retry)) }
+            PText(message, Modifier.weight(1f).padding(horizontal = 10.dp), style = Pocket.type.bodySmall,
+                color = Pocket.colors.ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            PocketTextButton(onClick = onRetry) { PText(stringResource(R.string.v04_transcript_retry)) }
         }
     }
 }
@@ -418,5 +425,5 @@ private fun ReadFailureCard(message: String, onRetry: () -> Unit) {
 @Composable
 private fun SkeletonBar(fraction: Float, height: androidx.compose.ui.unit.Dp) {
     Box(Modifier.fillMaxWidth(fraction).height(height).clip(RoundedCornerShape(height / 2))
-        .background(MaterialTheme.colorScheme.surfaceContainerHigh).pocketShimmer())
+        .background(Pocket.colors.fillStrong).pocketShimmer())
 }

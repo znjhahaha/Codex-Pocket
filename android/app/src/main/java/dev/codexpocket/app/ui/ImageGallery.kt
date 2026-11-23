@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.graphics.ImageDecoder
 import android.util.LruCache
 import androidx.compose.animation.core.Animatable
@@ -22,9 +23,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -218,7 +216,7 @@ private fun GalleryRetry(file: MentionedFile) {
         val identity = "${source?.ownerKey}:${media?.cacheKey ?: file.path}"
         if (galleryRetries.size > 512) galleryRetries.clear()
         galleryRetries[identity] = (galleryRetries[identity] ?: 0) + 1
-    } }, Modifier.heightIn(min=48.dp).testTag("image-retry:${media?.mediaId ?: file.path}")) { Text("重试图片") }
+    } }, Modifier.heightIn(min=48.dp).testTag("image-retry:${media?.mediaId ?: file.path}")) { PText("重试图片") }
 }
 
 /**
@@ -353,7 +351,7 @@ private fun ImageDeck(images: List<MentionedFile>, geometry: MultiImageGeometry,
                         else Modifier.semantics { contentDescription = file.name })) {
                     ImageFill(load, file)
                     if (index == 8 && images.size > 9) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .45f)), contentAlignment = Alignment.Center) {
-                        Text("+${images.size - 9}", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                        PText("+${images.size - 9}", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -363,14 +361,14 @@ private fun ImageDeck(images: List<MentionedFile>, geometry: MultiImageGeometry,
 
 @Composable
 private fun DeckPill(open: Boolean, count: Int, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val scale = pressScale(interaction)
-    Text(if (open) "收起" else "展开 $count", Modifier.width(88.dp).testTag("image-deck-toggle").graphicsLayer { scaleX = scale; scaleY = scale }
-        .clip(PocketCapsule).background(c.surfaceContainerHigh)
+    PText(if (open) "收起" else "展开 $count", Modifier.width(88.dp).testTag("image-deck-toggle").graphicsLayer { scaleX = scale; scaleY = scale }
+        .clip(PocketCapsule).background(c.fillStrong)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
         .semantics { stateDescription = if (open) "图片已展开" else "图片已收起" }
-        .padding(horizontal = 14.dp, vertical = 7.dp), style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant,
+        .padding(horizontal = 14.dp, vertical = 7.dp), style = Pocket.type.label, color = c.inkMuted,
         maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
@@ -419,7 +417,7 @@ private fun GridCell(file: MentionedFile, size: Dp, shape: RoundedCornerShape, m
         .semantics { contentDescription = file.name }) {
         ImageFill(load, file)
         if (more > 0) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .45f)), contentAlignment = Alignment.Center) {
-            Text("+$more", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            PText("+$more", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -427,19 +425,19 @@ private fun GridCell(file: MentionedFile, size: Dp, shape: RoundedCornerShape, m
 /** Shimmer while loading, a fade in when ready, a quiet glyph and name when bytes are unavailable. */
 @Composable
 private fun ImageFill(load: ImageLoad, file: MentionedFile) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val appear by animateFloatAsState(if (load is ImageLoad.Ready) 1f else 0f, tween(pocketMotionMillis(220)), label = "image-appear")
-    Box(Modifier.fillMaxSize().background(c.surfaceContainerHigh), contentAlignment = Alignment.Center) {
+    Box(Modifier.fillMaxSize().background(c.fillStrong), contentAlignment = Alignment.Center) {
         when (load) {
             is ImageLoad.Ready -> Image(load.bitmap, file.name, Modifier.fillMaxSize().graphicsLayer { alpha = appear }, contentScale = ContentScale.Crop)
             ImageLoad.Loading -> PocketShimmer(Modifier.fillMaxSize())
             ImageLoad.Failed -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(6.dp)) {
-                Icon(PocketIcons.Image, null, Modifier.size(20.dp), tint = c.onSurfaceVariant)
-                Text(file.name.ifBlank { file.path.substringAfterLast('\\').substringAfterLast('/') }, style = MaterialTheme.typography.labelSmall,
-                    color = c.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                PIcon(PocketIcons.Image, null, Modifier.size(20.dp), tint = c.inkMuted)
+                PText(file.name.ifBlank { file.path.substringAfterLast('\\').substringAfterLast('/') }, style = Pocket.type.caption,
+                    color = c.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
-            is ImageLoad.MediaUnavailable -> Text(toolMediaLabel(load.status), Modifier.padding(8.dp), style = MaterialTheme.typography.labelSmall,
-                color = c.onSurfaceVariant, maxLines = 2)
+            is ImageLoad.MediaUnavailable -> PText(toolMediaLabel(load.status), Modifier.padding(8.dp), style = Pocket.type.caption,
+                color = c.inkMuted, maxLines = 2)
         }
     }
 }
@@ -472,13 +470,13 @@ internal fun ImageViewer(images: List<MentionedFile>, start: Int, onDismiss: () 
                 verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(44.dp).clip(PocketCapsule).background(Color.White.copy(alpha = .14f)).clickable(role = Role.Button, onClick = onDismiss)
                     .semantics { contentDescription = "关闭" }, contentAlignment = Alignment.Center) {
-                    Icon(PocketIcons.Close, null, Modifier.size(20.dp), tint = Color.White)
+                    PIcon(PocketIcons.Close, null, Modifier.size(20.dp), tint = Color.White)
                 }
-                Text(images[pager.currentPage].name, Modifier.weight(1f).padding(horizontal = 12.dp), color = Color.White.copy(alpha = .9f),
-                    style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (images.size > 1) Text("${pager.currentPage + 1} / ${images.size}", Modifier.clip(PocketCapsule)
+                PText(images[pager.currentPage].name, Modifier.weight(1f).padding(horizontal = 12.dp), color = Color.White.copy(alpha = .9f),
+                    style = Pocket.type.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (images.size > 1) PText("${pager.currentPage + 1} / ${images.size}", Modifier.clip(PocketCapsule)
                     .background(Color.White.copy(alpha = .14f)).padding(horizontal = 12.dp, vertical = 6.dp),
-                    color = Color.White, style = MaterialTheme.typography.labelLarge)
+                    color = Color.White, style = Pocket.type.label)
             }
         }
     }
@@ -527,13 +525,13 @@ private fun ZoomableImage(file: MentionedFile, drag: Float, enter: Float, onDrag
             }, contentScale = ContentScale.Fit)
             ImageLoad.Loading -> PocketLoader()
             ImageLoad.Failed -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(PocketIcons.Image, null, Modifier.size(36.dp), tint = Color.White.copy(alpha = .7f))
+                PIcon(PocketIcons.Image, null, Modifier.size(36.dp), tint = Color.White.copy(alpha = .7f))
                 Spacer(Modifier.height(8.dp))
-                Text("无法读取这张图片。电脑助手需要更新到 0.5 才能预览电脑上的图片。", Modifier.padding(horizontal = 32.dp),
-                    color = Color.White.copy(alpha = .8f), style = MaterialTheme.typography.bodyMedium)
+                PText("无法读取这张图片。电脑助手需要更新到 0.5 才能预览电脑上的图片。", Modifier.padding(horizontal = 32.dp),
+                    color = Color.White.copy(alpha = .8f), style = Pocket.type.body)
             }
             is ImageLoad.MediaUnavailable -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(toolMediaLabel(load.status), Modifier.padding(32.dp), color = Color.White.copy(alpha = .8f), style = MaterialTheme.typography.bodyMedium)
+                PText(toolMediaLabel(load.status), Modifier.padding(32.dp), color = Color.White.copy(alpha = .8f), style = Pocket.type.body)
                 GalleryRetry(file)
             }
         }

@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.os.Build
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -7,7 +8,6 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -31,14 +31,14 @@ import com.kyant.backdrop.effects.lens
 @Composable
 internal fun MinimapGlassThumb(backdrop: Backdrop, held: Boolean, visibility: Float, modifier: Modifier) {
     val preferences = rememberPocketGlassPreferences()
-    val dark = MaterialTheme.colorScheme.background.luminance() < .3f
+    val dark = Pocket.colors.bg.luminance() < .3f
     val optics = LocalPocketGlass.current && !preferences.highContrast && !preferences.batterySaver &&
         LocalView.current.isHardwareAccelerated && Build.VERSION.SDK_INT >= 31
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
     val press by animateFloatAsState(if (held) 1f else 0f,
         if (motion) spring(dampingRatio = .88f, stiffness = 780f) else snap(), label = "minimap-glass-grip")
     val shape = RoundedCornerShape(10.dp)
-    val fallback = MaterialTheme.colorScheme.surfaceContainerHigh
+    val fallback = Pocket.colors.fillStrong
     val material = if (optics) Modifier.drawBackdrop(
         backdrop = backdrop, shape = { shape },
         effects = {

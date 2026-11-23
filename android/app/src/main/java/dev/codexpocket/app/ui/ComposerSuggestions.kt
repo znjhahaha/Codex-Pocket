@@ -1,11 +1,11 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,23 +51,23 @@ internal fun ComposerSuggestions(
         Column(Modifier.fillMaxWidth()) {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 16.dp, end = 4.dp),
                 verticalAlignment = Alignment.CenterVertically) {
-                Icon(if (trigger.kind == ComposerTriggerKind.Command) PocketIcons.Command else PocketIcons.AlternateEmail,
-                    null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                PIcon(if (trigger.kind == ComposerTriggerKind.Command) PocketIcons.Command else PocketIcons.AlternateEmail,
+                    null, Modifier.size(18.dp), tint = Pocket.colors.inkMuted)
                 Spacer(Modifier.width(8.dp))
-                Text(if (trigger.kind == ComposerTriggerKind.Command) "命令与技能" else "引用",
-                    Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
+                PText(if (trigger.kind == ComposerTriggerKind.Command) "命令与技能" else "引用",
+                    Modifier.weight(1f), style = Pocket.type.label)
                 Box(Modifier.size(48.dp).focusProperties { canFocus = false }
                     .clickable(role = Role.Button, onClick = onDismiss).semantics { contentDescription = "关闭建议" },
                     contentAlignment = Alignment.Center) {
-                    Icon(PocketIcons.Close, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PIcon(PocketIcons.Close, null, Modifier.size(18.dp), tint = Pocket.colors.inkMuted)
                 }
             }
             LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("composer-suggestion-list"),
                 contentPadding = PaddingValues(bottom = 8.dp)) {
                 sections.forEach { section ->
                     item(key = "heading:${section.group.name}", contentType = "heading") {
-                        Text(if (section.group == ComposerSuggestionGroup.Plugins) "应用与插件" else section.group.label, Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        PText(if (section.group == ComposerSuggestionGroup.Plugins) "应用与插件" else section.group.label, Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                     }
                     items(section.candidates, key = { it.key }, contentType = { it.group }) { candidate ->
                         ComposerSuggestionRow(candidate) { onSelect(candidate) }
@@ -76,14 +76,14 @@ internal fun ComposerSuggestions(
                 if (status != null) item(key = "status", contentType = "status") {
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        if (searching) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        if (searching) PSpinner(Modifier.size(16.dp), 2.dp, Pocket.colors.solid)
+                        PText(status, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted,
                             maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
                 }
                 if (unsupported.isNotEmpty()) item(key = "unsupported", contentType = "status") {
-                    Text("当前 Codex 未提供${unsupported.joinToString("、")}", Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PText("当前 Codex 未提供${unsupported.joinToString("、")}", Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
             }
         }
@@ -106,14 +106,14 @@ private fun ComposerSuggestionRow(candidate: ComposerSuggestion, onClick: () -> 
         .clickable(role = Role.Button, onClick = onClick).testTag("composer-suggestion-${candidate.key}")
         .padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        PIcon(icon, null, Modifier.size(18.dp), tint = Pocket.colors.inkMuted)
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(title, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (source != null) Text(source, Modifier.widthIn(max = 96.dp), style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                PText(title, Modifier.weight(1f), style = Pocket.type.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (source != null) PText(source, Modifier.widthIn(max = 96.dp), style = Pocket.type.caption,
+                    color = Pocket.colors.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Text(candidate.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            PText(candidate.detail, style = Pocket.type.caption, color = Pocket.colors.inkMuted,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }

@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -7,7 +8,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,8 +27,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.MotionGlyphs
-import dev.codexpocket.app.ui.kit.PToggleGlyph
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -44,14 +42,14 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             Row(Modifier.fillMaxWidth().heightIn(min = 40.dp)
                 .clickable(interactionSource = interaction, indication = null, onClick = onExpand),
                 verticalAlignment = Alignment.CenterVertically) {
-                Text(row.processLabel ?: "查看过程", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PText(row.processLabel ?: "查看过程", style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
                 val angle by androidx.compose.animation.core.animateFloatAsState(if (expanded) 90f else 0f, pocketPressSpring(), label = "process-chevron")
-                Icon(PocketIcons.ChevronRight, null, Modifier.padding(start = 5.dp).size(14.dp).graphicsLayer { rotationZ = angle }, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                PIcon(PocketIcons.ChevronRight, null, Modifier.padding(start = 5.dp).size(14.dp).graphicsLayer { rotationZ = angle }, tint = Pocket.colors.inkMuted)
             }
-            row.processDetail?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            row.processDetail?.let { PText(it, style = Pocket.type.caption, color = Pocket.colors.inkMuted) }
             // Completion remains visible when the successful task's other work is folded.
             if (!expanded) row.items.filter { it.type == "contextCompaction" }.forEach { CompactionStatus(it, timeline) }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
+            PDivider(color = Pocket.colors.line.copy(alpha = .4f))
         }
         TranscriptKind.User -> Column(Modifier.fillMaxWidth().padding(start = 48.dp), horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -68,7 +66,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             val prose = if (replies.isNotEmpty()) replies.joinToString("\n\n") { "${it.string("question")}\n${it.string("answer")}" }
                 else if (message.request.trimStart().startsWith("<send_user_message_question_reply>")) stringResource(R.string.submit_answers) else message.request.trim()
             val hasImages = remember(item.raw) { transcriptImageSources(item).isNotEmpty() }
-            if (prose.isNotBlank() || hasImages) Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            if (prose.isNotBlank() || hasImages) PSurface(shape = RoundedCornerShape(22.dp), color = Pocket.colors.fillStrong,
                 modifier = Modifier.widthIn(max = 560.dp)) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
                     val implementation = remember(item, timeline) { timeline?.let { PlanPresentation.implementedProposal(item, it) } }
@@ -76,7 +74,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                         var showingPlan by androidx.compose.runtime.saveable.rememberSaveable(messageScope, item.key) { mutableStateOf(false) }
                         Row(Modifier.heightIn(min = 32.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { showingPlan = !showingPlan }, verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("是，实施此计划", style = MaterialTheme.typography.bodyLarge)
+                            PText("是，实施此计划", style = Pocket.type.body)
                             ActivityExpansionIcon(showingPlan)
                         }
                         if (showingPlan) Box(Modifier.padding(top = 10.dp)) { MarkdownText(implementation.content, "$messageScope/${item.key}/implemented-plan") }
@@ -91,9 +89,9 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                     val date = java.util.Date(time.epochMillis)
                     val label = android.text.format.DateFormat.getTimeFormat(context).format(date)
                     val full = android.text.format.DateFormat.getMediumDateFormat(context).format(date) + " " + label
-                    Text(label, Modifier.padding(end = 4.dp).testTag("message-time:${item.key}")
+                    PText(label, Modifier.padding(end = 4.dp).testTag("message-time:${item.key}")
                         .semantics { contentDescription = (if (time.fromTurnStart) "回合开始时间：" else "发送时间：") + full },
-                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
                 CopyAction(prose) { clipboard.setText(AnnotatedString(prose)) }
                 if (onEdit != null) QuietAction(PocketIcons.Edit, "编辑此消息") { onEdit(item) }
@@ -131,16 +129,16 @@ private fun CompactionStatus(item: TimelineItem, timeline: NativeTimeline?) {
 internal fun CompactionStatusRow(label: String, modifier: Modifier = Modifier) {
     Row(modifier.padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Icon(PocketIcons.FoldVertical, null, Modifier.size(16.dp).testTag("compaction-status-icon"),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        PIcon(PocketIcons.FoldVertical, null, Modifier.size(16.dp).testTag("compaction-status-icon"),
+            tint = Pocket.colors.inkMuted)
+        PText(label, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
     }
 }
 
 /** Small gray icon under an answer; the press is a soft circle, not a 48dp tile. */
 @Composable
 internal fun QuietAction(icon: ImageVector, label: String, onClick: () -> Unit) {
-    QuietAction(onClick) { Icon(icon, label, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+    QuietAction(onClick) { PIcon(icon, label, Modifier.size(17.dp), tint = Pocket.colors.inkMuted) }
 }
 
 @Composable
@@ -149,7 +147,7 @@ private fun QuietAction(onClick: () -> Unit, glyph: @Composable () -> Unit) {
     val pressed by interaction.collectIsPressedAsState()
     val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) .88f else 1f, pocketPressSpring(), label = "quiet-press")
     Box(Modifier.size(40.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(CircleShape)
-        .background(if (pressed) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)
+        .background(if (pressed) Pocket.colors.fillStrong else Color.Transparent)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
         glyph()
     }
@@ -158,7 +156,7 @@ private fun QuietAction(onClick: () -> Unit, glyph: @Composable () -> Unit) {
 /** The copy glyph draws its own check and back, in the box and under the name of the icon it replaces. */
 @Composable
 internal fun CopyGlyphAction(copied: Boolean, label: String, onClick: () -> Unit) {
-    QuietAction(onClick) { PToggleGlyph(MotionGlyphs.CopyCheck, copied, Modifier.size(17.dp), MaterialTheme.colorScheme.onSurfaceVariant, label) }
+    QuietAction(onClick) { PToggleGlyph(MotionGlyphs.CopyCheck, copied, Modifier.size(17.dp), Pocket.colors.inkMuted, label) }
 }
 
 /** Copy morphs into a check for a moment, the way iOS confirms a copy. */

@@ -48,7 +48,7 @@ class PocketLightPointsTest {
                 } }
                 CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalWindowInfo provides window,
                     LocalLifecycleOwner provides owner) {
-                    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                    Box(Modifier.fillMaxSize().background(dev.codexpocket.app.ui.kit.Pocket.colors.bg)) {
                         PocketLightPoints(Modifier.matchParentSize(), edgeOnly, active)
                         content()
                     }

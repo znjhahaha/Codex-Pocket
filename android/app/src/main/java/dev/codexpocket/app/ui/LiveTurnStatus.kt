@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
@@ -15,8 +16,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -59,9 +58,9 @@ internal fun nativeThinkingAllowed(turnId: String, timing: NativeTurnInfo?): Boo
 /** Also used for an accepted active child whose new native turn ID has not arrived yet. */
 @Composable
 internal fun NativeThinkingPlaceholder(modifier: Modifier = Modifier) {
-    Text("正在思考", modifier.fillMaxWidth().padding(vertical = 12.dp)
+    PText("正在思考", modifier.fillMaxWidth().padding(vertical = 12.dp)
         .testTag("live-thinking-placeholder").reasoningSweep(true),
-        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        style = Pocket.type.body, color = Pocket.colors.inkMuted)
 }
 
 /** Native summary prose, without a thought badge, activity spinner or a transcript clock. */
@@ -115,8 +114,8 @@ internal fun NativeSummaryProse(text: String, messageKey: String, modifier: Modi
     val renderer = LocalMarkdownCache.current
     var prose by remember(renderer, messageKey, text) { mutableStateOf<String?>(null) }
     LaunchedEffect(renderer, messageKey, text) { prose = renderer?.render(messageKey, text)?.spans?.toString() }
-    Text(prose ?: remember(text) { markdownPreview(text) }, modifier.reasoningSweep(active && text.isNotBlank()), style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
+    PText(prose ?: remember(text) { markdownPreview(text) }, modifier.reasoningSweep(active && text.isNotBlank()), style = Pocket.type.bodySmall,
+        color = Pocket.colors.inkMuted, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
 }
 
 /** Native lifecycle times first. A mid-turn attachment without trusted timing shows no number. */
@@ -144,23 +143,23 @@ internal fun TaskElapsedLabel(info: NativeTurnInfo?, modifier: Modifier = Modifi
     }
     val elapsed = seconds ?: return
     val observed = info?.observed == true || (info?.startedAtMs == null && info?.observedStartNanos != null)
-    Text(elapsedLabel(elapsed), modifier.testTag("task-elapsed-label").semantics {
+    PText(elapsedLabel(elapsed), modifier.testTag("task-elapsed-label").semantics {
         contentDescription = (if (observed) "本次观察用时 " else "任务用时 ") + elapsedLabel(elapsed)
-    }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }, style = Pocket.type.caption, color = Pocket.colors.inkMuted)
 }
 
 /** Soft text feedback for other small controls; summary prose itself remains stable. */
 @Composable
 internal fun ShimmerText(text: String, style: TextStyle, modifier: Modifier = Modifier) {
-    val c = MaterialTheme.colorScheme
-    val base = c.onSurfaceVariant.copy(alpha = .75f)
-    if (pocketMotionMillis(1) == 0) { Text(text, modifier, style = style, color = base, maxLines = 1); return }
-    val bright = c.onSurface
+    val c = Pocket.colors
+    val base = c.inkMuted.copy(alpha = .75f)
+    if (pocketMotionMillis(1) == 0) { PText(text, modifier, style = style, color = base, maxLines = 1); return }
+    val bright = c.ink
     val x by rememberInfiniteTransition(label = "shimmer-text").animateFloat(-.3f, 1.3f,
         infiniteRepeatable(tween(1600, easing = LinearEasing)), label = "shimmer-text-x")
     var width by remember { mutableFloatStateOf(1f) }
     val band = width * .35f
     val center = width * x
-    Text(text, modifier.onSizeChanged { width = it.width.toFloat().coerceAtLeast(1f) }, maxLines = 1,
+    PText(text, modifier.onSizeChanged { width = it.width.toFloat().coerceAtLeast(1f) }, maxLines = 1,
         style = style.copy(brush = Brush.linearGradient(listOf(base, bright, base), start = Offset(center - band, 0f), end = Offset(center + band, 0f))))
 }

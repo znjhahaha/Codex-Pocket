@@ -1,10 +1,10 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -34,7 +34,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
     val current = repository
     if (current == null) {
         PocketTheme("system") { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            if (error != null) Text(error!!, Modifier.padding(24.dp)) else PocketProgressStatus("正在准备执行位置")
+            if (error != null) PText(error!!, Modifier.padding(24.dp)) else PocketProgressStatus("正在准备执行位置")
         } }
         return
     }
@@ -76,10 +76,10 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
             if (addingSsh && progress == null && catalog.selected?.kind == ExecutionTargetKind.LinuxSsh && error == null) addingSsh = false
         }
         if (notice != null && error == null) PocketDialog(onDismissRequest = locations::dismissNotice,
-            title = { Text("SSH 主机已添加") }, text = { Text(notice!!) },
+            title = { PText("SSH 主机已添加") }, text = { PText(notice!!) },
             confirmButton = { PocketButton("知道了", locations::dismissNotice) })
         if (error != null) PocketDialog(onDismissRequest = locations::dismissError,
-            title = { Text("执行位置") }, text = { Text(error!!) },
+            title = { PText("执行位置") }, text = { PText(error!!) },
             confirmButton = { PocketButton("知道了", locations::dismissError) })
     } }
 }
@@ -91,20 +91,20 @@ internal fun ExecutionLocationChoices(catalog: ExecutionTargetDirectory, current
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         catalog.targets.forEach { target ->
             val selected = target.id == catalog.selectedId
-            Surface(Modifier.fillMaxWidth().testTag("execution-location:${target.id}"),
-                shape = PocketOval, color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow) {
+            PSurface(Modifier.fillMaxWidth().testTag("execution-location:${target.id}"),
+                shape = PocketOval, color = if (selected) Pocket.colors.accentSoft else Pocket.colors.sunken) {
                 Row(Modifier.clickable { onSelect(target.id) }.padding(horizontal = 20.dp, vertical = 16.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Icon(if (target.kind == ExecutionTargetKind.LinuxSsh) PocketIcons.Terminal else PocketIcons.Computer, null)
+                    PIcon(if (target.kind == ExecutionTargetKind.LinuxSsh) PocketIcons.Terminal else PocketIcons.Computer, null)
                     Column(Modifier.weight(1f)) {
-                        Text(target.label, style = MaterialTheme.typography.titleSmall)
-                        Text(when (target.kind) {
+                        PText(target.label, style = Pocket.type.titleSmall)
+                        PText(when (target.kind) {
                             ExecutionTargetKind.Computer -> "电脑"
                             ExecutionTargetKind.LinuxSsh -> "Linux · SSH"
                             ExecutionTargetKind.ThisPhone -> "此手机 · 本地运行"
-                        }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
                     }
-                    Text(if (selected && currentOnline) "已连接" else if (selected) "当前" else "切换", style = MaterialTheme.typography.labelMedium)
+                    PText(if (selected && currentOnline) "已连接" else if (selected) "当前" else "切换", style = Pocket.type.labelSmall)
                 }
             }
         }

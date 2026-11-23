@@ -35,4 +35,16 @@ class KitNoMaterialTest {
             assertEquals("Material references in $prefix*.kt", emptyList<String>(), offenders)
         }
     }
+
+    @Test fun noScreenOfTheAppIsBuiltWithMaterialAndTheAppDoesNotShipIt() {
+        val sources = File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
+        assertTrue("App sources were not found from ${File(".").absolutePath}", sources.size > 100)
+        val offenders = sources.flatMap { file ->
+            file.readLines().mapIndexedNotNull { index, line -> if ("androidx.compose.material" in line) "${file.name}:${index + 1}" else null }
+        }
+        assertEquals("Material references in the app", emptyList<String>(), offenders)
+        val shipped = File("build.gradle.kts").readLines().map { it.trim() }
+            .filter { it.startsWith("implementation(") && "androidx.compose.material" in it }
+        assertEquals("Material may only be a test fixture", emptyList<String>(), shipped)
+    }
 }

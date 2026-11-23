@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
@@ -21,7 +22,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -55,9 +55,6 @@ import com.journeyapps.barcodescanner.DefaultDecoderFactory
 import com.journeyapps.barcodescanner.camera.CenterCropStrategy
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.PairingPhase
-import dev.codexpocket.app.ui.kit.MotionGlyphs
-import dev.codexpocket.app.ui.kit.PEntranceGlyph
-import dev.codexpocket.app.ui.kit.PPulseGlyph
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -133,10 +130,10 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             if (onDismiss != null) CircleAction(PocketIcons.ArrowBack, "返回", onDismiss)
             else Spacer(Modifier.size(48.dp))
-            Text(stringResource(R.string.pair_title), Modifier.weight(1f), textAlign = TextAlign.Center, style = MaterialTheme.typography.titleLarge)
+            PText(stringResource(R.string.pair_title), Modifier.weight(1f), textAlign = TextAlign.Center, style = Pocket.type.titleLarge)
             Spacer(Modifier.size(48.dp))
         }
-        Text("扫描电脑上的配对二维码", textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        PText("扫描电脑上的配对二维码", textAlign = TextAlign.Center, color = Pocket.colors.inkMuted)
         Box(Modifier.widthIn(max = 440.dp).fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(30.dp))
             .background(Color(0xFF17171A)).testTag("pair-preview"), contentAlignment = Alignment.Center) {
             if (permission) PairingCamera(active, torch,
@@ -146,8 +143,8 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 // A code that has just been read draws its confirmation; a paused scanner shows the still icon.
                 if (scanner.computerName != null || payload.isNotBlank()) PEntranceGlyph(MotionGlyphs.CheckCircle, true, Modifier.size(42.dp), Color.White)
-                else Icon(PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
-                Text(when {
+                else PIcon(PocketIcons.QrCodeScanner, null, Modifier.size(42.dp), tint = Color.White)
+                PText(when {
                     scanner.computerName != null -> "已读取配对内容"
                     payload.isNotBlank() -> "已读取配对内容"
                     manual -> "正在手动配对"
@@ -165,36 +162,36 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
             }
         }
         if (permission) PocketTextButton({ rescans++; retry(); manual = false }, enabled = !working, modifier = Modifier.testTag("pair-scan")) {
-            PPulseGlyph(MotionGlyphs.Refresh, rescans, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("重新扫描")
+            PPulseGlyph(MotionGlyphs.Refresh, rescans, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); PText("重新扫描")
         }
         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             PocketTextButton({ torch = !torch }, enabled = active && context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {
-                Icon(PocketIcons.Sun, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(if (torch) "关闭补光" else "补光灯")
+                PIcon(PocketIcons.Sun, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); PText(if (torch) "关闭补光" else "补光灯")
             }
             PocketTextButton({ retry(); paused = true; album.launch("image/*") }, enabled = !working) {
-                Icon(PocketIcons.Image, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("相册")
+                PIcon(PocketIcons.Image, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); PText("相册")
             }
             PocketTextButton({ manual = !manual; torch = false }, enabled = !working, modifier = Modifier.testTag("pair-manual-toggle")) {
-                Text(stringResource(if (manual) R.string.hide_manual else R.string.manual_pairing))
+                PText(stringResource(if (manual) R.string.hide_manual else R.string.manual_pairing))
             }
         }
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             listOf("在电脑上打开 Codex Pocket", "选择连接手机，生成配对二维码", "扫描二维码，确认后安全连接").forEachIndexed { index, step ->
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
-                    Text("${index + 1}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.secondary)
-                    Text(step, style = MaterialTheme.typography.bodyMedium)
+                    PText("${index + 1}", style = Pocket.type.label, color = Pocket.colors.accent)
+                    PText(step, style = Pocket.type.body)
                 }
             }
         }
-        issue?.let { Text(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error) }
+        issue?.let { PText(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = Pocket.colors.danger) }
         scanner.feedback?.let { decision ->
             val message = when (decision) {
                 ScanDecision.Expired -> "配对码已过期，请在电脑上生成新的配对码"
                 else -> "不是有效的 Codex Pocket 配对码"
             }
-            Text(message, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error)
+            PText(message, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = Pocket.colors.danger)
         }
-        if (phase == PairingPhase.Failed) Text(error ?: "连接失败，请检查电脑后重试", color = MaterialTheme.colorScheme.error)
+        if (phase == PairingPhase.Failed) PText(error ?: "连接失败，请检查电脑后重试", color = Pocket.colors.danger)
         if (working) {
             PocketProgressStatus(when {
                 decoding -> "正在读取图片"
@@ -208,7 +205,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
         if (manual) PocketTextField(payload, { payload = it.take(65_536); issue = null; scanner.cancel() },
             label = stringResource(R.string.paste_pairing), modifier = Modifier.testTag("pair-payload"), minLines = 2, maxLines = 4,
             visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), enabled = !working)
-        if (!manual && payload.isNotBlank()) Text("配对内容待验证")
+        if (!manual && payload.isNotBlank()) PText("配对内容待验证")
         if (manual || payload.isNotBlank()) {
             PocketTextField(name, { name = it.take(80) }, label = stringResource(R.string.device_name), singleLine = true, enabled = !working)
             PocketButton(stringResource(R.string.pair_securely), onClick = {
@@ -225,7 +222,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
                 }
             }, enabled = payload.isNotBlank() && name.isNotBlank() && !working, modifier = Modifier.fillMaxWidth().testTag("pair-connect"))
         }
-        Text(stringResource(R.string.pair_privacy), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        PText(stringResource(R.string.pair_privacy), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
     }
     scanner.computerName?.let { computerName ->
         PairingConfirmationDialog(computerName, name, { name = it.take(80) },
@@ -246,10 +243,10 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
 internal fun PairingConfirmationDialog(computerName: String, deviceName: String, onNameChange: (String) -> Unit,
     enabled: Boolean, onCancel: () -> Unit, onConnect: () -> Unit) {
     PocketDialog(onDismissRequest = onCancel,
-        title = { Text("连接电脑", Modifier.testTag("pair-confirm-title")) },
+        title = { PText("连接电脑", Modifier.testTag("pair-confirm-title")) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(computerName, Modifier.testTag("pair-confirm-computer"), style = MaterialTheme.typography.titleMedium,
+                PText(computerName, Modifier.testTag("pair-confirm-computer"), style = Pocket.type.title,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
                 PocketTextField(deviceName, onNameChange, label = stringResource(R.string.device_name),
                     singleLine = true, enabled = enabled, modifier = Modifier.testTag("pair-confirm-name"))
@@ -257,7 +254,7 @@ internal fun PairingConfirmationDialog(computerName: String, deviceName: String,
         },
         confirmButton = { PocketButton("连接", onConnect, enabled = enabled && deviceName.isNotBlank(),
             modifier = Modifier.testTag("pair-confirm-connect")) },
-        dismissButton = { PocketTextButton(onCancel, modifier = Modifier.testTag("pair-confirm-cancel")) { Text("取消") } })
+        dismissButton = { PocketTextButton(onCancel, modifier = Modifier.testTag("pair-confirm-cancel")) { PText("取消") } })
 }
 
 private fun Context.cameraGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED

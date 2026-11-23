@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -116,6 +118,16 @@ internal class PStageState<K : Any>(initial: K) {
     }
 }
 
+/** What a stage lets a stage inside it do with a back gesture that the inner one has no page for. */
+internal interface PStageGesture {
+    /** False when this stage has nowhere to go back to either. */
+    fun hold(amount: Float): Boolean
+    fun cancel()
+    fun committed()
+}
+
+internal val LocalPStageGesture = staticCompositionLocalOf<PStageGesture?> { null }
+
 @Composable
 internal fun <K : Any> rememberPStageState(initial: K): PStageState<K> = remember { PStageState(initial) }
 
@@ -138,6 +150,7 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
     val currentDepth by rememberUpdatedState(depth)
     val currentOrder by rememberUpdatedState(order)
     val peek by rememberUpdatedState(back)
+    val motionNow by rememberUpdatedState({ motion })
     LaunchedEffect(page, motion) {
         state.show(page, motion) { old, new ->
             val change = currentDepth(new) - currentDepth(old)
@@ -145,14 +158,27 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
             when { change > 0 -> PStageMove.Push; change < 0 -> PStageMove.Pop; step > 0 -> PStageMove.Forward; step < 0 -> PStageMove.Backward; else -> PStageMove.Fade }
         }
     }
+    val outer = LocalPStageGesture.current
+    val gesture = remember(state, scope) {
+        object : PStageGesture {
+            override fun hold(amount: Float): Boolean {
+                val under = peek ?: return false
+                if (motionNow()) scope.launch { state.hold(under, amount) }
+                return true
+            }
+            override fun cancel() { scope.launch { state.letGo() } }
+            // Back went somewhere other than the page that was showing beneath: put this one back.
+            override fun committed() { if (state.held) scope.launch { repeat(2) { withFrameNanos { } }; if (state.held) state.letGo() } }
+        }
+    }
     if (onBack != null) {
         val commit by rememberUpdatedState(onBack)
+        // With nothing of its own to go back to, a stage inside another lets the outer one preview the way out.
         PBackHandler(true,
-            onProgress = { event -> peek?.let { under -> if (motion) scope.launch { state.hold(under, event.progress) } } },
-            onCancel = { scope.launch { state.letGo() } }) {
+            onProgress = { event -> if (!gesture.hold(event.progress)) outer?.hold(event.progress) },
+            onCancel = { gesture.cancel(); outer?.cancel() }) {
             commit()
-            // Back went somewhere other than the page that was showing beneath: put this one back.
-            if (state.held) scope.launch { repeat(2) { withFrameNanos { } }; if (state.held) state.letGo() }
+            gesture.committed(); outer?.committed()
         }
     }
     val background = Pocket.colors.bg
@@ -187,7 +213,7 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                     Box(Modifier.fillMaxSize().background(background)
                         .then(if (active) Modifier else Modifier.clearAndSetSemantics { }.pointerInput(Unit) {
                             awaitPointerEventScope { while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() } }
-                        })) { content(shown) }
+                        })) { CompositionLocalProvider(LocalPStageGesture provides gesture) { content(shown) } }
                     val stacked = from != null && (state.move == PStageMove.Push || state.move == PStageMove.Pop)
                     // The page beneath dims as it is covered; the page above casts a soft edge onto it.
                     if (stacked && !above) Box(Modifier.matchParentSize().graphicsLayer {

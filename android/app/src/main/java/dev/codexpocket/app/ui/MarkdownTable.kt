@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -13,7 +14,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -48,7 +48,7 @@ internal fun tableColumnWidths(table: MarkdownTableData, viewport: Int, paint: T
 internal fun MarkdownTable(table: MarkdownTableData) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    val colors = MaterialTheme.colorScheme
+    val colors = Pocket.colors
     val scroll = rememberScrollState()
     val clipboard = LocalClipboardManager.current
     BoxWithConstraints(Modifier.fillMaxWidth().testTag("markdown-table")) {
@@ -59,19 +59,19 @@ internal fun MarkdownTable(table: MarkdownTableData) {
         val widths = remember(table, viewportPixels, density) { tableColumnWidths(table, viewportPixels, paint, density.density) }
         val pixels = widths.sum()
         Column {
-            Surface(shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, colors.outlineVariant), color = colors.surface) {
+            PSurface(shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, colors.line), color = colors.surface) {
                 Box(Modifier.horizontalScroll(scroll)) {
                     AndroidView(factory = { MarkdownTableView(it) }, update = { view ->
-                        view.update(table, widths, paint, density.density, colors.onSurface.toArgb(),
-                            colors.surfaceContainerLow.toArgb(), colors.outlineVariant.toArgb())
+                        view.update(table, widths, paint, density.density, colors.ink.toArgb(),
+                            colors.sunken.toArgb(), colors.line.toArgb())
                     }, modifier = Modifier.width(with(density) { pixels.toDp() }).testTag("markdown-table-cells"))
                 }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                if (pixels > viewportPixels) Text("左右滑动查看完整表格", style = MaterialTheme.typography.labelSmall,
-                    color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
+                if (pixels > viewportPixels) PText("左右滑动查看完整表格", style = Pocket.type.caption,
+                    color = colors.inkMuted, modifier = Modifier.padding(top = 8.dp))
                 Spacer(Modifier.weight(1f))
-                PocketTextButton(onClick = { clipboard.setText(AnnotatedString(table.plainText)) }) { Text("复制表格", style = MaterialTheme.typography.labelSmall) }
+                PocketTextButton(onClick = { clipboard.setText(AnnotatedString(table.plainText)) }) { PText("复制表格", style = Pocket.type.caption) }
             }
         }
     }

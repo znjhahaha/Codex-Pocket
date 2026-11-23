@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
@@ -10,11 +11,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -80,7 +76,7 @@ internal fun DetailScreen(item: TimelineItem, onBack: () -> Unit, onSource: (Str
     fun back() { if (files.size > 1 && selected != null) selectedId = null else onBack() }
     BackHandler(files.size > 1 && selected != null) { selectedId = null }
     val (selectedName, selectedFolder) = remember(selected?.path) { selected?.path?.let(::splitPath) ?: ("" to "") }
-    Scaffold(topBar = {
+    PScaffold(topBar = {
         ReviewHeader(
             title = when { listing -> context.getString(R.string.delivery_changed_files, files.size); selected != null -> selectedName.ifBlank { context.getString(R.string.unified_diff) }; else -> itemLabel(item.type) },
             backLabel = context.getString(if (files.size > 1 && selected != null) R.string.delivery_back_files else R.string.back_conversation),
@@ -110,11 +106,11 @@ internal fun DetailScreen(item: TimelineItem, onBack: () -> Unit, onSource: (Str
                     DiffLines(selected?.diff ?: data.fallback, selected != null, Modifier.weight(1f).fillMaxWidth(), selected?.path, onComment, onScrolled = { contentScrolled = it }, onDraftComment = onDraftComment,
                         leading = selected?.let { file -> {
                             val (add, remove) = pocketDiffColors()
-                            if (inlineDiffFallback(file.diff) == null) Text(androidx.compose.ui.text.buildAnnotatedString {
+                            if (inlineDiffFallback(file.diff) == null) PText(androidx.compose.ui.text.buildAnnotatedString {
                                 withStyle(androidx.compose.ui.text.SpanStyle(color = add)) { append("+${file.additions}") }
                                 append("  ")
                                 withStyle(androidx.compose.ui.text.SpanStyle(color = remove)) { append("−${file.deletions}") }
-                            }, style = MaterialTheme.typography.labelLarge, fontFamily = FontFamily.Monospace,
+                            }, style = Pocket.type.label, fontFamily = FontFamily.Monospace,
                                 modifier = Modifier.semantics { contentDescription = context.getString(R.string.delivery_diff_counts, file.additions, file.deletions) })
                             ViewerToggle(stringResource(R.string.v02_open_source), PocketIcons.Code, false, { if (canRead && file.path.isNotBlank()) onSource(file.path) })
                         } })
@@ -200,12 +196,12 @@ internal fun DiffLines(
             ViewerToggle("自动换行", PocketIcons.WrapText, wrap, { wrap = !wrap })
             if (expanded.isNotEmpty()) ViewerToggle("折叠上下文", PocketIcons.FoldVertical, false, { expanded = emptySet() })
         }
-        if (showControls && commentsEnabled && path != null && !binary) Text("点按行号添加草稿评论 · 旧侧 / 新侧", Modifier.padding(horizontal = 16.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (showControls && commentsEnabled && path != null && !binary) PText("点按行号添加草稿评论 · 旧侧 / 新侧", Modifier.padding(horizontal = 16.dp, vertical = 2.dp), style = Pocket.type.caption, color = Pocket.colors.inkMuted)
         Box(Modifier.weight(1f).fillMaxWidth()) {
         when {
             binary -> DiffFallbackNotice(InlineDiffFallback.Binary, Modifier.fillMaxSize())
             parsed == null -> ReviewLoading(Modifier.fillMaxSize())
-            content.isBlank() -> Text(stringResource(R.string.delivery_diff_empty), Modifier.padding(24.dp))
+            content.isBlank() -> PText(stringResource(R.string.delivery_diff_empty), Modifier.padding(24.dp))
             else -> BoxWithConstraints(Modifier.fillMaxSize()) {
                 val viewport = maxWidth
                 val gutterWidth = (numberWidth * ((document?.numberDigits ?: 1) * if (isDiff) 2 else 1) + 28.dp)
@@ -217,7 +213,7 @@ internal fun DiffLines(
                         items(rows, key = { it.row.index }, contentType = { if (it.hiddenCount > 0) "fold" else "line" }) { visible ->
                             val row = visible.row
                             if (visible.hiddenCount > 0) {
-                                PocketTextButton(onClick = { expanded = expanded + row.index }, modifier = Modifier.width(viewport)) { Text("展开 ${visible.hiddenCount} 行未改动上下文") }
+                                PocketTextButton(onClick = { expanded = expanded + row.index }, modifier = Modifier.width(viewport)) { PText("展开 ${visible.hiddenCount} 行未改动上下文") }
                             } else {
                                 val added = isDiff && row.newLine != null && row.oldLine == null
                                 val removed = isDiff && row.oldLine != null && row.newLine == null
@@ -233,11 +229,11 @@ internal fun DiffLines(
                                     val range = row.text.removeSuffix(context).trim()
                                     Row(Modifier.width(viewport).padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 4.dp),
                                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Text(range, Modifier.clip(PocketCapsule).background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = .6f))
+                                        PText(range, Modifier.clip(PocketCapsule).background(Pocket.colors.accentSoft.copy(alpha = .6f))
                                             .padding(horizontal = 10.dp, vertical = 3.dp), fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSecondaryContainer, maxLines = 1)
-                                        if (context.isNotBlank()) Text(context, Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            color = Pocket.colors.onAccentSoft, maxLines = 1)
+                                        if (context.isNotBlank()) PText(context, Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                                            color = Pocket.colors.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                 } else Row(Modifier.fillMaxWidth().background(background)
                                     .drawBehind { if (added || removed) drawRect(if (added) addColor else removeColor, size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height)) }
@@ -245,11 +241,11 @@ internal fun DiffLines(
                                     Box(Modifier.width(gutterWidth).testTag("diff-gutter:${row.index}").heightIn(min = if (number != null) 28.dp else 24.dp)
                                         .clickable(enabled = commentsEnabled && !path.isNullOrBlank() && number != null && number > 0) { target = row }
                                         .padding(horizontal = 8.dp, vertical = 3.dp), contentAlignment = Alignment.TopEnd) {
-                                        Text(if (isDiff) "${row.oldLine ?: "·"}  ${row.newLine ?: "·"}" else number?.toString().orEmpty(), fontFamily = FontFamily.Monospace, fontSize = 11.sp, textAlign = TextAlign.End,
+                                        PText(if (isDiff) "${row.oldLine ?: "·"}  ${row.newLine ?: "·"}" else number?.toString().orEmpty(), fontFamily = FontFamily.Monospace, fontSize = 11.sp, textAlign = TextAlign.End,
                                             maxLines = 1, softWrap = false,
-                                            color = when { added -> addColor; removed -> removeColor; else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .7f) })
+                                            color = when { added -> addColor; removed -> removeColor; else -> Pocket.colors.inkMuted.copy(alpha = .7f) })
                                     }
-                                    if (isDiff) Text(if (added) "+" else if (removed) "−" else " ", Modifier.width(14.dp).padding(vertical = 3.dp), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                                    if (isDiff) PText(if (added) "+" else if (removed) "−" else " ", Modifier.width(14.dp).padding(vertical = 3.dp), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
                                         color = if (added) addColor else removeColor)
                                     val plain = reviewCode(row, isDiff)
                                     val code = highlighted?.getOrNull(row.index)?.takeIf { it.text == plain && plain.isNotEmpty() }
@@ -257,7 +253,7 @@ internal fun DiffLines(
                                     // the old/new coordinates and +/- column stay fixed at the viewport edge.
                                     Box(Modifier.weight(1f).clipToBounds().testTag("diff-code:${row.index}")
                                         .then(if (wrap) Modifier else Modifier.horizontalScroll(horizontal))) {
-                                        Text(code ?: AnnotatedString(plain.ifEmpty { " " }),
+                                        PText(code ?: AnnotatedString(plain.ifEmpty { " " }),
                                             Modifier.then(if (wrap) Modifier.fillMaxWidth() else Modifier.width(codeWidth)).padding(top = 3.dp, bottom = 3.dp, end = 12.dp),
                                             fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 20.sp, softWrap = wrap)
                                     }
@@ -287,34 +283,34 @@ internal fun DiffLines(
 /** GitHub "Files changed" row: type badge, bold name over its folder, +/− and the five-square bar. */
 @Composable
 private fun ChangedFileRow(file: DiffFile, kind: String?, label: String, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val (add, remove) = pocketDiffColors()
     val (name, folder) = remember(label) { splitPath(label) }
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) .98f else 1f, pocketPressSpring(), label = "file-row")
     Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(RoundedCornerShape(16.dp))
-        .background(if (pressed) c.surfaceContainerHigh else Color.Transparent)
+        .background(if (pressed) c.fillStrong else Color.Transparent)
         .clickable(interactionSource = interaction, indication = null, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick)
         .padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         FileBadge(file.path)
         Column(Modifier.weight(1f)) {
-            Text(name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            PText(name, style = Pocket.type.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val meta = listOfNotNull(kind, folder.takeIf(String::isNotBlank)).joinToString(" · ")
-            if (meta.isNotBlank()) Text(meta, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.StartEllipsis)
+            if (meta.isNotBlank()) PText(meta, style = Pocket.type.caption, color = c.inkMuted, maxLines = 1, overflow = TextOverflow.StartEllipsis)
         }
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (inlineDiffFallback(file.diff) == InlineDiffFallback.Binary) Text("二进制", style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
+            if (inlineDiffFallback(file.diff) == InlineDiffFallback.Binary) PText("二进制", style = Pocket.type.labelSmall, color = c.inkMuted)
             else {
-            Text(androidx.compose.ui.text.buildAnnotatedString {
+            PText(androidx.compose.ui.text.buildAnnotatedString {
                 withStyle(androidx.compose.ui.text.SpanStyle(color = add)) { append("+${file.additions}") }
                 append(" ")
                 withStyle(androidx.compose.ui.text.SpanStyle(color = remove)) { append("−${file.deletions}") }
-            }, style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace)
+            }, style = Pocket.type.labelSmall, fontFamily = FontFamily.Monospace)
             DiffStatBar(file.additions, file.deletions)
             }
         }
-        Icon(PocketIcons.ChevronRight, null, Modifier.size(16.dp), tint = c.onSurfaceVariant)
+        PIcon(PocketIcons.ChevronRight, null, Modifier.size(16.dp), tint = c.inkMuted)
     }
 }
 
@@ -328,8 +324,8 @@ internal fun diffNewLineNumbers(diff: String): List<Int?> = parseReviewLines(dif
 @Composable
 internal fun ReviewHeader(title: String, backLabel: String, onBack: () -> Unit, scrolled: Boolean, subtitle: String? = null, badgePath: String? = null,
     actions: @Composable RowScope.() -> Unit = {}) {
-    val edge by animateColorAsState(if (scrolled) MaterialTheme.colorScheme.outlineVariant else Color.Transparent, tween(pocketMotionMillis(180)), label = "review-scroll-edge")
-    Surface(color = MaterialTheme.colorScheme.background) {
+    val edge by animateColorAsState(if (scrolled) Pocket.colors.line else Color.Transparent, tween(pocketMotionMillis(180)), label = "review-scroll-edge")
+    PSurface(color = Pocket.colors.bg) {
         Row(
             Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars)
                 .drawBehind { drawLine(edge, Offset(0f, size.height), Offset(size.width, size.height), 1.dp.toPx()) }
@@ -339,9 +335,9 @@ internal fun ReviewHeader(title: String, backLabel: String, onBack: () -> Unit, 
             ActionIcon(PocketIcons.ArrowBack, backLabel, onClick = onBack)
             if (badgePath != null) Box(Modifier.padding(start = 2.dp, end = 8.dp)) { FileBadge(badgePath, 32.dp) }
             Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
-                Text(title, maxLines = if (subtitle.isNullOrBlank()) 2 else 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                if (!subtitle.isNullOrBlank()) Text(subtitle, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PText(title, maxLines = if (subtitle.isNullOrBlank()) 2 else 1, overflow = TextOverflow.Ellipsis, style = Pocket.type.title)
+                if (!subtitle.isNullOrBlank()) PText(subtitle, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = Pocket.type.caption,
+                    color = Pocket.colors.inkMuted)
             }
             actions()
         }
@@ -352,7 +348,7 @@ internal fun ReviewHeader(title: String, backLabel: String, onBack: () -> Unit, 
 internal fun ReviewLoading(modifier: Modifier) {
     Column(modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         repeat(4) { index ->
-            Box(Modifier.fillMaxWidth(if (index % 2 == 0) .84f else .62f).height(12.dp).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(6.dp)))
+            Box(Modifier.fillMaxWidth(if (index % 2 == 0) .84f else .62f).height(12.dp).background(Pocket.colors.fill, RoundedCornerShape(6.dp)))
         }
     }
 }

@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -10,7 +11,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -127,8 +127,8 @@ internal fun ReferenceEditor(value: TextFieldValue, onValueChange: (TextFieldVal
                 }
             }
         }, minLines = minLines, singleLine = false, readOnly = readOnly,
-        textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-        cursorBrush = SolidColor(MaterialTheme.colorScheme.secondary), visualTransformation = transformed,
+        textStyle = Pocket.type.body.copy(color = Pocket.colors.ink),
+        cursorBrush = SolidColor(Pocket.colors.accent), visualTransformation = transformed,
         onTextLayout = { layout = it }, decorationBox = decorationBox)
     selected?.let { ReferenceMetadata(it, anchor, closeMetadata) }
 }
@@ -136,7 +136,7 @@ internal fun ReferenceEditor(value: TextFieldValue, onValueChange: (TextFieldVal
 /** Read-only display for the separate history preview and for a parent SelectionContainer. */
 @Composable
 internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: Modifier = Modifier,
-    maxLines: Int = Int.MAX_VALUE, color: Color = MaterialTheme.colorScheme.onSurface) {
+    maxLines: Int = Int.MAX_VALUE, color: Color = Pocket.colors.ink) {
     val valid = remember(text, spans) { validReferenceSpans(text, spans) }
     val threads = remember(text, valid) {threadTextLinks(text, valid.map {it.start until it.end})}
     val binding = LocalThreadLinkBinding.current
@@ -180,7 +180,7 @@ internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: M
     val inline = valid.mapIndexed { index, span -> "reference:$index" to InlineTextContent(
         Placeholder(1.em, 1.em, PlaceholderVerticalAlign.TextCenter)) {
         Box(Modifier.fillMaxSize().clickable { openMetadata(span) }, contentAlignment = Alignment.Center) {
-            Icon(referenceIcon(span.reference.string("type")), "查看${span.displayName}", Modifier.fillMaxSize().padding(1.dp), tint = ReferenceBlue)
+            PIcon(referenceIcon(span.reference.string("type")), "查看${span.displayName}", Modifier.fillMaxSize().padding(1.dp), tint = ReferenceBlue)
         }
     } }.toMap()
     val density=LocalDensity.current
@@ -189,17 +189,17 @@ internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: M
         // Only the icon is a placeholder; title and following prose share one line layout.
         "thread:$i" to InlineTextContent(Placeholder(1.5.em,1.125.em,PlaceholderVerticalAlign.TextCenter)) {
             Box(Modifier.fillMaxSize().clickable {openThread(link)},contentAlignment=Alignment.CenterStart) {
-                Icon(PocketIcons.Link2,"会话链接",Modifier.fillMaxHeight().aspectRatio(1f),tint=ReferenceBlue)
+                PIcon(PocketIcons.Link2,"会话链接",Modifier.fillMaxHeight().aspectRatio(1f),tint=ReferenceBlue)
             }
         }
     }.toMap()
-    Text(annotated, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }, inlineContent = inline + threadInline,
-        style = MaterialTheme.typography.bodyLarge, color = color, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
+    PText(annotated, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }, inlineContent = inline + threadInline,
+        style = Pocket.type.body, color = color, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
     selected?.let { ReferenceMetadata(it, anchor) { selected = null } }
     selectedThread?.let {link ->
         PocketAnchoredMenu("会话链接", {selectedThread = null}, anchor, widthDp = 288f, below=anchor?.top?.let {it < screenHeight * .45f} ?: true) {
             Column(Modifier.padding(12.dp).testTag("thread-reference-menu")) {
-                Text(threadTitle(link), style = MaterialTheme.typography.titleSmall,maxLines=2,overflow=TextOverflow.Ellipsis)
+                PText(threadTitle(link), style = Pocket.type.titleSmall,maxLines=2,overflow=TextOverflow.Ellipsis)
                 PocketMenuItem("打开会话",PocketIcons.Link2,{selectedThread=null;handler?.invoke(link.url)},Modifier.testTag("thread-reference-open"),enabled=binding?.origin!=null)
                 PocketMenuItem("复制链接",PocketIcons.ContentCopy,{clipboard.setText(AnnotatedString(link.url));selectedThread=null},Modifier.testTag("thread-reference-copy"))
             }
@@ -221,11 +221,11 @@ private fun ReferenceMetadata(span: ReferenceSpan, anchor: Rect?, onDismiss: () 
     PocketAnchoredMenu("引用详情", onDismiss, anchor, widthDp = 288f, below = below) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).testTag("reference-metadata"), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(referenceIcon(span.reference.string("type")), null, Modifier.size(18.dp), tint = ReferenceBlue)
-                Text(span.displayName, style = MaterialTheme.typography.titleSmall, color = ReferenceBlue)
+                PIcon(referenceIcon(span.reference.string("type")), null, Modifier.size(18.dp), tint = ReferenceBlue)
+                PText(span.displayName, style = Pocket.type.titleSmall, color = ReferenceBlue)
             }
             listOf("description", "source", "path").map { span.reference.string(it) }.filter { it.isNotBlank() }.distinct().forEach {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                PText(it, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted,
                     maxLines = 3, overflow = TextOverflow.Ellipsis)
             }
         }

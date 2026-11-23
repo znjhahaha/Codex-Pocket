@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateDpAsState
@@ -12,10 +13,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -69,8 +66,8 @@ internal fun FileBadge(path: String, size: androidx.compose.ui.unit.Dp = 30.dp) 
     val ext = path.substringAfterLast('.', "").lowercase().take(4)
     val tint = badgeColor(ext)
     Box(Modifier.size(size).clip(RoundedCornerShape(size * .3f)).background(tint.copy(alpha = .16f)), contentAlignment = Alignment.Center) {
-        if (ext.isBlank()) Icon(PocketIcons.Description, null, Modifier.size(size * .55f), tint = tint)
-        else Text(ext.uppercase(), color = tint, fontSize = if (ext.length > 3) 8.sp else 9.5.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, maxLines = 1)
+        if (ext.isBlank()) PIcon(PocketIcons.Description, null, Modifier.size(size * .55f), tint = tint)
+        else PText(ext.uppercase(), color = tint, fontSize = if (ext.length > 3) 8.sp else 9.5.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, maxLines = 1)
     }
 }
 
@@ -80,7 +77,7 @@ internal fun FileBadge(path: String, size: androidx.compose.ui.unit.Dp = 30.dp) 
  */
 @Composable
 internal fun PocketSegmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val density = LocalDensity.current
     var widths by remember(options) { mutableStateOf(List(options.size) { 0 }) }
     val target = with(density) { widths.take(selected).sum().toDp() }
@@ -88,16 +85,16 @@ internal fun PocketSegmented(options: List<String>, selected: Int, onSelect: (In
     val motion = if (pocketMotionMillis(1) == 0) androidx.compose.animation.core.snap() else spring<androidx.compose.ui.unit.Dp>(dampingRatio = .78f, stiffness = 520f)
     val offset by animateDpAsState(target, motion, label = "segment-x")
     val thumb by animateDpAsState(width, motion, label = "segment-w")
-    Box(modifier.clip(PocketCapsule).background(c.surfaceContainerHigh).padding(3.dp)) {
+    Box(modifier.clip(PocketCapsule).background(c.fillStrong).padding(3.dp)) {
         if (widths.any { it > 0 }) Box(Modifier.offset(x = offset).width(thumb).height(34.dp).shadow(1.dp, PocketCapsule).clip(PocketCapsule).background(c.surface))
         Row {
             options.forEachIndexed { index, label ->
                 val active = index == selected
-                val color by animateColorAsState(if (active) c.onSurface else c.onSurfaceVariant, tween(pocketMotionMillis(140)), label = "segment-text")
+                val color by animateColorAsState(if (active) c.ink else c.inkMuted, tween(pocketMotionMillis(140)), label = "segment-text")
                 Box(Modifier.height(34.dp).onSizeChanged { size -> if (widths.getOrNull(index) != size.width) widths = widths.toMutableList().also { it[index] = size.width } }
                     .clip(PocketCapsule).clickable(role = Role.Tab) { onSelect(index) }.semantics { this.selected = active }
                     .padding(horizontal = 16.dp), contentAlignment = Alignment.Center) {
-                    PocketTabLabel(label, active, style = MaterialTheme.typography.labelLarge, color = color)
+                    PocketTabLabel(label, active, style = Pocket.type.label, color = color)
                 }
             }
         }
@@ -107,34 +104,34 @@ internal fun PocketSegmented(options: List<String>, selected: Int, onSelect: (In
 /** Icon + short label capsule that tints when on. Used for wrap / search toggles in the viewers. */
 @Composable
 internal fun ViewerToggle(label: String, icon: ImageVector, on: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier, description: String = label) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .92f else 1f, pocketPressSpring(), label = "viewer-toggle")
-    val fill by animateColorAsState(if (on) c.secondaryContainer else c.surfaceContainerHigh, tween(pocketMotionMillis(160)), label = "viewer-toggle-fill")
-    val tint by animateColorAsState(if (on) c.onSecondaryContainer else c.onSurfaceVariant, tween(pocketMotionMillis(160)), label = "viewer-toggle-tint")
+    val fill by animateColorAsState(if (on) c.accentSoft else c.fillStrong, tween(pocketMotionMillis(160)), label = "viewer-toggle-fill")
+    val tint by animateColorAsState(if (on) c.onAccentSoft else c.inkMuted, tween(pocketMotionMillis(160)), label = "viewer-toggle-tint")
     Row(modifier.height(36.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketCapsule).background(fill)
         .clickable(interactionSource = interaction, indication = null, role = Role.Switch, onClick = onClick)
         .semantics { contentDescription = description; selected = on }.padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Icon(icon, null, Modifier.size(16.dp), tint = tint)
-        if (label.isNotBlank()) Text(label, style = MaterialTheme.typography.labelMedium, color = tint, maxLines = 1)
+        PIcon(icon, null, Modifier.size(16.dp), tint = tint)
+        if (label.isNotBlank()) PText(label, style = Pocket.type.labelSmall, color = tint, maxLines = 1)
     }
 }
 
 /** Floating "change 2 of 5" capsule with up/down, pinned bottom-end over the diff. */
 @Composable
 internal fun ChangeNavigator(current: Int, total: Int, onPrevious: () -> Unit, onNext: () -> Unit, modifier: Modifier = Modifier) {
-    val c = MaterialTheme.colorScheme
-    Surface(modifier, shape = PocketCapsule, color = c.surfaceContainerHighest, shadowElevation = 0.dp, tonalElevation = 0.dp,
-        border = androidx.compose.foundation.BorderStroke(.5.dp, c.outlineVariant.copy(alpha = .7f))) {
+    val c = Pocket.colors
+    PSurface(modifier, shape = PocketCapsule, color = c.fillStrongest,
+        border = androidx.compose.foundation.BorderStroke(.5.dp, c.line.copy(alpha = .7f))) {
         Row(Modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             ActionIcon(PocketIcons.ArrowUpward, "上一处变更", current > 0, onPrevious)
             androidx.compose.animation.AnimatedContent(current, label = "change-index", transitionSpec = {
                 val up = targetState > initialState
                 (androidx.compose.animation.slideInVertically { if (up) it else -it } + androidx.compose.animation.fadeIn()) togetherWith
                     (androidx.compose.animation.slideOutVertically { if (up) -it else it } + androidx.compose.animation.fadeOut())
-            }) { shown -> Text("${shown + 1}/$total", style = MaterialTheme.typography.labelLarge, fontFamily = FontFamily.Monospace) }
+            }) { shown -> PText("${shown + 1}/$total", style = Pocket.type.label, fontFamily = FontFamily.Monospace) }
             ActionIcon(PocketIcons.ArrowDownward, "下一处变更", current < total - 1, onNext)
         }
     }
@@ -145,7 +142,7 @@ internal fun ChangeNavigator(current: Int, total: Int, onPrevious: () -> Unit, o
 internal fun ReadingProgress(fraction: Float, modifier: Modifier = Modifier) {
     val shown by animateFloatAsState(fraction.coerceIn(0f, 1f), tween(pocketMotionMillis(120)), label = "reading-progress")
     Box(modifier.fillMaxWidth().height(2.dp)) {
-        Box(Modifier.fillMaxHeight().fillMaxWidth(shown).background(MaterialTheme.colorScheme.primary.copy(alpha = .7f)))
+        Box(Modifier.fillMaxHeight().fillMaxWidth(shown).background(Pocket.colors.solid.copy(alpha = .7f)))
     }
 }
 
@@ -158,7 +155,7 @@ internal fun DiffStatBar(additions: Int, deletions: Int) {
     val red = if (deletions == 0) 0 else (5 - green).coerceAtMost(5)
     Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
         repeat(5) { i ->
-            val color = when { i < green -> add; i < green + red -> remove; else -> MaterialTheme.colorScheme.outlineVariant }
+            val color = when { i < green -> add; i < green + red -> remove; else -> Pocket.colors.line }
             Box(Modifier.size(7.dp).clip(RoundedCornerShape(1.5.dp)).background(color))
         }
     }

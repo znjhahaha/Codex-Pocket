@@ -111,7 +111,7 @@ class V02UiTest {
     }
     @Test fun darkThemeProvidesReadableContentColorForTranslucentSurfaces() {
         var foreground = androidx.compose.ui.graphics.Color.Unspecified
-        content { PocketTheme("dark") { foreground = LocalContentColor.current; PocketBackdrop { Text("Dark content") } } }
+        content { PocketTheme("dark") { foreground = dev.codexpocket.app.ui.kit.Pocket.ink; PocketBackdrop { Text("Dark content") } } }
         compose.runOnIdle {
             assertTrue(foreground.red > .8f && foreground.green > .8f && foreground.blue > .8f)
         }

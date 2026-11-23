@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.content.Context
 import android.text.Spanned
 import android.text.SpannedString
@@ -8,7 +9,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -187,9 +187,9 @@ internal val LocalMarkdownCache = staticCompositionLocalOf<MarkdownRenderCache?>
 internal fun ProvideMarkdownRendering(threadLinks: ThreadLinkBinding? = LocalThreadLinkBinding.current, content: @Composable () -> Unit) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    val foreground = MaterialTheme.colorScheme.onSurface.toArgb()
-    val keyword = MaterialTheme.colorScheme.primary.toArgb()
-    val literal = MaterialTheme.colorScheme.tertiary.toArgb()
+    val foreground = Pocket.colors.ink.toArgb()
+    val keyword = Pocket.colors.solid.toArgb()
+    val literal = Pocket.colors.accent.toArgb()
     val renderer = remember(context, density.density, density.fontScale, foreground, keyword, literal) {
         MarkdownRenderCache(context, foreground, keyword, literal)
     }
@@ -226,8 +226,8 @@ private class MarkdownView(context: Context) : TextView(context) {
 internal fun MarkdownText(text: String, messageKey: String) {
     val context = LocalContext.current
     val renderer = checkNotNull(LocalMarkdownCache.current)
-    val color = MaterialTheme.colorScheme.onSurface.toArgb()
-    val link = MaterialTheme.colorScheme.primary.toArgb()
+    val color = Pocket.colors.ink.toArgb()
+    val link = Pocket.colors.solid.toArgb()
     val clipboard = LocalClipboardManager.current
     var rendered by remember(renderer, messageKey) { mutableStateOf<RenderedMarkdown?>(null) }
     LaunchedEffect(renderer, messageKey, text) {
@@ -240,7 +240,7 @@ internal fun MarkdownText(text: String, messageKey: String) {
     // so emitting sibling AndroidViews here would paint every heading at the same origin.
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
     // Until the off-thread render lands, show the prose without Markdown punctuation instead of flashing `**`.
-    if (current == null) Text(remember(text) { markdownPreview(text) }, style = MaterialTheme.typography.bodyLarge)
+    if (current == null) PText(remember(text) { markdownPreview(text) }, style = Pocket.type.body)
     parts.forEachIndexed { index, part ->
         key(messageKey, index) {
             if (part.table != null) MarkdownTable(part.table)
@@ -252,7 +252,7 @@ internal fun MarkdownText(text: String, messageKey: String) {
     // Nested list/quote code keeps its original structure and still has an exact copy action.
     val topCodes = parts.mapNotNull { it.code }.toMutableList()
     current?.code?.forEachIndexed { index, code ->
-        if (topCodes.contains(code)) topCodes.remove(code) else PocketTextButton(onClick = { clipboard.setText(AnnotatedString(code)) }) { Text(context.getString(R.string.copy_code_number, index + 1)) }
+        if (topCodes.contains(code)) topCodes.remove(code) else PocketTextButton(onClick = { clipboard.setText(AnnotatedString(code)) }) { PText(context.getString(R.string.copy_code_number, index + 1)) }
     }
     }
 }
@@ -269,7 +269,7 @@ internal fun MarkdownSpans(spans: Spanned, renderer: MarkdownRenderCache, color:
         }
         return
     }
-    val codeBackground = MaterialTheme.colorScheme.surfaceContainerHigh.toArgb()
+    val codeBackground = Pocket.colors.fillStrong.toArgb()
     AndroidView(
         factory = { MarkdownView(it).apply {
             typeface = ReadingTypography.typeface(it)
@@ -305,23 +305,23 @@ internal fun CodeBlock(code: String, language: String) {
     }
     val display = remember(highlighted, code) { highlighted.takeIf { it.text == code.trimEnd('\n') } ?: AnnotatedString(code.trimEnd('\n')) }
     LaunchedEffect(copied) { if (copied) { kotlinx.coroutines.delay(1800); copied = false } }
-    Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainerLow, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("code-block")) {
+    PSurface(shape = RoundedCornerShape(12.dp), color = Pocket.colors.sunken, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("code-block")) {
         Column {
             BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val compact = maxWidth < 320.dp || LocalDensity.current.fontScale > 1.15f
                 Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(language.ifBlank { stringResource(R.string.v02_code) }, Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    PText(language.ifBlank { stringResource(R.string.v02_code) }, Modifier.weight(1f),
+                        style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted,
                         maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                     ViewerToggle(if (compact) "" else "自动换行", PocketIcons.WrapText, wrap, { wrap = !wrap }, description = "自动换行")
                     val copyLabel = stringResource(if (copied) R.string.v02_copy_done else R.string.copy_code)
                     if (compact) ActionIcon(if (copied) PocketIcons.Check else PocketIcons.ContentCopy, copyLabel,
                         onClick = { clipboard.setText(AnnotatedString(code)); copied = true })
-                    else PocketTextButton(onClick = { clipboard.setText(AnnotatedString(code)); copied = true }) { Text(copyLabel) }
+                    else PocketTextButton(onClick = { clipboard.setText(AnnotatedString(code)); copied = true }) { PText(copyLabel) }
                 }
             }
             androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(display, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())).padding(horizontal = 14.dp).padding(bottom = 14.dp), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, softWrap = wrap)
+                PText(display, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())).padding(horizontal = 14.dp).padding(bottom = 14.dp), fontFamily = FontFamily.Monospace, style = Pocket.type.bodySmall, softWrap = wrap)
             }
         }
     }

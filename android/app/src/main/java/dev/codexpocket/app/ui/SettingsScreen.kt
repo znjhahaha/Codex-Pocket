@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import android.Manifest
 import android.content.Intent
 import android.os.Build
@@ -24,10 +25,6 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -48,8 +45,6 @@ import androidx.core.content.ContextCompat
 import dev.codexpocket.app.WatchService
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
-import dev.codexpocket.app.ui.kit.orSnap
-import dev.codexpocket.app.ui.kit.pocketSelectable
 
 @Composable
 internal fun PairScreen(
@@ -80,7 +75,7 @@ internal fun SettingsPageLayout(
     val pages = rememberSaveableStateHolder()
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    val background = MaterialTheme.colorScheme.background
+    val background = Pocket.colors.bg
     Column(modifier.fillMaxSize().background(background).testTag("management-settings")) {
         SettingsPageSegments(page, { page = it }, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
         AnimatedContent(
@@ -122,14 +117,14 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
     val trail by animateFloatAsState(page.ordinal.toFloat(), spring<Float>(dampingRatio = .85f, stiffness = 300f).orSnap(motion), label = "settings-selected-thumb-trail")
     val selection = minOf(lead, trail)
     CompositionLocalProvider(LocalPocketClearGlass provides true) {
-        Surface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
+        PSurface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), color = Pocket.colors.fill) {
             BoxWithConstraints(Modifier.fillMaxWidth().padding(5.dp)) {
                 val itemWidth = maxWidth / SettingsPage.entries.size
                 Box {
                     Box(Modifier.matchParentSize()) {
-                        Surface(Modifier.offset(x = itemWidth * selection).width(itemWidth * (1f + maxOf(lead, trail) - selection)).fillMaxHeight()
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f), RoundedCornerShape(24.dp))
-                            .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.primaryContainer) { }
+                        PSurface(Modifier.offset(x = itemWidth * selection).width(itemWidth * (1f + maxOf(lead, trail) - selection)).fillMaxHeight()
+                            .border(1.dp, Pocket.colors.line.copy(alpha = .45f), RoundedCornerShape(24.dp))
+                            .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), color = Pocket.colors.accentSoft) { }
                     }
                     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).selectableGroup()) {
                         SettingsPage.entries.forEach { item ->
@@ -138,8 +133,8 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
                                 .testTag("settings-tab:" + item.name).pocketSelectable(page == item, role = Role.Tab,
                                     interactionSource = interaction, pressedScale = .96f, haptic = null, onClick = { onSelect(item) })
                                 .padding(horizontal = 6.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
-                                PocketTabLabel(item.label, page == item, style = MaterialTheme.typography.labelMedium,
-                                    color = if (page == item) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                                PocketTabLabel(item.label, page == item, style = Pocket.type.labelSmall,
+                                    color = if (page == item) Pocket.colors.onAccentSoft else Pocket.colors.inkMuted)
                             }
                         }
                     }
@@ -184,8 +179,8 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                 chooseLocation?.let { choose -> PocketButton("执行位置", choose, Modifier.fillMaxWidth().testTag("settings-execution-locations"), secondary = true) }
                 if (!s.paired) {
                     SettingsSection(context.getString(R.string.no_pair)) {
-                        Text(context.getString(R.string.return_pairing), Modifier.padding(12.dp),
-                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        PText(context.getString(R.string.return_pairing), Modifier.padding(12.dp),
+                            style = Pocket.type.body, color = Pocket.colors.inkMuted)
                         if (onPair != null) PocketActionRow("扫码配对电脑", PocketIcons.QrCodeScanner, onPair)
                     }
                 } else {
@@ -194,15 +189,15 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             SettingsCircleIcon(PocketIcons.Computer)
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(s.computerName, style = MaterialTheme.typography.titleMedium)
-                                Text(context.stateLabel(s.connection), style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                PText(s.computerName, style = Pocket.type.title)
+                                PText(context.stateLabel(s.connection), style = Pocket.type.bodySmall,
+                                    color = Pocket.colors.inkMuted)
                             }
                         }
-                        Text(context.getString(R.string.pinned_tls), Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (s.connectionDetail.isNotBlank()) Text(s.connectionDetail, Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.bodySmall)
+                        PText(context.getString(R.string.pinned_tls), Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+                        if (s.connectionDetail.isNotBlank()) PText(s.connectionDetail, Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            style = Pocket.type.bodySmall)
                         PocketActionRow("连接诊断", PocketIcons.Search, { repo.inspectConnection() }, enabled = s.online)
                         PocketActionRow(context.getString(R.string.reconnect), PocketIcons.Refresh, { reconnects++; repo.reconnect() },
                             glyph = { PocketRefreshGlyph(reconnects) })
@@ -213,10 +208,10 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                     if (s.sessionModes.size > 1) SettingsSection("新会话默认模式") {
                         SessionModeChoices(s.sessionPreferences.defaultMode, s.online && s.preferencesFresh &&
                             s.supports(BrokerCapability.PreferencesUpdate) && s.actionStatus["preferences"]?.loading != true, repo::setDefaultSessionMode)
-                        Text("默认跟随桌面。独立 CLI 需要显式选择；已有任务保留当前归属。", Modifier.padding(12.dp),
-                            style = MaterialTheme.typography.bodySmall)
-                        PocketTextButton({ repo.refreshSessionPreferences() }, enabled = s.online && s.supports(BrokerCapability.PreferencesRead)) { Text("刷新默认模式") }
-                        s.actionStatus["preferences"]?.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        PText("默认跟随桌面。独立 CLI 需要显式选择；已有任务保留当前归属。", Modifier.padding(12.dp),
+                            style = Pocket.type.bodySmall)
+                        PocketTextButton({ repo.refreshSessionPreferences() }, enabled = s.online && s.supports(BrokerCapability.PreferencesRead)) { PText("刷新默认模式") }
+                        s.actionStatus["preferences"]?.error?.let { PText(it, color = Pocket.colors.danger) }
                     }
                     if (s.runtimes.isNotEmpty()) SettingsSection("运行环境") {
                         s.runtimes.forEachIndexed { index, runtime ->
@@ -224,33 +219,33 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 SettingsCircleIcon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer)
                                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    Text(context.sourceLabel(runtime.source) + " · ${index + 1}", style = MaterialTheme.typography.bodyMedium)
-                                    Text(runtimeVersionLabel(runtime.version), style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    PText(context.sourceLabel(runtime.source) + " · ${index + 1}", style = Pocket.type.body)
+                                    PText(runtimeVersionLabel(runtime.version), style = Pocket.type.caption,
+                                        color = Pocket.colors.inkMuted)
                                 }
-                                Text(if (runtime.online) "已连接" else "离线", style = MaterialTheme.typography.labelSmall)
+                                PText(if (runtime.online) "已连接" else "离线", style = Pocket.type.caption)
                             }
                         }
                     }
                     SettingsSection(context.getString(R.string.paired_devices)) {
                         PocketActionRow(context.getString(R.string.refresh_devices), PocketIcons.Refresh, { deviceRefreshes++; repo.devices() }, enabled = s.online,
                             glyph = { PocketRefreshGlyph(deviceRefreshes) })
-                        if (s.devices.isEmpty()) Text(if (s.online) context.getString(R.string.refresh_devices_hint) else context.getString(R.string.offline_devices),
-                            Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        if (s.devices.isEmpty()) PText(if (s.online) context.getString(R.string.refresh_devices_hint) else context.getString(R.string.offline_devices),
+                            Modifier.padding(12.dp), color = Pocket.colors.inkMuted, style = Pocket.type.bodySmall)
                         s.devices.forEach { device ->
                             PocketActionRow(
                                 title = device.string("name", context.getString(R.string.device)), icon = PocketIcons.PhoneAndroid,
                                 onClick = { revoke = device.string("id") }, enabled = s.online && !s.busy,
-                                trailing = { Text(context.getString(R.string.revoke), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error) },
+                                trailing = { PText(context.getString(R.string.revoke), style = Pocket.type.labelSmall, color = Pocket.colors.danger) },
                             )
                         }
                     }
                     if (s.commands.isNotEmpty()) SettingsSection(context.getString(R.string.unconfirmed_actions)) {
-                        Text(context.getString(R.string.unknown_explainer), Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        PText(context.getString(R.string.unknown_explainer), Modifier.padding(12.dp), style = Pocket.type.bodySmall,
+                            color = Pocket.colors.inkMuted)
                         s.commands.forEach { command ->
-                            Text(context.actionLabel(command.method) + " · " + context.stateLabel(command.status),
-                                Modifier.padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.bodyMedium)
+                            PText(context.actionLabel(command.method) + " · " + context.stateLabel(command.status),
+                                Modifier.padding(horizontal = 12.dp, vertical = 4.dp), style = Pocket.type.body)
                         }
                         PocketActionRow(context.getString(R.string.check_windows), PocketIcons.Search, { repo.checkCommands() }, enabled = s.online && !s.busy)
                     }
@@ -275,39 +270,39 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                     PocketActionRow(context.getString(R.string.remote_watch), PocketIcons.Wifi, { changeWatch(!s.watch) },
                         subtitle = context.getString(R.string.watch_hint),
                         trailing = { PocketToggle(s.watch, ::changeWatch, Modifier.semantics { contentDescription = context.getString(R.string.remote_watch) }) })
-                    Text(context.getString(R.string.watch_limits), Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PText(context.getString(R.string.watch_limits), Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
                     PocketActionRow(context.getString(R.string.v02_push), PocketIcons.NotificationsNone, { repo.registerPush() },
                         subtitle = if (s.pushStatus == "unconfigured") context.getString(R.string.v02_push_unconfigured) else s.pushStatus,
                         enabled = s.pushConfigured && s.online && !s.busy,
-                        trailing = { Text(context.getString(R.string.v02_push_enable), style = MaterialTheme.typography.labelMedium) })
+                        trailing = { PText(context.getString(R.string.v02_push_enable), style = Pocket.type.labelSmall) })
                 }
                 SettingsSection(context.getString(R.string.on_device)) {
                     PocketActionRow(context.getString(R.string.clear_histories), PocketIcons.DeleteOutline, { clear = true })
                     PocketActionRow(context.getString(R.string.forget_pairing), PocketIcons.Unplug, { forget = true }, destructive = true)
                 }
-                Text(context.getString(R.string.app_about), Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("${dev.codexpocket.app.BuildConfig.VERSION_NAME} · ${dev.codexpocket.app.BuildConfig.POCKET_BUILD_ID}", Modifier.padding(horizontal = 8.dp),
-                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("阅读字体使用 MiSans，版权归小米所有。字体原文件及许可协议随应用提供。", Modifier.padding(horizontal = 8.dp),
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                PText(context.getString(R.string.app_about), Modifier.padding(horizontal = 8.dp), style = Pocket.type.bodySmall,
+                    color = Pocket.colors.inkMuted)
+                PText("${dev.codexpocket.app.BuildConfig.VERSION_NAME} · ${dev.codexpocket.app.BuildConfig.POCKET_BUILD_ID}", Modifier.padding(horizontal = 8.dp),
+                    style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                PText("阅读字体使用 MiSans，版权归小米所有。字体原文件及许可协议随应用提供。", Modifier.padding(horizontal = 8.dp),
+                    style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
             }
         }
     }
     if (forget) PocketDialog(
-        onDismissRequest = { forget = false }, title = { Text(context.getString(R.string.forget_title)) }, text = { Text(context.getString(R.string.forget_body)) },
+        onDismissRequest = { forget = false }, title = { PText(context.getString(R.string.forget_title)) }, text = { PText(context.getString(R.string.forget_body)) },
         confirmButton = { PocketButton(context.getString(R.string.forget), { watch(false); repo.forget(); forget = false }, destructive = true) },
         dismissButton = { PocketButton(context.getString(R.string.cancel), { forget = false }, secondary = true) },
     )
     if (clear) PocketDialog(
-        onDismissRequest = { clear = false }, title = { Text(context.getString(R.string.clear_title)) }, text = { Text(context.getString(R.string.clear_body)) },
+        onDismissRequest = { clear = false }, title = { PText(context.getString(R.string.clear_title)) }, text = { PText(context.getString(R.string.clear_body)) },
         confirmButton = { PocketButton(context.getString(R.string.clear_cache), { repo.clearCache(); clear = false }, destructive = true) },
         dismissButton = { PocketButton(context.getString(R.string.cancel), { clear = false }, secondary = true) },
     )
     revoke?.let { id ->
         PocketDialog(
-            onDismissRequest = { revoke = null }, title = { Text(context.getString(R.string.revoke_title)) }, text = { Text(context.getString(R.string.revoke_body)) },
+            onDismissRequest = { revoke = null }, title = { PText(context.getString(R.string.revoke_title)) }, text = { PText(context.getString(R.string.revoke_body)) },
             confirmButton = { PocketButton(context.getString(R.string.revoke), { repo.revoke(id); revoke = null }, destructive = true) },
             dismissButton = { PocketButton(context.getString(R.string.cancel), { revoke = null }, secondary = true) },
         )
@@ -317,17 +312,17 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
 @Composable
 private fun SettingsPageTitle(title: String, subtitle: String) {
     Column(Modifier.padding(horizontal = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
-        Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        PText(title, Modifier.semantics { heading() }, style = Pocket.type.titleLarge)
+        PText(subtitle, style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
     }
 }
 
 @Composable
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, Modifier.padding(horizontal = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleSmall)
-        Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .55f))) {
+        PText(title, Modifier.padding(horizontal = 4.dp).semantics { heading() }, style = Pocket.type.titleSmall)
+        PSurface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = Pocket.colors.surface,
+            border = BorderStroke(1.dp, Pocket.colors.line.copy(alpha = .55f))) {
             Column(Modifier.padding(6.dp), content = content)
         }
     }
@@ -335,7 +330,7 @@ private fun SettingsSection(title: String, content: @Composable ColumnScope.() -
 
 @Composable
 internal fun SettingsCircleIcon(icon: ImageVector) {
-    Box(Modifier.size(38.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, CircleShape), contentAlignment = Alignment.Center) {
-        Icon(icon, null, Modifier.size(19.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    Box(Modifier.size(38.dp).background(Pocket.colors.sunken, CircleShape), contentAlignment = Alignment.Center) {
+        PIcon(icon, null, Modifier.size(19.dp), tint = Pocket.colors.inkMuted)
     }
 }

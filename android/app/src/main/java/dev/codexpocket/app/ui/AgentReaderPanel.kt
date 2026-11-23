@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.horizontalScroll
 
 import androidx.compose.foundation.background
@@ -10,10 +11,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -103,7 +100,7 @@ internal fun AgentReaderPanel(
     ) {
         Column(Modifier.fillMaxSize().testTag("agent-reader-panel")) {
             AgentReaderToolbar(name, fullScreen, agents.size, onList, onClose, onFullscreen)
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
+            PDivider(color = Pocket.colors.line.copy(alpha = .5f))
             if (child == null) {
                 if (state.error != null) AgentReaderNotice(state.error, online, state.loading, onRetry)
                 AgentRosterList(agents, names, online, state.loading, rosterList, historyExpanded,
@@ -129,32 +126,32 @@ internal fun AgentReaderPanel(
 @Composable
 private fun AgentReaderToolbar(name: String?, fullScreen: Boolean, count: Int,
     onList: () -> Unit, onClose: () -> Unit, onFullscreen: (Boolean) -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     Column(Modifier.fillMaxWidth().background(c.surface.copy(alpha = .94f)).testTag("agent-reader-toolbar")) {
         if (fullScreen) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 PocketTextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp).testTag("agent-reader-return-main")) {
-                    Icon(PocketIcons.ArrowBack, null, Modifier.size(18.dp))
-                    Text("返回主任务", Modifier.padding(start = 6.dp), style = MaterialTheme.typography.labelLarge)
+                    PIcon(PocketIcons.ArrowBack, null, Modifier.size(18.dp))
+                    PText("返回主任务", Modifier.padding(start = 6.dp), style = Pocket.type.label)
                 }
                 Spacer(Modifier.weight(1f))
                 AgentReaderSizeButton(fullScreen, onFullscreen)
                 ActionIcon(PocketIcons.Close, "关闭子代理阅读", onClick = onClose)
             }
-            Text(name.orEmpty(), Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 4.dp)
-                .testTag("agent-reader-name"), style = MaterialTheme.typography.titleMedium,
+            PText(name.orEmpty(), Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 4.dp)
+                .testTag("agent-reader-name"), style = Pocket.type.title,
                 maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text("子代理 · 只读", Modifier.padding(start = 18.dp, bottom = 10.dp),
-                style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+            PText("子代理 · 只读", Modifier.padding(start = 18.dp, bottom = 10.dp),
+                style = Pocket.type.caption, color = c.inkMuted)
         } else {
             Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 if (name != null) ActionIcon(PocketIcons.ArrowBack, "返回子代理列表", onClick = onList)
                 Column(Modifier.weight(1f).padding(start = if (name == null) 10.dp else 2.dp, end = 4.dp)) {
-                    Text(name ?: "子代理", Modifier.testTag("agent-reader-name"),
-                        style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Text(if (name == null) "$count 个原生子任务" else "子代理 · 只读",
-                        style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                    PText(name ?: "子代理", Modifier.testTag("agent-reader-name"),
+                        style = Pocket.type.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    PText(if (name == null) "$count 个原生子任务" else "子代理 · 只读",
+                        style = Pocket.type.caption, color = c.inkMuted)
                 }
                 if (name != null) AgentReaderSizeButton(fullScreen, onFullscreen)
                 ActionIcon(PocketIcons.Close, "关闭子代理阅读", onClick = onClose)
@@ -173,9 +170,9 @@ private fun AgentReaderSizeButton(fullScreen: Boolean, onFullscreen: (Boolean) -
 @Composable
 private fun AgentReaderNotice(error: String, online: Boolean, loading: Boolean, onRetry: () -> Unit) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("agent-reader-error")) {
-        Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        PText(error, style = Pocket.type.bodySmall, color = Pocket.colors.danger)
         PocketTextButton(onClick = onRetry, enabled = online && !loading,
-            modifier = Modifier.testTag("agent-reader-retry")) { Text("重新加载此子代理") }
+            modifier = Modifier.testTag("agent-reader-retry")) { PText("重新加载此子代理") }
     }
 }
 
@@ -211,7 +208,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
     val list = memory.list
     val minimapState = rememberConversationMinimapState(list, scope)
     val minimapShown = rememberConversationMinimapVisibility(scope, rows, list)
-    val backdropColor = MaterialTheme.colorScheme.background
+    val backdropColor = Pocket.colors.bg
     val backdrop = rememberLayerBackdrop { drawRect(backdropColor); drawContent() }
     val latestKeys by rememberUpdatedState(keys)
     ObserveTranscriptDrag(list, memory.gesture) { memory.following = it }
@@ -234,11 +231,11 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             val updated = remember(state.updatedAt) { state.updatedAt.takeIf { it > 0 }?.let {
                 DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(it))
             } }
-            Text(if (!online) "离线 · 缓存内容" else if (state.loading) "正在读取"
+            PText(if (!online) "离线 · 缓存内容" else if (state.loading) "正在读取"
                 else if ((live != null && turn != null && liveOnline) || thinkingWithoutTurn) "实时更新" else "原生会话记录",
-                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (updated != null) Text("更新于 $updated", Modifier.weight(1f),
-                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+            if (updated != null) PText("更新于 $updated", Modifier.weight(1f),
+                style = Pocket.type.caption, color = Pocket.colors.inkMuted)
         }
         if (state.error != null) AgentReaderNotice(state.error, online, state.loading, onRetry)
         BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
@@ -257,7 +254,7 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
                         memory.anchor = TranscriptAnchor(list.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String,
                             list.firstVisibleItemScrollOffset)
                         onOlder()
-                    }) { Text("加载更早记录") }
+                    }) { PText("加载更早记录") }
             }
             rows.forEach { row ->
                 item(key = row.key, contentType = row.kind) {
@@ -292,9 +289,9 @@ private fun AgentReaderTranscript(state: AgentReaderState, online: Boolean, memo
             }
             if (thinkingWithoutTurn) item(key = "live-native-child", contentType = "live-status") { NativeThinkingPlaceholder() }
             if (rows.isEmpty() && !showThinking) item(key = "empty", contentType = "notice") {
-                Text(if (state.loading) "正在加载子代理对话…" else if (!online) "此子代理暂无缓存内容" else "此子代理尚无对话内容",
+                PText(if (state.loading) "正在加载子代理对话…" else if (!online) "此子代理暂无缓存内容" else "此子代理尚无对话内容",
                     Modifier.padding(vertical = 24.dp).testTag("agent-reader-empty"),
-                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    style = Pocket.type.body, color = Pocket.colors.inkMuted)
             }
             item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
         }
@@ -321,15 +318,15 @@ private fun AgentReaderToolDetail(item: TimelineItem, onClose: () -> Unit) {
     ToolResultFrame(if (value.command != null) "Shell · 只读" else "工具详情 · 只读", text, wrap, { wrap = !wrap },
         Modifier.testTag("agent-reader-detail:${item.key}"), onClose) {
         value.command?.let { command ->
-            if (command.cwd.isNotBlank()) Text(command.cwd, style = MaterialTheme.typography.labelSmall)
-            command.exitCode?.let { Text("退出码 $it", style = MaterialTheme.typography.labelSmall) }
+            if (command.cwd.isNotBlank()) PText(command.cwd, style = Pocket.type.caption)
+            command.exitCode?.let { PText("退出码 $it", style = Pocket.type.caption) }
         }
         if (shown.isNotBlank()) Box(Modifier.fillMaxWidth()) {
-            SelectionContainer { Text(shown, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())),
-                softWrap = wrap, style = MaterialTheme.typography.bodySmall,
+            SelectionContainer { PText(shown, Modifier.fillMaxWidth().then(if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())),
+                softWrap = wrap, style = Pocket.type.bodySmall,
                 fontFamily = FontFamily.Monospace) }
-        } else Text("此工具没有可用的文本详情", style = MaterialTheme.typography.bodySmall)
-        if (shown.length < text.length) Text("预览显示前 65,536 个字符 · 复制保留全文", style = MaterialTheme.typography.labelSmall)
-        if (value.output.truncated) Text("原生输出已截断", style = MaterialTheme.typography.labelSmall)
+        } else PText("此工具没有可用的文本详情", style = Pocket.type.bodySmall)
+        if (shown.length < text.length) PText("预览显示前 65,536 个字符 · 复制保留全文", style = Pocket.type.caption)
+        if (value.output.truncated) PText("原生输出已截断", style = Pocket.type.caption)
     }
 }

@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.codexpocket.app.ui
 
+import dev.codexpocket.app.ui.kit.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,7 +32,6 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -56,13 +56,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
-import dev.codexpocket.app.ui.kit.MotionGlyphs
-import dev.codexpocket.app.ui.kit.MotionIcon
-import dev.codexpocket.app.ui.kit.PIconButton
-import dev.codexpocket.app.ui.kit.PToggleGlyph
-import dev.codexpocket.app.ui.kit.PocketHaptic
-import dev.codexpocket.app.ui.kit.rememberGlyphToggle
-import dev.codexpocket.app.ui.kit.rememberPocketHaptics
 import kotlinx.serialization.json.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
@@ -331,11 +324,11 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                     Box(Modifier.size(48.dp).onGloballyPositioned { addAnchor = it.boundsInRoot() }, contentAlignment = Alignment.Center) {
                         PIconButton(PocketIcons.Add, stringResource(R.string.v02_references), { addMenu = true },
                             glyph = { PToggleGlyph(MotionGlyphs.PlusClose, addMenu) })
-                        if (attachmentCount > 0) Text(attachmentCount.toString(), Modifier.align(Alignment.TopEnd)
-                            .clip(PocketCapsule).background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                        if (attachmentCount > 0) PText(attachmentCount.toString(), Modifier.align(Alignment.TopEnd)
+                            .clip(PocketCapsule).background(Pocket.colors.fillStrongest)
                             .padding(horizontal = 4.dp).testTag("composer-attachment-count")
                             .semantics { contentDescription = "$attachmentCount 个附件" },
-                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurface)
+                            style = Pocket.type.caption, color = Pocket.colors.ink)
                     }
                     Box(Modifier.fillMaxWidth().heightIn(max = if (compact) 44.dp else editorLimit)) {
                         // Stable CoreTextField slot and ONE scroller; preview never changes editor line policy.
@@ -357,7 +350,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                                     }.testTag("composer-input"), readOnly = expanded || compact,
                                 decorationBox = { inner ->
                                     Box {
-                                        if (editor.text.isEmpty()) Text(stringResource(R.string.message_codex), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        if (editor.text.isEmpty()) PText(stringResource(R.string.message_codex), style = Pocket.type.body, color = Pocket.colors.inkMuted)
                                         inner()
                                     }
                                 }, onMetadataOpenChange = reportReferenceMetadata)
@@ -368,7 +361,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                             }, contentAlignment = Alignment.CenterStart) {
                             ReferenceText(editor.text.replace('\n', ' ').ifEmpty { stringResource(R.string.message_codex) }, editorReferences,
                                 maxLines = 1,
-                                color = if (text.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface)
+                                color = if (text.isEmpty()) Pocket.colors.inkMuted else Pocket.colors.ink)
                         }
                     }
                     Row(Modifier.fillMaxWidth().heightIn(min = if (compact) 48.dp else 56.dp)
@@ -419,8 +412,8 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 enter = fadeIn(tween(pocketMotionMillis(110))) + expandVertically(if (motion) tween(220) else snap()),
                 exit = fadeOut(tween(pocketMotionMillis(90))) + shrinkVertically(if (motion) tween(220) else snap())) {
                 Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    Icon(PocketIcons.Lock, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(permissionLabel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    PIcon(PocketIcons.Lock, null, Modifier.size(12.dp), tint = Pocket.colors.inkMuted)
+                    PText(permissionLabel, style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
             }
         }
@@ -446,7 +439,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                 }
                 ActionIcon(PocketIcons.CloseFullscreen, stringResource(R.string.v02_collapse_composer), onClick = closeEditor)
                 if (running) {
-                    PocketTextButton(onSteer, enabled = availability.steer, modifier = Modifier.testTag("composer-steer")) { Text(stringResource(R.string.v02_steer)) }
+                    PocketTextButton(onSteer, enabled = availability.steer, modifier = Modifier.testTag("composer-steer")) { PText(stringResource(R.string.v02_steer)) }
                     ActionIcon(PocketIcons.StopCircle, stringResource(R.string.stop_turn), availability.stop, stop)
                 }
                 ComposerSendButton(running, availability.send, { turnGlyph.value }, send)
@@ -466,12 +459,12 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
 /** Model capsule at the input's top-right: model, effort in gray, chevron. Fills a shade darker on press or while open. */
 @Composable
 private fun ComposerModelChip(model: String, detail: String, open: Boolean, chevron: Float, description: String, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .95f else 1f, pocketPressSpring(), label = "model-chip-press")
     // Opaque: the capsule now floats over the transcript, outside the glass box.
-    val fill by animateColorAsState(if (pressed || open) c.surfaceContainerHighest else c.surfaceContainerHigh,
+    val fill by animateColorAsState(if (pressed || open) c.fillStrongest else c.fillStrong,
         tween(pocketMotionMillis(140)), label = "model-chip-fill")
     Row(Modifier.widthIn(max = 240.dp).heightIn(min = 40.dp)
         .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
@@ -479,12 +472,12 @@ private fun ComposerModelChip(model: String, detail: String, open: Boolean, chev
         verticalAlignment = Alignment.CenterVertically) {
         Row(Modifier.height(34.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketCapsule).background(fill)
             .padding(start = 13.dp, end = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            Icon(PocketIcons.Sparkle, null, Modifier.size(13.dp), tint = c.onSurfaceVariant)
-            Text(model, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelLarge, color = c.onSurface)
+            PIcon(PocketIcons.Sparkle, null, Modifier.size(13.dp), tint = c.inkMuted)
+            PText(model, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis, style = Pocket.type.label, color = c.ink)
             if (detail.isNotBlank()) androidx.compose.animation.AnimatedContent(detail, transitionSpec = {
                 fadeIn(tween(pocketMotionMillis(140))) togetherWith fadeOut(tween(pocketMotionMillis(90)))
-            }, label = "model-chip-detail") { value -> Text(value, maxLines = 1, style = MaterialTheme.typography.labelLarge, color = c.onSurfaceVariant) }
-            Icon(PocketIcons.KeyboardArrowDown, null, Modifier.size(14.dp).graphicsLayer { rotationZ = chevron }, tint = c.onSurfaceVariant)
+            }, label = "model-chip-detail") { value -> PText(value, maxLines = 1, style = Pocket.type.label, color = c.inkMuted) }
+            PIcon(PocketIcons.KeyboardArrowDown, null, Modifier.size(14.dp).graphicsLayer { rotationZ = chevron }, tint = c.inkMuted)
         }
     }
 }
@@ -492,18 +485,18 @@ private fun ComposerModelChip(model: String, detail: String, open: Boolean, chev
 /** Steer while a turn runs: a small outlined capsule, icon-only on narrow screens. */
 @Composable
 private fun ComposerPill(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, enabled: Boolean, showLabel: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .94f else 1f, pocketPressSpring(), label = "composer-pill")
-    val fill by animateColorAsState(if (pressed) c.surfaceContainerHighest else c.surfaceContainerHigh.copy(alpha = .75f), tween(pocketMotionMillis(120)), label = "composer-pill-fill")
-    val tint = if (enabled) c.onSurface else c.onSurfaceVariant.copy(alpha = .55f)
+    val fill by animateColorAsState(if (pressed) c.fillStrongest else c.fillStrong.copy(alpha = .75f), tween(pocketMotionMillis(120)), label = "composer-pill-fill")
+    val tint = if (enabled) c.ink else c.inkMuted.copy(alpha = .55f)
     Box(modifier.heightIn(min = 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center) {
         Row(Modifier.height(34.dp).graphicsLayer { scaleX = scale; scaleY = scale }.clip(PocketCapsule).background(fill)
             .padding(horizontal = if (showLabel) 12.dp else 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            Icon(icon, null, Modifier.size(16.dp), tint = tint)
-            if (showLabel) Text(label, maxLines = 1, style = MaterialTheme.typography.labelLarge, color = tint)
+            PIcon(icon, null, Modifier.size(16.dp), tint = tint)
+            if (showLabel) PText(label, maxLines = 1, style = Pocket.type.label, color = tint)
         }
     }
 }
@@ -514,7 +507,7 @@ private fun ComposerPill(label: String, icon: androidx.compose.ui.graphics.vecto
  */
 @Composable
 private fun ComposerStopButton(enabled: Boolean, morph: () -> Float, onStop: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .9f else 1f, pocketPressSpring(), label = "composer-stop")
@@ -522,9 +515,9 @@ private fun ComposerStopButton(enabled: Boolean, morph: () -> Float, onStop: () 
     Box(Modifier.size(44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onStop)
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
         Box(Modifier.size(34.dp).graphicsLayer { scaleX = scale; scaleY = scale }
-            .background(if (enabled) c.onSurface else c.surfaceContainerHigh, CircleShape), contentAlignment = Alignment.Center) {
+            .background(if (enabled) c.ink else c.fillStrong, CircleShape), contentAlignment = Alignment.Center) {
             // The glyph's square is 10 of 24 grid units: 26.4dp draws it at the 11dp it has always been.
-            MotionIcon(MotionGlyphs.SendStop, morph, Modifier.size(26.4.dp), if (enabled) c.surface else c.onSurfaceVariant)
+            MotionIcon(MotionGlyphs.SendStop, morph, Modifier.size(26.4.dp), if (enabled) c.surface else c.inkMuted)
         }
     }
 }
@@ -535,7 +528,7 @@ private fun ComposerSendButton(running: Boolean, enabled: Boolean, morph: () -> 
     val pressed by interaction.collectIsPressedAsState()
     val focused by interaction.collectIsFocusedAsState()
     val press by animateFloatAsState(if (pressed) 1f else 0f, pocketPressSpring(), label = "send-press")
-    val color by androidx.compose.animation.animateColorAsState(if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
+    val color by androidx.compose.animation.animateColorAsState(if (enabled) Pocket.colors.solid else Pocket.colors.fillStrong,
         tween(pocketMotionMillis(180)), label = "send-ready")
     // When a draft becomes sendable the button "pops" on an underdamped spring, then settles.
     val ready by animateFloatAsState(if (enabled) 1f else .88f,
@@ -556,15 +549,15 @@ private fun ComposerSendButton(running: Boolean, enabled: Boolean, morph: () -> 
         })
         .testTag("composer-send"), contentAlignment = Alignment.Center) {
         Box(Modifier.size(42.dp).background(color, RoundedCornerShape(21.dp))
-            .border(if (focused) 2.dp else 0.dp, if (focused) MaterialTheme.colorScheme.secondary else Color.Transparent, RoundedCornerShape(21.dp)), contentAlignment = Alignment.Center) {
+            .border(if (focused) 2.dp else 0.dp, if (focused) Pocket.colors.accent else Color.Transparent, RoundedCornerShape(21.dp)), contentAlignment = Alignment.Center) {
             androidx.compose.animation.Crossfade(running, animationSpec = tween(pocketMotionMillis(120)), label = "send-queue-morph") { queue ->
                 val glyph = Modifier.size(21.dp).graphicsLayer {
                     val l = launch.value
                     translationY = -press * 3.dp.toPx() - l * 22.dp.toPx()
                     alpha = 1f - kotlin.math.abs(l)
                 }
-                val tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                if (queue) Icon(PocketIcons.PlaylistAdd, stringResource(R.string.v02_queue), glyph, tint = tint)
+                val tint = if (enabled) Pocket.colors.onSolid else Pocket.colors.inkMuted
+                if (queue) PIcon(PocketIcons.PlaylistAdd, stringResource(R.string.v02_queue), glyph, tint = tint)
                 // Returning from a turn the square becomes the arrow; leaving for one the arrow simply fades.
                 else MotionIcon(MotionGlyphs.SendStop, { if (running) 0f else morph() }, glyph, tint, stringResource(R.string.send_message))
             }
@@ -575,29 +568,29 @@ private fun ComposerSendButton(running: Boolean, enabled: Boolean, morph: () -> 
 /** "↳ 引导": text-only, darkens on press, as in Codex's queue row. */
 @Composable
 private fun QueueSteer(enabled: Boolean, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val tint by animateColorAsState(when { !enabled -> c.onSurfaceVariant.copy(alpha = .45f); pressed -> c.onSurface; else -> c.onSurfaceVariant },
+    val tint by animateColorAsState(when { !enabled -> c.inkMuted.copy(alpha = .45f); pressed -> c.ink; else -> c.inkMuted },
         tween(pocketMotionMillis(120)), label = "queue-steer")
     Row(Modifier.heightIn(min = 44.dp).clip(PocketCapsule)
         .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
         .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-        Icon(PocketIcons.SubdirectoryArrowRight, null, Modifier.size(14.dp), tint = tint)
-        Text("引导", style = MaterialTheme.typography.labelLarge, color = tint, maxLines = 1)
+        PIcon(PocketIcons.SubdirectoryArrowRight, null, Modifier.size(14.dp), tint = tint)
+        PText("引导", style = Pocket.type.label, color = tint, maxLines = 1)
     }
 }
 
 @Composable
 private fun QueueIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, enabled: Boolean, onClick: () -> Unit) {
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val tint by animateColorAsState(when { !enabled -> c.onSurfaceVariant.copy(alpha = .45f); pressed -> c.onSurface; else -> c.onSurfaceVariant },
+    val tint by animateColorAsState(when { !enabled -> c.inkMuted.copy(alpha = .45f); pressed -> c.ink; else -> c.inkMuted },
         tween(pocketMotionMillis(120)), label = "queue-icon")
     Box(Modifier.size(40.dp, 44.dp).clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
-        Icon(icon, null, Modifier.size(17.dp), tint = tint)
+        PIcon(icon, null, Modifier.size(17.dp), tint = tint)
     }
 }
 
@@ -627,18 +620,18 @@ internal fun NativeQueue(s: PocketState, onEdit: (String, String) -> Unit, onDel
     val ids = entries.map { it.string("id") }
     val enabled = s.online && s.accessAllowsSending() && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false
     val canSteer = onSteer != null && enabled && s.timeline.activeTurn != null && s.supports("turn/steer")
-    val c = MaterialTheme.colorScheme
+    val c = Pocket.colors
     val shown = if (expanded || entries.size <= QUEUE_VISIBLE + 1) entries else entries.take(QUEUE_VISIBLE)
     PocketGlassSurface(modifier = modifier.fillMaxWidth().testTag("native-queue"), shape = RoundedCornerShape(20.dp), dense = true) {
         Column(Modifier.animateContentSize(androidx.compose.animation.core.spring(dampingRatio = .9f, stiffness = 520f)).padding(vertical = 2.dp)) {
             shown.forEachIndexed { index, entry -> key(entry.string("id")) {
                 val id = entry.string("id")
-                if (index > 0) HorizontalDivider(Modifier.padding(start = 40.dp, end = 12.dp), thickness = .5.dp, color = c.outlineVariant.copy(alpha = .5f))
+                if (index > 0) PDivider(Modifier.padding(start = 40.dp, end = 12.dp), thickness = .5.dp, color = c.line.copy(alpha = .5f))
                 Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(start = 14.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(PocketIcons.PlaylistPlay, null, Modifier.size(15.dp), tint = c.onSurfaceVariant)
+                    PIcon(PocketIcons.PlaylistPlay, null, Modifier.size(15.dp), tint = c.inkMuted)
                     Spacer(Modifier.width(10.dp))
-                    Text(queueText(entry).ifBlank { stringResource(R.string.delivery_queue_attachment) }, Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodyMedium, color = c.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    PText(queueText(entry).ifBlank { stringResource(R.string.delivery_queue_attachment) }, Modifier.weight(1f),
+                        style = Pocket.type.body, color = c.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (onSteer != null) QueueSteer(canSteer) { onSteer(id) }
                     QueueIcon(PocketIcons.DeleteOutline, stringResource(R.string.v02_queue_delete), enabled && s.supports("thread/queue/delete")) { onDelete(id) }
                     Box(Modifier.onGloballyPositioned { anchors[id] = it.boundsInRoot() }) {
@@ -647,10 +640,10 @@ internal fun NativeQueue(s: PocketState, onEdit: (String, String) -> Unit, onDel
                 }
             } }
             if (entries.size > shown.size || (expanded && entries.size > QUEUE_VISIBLE + 1)) {
-                HorizontalDivider(Modifier.padding(start = 40.dp, end = 12.dp), thickness = .5.dp, color = c.outlineVariant.copy(alpha = .5f))
+                PDivider(Modifier.padding(start = 40.dp, end = 12.dp), thickness = .5.dp, color = c.line.copy(alpha = .5f))
                 Row(Modifier.fillMaxWidth().heightIn(min = 36.dp).clickable(role = Role.Button) { expanded = !expanded }.padding(start = 40.dp),
                     verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (expanded) "收起" else "还有 ${entries.size - shown.size} 条", style = MaterialTheme.typography.labelMedium, color = c.onSurfaceVariant)
+                    PText(if (expanded) "收起" else "还有 ${entries.size - shown.size} 条", style = Pocket.type.labelSmall, color = c.inkMuted)
                 }
             }
         }
@@ -669,7 +662,7 @@ internal fun NativeQueue(s: PocketState, onEdit: (String, String) -> Unit, onDel
     }
     editing?.let { entry ->
         var text by remember(entry) { mutableStateOf(queueText(entry)) }
-        PocketDialog(onDismissRequest = { editing = null }, title = { Text(stringResource(R.string.v02_queue_edit)) }, text = { PocketTextField(text, { text = it }, Modifier.fillMaxWidth(), minLines = 3, maxLines = 8) },
+        PocketDialog(onDismissRequest = { editing = null }, title = { PText(stringResource(R.string.v02_queue_edit)) }, text = { PocketTextField(text, { text = it }, Modifier.fillMaxWidth(), minLines = 3, maxLines = 8) },
             confirmButton = { PocketButton(stringResource(R.string.save), enabled = enabled && text.isNotBlank() && entries.any { it.string("id") == entry.string("id") }, onClick = { onEdit(entry.string("id"), text); editing = null }) },
             dismissButton = { PocketButton(stringResource(R.string.cancel), onClick = { editing = null }, secondary = true) })
     }
