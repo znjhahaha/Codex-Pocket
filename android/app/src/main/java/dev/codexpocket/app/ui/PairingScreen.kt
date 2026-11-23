@@ -113,7 +113,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
         }
     }
     fun retry() { payload = ""; issue = null; scanner.cancel(); paused = false; torch = false }
-    val album = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    val album = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) { if (payload.isEmpty() && issue == null) paused = false }
         else scope.launch {
             decoding = true
@@ -168,7 +168,7 @@ internal fun EmbeddedPairingScreen(busy: Boolean, onPair: (String, String) -> An
             PocketTextButton({ torch = !torch }, enabled = active && context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {
                 PIcon(PocketIcons.Sun, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); PText(if (torch) "关闭补光" else "补光灯")
             }
-            PocketTextButton({ retry(); paused = true; album.launch("image/*") }, enabled = !working) {
+            PocketTextButton({ retry(); paused = true; album.launch(arrayOf("image/*")) }, enabled = !working) {
                 PIcon(PocketIcons.Image, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); PText("相册")
             }
             PocketTextButton({ manual = !manual; torch = false }, enabled = !working, modifier = Modifier.testTag("pair-manual-toggle")) {
