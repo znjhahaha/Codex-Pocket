@@ -33,7 +33,8 @@ internal fun TurnChangesCard(summary: TurnChangeSummary, onDetail: (TimelineItem
     var shown by rememberSaveable(summary.turnId) { mutableIntStateOf(3) }
     val colors = Pocket.colors
     val (add, remove) = pocketDiffColors()
-    PSurface(Modifier.fillMaxWidth().padding(top = 12.dp).testTag("turn-changes:${summary.turnId}"),
+    val detailKey = remember(summary.turnId) { TimelineItem(summary.turnId, "pocket-change-summary", "fileChange").key }
+    PSurface(Modifier.fillMaxWidth().padding(top = 12.dp).pocketMorphSource("detail:$detailKey").testTag("turn-changes:${summary.turnId}"),
         shape = RoundedCornerShape(16.dp), color = colors.surface,
         border = BorderStroke(1.dp, colors.line.copy(alpha = .6f))) {
         Column {

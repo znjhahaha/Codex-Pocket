@@ -172,7 +172,7 @@ internal fun AssistantJobInlineCard(task: AssistantTask, state: AssistantUiState
     // Opens by itself when there is something to decide; the reader's own choice then stays.
     var chosen by rememberSaveable(task.id) { mutableStateOf<Boolean?>(null) }
     val expanded = chosen ?: (job?.readyToMerge == true || outcome?.second == PTone.Warning)
-    PCard(modifier.testTag("assistant-chat-task:${task.id}").animateContentSize(PocketMotion.resize<androidx.compose.ui.unit.IntSize>().orSnap(motion)),
+    PCard(modifier.pocketMorphSource("Task:${task.id}", 20.dp).testTag("assistant-chat-task:${task.id}").animateContentSize(PocketMotion.resize<androidx.compose.ui.unit.IntSize>().orSnap(motion)),
         color = if (nested) c.sunken else c.surface, padding = PaddingValues(0.dp), spacing = 0.dp,
         border = if (nested) null else BorderStroke(1.dp, (if (view.pending.isNotEmpty()) c.warning.copy(alpha = .55f) else c.line.copy(alpha = if (c.dark) .5f else .7f)))) {
         Column(Modifier.fillMaxWidth().pocketPressable(role = Role.Button, pressedScale = .99f, onClickLabel = if (expanded) "收起任务" else "展开任务") { chosen = !expanded }
@@ -281,7 +281,7 @@ internal fun AssistantGroupInlineCard(group: AssistantGroup, tasks: List<Assista
     val done = tasks.count { it.status == AssistantTaskStatus.Done }
     val running = tasks.count { it.status == AssistantTaskStatus.Running }
     val waiting = tasks.count { state.snapshot?.taskNeedsAttention(it) == true }
-    PCard(modifier.testTag("assistant-group:${group.id}").animateContentSize(PocketMotion.resize<androidx.compose.ui.unit.IntSize>().orSnap(motion)),
+    PCard(modifier.pocketMorphSource("Group:${group.id}", 20.dp).testTag("assistant-group:${group.id}").animateContentSize(PocketMotion.resize<androidx.compose.ui.unit.IntSize>().orSnap(motion)),
         color = c.surface, padding = PaddingValues(0.dp), spacing = 0.dp, border = BorderStroke(1.dp, c.line.copy(alpha = if (c.dark) .5f else .7f))) {
         Column(Modifier.fillMaxWidth().pocketPressable(role = Role.Button, pressedScale = .99f, onClickLabel = if (expanded) "收起任务组" else "展开任务组") { expanded = !expanded }
             .testTag("assistant-group-expand:${group.id}").semantics { stateDescription = if (expanded) "已展开" else "已收起" }

@@ -45,7 +45,7 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
         items(approvals, key = { it.key }, contentType = { "approval" }) { approval ->
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 s.chats.firstOrNull { it.runtimeId == approval.runtimeId && it.key.nativeId == approval.threadId }?.let { chat ->
-                    PocketActionRow(chat.title, PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) })
+                    Box(Modifier.pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(chat.title, PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) }) }
                 }
                 if (!s.approvalsFresh) PText("待重新同步 · 连接电脑后确认是否仍需审批", style = Pocket.type.bodySmall)
                 ApprovalCard(approval, s.online && s.approvalsFresh && !s.busy && s.runtimes.any { it.id == approval.runtimeId && it.online }, repo::respond)
@@ -54,21 +54,21 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
         items(questions, key = { it.first + it.second.string("id") }, contentType = { "question" }) { (key, question) ->
             s.chats.firstOrNull { it.key.encoded == key }?.let { chat ->
                 if (chat.key == s.selected?.key) AsyncQuestionForm(question, s, repo::answerAsync)
-                else PocketActionRow(
+                else Box(Modifier.pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(
                     question.string("title"), PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, subtitle = chat.title,
                     trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
-                )
+                ) }
             }
         }
         if (questions.isEmpty()) items(s.advanced.asyncQuestions, key = { it.string("id") }, contentType = { "question" }) { AsyncQuestionForm(it, s, repo::answerAsync) }
         items(results, key = { "result:${it.key.encoded}" }, contentType = { "result" }) { chat ->
-            PocketActionRow(
+            Box(Modifier.pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(
                 title = chat.title,
                 icon = if (chat.status == "failed") PocketIcons.ErrorOutline else PocketIcons.CheckCircle,
                 onClick = { onOpenChat(chat) },
                 subtitle = stringResource(if (chat.status == "failed") R.string.v02_failed_result else R.string.v02_unread_result),
                 trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
-            )
+            ) }
         }
     }
 }

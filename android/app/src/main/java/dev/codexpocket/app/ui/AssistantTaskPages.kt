@@ -73,7 +73,7 @@ import kotlinx.serialization.json.*
 @Composable internal fun AssistantTaskListCard(task:AssistantTask,state:AssistantUiState,navigate:(String)->Unit) {
     val snapshot=state.snapshot ?: return
     val view=state.jobView(task)
-    AssistantCard(Modifier.testTag("assistant-task:${task.id}")) {
+    AssistantCard(Modifier.pocketMorphSource("Task:${task.id}", 20.dp).testTag("assistant-task:${task.id}")) {
         Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
             AssistantJobGlyph(view)
             PText(view.label,Modifier.weight(1f),style=Pocket.type.labelSmall,color=assistantToneInk(view.tone),maxLines=1,overflow=TextOverflow.Ellipsis)

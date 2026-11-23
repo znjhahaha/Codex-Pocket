@@ -11,6 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.BlurEffect
@@ -82,11 +83,15 @@ internal class PEntrance(open: Boolean) {
         internal set
 }
 
+/** True on a page a stage is returning to: its content is shown as it was, not staggered in a second time. */
+internal val LocalPocketEntranceQuiet = staticCompositionLocalOf { false }
+
 /** Restarted when [key] changes, so a page that swaps its whole content can stagger it in again. */
 @Composable
 internal fun rememberPocketEntrance(key: Any? = Unit, windowMillis: Long = 420): PEntrance {
     val motion = rememberPocketMotion()
-    val entrance = remember(key) { PEntrance(motion) }
+    val quiet = LocalPocketEntranceQuiet.current
+    val entrance = remember(key) { PEntrance(motion && !quiet) }
     LaunchedEffect(entrance) { if (entrance.open) { pocketPause(windowMillis); entrance.open = false } }
     return entrance
 }

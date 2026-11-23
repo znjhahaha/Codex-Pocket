@@ -85,7 +85,7 @@ internal fun assistantPageTitle(page: String) = when {
         // from landing on the first text field, which would raise the keyboard on a page that was only opened.
         Box(modifier.fillMaxSize().background(Pocket.colors.bg).testTag("assistant-workspace").focusTarget()) {
             // On the first page there is nothing here to go back to: whoever opened the assistant previews the way out.
-            PStage(page, depth = { depths[it] ?: 1 }, back = previous, onBack = ::back) { page ->
+            PStage(page, depth = { depths[it] ?: 1 }, back = previous, onBack = ::back, source = { it.takeIf { name -> ':' in name } }) { page ->
                 holder.SaveableStateProvider("$owner:$page") {
                     if (page == "Main") AssistantStage(state, workspaces, canAct, connected, ::act, ::navigate, onOpenThread, ::back, onProjectSelected, notice)
                     else AssistantSubpage(assistantPageTitle(page), ::back, notice) {
@@ -455,7 +455,7 @@ private fun AssistantMessageRow(message: AssistantChatMessage, scope: String, sh
 private fun AssistantResultRow(operation: AssistantOperation, snapshot: AssistantSnapshot, navigate: (String) -> Unit) {
     val c = Pocket.colors
     val failed = operation.phase == AssistantOperationPhase.Failed
-    AssistantCard(Modifier.testTag("assistant-result:${operation.id}")) {
+    AssistantCard(Modifier.pocketMorphSource("Result:${operation.id}", 20.dp).testTag("assistant-result:${operation.id}")) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AssistantBadge(if (failed) "遇到问题" else "已完成", failed, if (failed) PTone.Danger else PTone.Positive)
             snapshot.operationMemberId(operation.id, operation.taskId)?.let { id -> snapshot.members.firstOrNull { it.id == id } }?.let { member ->

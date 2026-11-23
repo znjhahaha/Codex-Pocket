@@ -187,7 +187,15 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
         assistantReturn -> PocketPage.Assistant
         else -> pageFor(atHome = true)
     }?.takeIf { it != page }
-    PStage(page, depth = { it.depth }, back = backPage, onBack = goBack.takeIf { canGoBack }) { shown ->
+    PStage(page, depth = { it.depth }, back = backPage, onBack = goBack.takeIf { canGoBack }, source = { shown ->
+        // What each page opens out of: its row on the home list, its card in the conversation, the assistant's button.
+        when (shown) {
+            PocketPage.Conversation -> s.selected?.key?.encoded?.let { "chat:$it" }
+            PocketPage.Detail -> (detail ?: shownDetail.value)?.let { "detail:${it.key}" }
+            PocketPage.Assistant -> "assistant"
+            else -> null
+        }
+    }) { shown ->
         val settings = shown == PocketPage.Settings
         val conversation = shown == PocketPage.Conversation
         when (shown) {

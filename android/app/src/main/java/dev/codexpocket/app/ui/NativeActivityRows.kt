@@ -520,7 +520,7 @@ private fun ActivityDetail(item: TimelineItem, value: PresentedActivity, scope: 
     val openAgent = LocalNativeAgentReader.current
     val c = Pocket.colors
     val names = LocalNativeAgentNames.current
-    Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 4.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(Modifier.fillMaxWidth().pocketMorphSource("detail:${item.key}", 14.dp).padding(start = 4.dp, top = 4.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (value.kind == ActivityKind.Reasoning) {
             item.summaryParts.filter(String::isNotBlank).forEachIndexed { index, part -> NativeSummaryProse(part, "$scope/${item.key}/reasoning:$index") }
             return@Column

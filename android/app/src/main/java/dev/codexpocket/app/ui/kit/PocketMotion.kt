@@ -7,6 +7,8 @@ import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.MonotonicFrameClock
+import kotlinx.coroutines.withContext
 import dev.codexpocket.app.ui.rememberPocketGlassPreferences
 
 /**
@@ -79,6 +81,30 @@ internal fun rubberBandInverse(displayed: Float, dimension: Float, coefficient: 
     val pulled = kotlin.math.abs(displayed).coerceAtMost(dimension * .999f)
     val distance = (1f / (1f - pulled / dimension) - 1f) * dimension / coefficient
     return if (displayed < 0f) -distance else distance
+}
+
+/**
+ * A frame clock that never jumps: however late a frame arrives, the animation reading this clock
+ * moves on by at most [maxStepNanos]. A page that is slow to compose then makes its transition take
+ * longer instead of making it skip, so every step of the way is still drawn.
+ */
+internal class SteadyFrameClock(private val parent: MonotonicFrameClock, private val maxStepNanos: Long = 34_000_000L) : MonotonicFrameClock {
+    private var last = Long.MIN_VALUE
+    private var time = 0L
+    override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R = parent.withFrameNanos { real ->
+        time = if (last == Long.MIN_VALUE) real else time + steadyStep(real - last, maxStepNanos)
+        last = real
+        onFrame(time)
+    }
+}
+
+/** How far a steady clock moves for a frame that took [elapsedNanos]. */
+internal fun steadyStep(elapsedNanos: Long, maxStepNanos: Long = 34_000_000L): Long = elapsedNanos.coerceIn(0L, maxStepNanos)
+
+/** Runs [block] with its animations on a [SteadyFrameClock]. Use it for a transition that brings heavy content with it. */
+internal suspend fun <T> pocketSteadyFrames(block: suspend () -> T): T {
+    val clock = kotlin.coroutines.coroutineContext[MonotonicFrameClock] ?: return block()
+    return withContext(SteadyFrameClock(clock)) { block() }
 }
 
 /** System animations on, not saving power, not in high-contrast text. Decoration stops otherwise. */

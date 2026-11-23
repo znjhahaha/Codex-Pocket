@@ -34,7 +34,7 @@ val LocalAssistantArtifacts=staticCompositionLocalOf<AssistantArtifactSource?> {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun AssistantArtifactCard(artifact:AssistantArtifact,snapshot:AssistantSnapshot,navigate:(String)->Unit,open:(String,String)->Unit) {
     val c=Pocket.colors
-    AssistantCard(Modifier.testTag("assistant-artifact:${artifact.id}")) {
+    AssistantCard(Modifier.pocketMorphSource("Artifact:${artifact.id}", 20.dp).testTag("assistant-artifact:${artifact.id}")) {
         Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)) {
             PIcon(when(artifact.category) {"link"->PocketIcons.Link;"image"->PocketIcons.Image;"code"->PocketIcons.Code;else->PocketIcons.Description},null,Modifier.size(18.dp),c.inkMuted)
             PText(artifact.name,Modifier.weight(1f),style=Pocket.type.titleSmall,maxLines=3,overflow=TextOverflow.Ellipsis)

@@ -385,7 +385,7 @@ internal fun ChatHomeRow(
     // Two quiet lines: title + time, then a one-line preview. State shows only when it needs attention;
     // actions are a long press away (also exposed to accessibility as the long-click action).
     Column(modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
-        Column(Modifier.fillMaxWidth().heightIn(min = 64.dp).graphicsLayer { scaleX = scale; scaleY = scale }
+        Column(Modifier.fillMaxWidth().heightIn(min = 64.dp).pocketMorphSource("chat:${chat.key.encoded}").graphicsLayer { scaleX = scale; scaleY = scale }
             .clip(RoundedCornerShape(16.dp)).background(pressColor)
             .combinedClickable(interactionSource = interaction, indication = null, onClick = onSelect, onLongClick = { menu = true },
                 onLongClickLabel = actionsLabel, role = Role.Button)
