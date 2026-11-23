@@ -2310,8 +2310,7 @@ impl Broker {
         let secret = storage::secret();
         state
             .devices
-            .add(id.clone(), name, &secret, storage::now())
-            .map_err(anyhow::Error::msg)?;
+            .add_for_pairing(id.clone(), name, &secret, storage::now())?;
         // Consume first. A crash may require re-pairing but can never reuse the invitation.
         if let Err(error) =
             storage::atomic_write(&path, br#"{"tokenHash":"","expiresAt":0,"used":true}"#)

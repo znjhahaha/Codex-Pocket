@@ -69,9 +69,11 @@ enum class PocketFailure(val label: String) {
     ModelSpeed("当前模型未提供 Fast 速度档位"), RuntimeSpeed("当前运行时未提供 serviceTier 能力"),
     StaleRevision("默认模式已在其他设备更新，请刷新后重试"), InvalidSnapshot("电脑返回的状态不完整，请刷新后重试"),
     MediaOwner("图片所属会话或连接已变化，请重新打开图片"), MediaExpired("图片已过期"),
-    MediaUnsupported("暂不支持这张图片"), MediaFailed("图片读取失败，请重试");
+    MediaUnsupported("暂不支持这张图片"), MediaFailed("图片读取失败，请重试"),
+    DeviceLimitReached("已达到 8 台配对设备上限，请在电脑上移除不再使用的设备后重试");
     companion object {
         fun fromCode(code: String): PocketFailure? = when (code) {
+            "device_limit_reached" -> DeviceLimitReached
             "adapter_incomplete", "integration_required" -> DesktopIntegration
             "owner_uncertain" -> OwnerUncertain
             "multiple_owners" -> MultipleOwners

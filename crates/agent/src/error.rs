@@ -17,6 +17,7 @@ pub enum Code {
     OperationInProgress,
     RequestTimeout,
     NativeHistoryUnavailable,
+    DeviceLimitReached,
 }
 impl Code {
     pub fn as_str(self) -> &'static str {
@@ -37,6 +38,7 @@ impl Code {
             Self::OperationInProgress => "operation_in_progress",
             Self::RequestTimeout => "request_timeout",
             Self::NativeHistoryUnavailable => "native_history_unavailable",
+            Self::DeviceLimitReached => "device_limit_reached",
         }
     }
     pub fn message(self) -> &'static str {
@@ -57,6 +59,7 @@ impl Code {
             Self::OperationInProgress => "A previous operation is still being reconciled",
             Self::RequestTimeout => "The read operation timed out; the connection may still be available",
             Self::NativeHistoryUnavailable => "The current Codex runtime cannot read this thread history; cached messages and drafts are retained",
+            Self::DeviceLimitReached => "Maximum paired devices reached; remove an unused device before pairing again",
         }
     }
 }

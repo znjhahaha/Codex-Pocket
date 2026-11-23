@@ -24,19 +24,27 @@ impl DeviceStore {
             .is_some_and(|d| bool::from(d.secret_hash.as_bytes().ct_eq(candidate.as_bytes())))
     }
     pub fn add(&mut self, id: String, name: String, secret: &str, now: u64) -> Result<(), String> {
+        self.add_for_pairing(id, name, secret, now)
+            .map_err(|error| error.to_string())
+    }
+    // The broker needs a typed refusal; existing local callers retain their string error contract.
+    pub(crate) fn add_for_pairing(&mut self, id: String, name: String, secret: &str, now: u64) -> anyhow::Result<()> {
         if id.is_empty()
             || id.len() > 128
             || name.is_empty()
             || name.chars().count() > 64
             || name.chars().any(char::is_control)
         {
-            return Err("Invalid device identity".into());
+            anyhow::bail!("Invalid device identity");
         }
         if self.devices.contains_key(&id) {
-            return Err("Device identity already paired".into());
+            anyhow::bail!("Device identity already paired");
         }
         if self.devices.len() >= 8 {
-            return Err("Maximum paired devices reached".into());
+            return Err(crate::error::classify(
+                anyhow::anyhow!("Maximum paired devices reached"),
+                crate::error::Code::DeviceLimitReached,
+            ));
         }
         self.devices.insert(
             id.clone(),
