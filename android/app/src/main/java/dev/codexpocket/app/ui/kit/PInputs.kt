@@ -1,10 +1,14 @@
 package dev.codexpocket.app.ui.kit
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -22,6 +26,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,6 +46,8 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathMeasure
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -44,6 +55,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 /**
  * A text input. [bare] drops the well for hosts that draw their own container, such as a glass
@@ -85,28 +98,56 @@ internal fun PTextField(value: String, onValueChange: (String) -> Unit, modifier
         })
 }
 
-/** A switch whose thumb travels on a spring and widens while held. 52x48 target. */
+/**
+ * A switch that can be tapped or dragged. The thumb follows the finger, widens while held, stretches
+ * with its own speed as it crosses, and the track takes its colour from where the thumb is. 52x48 target.
+ */
 @Composable
 internal fun PSwitch(checked: Boolean, onCheckedChange: ((Boolean) -> Unit)?, modifier: Modifier = Modifier, enabled: Boolean = true) {
     val c = Pocket.colors
     val motion = rememberPocketMotion()
+    val haptics = rememberPocketHaptics()
+    val scope = rememberCoroutineScope()
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val travel = animateFloatAsState(if (checked) 1f else 0f, PocketMotion.state<Float>().orSnap(motion), label = "switch-thumb")
-    val stretch = animateFloatAsState(if (pressed) 1f else 0f, PocketMotion.press<Float>().orSnap(motion), label = "switch-press")
-    val track by animateColorAsState(if (checked) c.solid else c.fillStrongest, PocketMotion.color<Color>().orSnap(motion), label = "switch-track")
-    val thumb = if (checked) c.onSolid else c.surface
-    val toggle = if (onCheckedChange != null) Modifier.pocketToggleable(checked, enabled, Role.Switch, interaction, onValueChange = onCheckedChange) else Modifier
+    val travel = remember { Animatable(if (checked) 1f else 0f) }
+    var dragging by remember { mutableStateOf(false) }
+    val latest by rememberUpdatedState(checked)
+    val change by rememberUpdatedState(onCheckedChange)
+    val spec = PocketMotion.state<Float>().orSnap(motion)
+    LaunchedEffect(checked) { if (!dragging) travel.animateTo(if (checked) 1f else 0f, spec) }
+    val stretch = animateFloatAsState(if (pressed || dragging) 1f else 0f, PocketMotion.press<Float>().orSnap(motion), label = "switch-press")
+    val run = with(LocalDensity.current) { (44.dp - 6.dp - 21.dp).toPx() }
+    val flick = with(LocalDensity.current) { 400.dp.toPx() }
+    val drag = rememberDraggableState { delta -> scope.launch { travel.snapTo((travel.value + delta / run).coerceIn(0f, 1f)) } }
+    val toggle = if (onCheckedChange != null) Modifier.pocketToggleable(checked, enabled, Role.Switch, interaction, onValueChange = onCheckedChange)
+        .draggable(drag, Orientation.Horizontal, enabled, onDragStarted = { dragging = true }, onDragStopped = { velocity ->
+            dragging = false
+            // A flick decides by its direction; a slow drag by which half the thumb was left in.
+            val on = if (abs(velocity) > flick) velocity > 0f else travel.value > .5f
+            if (on != latest) { haptics.perform(if (on) PocketHaptic.ToggleOn else PocketHaptic.ToggleOff); change?.invoke(on) }
+            travel.animateTo(if (on) 1f else 0f, spec, velocity / run)
+            // The owner may have refused the change: show what it holds.
+            if (!dragging) travel.animateTo(if (latest) 1f else 0f, spec)
+        }) else Modifier
+    val off = c.fillStrongest; val on = c.solid
+    val thumbOff = c.surface; val thumbOn = c.onSolid
     Box(modifier.size(52.dp, 48.dp).then(toggle).drawBehind {
         val w = 44.dp.toPx(); val h = 27.dp.toPx()
         val left = (size.width - w) / 2; val top = (size.height - h) / 2
         val fade = if (enabled) 1f else .4f
+        val at = travel.value.coerceIn(0f, 1f)
+        val track = lerp(off, on, at)
         drawRoundRect(track.copy(alpha = track.alpha * fade), Offset(left, top), Size(w, h), CornerRadius(h / 2))
         val inset = 3.dp.toPx(); val d = h - inset * 2
-        val extra = 5.dp.toPx() * stretch.value
-        val run = w - inset * 2 - d - extra
-        val x = left + inset + run * travel.value.coerceIn(-.05f, 1.05f)
-        drawRoundRect(thumb.copy(alpha = thumb.alpha * (if (enabled) 1f else .7f)), Offset(x, top + inset), Size(d + extra, d), CornerRadius(d / 2))
+        // Held it widens; in flight it stretches along its travel and thins across it.
+        val speed = if (motion) (abs(travel.velocity) * .9f).coerceAtMost(6f) else 0f
+        val extra = 5.dp.toPx() * stretch.value + speed.dp.toPx()
+        val thin = (speed * .25f).dp.toPx()
+        val x = left + inset + (w - inset * 2 - d - extra) * travel.value.coerceIn(-.05f, 1.05f)
+        val thumb = lerp(thumbOff, thumbOn, at)
+        drawRoundRect(thumb.copy(alpha = thumb.alpha * (if (enabled) 1f else .7f)), Offset(x, top + inset + thin / 2), Size(d + extra, d - thin),
+            CornerRadius((d - thin) / 2))
     })
 }
 

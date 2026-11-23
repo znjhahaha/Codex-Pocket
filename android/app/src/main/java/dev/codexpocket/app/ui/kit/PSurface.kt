@@ -19,14 +19,21 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.isTraversalGroup
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-/** An opaque container: fill, outline and the ink its content inherits. Reading surfaces stay solid. */
+/**
+ * An opaque container: fill, outline and the ink its content inherits. Reading surfaces stay solid,
+ * and a touch on their empty space stops there instead of reaching whatever lies beneath.
+ */
 @Composable
 internal fun PSurface(modifier: Modifier = Modifier, shape: Shape = RectangleShape, color: Color = Pocket.colors.surface,
     ink: Color = Pocket.colors.ink, border: BorderStroke? = null, content: @Composable () -> Unit) {
-    Box(modifier.then(if (border != null) Modifier.border(border, shape) else Modifier).clip(shape).background(color),
+    Box(modifier.then(if (border != null) Modifier.border(border, shape) else Modifier).clip(shape).background(color)
+        .semantics { isTraversalGroup = true }.pointerInput(Unit) { },
         propagateMinConstraints = true) { ProvidePInk(ink, content = content) }
 }
 

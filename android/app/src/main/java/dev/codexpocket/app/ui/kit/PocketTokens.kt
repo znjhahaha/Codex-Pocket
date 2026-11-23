@@ -161,3 +161,9 @@ internal fun ProvidePInk(ink: Color, style: TextStyle? = null, content: @Composa
     if (style == null) CompositionLocalProvider(LocalPInk provides ink, content = content)
     else CompositionLocalProvider(LocalPInk provides ink, LocalPTextStyle provides style, content = content)
 }
+
+/** Text inside takes [style] where it names none of its own, layered over whatever the container already set. */
+@Composable
+internal fun ProvidePTextStyle(style: TextStyle, content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalPTextStyle provides (LocalPTextStyle.current?.merge(style) ?: style), content = content)
+}

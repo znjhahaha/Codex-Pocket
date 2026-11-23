@@ -2,6 +2,7 @@ package dev.codexpocket.app.ui.kit
 
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FiniteAnimationSpec
+import androidx.compose.animation.core.SpringSpec
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -23,6 +24,16 @@ internal object PocketMotion {
     const val EnterOffsetDp = 12
 
     fun <T> press(): FiniteAnimationSpec<T> = spring(dampingRatio = .82f, stiffness = 900f)
+    /** Letting go is slower and looser than pressing in, so the control is seen to come back. */
+    fun <T> release(): FiniteAnimationSpec<T> = PocketSprings.of(response = .34f, damping = .68f)
+    /** A page arriving or leaving: no overshoot, and it carries on from wherever a gesture left it. */
+    fun <T> page(): SpringSpec<T> = PocketSprings.of(response = .44f, damping = 1f)
+    /** A sheet or menu growing out of its source: a trace of overshoot in position and size. */
+    fun <T> morph(): SpringSpec<T> = PocketSprings.of(response = .36f, damping = .84f)
+    /** Something trailing a finger: quick enough to feel attached, damped enough not to wobble. */
+    fun <T> follow(): SpringSpec<T> = PocketSprings.of(response = .24f, damping = .86f)
+    /** Returning after being pulled past a limit. */
+    fun <T> rebound(): SpringSpec<T> = PocketSprings.of(response = .42f, damping = .78f)
     /** Containers changing size: cards expanding, sheets settling. */
     fun <T> resize(): FiniteAnimationSpec<T> = spring(dampingRatio = .88f, stiffness = 380f)
     /** A control changing state in place: capsules, titles, sliding selections. */
@@ -32,6 +43,42 @@ internal object PocketMotion {
     fun <T> enter(): FiniteAnimationSpec<T> = tween(EnterMillis, easing = EaseOut)
     fun <T> exit(): FiniteAnimationSpec<T> = tween(ExitMillis, easing = EaseOut)
     fun <T> color(): FiniteAnimationSpec<T> = tween(ColorMillis, easing = EaseOut)
+}
+
+/**
+ * Springs described the way SwiftUI describes them: [response] is the period of the undamped
+ * oscillation in seconds, damping 1 never overshoots and lower values bounce. Unit mass, so
+ * stiffness is (2π / response)².
+ */
+internal object PocketSprings {
+    fun stiffness(response: Float): Float { val w = (2.0 * Math.PI / response.coerceAtLeast(.01f)).toFloat(); return w * w }
+    fun <T> of(response: Float, damping: Float = 1f, threshold: T? = null): SpringSpec<T> =
+        spring(dampingRatio = damping, stiffness = stiffness(response), visibilityThreshold = threshold)
+    /** Settles without a bounce. Sheets, pages, size changes. */
+    fun <T> smooth(response: Float = .35f): SpringSpec<T> = of(response, 1f)
+    /** A barely visible overshoot. Selections, toggles, menus. */
+    fun <T> snappy(response: Float = .3f): SpringSpec<T> = of(response, .85f)
+    /** A clear bounce. Confirmations and glyphs, never containers of text. */
+    fun <T> bouncy(response: Float = .4f): SpringSpec<T> = of(response, .68f)
+}
+
+/**
+ * The pull of a scroll view past its edge: nearly one to one at first, then harder the further it
+ * goes, approaching [dimension] and never reaching it. The sign of [overshoot] is kept.
+ */
+internal fun rubberBand(overshoot: Float, dimension: Float, coefficient: Float = .55f): Float {
+    if (dimension <= 0f || overshoot == 0f) return 0f
+    val distance = kotlin.math.abs(overshoot)
+    val pulled = (1f - 1f / (distance * coefficient / dimension + 1f)) * dimension
+    return if (overshoot < 0f) -pulled else pulled
+}
+
+/** How far a finger must have travelled to produce [displayed] under [rubberBand]. */
+internal fun rubberBandInverse(displayed: Float, dimension: Float, coefficient: Float = .55f): Float {
+    if (dimension <= 0f || displayed == 0f) return 0f
+    val pulled = kotlin.math.abs(displayed).coerceAtMost(dimension * .999f)
+    val distance = (1f / (1f - pulled / dimension) - 1f) * dimension / coefficient
+    return if (displayed < 0f) -distance else distance
 }
 
 /** System animations on, not saving power, not in high-contrast text. Decoration stops otherwise. */
