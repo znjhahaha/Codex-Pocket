@@ -16,6 +16,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.ui.kit.PIcon
+import dev.codexpocket.app.ui.kit.PLoopGlyph
+import dev.codexpocket.app.ui.kit.ToolGlyphs
 import dev.codexpocket.app.ui.kit.Pocket
 import kotlin.math.PI
 import kotlin.math.cos
@@ -97,10 +99,10 @@ internal fun ActivityMotionIcon(kind: ActivityMotion, running: Boolean, modifier
 
 @Composable
 internal fun NativeActivityIcon(icon: ImageVector, running: Boolean, tint: Color) {
-    val kind=when(icon) {
-        PocketIcons.Terminal -> ActivityMotion.Terminal
-        PocketIcons.BookOpen, PocketIcons.Edit -> ActivityMotion.Document
-        else -> ActivityMotion.Tool
-    }
-    ActivityMotionIcon(kind,running,tint=tint,fallback=icon)
+    // The terminal keeps its own typing-and-scrolling loop. Every other tool moves the way its icon is drawn:
+    // the book turns a leaf, the pencil writes, the glass searches, the globe spins, and each stops on the icon itself.
+    if(icon==PocketIcons.Terminal) { ActivityMotionIcon(ActivityMotion.Terminal,running,tint=tint,fallback=icon); return }
+    val glyph=ToolGlyphs.working(icon)
+    if(glyph==null) ActivityMotionIcon(ActivityMotion.Tool,running,tint=tint,fallback=icon)
+    else PLoopGlyph(glyph,running,Modifier.size(16.dp),tint,millis=ToolGlyphs.period(icon))
 }

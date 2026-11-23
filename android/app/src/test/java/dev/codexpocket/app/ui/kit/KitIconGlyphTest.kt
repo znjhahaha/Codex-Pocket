@@ -113,6 +113,35 @@ class KitIconGlyphTest {
         assertTrue("These do not move: $still", still.isEmpty())
     }
 
+    @Test fun eachToolLoopStartsAndEndsOnItsIconSoItCanRepeatAndStopWithoutASeam() {
+        var t by mutableFloatStateOf(1f)
+        val names = ToolGlyphs.byName.keys.toList()
+        assertTrue("Loops for icons that do not exist: ${names - icons.keys}", icons.keys.containsAll(names))
+        // Every icon a tool line can show has something to do while the tool runs.
+        for (name in listOf("BookOpen", "Edit", "Search", "Folder", "Globe", "Link", "Image", "RobotOutline", "Sparkle", "Wrench", "Checklist"))
+            assertNotNull("$name is still while its tool runs", ToolGlyphs.working(icons.getValue(name)))
+        content {
+            FlowRow(Modifier.padding(6.dp)) {
+                names.forEach { name ->
+                    Column {
+                        PIcon(icons.getValue(name), null, Modifier.size(24.dp).testTag("static:$name"))
+                        MotionIcon(ToolGlyphs.byName.getValue(name), { t }, Modifier.size(24.dp).testTag("glyph:$name"))
+                    }
+                }
+            }
+        }
+        val end = pixels("tool-glyphs-end")
+        compose.runOnIdle { t = 0f }
+        val start = pixels()
+        val frames = listOf(.2f, .42f, .7f).map { step -> compose.runOnIdle { t = step }; pixels("tool-glyphs-${(step * 100).toInt()}") }
+        for (name in names) {
+            val static = region(end, "static:$name")
+            assertTrue("$name ends away from its icon", mismatch(static, region(end, "glyph:$name")) < .06f)
+            assertTrue("$name starts away from its icon", mismatch(static, region(start, "glyph:$name")) < .06f)
+            assertTrue("$name does not move", frames.any { !region(end, "glyph:$name").contentEquals(region(it, "glyph:$name")) })
+        }
+    }
+
     @Test fun everyGlyphDrawsAtAnyProgressWithoutLeavingItsBox() {
         var t by mutableFloatStateOf(0f)
         content { FlowRow { IconGlyphs.byName.values.distinct().forEach { MotionIcon(it, { t }, Modifier.size(24.dp)) } } }

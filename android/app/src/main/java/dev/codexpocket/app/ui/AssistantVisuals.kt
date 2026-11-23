@@ -17,8 +17,9 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import dev.codexpocket.app.ui.kit.PIcon
-import dev.codexpocket.app.ui.kit.Pocket
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.remember
+import dev.codexpocket.app.ui.kit.*
 
 /**
  * The assistant's colours, read from Pocket's shared tokens so they follow the selected appearance.
@@ -47,21 +48,74 @@ fun assistantPalette(): AssistantPalette {
 
 /** Decorative identity only. The surrounding chat row or control supplies its semantics. */
 @Composable
-fun AssistantAvatar(modifier: Modifier = Modifier, size: Dp = 32.dp, tint: Color = Color.Unspecified) {
+fun AssistantAvatar(modifier: Modifier = Modifier, size: Dp = 32.dp, tint: Color = Color.Unspecified, lively: Boolean = false) {
     val palette = assistantPalette()
     Box(modifier.size(size).background(palette.outgoing, RoundedCornerShape(30)), contentAlignment = Alignment.Center) {
-        PIcon(AssistantIcons.Mark, null, Modifier.fillMaxSize(.8f), tint = if (tint != Color.Unspecified) tint else palette.accent)
+        AssistantFace(Modifier.fillMaxSize(.8f), tint = if (tint != Color.Unspecified) tint else palette.accent, lively = lively)
     }
 }
 
-/** Original assistant artwork: a soft pocket face and a matching, compact outline set. */
+/**
+ * The assistant's face, alive: it blinks and glances while [lively], narrows its eyes into a smile
+ * while [held] under a finger, and hops with a few sparks each time [cheer] changes. At rest it is
+ * [AssistantIcons.Mark]. Only the drawing moves; its box and whatever surrounds it stay put.
+ */
+@Composable
+internal fun AssistantFace(modifier: Modifier = Modifier.size(24.dp), tint: Color = Color.Unspecified, lively: Boolean = false,
+    held: Boolean = false, cheer: Any? = null) {
+    val ink = if (tint != Color.Unspecified) tint else Pocket.ink
+    val idle = rememberGlyphLoop(lively, 4600)
+    val hop = rememberGlyphPulse(cheer, 760)
+    val squint = rememberGlyphToggle(held)
+    val pen = remember { GlyphScope() }
+    // The loop hands out a different state when it starts or stops, so the glyph is rebuilt around whichever is current.
+    val glyph = remember(idle, hop, squint) { MotionGlyph { with(AssistantGlyphs) { face(idle.value, hop.value, squint.value) } } }
+    Canvas(modifier) { drawGlyph(pen, glyph, 1f, ink) }
+}
+
+/** The assistant's mark in motion. Every curve is a function of progress, so each pose can be checked on its own. */
+internal object AssistantGlyphs {
+    /** How shut an eye is at [t] for a blink centred on [at]. */
+    private fun shut(t: Float, at: Float, half: Float = .028f): Float = GlyphMotion.smooth(1f - kotlin.math.abs(t - at) / half)
+
+    /**
+     * [idle] runs 0..1 over a few seconds: one blink, a glance to the side, a double blink. [hop] runs 0..1 once
+     * per tap: up and down with sparks. [held] is 0..1 while a finger rests on the face. All at rest: 1, 1, 0.
+     */
+    fun GlyphScope.face(idle: Float, hop: Float, held: Float) {
+        val up = GlyphMotion.pulse(GlyphMotion.window(hop, 0f, .5f))
+        val land = GlyphMotion.pulse(GlyphMotion.window(hop, .5f, .82f))
+        val glad = maxOf(held.coerceIn(0f, 1f), GlyphMotion.window(hop, .04f, .2f) * (1f - GlyphMotion.window(hop, .7f, .92f)))
+        val open = 1f - maxOf(shut(idle, .32f), shut(idle, .84f), shut(idle, .9f))
+        val glance = .8f * (GlyphMotion.window(idle, .5f, .56f) - GlyphMotion.window(idle, .68f, .74f))
+        move(0f, -1.7f * up) { stretch(1f + .05f * land, 1f - .06f * land, 12f, 20.4f) {
+            path(BrandGlyphs.Pocket)
+            if (glad < 1f) for (x in floatArrayOf(9.4f, 14.6f)) {
+                val half = .12f + .9f * open
+                line(x + glance, 10.6f - half, x + glance, 10.6f + half, 1f - glad)
+            }
+            if (glad > 0f) { path("M8.3 11.3q1.1-1.7 2.2 0", glad); path("M13.5 11.3q1.1-1.7 2.2 0", glad) }
+            // One outline, widened and deepened: a path made per frame would never leave the cache.
+            stretch(1f + .22f * glad, 1f + .7f * glad, 12f, 14.3f) { path("M9.6 14.3q2.4 1.9 4.8 0") }
+        } }
+        val spark = GlyphMotion.pulse(GlyphMotion.window(hop, .12f, .8f))
+        if (spark > 0f) {
+            val out = GlyphMotion.easeOut(GlyphMotion.window(hop, .12f, .6f))
+            line(19.4f + .6f * out, 4.6f - .6f * out, 20.2f + 1.3f * out, 3.8f - 1.3f * out, spark)
+            line(20.2f + .7f * out, 7.4f, 21f + 1.6f * out, 7.4f, spark)
+            line(16.6f, 3.8f - .7f * out, 16.6f, 3f - 1.6f * out, spark)
+        }
+    }
+}
+
+/** Original assistant artwork: Pocket's own pocket with a face, and a matching, compact outline set. */
 object AssistantIcons {
     val Mark: ImageVector by lazy {
         icon(
             "Mark",
-            "M7 4.5H17C19.2 4.5 20.5 5.9 20.5 8V11.5C20.5 16.5 17 19.5 12 19.5H8.8L5 21L5.7 17.2C4.2 15.8 3.5 13.8 3.5 11.5V8C3.5 5.9 4.8 4.5 7 4.5Z",
-            "M8.5 9.2V9.85M15.5 9.2V9.85",
-            "M8.5 13.1C10.3 15.3 13.7 15.3 15.5 13.1",
+            "M5 6.5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8c0 1.7-.9 2.9-2.3 3.7l-3.4 1.9a2.6 2.6 0 0 1-2.6 0l-3.4-1.9C5.9 17.4 5 16.2 5 14.5z",
+            "M9.4 9.58V11.62M14.6 9.58V11.62",
+            "M9.6 14.3q2.4 1.9 4.8 0",
         )
     }
     val Tasks: ImageVector by lazy {

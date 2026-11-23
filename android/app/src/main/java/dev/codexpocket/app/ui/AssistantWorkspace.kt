@@ -355,7 +355,7 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
         }
         if (rows.none { it is AssistantTimeline.Message } && snapshot.prepared) item("greeting") {
             Column(Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                AssistantAvatar(size = 44.dp)
+                AssistantAvatar(size = 44.dp, lively = true)
                 PText("想推进哪件事？", Modifier.semantics { heading() }, style = Pocket.type.headline)
                 PText("说清目标，助理会安排任务、汇报进展，把需要你决定的事带回来。", style = Pocket.type.body, color = c.inkMuted)
             }
