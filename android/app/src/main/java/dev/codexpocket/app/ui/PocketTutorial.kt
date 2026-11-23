@@ -29,55 +29,55 @@ internal class TourChapter(val scene: TourScene, val kicker: String, val title: 
 /** The whole tutorial, in the order a new user meets the app. Add a chapter here and it gets a page, a dot and a scene. */
 internal val PocketTourChapters: List<TourChapter> = listOf(
     TourChapter(TourScene.Welcome, "欢迎", "把 Codex 装进口袋",
-        "电脑上的 Codex 继续干活，你在手机上接着聊、看进度、点确认。花一分钟走一遍，之后随时能在设置里重看。", listOf(
-            TourPoint(PocketIcons.Computer, "会话、草稿和历史都留在原处，手机只是另一扇窗"),
+        "电脑上的 Codex 继续干活，你在手机上接着聊、看进度、点确认。之后可在「设置 › 应用设置 › 使用教程」重看。", listOf(
+            TourPoint(PocketIcons.Computer, "会话与历史保存在执行位置，草稿保存在手机"),
             TourPoint(PocketIcons.ShieldCheck, "连接全程加密，配对过的手机才能访问"),
             TourPoint(PocketIcons.Sparkle, "左右滑动翻页，右上角可以跳过"))),
     TourChapter(TourScene.Pair, "第一步", "连接你的电脑",
-        "在电脑上打开 Codex Pocket 助手，选择「配对设备」，用手机扫描屏幕上的二维码。", listOf(
+        "在电脑上打开 Codex Pocket 助手，点「添加设备」，用手机扫描配对二维码。", listOf(
             TourPoint(PocketIcons.QrCodeScanner, "二维码 5 分钟内有效，只在扫码时申请相机权限"),
-            TourPoint(PocketIcons.Link, "扫不了码时，可以粘贴配对内容手动连接"),
-            TourPoint(PocketIcons.Smartphone, "给这台手机起个名字，方便在电脑端认出它"))),
+            TourPoint(PocketIcons.Link, "也可从相册选择二维码，或手动粘贴配对内容"),
+            TourPoint(PocketIcons.Smartphone, "确认电脑名称，再给手机起个名字，方便认出它"))),
     TourChapter(TourScene.Locations, "执行位置", "Codex 在哪里运行，由你选",
-        "项目、对话和用量都跟随当前的执行位置。在首页顶部或「设置 › 电脑连接」里切换。", listOf(
+        "项目、对话和用量都跟随当前的执行位置。在首页顶部的电脑菜单或「设置 › 电脑连接」切换。", listOf(
             TourPoint(PocketIcons.Computer, "电脑：扫码配对的那台电脑"),
-            TourPoint(PocketIcons.Terminal, "Linux · SSH：填好主机和密钥，Pocket 自动装好运行环境"),
-            TourPoint(PocketIcons.Smartphone, "此手机：安装包带本机 Codex 时，直接在手机上运行"))),
+            TourPoint(PocketIcons.Terminal, "Linux · SSH：核对主机指纹，用密码或密钥连接"),
+            TourPoint(PocketIcons.Smartphone, "此手机：需安装包支持，并登录账号或配置模型服务"))),
     TourChapter(TourScene.Home, "首页", "所有会话，一眼看全",
         "底部三个页签：会话、待处理、管理。点一行，会话从那一行展开；返回时收回原处。", listOf(
             TourPoint(PocketIcons.Edit, "右上角新建会话，选好项目和模型就能开聊"),
             TourPoint(PocketIcons.Search, "搜索会话标题，会话按项目归组"),
             TourPoint(PocketIcons.Tune, "底栏和分段控件都可以按住拖动切换"))),
     TourChapter(TourScene.Send, "对话", "像发消息一样指挥 Codex",
-        "在输入框写下要做的事并发送。任务运行中也能继续输入：插话立即生效，或排队等这一轮结束。", listOf(
-            TourPoint(PocketIcons.Add, "「+」添加图片、文件和引用；输入 @ 选文件，/ 用命令"),
-            TourPoint(PocketIcons.Tune, "输入框上方切换模型、思考强度和权限"),
-            TourPoint(PocketIcons.StopCircle, "运行中发送键变成停止，随时可以叫停"))),
+        "写下要做的事并发送。运行中可用「立即引导」补充当前任务，或「加入队列」留到下一轮。", listOf(
+            TourPoint(PocketIcons.Add, "「+」添加图片、文本或引用；@ 选引用，/ 用命令或技能"),
+            TourPoint(PocketIcons.Tune, "点模型名称调整模型与思考强度，点盾牌调整权限"),
+            TourPoint(PocketIcons.StopCircle, "运行中点停止键，可结束当前一轮"))),
     TourChapter(TourScene.Process, "过程", "它做了什么，都看得见",
-        "命令、读写文件、搜索和思考按顺序列出。正在运行的那一步图标会动，做完后收成一行。", listOf(
-            TourPoint(PocketIcons.ChevronRight, "点任意一步展开输出，再点进入完整详情"),
-            TourPoint(PocketIcons.Description, "每一轮的文件改动汇总成卡片，可逐个查看差异"),
+        "命令、读写文件和搜索按步骤列出，当前思考显示在底部状态区。", listOf(
+            TourPoint(PocketIcons.ChevronRight, "点过程行展开或收起输出，更多内容见「打开完整详情」"),
+            TourPoint(PocketIcons.Description, "有文件改动时，回合末的卡片可逐个查看差异"),
             TourPoint(PocketIcons.ArrowDownward, "往上翻历史时，点输入框上方的箭头回到最新"))),
     TourChapter(TourScene.Approve, "确认", "需要你点头的事，不会错过",
-        "Codex 要执行命令、修改文件或向你提问时，会停下来等你。请求出现在会话里，也汇总在「待处理」页签。", listOf(
-            TourPoint(PocketIcons.ShieldCheck, "允许这一次、本次会话都允许，或者拒绝"),
-            TourPoint(PocketIcons.Checklist, "计划模式下先看计划，确认后才动手"),
-            TourPoint(PocketIcons.NotificationsNone, "开启后台通知，离开应用也能收到提醒"))),
+        "需要审批或回答问题时，请求会出现在会话和「待处理」里。是否需要审批，取决于当前会话权限。", listOf(
+            TourPoint(PocketIcons.ShieldCheck, "按请求提供的选项允许或拒绝，有时可选「本会话允许」"),
+            TourPoint(PocketIcons.Checklist, "计划完成后，可选「是，实施此计划」或「提出修改…」"),
+            TourPoint(PocketIcons.NotificationsNone, "开启「后台关注」并允许通知，接收完成和待处理提醒"))),
     TourChapter(TourScene.Edit, "修改", "发出去的消息也能改",
         "点消息下方的铅笔，气泡原地变成输入框。改好后重新发送，这一轮及之后的对话会撤回重来。", listOf(
-            TourPoint(PocketIcons.Edit, "就在气泡里编辑，不会弹出别的窗口"),
+            TourPoint(PocketIcons.Edit, "每轮首条消息可编辑，运行中先停止任务"),
             TourPoint(PocketIcons.Info, "撤回的是对话，已经写入的文件修改不会被撤销"),
-            TourPoint(PocketIcons.ContentCopy, "每条消息和回复下方都有复制按钮"))),
+            TourPoint(PocketIcons.ContentCopy, "消息和已完成的回复下方有复制按钮"))),
     TourChapter(TourScene.Assistant, "口袋助理", "把琐事交给助理",
         "首页右下角的圆形按钮是助理的入口。告诉它目标，它会拆成任务，在原生 Codex 会话里执行，再把成果带回来。", listOf(
-            TourPoint(PocketIcons.Checklist, "任务进度和成果都在助理页，点卡片看详情"),
-            TourPoint(PocketIcons.PendingActions, "计划任务可以定时或重复执行"),
-            TourPoint(PocketIcons.BookOpen, "记忆让它记住你的偏好，随时可以查看和删除"))),
+            TourPoint(PocketIcons.Checklist, "点卡片看任务与成果，保存时可自选位置"),
+            TourPoint(PocketIcons.PendingActions, "计划可定时或重复；按所选时区执行，错过默认跳过"),
+            TourPoint(PocketIcons.BookOpen, "记忆可查看、修改和删除，自动保存的记忆也能撤销"))),
     TourChapter(TourScene.Usage, "用量与设置", "心里有数，随手可调",
         "「管理」页签里看用量和已配对的设备，「设置」里调整外观和通知。", listOf(
-            TourPoint(PocketIcons.Tune, "按时间范围和模型查看用量与额度"),
+            TourPoint(PocketIcons.Tune, "按时间范围和模型查看用量记录"),
             TourPoint(PocketIcons.Moon, "浅色、深色或跟随系统，液态玻璃可以关掉"),
-            TourPoint(PocketIcons.Refresh, "连接不顺时，用「连接诊断」和「重新连接」"))),
+            TourPoint(PocketIcons.Refresh, "离线时先「重新连接」，连上后可用「连接诊断」"))),
 )
 
 /** Opens the tutorial, and remembers that it has been seen. Null where there is nothing to open it with. */
@@ -96,7 +96,7 @@ internal class PocketTutorialController(private val context: Context?, first: Bo
         const val Store = "pocket-tutorial"
         const val Seen = "seen"
         /** Raise this when the tutorial has changed enough to be worth showing to everyone once more. */
-        const val Version = 1
+        const val Version = 2
     }
 }
 

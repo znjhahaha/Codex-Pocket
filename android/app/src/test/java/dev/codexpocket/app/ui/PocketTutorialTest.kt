@@ -10,6 +10,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import dev.codexpocket.app.MainActivity
+import dev.codexpocket.app.R
 import dev.codexpocket.app.ui.kit.*
 import org.junit.Assert.*
 import org.junit.Rule
@@ -55,6 +56,56 @@ class PocketTutorialTest {
         for (topic in listOf("配对", "执行位置", "SSH", "会话", "模型", "权限", "停止", "待处理", "计划", "通知", "铅笔", "助理", "记忆", "用量", "设置"))
             assertTrue("The tutorial says nothing about $topic", topic in all)
         PocketTourChapters.forEach { assertEquals("${it.title}: three points each", 3, it.points.size) }
+    }
+
+    private fun chapterText(scene: TourScene): String = PocketTourChapters.single { it.scene == scene }.let {
+        it.title + " " + it.body + " " + it.points.joinToString(" ") { point -> point.text }
+    }
+
+    // Guard the misleading claims found in the audit. Button labels are navigation contracts;
+    // the remaining wording and chapter detail stay free to be concise.
+    @Test fun welcomeDoesNotDescribePhoneDraftsAsSharedDesktopState() {
+        assertFalse("Phone drafts are not shared desktop drafts", "会话、草稿和历史都留在原处" in chapterText(TourScene.Welcome))
+    }
+
+    @Test fun pairingNamesTheExistingEntryAndKeepsTheFiveMinuteLifetime() {
+        val text = chapterText(TourScene.Pair)
+        assertTrue("Name the existing desktop entry", "添加设备" in text)
+        assertTrue("Pairing codes expire after five minutes", "5 分钟" in text)
+    }
+
+    @Test fun sendingNamesRunningActionsWithoutReplacingQueueWithStop() {
+        val text = chapterText(TourScene.Send)
+        assertTrue("Name the current-turn action", compose.activity.getString(R.string.v02_steer) in text)
+        assertTrue("Name the next-turn action", compose.activity.getString(R.string.v02_queue) in text)
+        assertFalse("Running turns keep a queue action alongside stop", "发送键变成停止" in text)
+    }
+
+    @Test fun approvalCopyDoesNotPromiseEveryOperationAndEveryDecision() {
+        val text = chapterText(TourScene.Approve)
+        assertFalse("Command and file operations do not always prompt", "要执行命令、修改文件或向你提问时，会停下来等你" in text)
+        assertFalse("Session approval is only present when offered by the request", "允许这一次、本次会话都允许，或者拒绝" in text)
+    }
+
+    @Test fun usageDoesNotPresentRecordedUsageAsRemainingQuota() {
+        assertFalse("Observed usage is not the account's remaining quota", "查看用量与额度" in chapterText(TourScene.Usage))
+    }
+
+    @Test fun versionTwoIsShownAfterVersionOneAndCompletionIsRemembered() {
+        assertEquals("The corrected behavior guidance must be shown again", 2, PocketTutorialController.Version)
+        val context: Context = compose.activity.applicationContext
+        val store = context.getSharedPreferences(PocketTutorialController.Store, Context.MODE_PRIVATE)
+        store.edit().putInt(PocketTutorialController.Seen, 1).commit()
+        fun controller() = PocketTutorialController(context,
+            first = store.getInt(PocketTutorialController.Seen, 0) < PocketTutorialController.Version)
+        val updated = controller()
+        assertTrue("Version 1 readers should see the revised tutorial", updated.open)
+        updated.finish()
+        assertEquals(2, store.getInt(PocketTutorialController.Seen, 0))
+        val nextVisit = controller()
+        assertFalse("Completing Version 2 should suppress automatic reopening", nextVisit.open)
+        nextVisit.show()
+        assertTrue("The revised tutorial can still be opened from settings", nextVisit.open)
     }
 
     @Test fun tappingNextWalksEveryChapterAndTheLastOneStarts() {
