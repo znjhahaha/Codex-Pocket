@@ -78,6 +78,7 @@ internal fun PocketBackdrop(content: @Composable () -> Unit) {
 private fun PocketContent(s: PocketState, repo: PocketRepository) {
     val context = LocalContext.current
     val chooseLocation = LocalExecutionLocationPicker.current
+    val locationKind = LocalExecutionLocation.current?.kind
     var home by rememberSaveable { mutableStateOf(true) }
     var runtimeFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var tab by rememberSaveable { mutableStateOf(HomeTab.Chats) }
@@ -208,7 +209,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 Column {
                 s.error?.let { Notice(it, error = true, action = stringResource(R.string.dismiss), onAction = repo::clearError) }
                 AssistantScreen(s.assistant, s.assistantModels,
-                    s.runtimes.filter { it.role != "managedHost" || it.id == assistantRuntime }.map { AssistantRuntimeChoice(it.id, "${if (it.role == "managedHost") "助理 CLI" else it.source} · ${it.version}", it.online && s.online) },
+                    s.runtimes.filter { it.role != "managedHost" || it.id == assistantRuntime }.map { AssistantRuntimeChoice(it.id, "${context.runtimeLabel(it, locationKind)} · ${runtimeVersionLabel(it.version)}", it.online && s.online) },
                     s.assistantWorkspaces(), repo::assistantAction,
                     onOpenThread = { runtime, thread -> assistantScope.launch {
                         repo.openAssistantThread(runtime, thread).join()
@@ -350,13 +351,13 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
             }, repo::chooseMode, { repo.refreshModels() }, onEffort = repo::chooseModel, onFast = { repo.setFastMode(it) })
         }
     }
-    if (hostSheet) PocketScreen(s.computerName, { hostSheet = false }, "此电脑上的 Codex") {
+    if (hostSheet) PocketScreen(s.computerName, { hostSheet = false }, runtimeLocationSubtitle(locationKind)) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             chooseLocation?.let { choose -> PocketButton("切换执行位置", { hostSheet = false; choose() }, Modifier.fillMaxWidth().testTag("execution-location-picker"), secondary = true) }
             s.runtimes.forEach { runtime ->
                 Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable { runtimeFilter = runtime.id; hostSheet = false; home = true; tab = HomeTab.Chats }, verticalAlignment = Alignment.CenterVertically) {
-                    PIcon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer, null)
-                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) { PText(context.sourceLabel(runtime.source)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall) }
+                    PIcon(runtimeIcon(runtime, locationKind), null)
+                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) { PText(context.runtimeLabel(runtime, locationKind)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall) }
                     Box(Modifier.size(7.dp).background(if (runtime.online) Pocket.colors.accent else Pocket.colors.inkFaint, CircleShape))
                 }
             }

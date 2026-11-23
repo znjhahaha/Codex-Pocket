@@ -2,10 +2,41 @@ package dev.codexpocket.app.ui
 
 import android.content.Context
 import dev.codexpocket.app.R
+import dev.codexpocket.app.data.RuntimeInfo
+import dev.codexpocket.wire.ExecutionTargetKind
 import java.util.Locale
 
-internal fun runtimeVersionLabel(value: String): String =
-    Regex("[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?").find(value)?.value ?: value.take(48)
+internal fun runtimeVersionLabel(value: String): String {
+    val version = value.trim()
+    if (version.isEmpty() || version.equals("unknown", ignoreCase = true)) return "原生版本未报告"
+    return Regex("[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?").find(version)?.value ?: version.take(48)
+}
+
+/** A CLI transport does not identify an assistant. Routing continues to use the native role. */
+internal fun Context.runtimeLabel(runtime: RuntimeInfo, location: ExecutionTargetKind?): String = when {
+    runtime.role == "managedHost" -> when (location) {
+        ExecutionTargetKind.Computer -> "电脑助理"
+        ExecutionTargetKind.LinuxSsh -> "SSH 助理"
+        ExecutionTargetKind.ThisPhone -> "此手机助理"
+        null -> "Pocket 助理"
+    }
+    // The packaged Android host serves ordinary sessions and is explicitly advertised as cliDaemon.
+    location == ExecutionTargetKind.ThisPhone && runtime.role == "cliDaemon" -> "此手机 Codex"
+    else -> sourceLabel(runtime.source)
+}
+
+internal fun runtimeIcon(runtime: RuntimeInfo, location: ExecutionTargetKind?) = when {
+    runtime.role == "managedHost" -> AssistantIcons.Mark
+    location == ExecutionTargetKind.ThisPhone && runtime.role == "cliDaemon" -> PocketIcons.PhoneAndroid
+    runtime.source == "cli" -> PocketIcons.Terminal
+    else -> PocketIcons.Computer
+}
+
+internal fun runtimeLocationSubtitle(location: ExecutionTargetKind?): String = when (location) {
+    ExecutionTargetKind.ThisPhone -> "此手机上的 Codex"
+    ExecutionTargetKind.LinuxSsh -> "此 SSH 主机上的 Codex"
+    ExecutionTargetKind.Computer, null -> "此电脑上的 Codex"
+}
 
 internal fun Context.sourceLabel(value: String) = when (value.lowercase(Locale.ROOT)) {
     "desktop" -> getString(R.string.source_desktop)

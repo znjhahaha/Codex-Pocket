@@ -2,6 +2,7 @@
 package dev.codexpocket.app.ui
 
 import dev.codexpocket.app.ui.kit.*
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
@@ -15,6 +16,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
@@ -23,11 +25,14 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
+import dev.codexpocket.wire.ExecutionTargetKind
 
 @Composable
 internal fun ExtensionManagementPanel(s: PocketState, onRuntime: (String) -> Unit,
     onToggle: (String, Boolean) -> Unit, onRefresh: () -> Unit,
     modifier: Modifier = Modifier, contentPadding: PaddingValues = PaddingValues(0.dp)) {
+    val context = LocalContext.current
+    val locationKind = LocalExecutionLocation.current?.kind
     var runtimeChoice by rememberSaveable(s.computerId) { mutableStateOf<String?>(null) }
     val runtime = s.runtimes.firstOrNull { it.id == runtimeChoice } ?: s.activeRuntime ?: s.runtimes.firstOrNull()
     var runtimeMenu by remember { mutableStateOf(false) }
@@ -58,7 +63,7 @@ internal fun ExtensionManagementPanel(s: PocketState, onRuntime: (String) -> Uni
                 color = Pocket.colors.fill, shape = RoundedCornerShape(16.dp)) {
                 Row(Modifier.heightIn(min = 48.dp).padding(12.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PText(runtime?.let { extensionRuntimeLabel(it, s.runtimes) } ?: "尚未发现运行时", Modifier.weight(1f),
+                    PText(runtime?.let { context.extensionRuntimeLabel(it, s.runtimes, locationKind) } ?: "尚未发现运行时", Modifier.weight(1f),
                         style = Pocket.type.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     PText(if (s.online && runtime?.online == true) "已连接" else "离线", style = Pocket.type.caption)
                     PIcon(PocketIcons.ExpandMore, "选择运行时", Modifier.size(16.dp))
@@ -67,7 +72,7 @@ internal fun ExtensionManagementPanel(s: PocketState, onRuntime: (String) -> Uni
             if (runtimeMenu) PMenu("选择运行时", { runtimeMenu = false }, runtimeAnchor, alignStart = true) {
                 s.runtimes.forEach { candidate ->
                     key(candidate.id) {
-                        PRow(extensionRuntimeLabel(candidate, s.runtimes), { runtimeChoice = candidate.id; runtimeMenu = false },
+                        PRow(context.extensionRuntimeLabel(candidate, s.runtimes, locationKind), { runtimeChoice = candidate.id; runtimeMenu = false },
                             Modifier.testTag("extension-runtime:" + candidate.id))
                     }
                 }
@@ -160,9 +165,8 @@ private fun ExtensionRow(entry: ManagedExtension, expanded: Boolean, pending: Bo
     }
 }
 
-private fun extensionRuntimeLabel(runtime: RuntimeInfo, runtimes: List<RuntimeInfo>): String {
-    fun base(value: RuntimeInfo) = (when (value.source) { "cli" -> "CLI"; "desktop" -> "桌面端"; else -> value.source.ifBlank { "运行时" } }) +
-        " · " + runtimeVersionLabel(value.version).ifBlank { "版本未知" }
+private fun Context.extensionRuntimeLabel(runtime: RuntimeInfo, runtimes: List<RuntimeInfo>, location: ExecutionTargetKind?): String {
+    fun base(value: RuntimeInfo) = runtimeLabel(value, location).ifBlank { "运行时" } + " · " + runtimeVersionLabel(value.version)
     val label = base(runtime)
     val same = runtimes.filter { base(it) == label }
     return if (same.size > 1) label + " · 实例 " + (same.indexOfFirst { it.id == runtime.id } + 1) else label

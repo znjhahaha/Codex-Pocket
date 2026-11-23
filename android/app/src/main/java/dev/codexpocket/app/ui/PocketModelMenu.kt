@@ -38,6 +38,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.wire.ExecutionTargetKind
 
 /** Root coordinates, already reduced by system/IME insets. Never overlaps the input capsule. */
 internal fun modelMenuBounds(viewport: Rect, anchor: Rect?, density: Float, widthDp: Float = 300f, alignStart: Boolean = false, below: Boolean = false): Rect {
@@ -288,6 +289,7 @@ private fun effortEnabled(s: PocketState) = s.paired && s.online && s.activeRunt
 @Composable
 private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit, onRetry: () -> Unit, selected: NativeModel?, onFast: ((Boolean) -> Unit)?) {
     val c = Pocket.colors
+    val locationKind = LocalExecutionLocation.current?.kind
     // A single model-first page: no second confirmation or effort-first drill-down.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(14.dp))
         .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -304,8 +306,16 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
             ModelCatalogState.Loading -> "正在读取模型目录"
             ModelCatalogState.Empty, ModelCatalogState.Ready -> "当前运行时未返回可用模型"
             ModelCatalogState.Unsupported -> "当前运行时不支持模型目录"
-            ModelCatalogState.Offline -> "电脑离线，连接后可重新读取模型"
-            ModelCatalogState.RuntimeUnavailable -> "电脑已连接，此会话暂无实时运行时"
+            ModelCatalogState.Offline -> when (locationKind) {
+                ExecutionTargetKind.ThisPhone -> "此手机的 Codex 未连接，连接后可重新读取模型"
+                ExecutionTargetKind.LinuxSsh -> "SSH 主机离线，连接后可重新读取模型"
+                ExecutionTargetKind.Computer, null -> "电脑离线，连接后可重新读取模型"
+            }
+            ModelCatalogState.RuntimeUnavailable -> when (locationKind) {
+                ExecutionTargetKind.ThisPhone -> "已连接此手机的 Codex，此会话暂无实时运行时"
+                ExecutionTargetKind.LinuxSsh -> "SSH 主机已连接，此会话暂无实时运行时"
+                ExecutionTargetKind.Computer, null -> "电脑已连接，此会话暂无实时运行时"
+            }
             ModelCatalogState.Failed -> "模型目录读取失败"
         }
         Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {

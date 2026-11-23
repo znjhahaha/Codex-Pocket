@@ -46,6 +46,7 @@ internal fun ProjectCreationForm(
     onCreate: (SessionMode, String, String?, Boolean) -> Unit,
 ) {
     val context = LocalContext.current
+    val locationKind = LocalExecutionLocation.current?.kind
     val focus = LocalFocusManager.current
     val c = Pocket.colors
     val preferences = remember(context) { context.getSharedPreferences("settings", Context.MODE_PRIVATE) }
@@ -197,7 +198,7 @@ internal fun ProjectCreationForm(
                                     else -> "创建时准备桌面运行环境"
                                 }, Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = Pocket.type.bodySmall, color = c.inkMuted)
                                 else if (available.size > 1) available.forEach { runtime ->
-                                    PRow("${context.sourceLabel(runtime.source)} · ${runtimeVersionLabel(runtime.version)}", { runtimeId = runtime.id },
+                                    PRow("${context.runtimeLabel(runtime, locationKind)} · ${runtimeVersionLabel(runtime.version)}", { runtimeId = runtime.id },
                                         enabled = !creating, selected = runtimeId == runtime.id, accentSelection = true)
                                 }
                             }

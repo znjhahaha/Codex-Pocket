@@ -39,6 +39,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.R
+import dev.codexpocket.wire.ExecutionTargetKind
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -51,6 +52,7 @@ import com.kyant.backdrop.backdrops.layerBackdrop
 @Composable
 internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> Unit, onDetail: (TimelineItem) -> Unit, onReferences: () -> Unit, onReadingHistory: (Boolean) -> Unit = {}, onAgent: (String) -> Unit = {}, onComposerAction: (ComposerAction) -> Unit = {}, header: @Composable () -> Unit = {}) {
     val context = LocalContext.current
+    val locationKind = LocalExecutionLocation.current?.kind
     val chat = s.selected ?: return
     ObserveThreadHandoff(s, repo)
     DisposableEffect(repo, chat.key) {
@@ -296,7 +298,11 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 }
                 if (read.empty && live == null && !showSending) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
                     Column(Modifier.widthIn(max = 420.dp).padding(30.dp)) {
-                        EmptyState(stringResource(R.string.what_working), stringResource(R.string.continue_chat))
+                        EmptyState(stringResource(R.string.what_working), when (locationKind) {
+                            ExecutionTargetKind.ThisPhone -> "在此手机上开始或继续对话。"
+                            ExecutionTargetKind.LinuxSsh -> "在手机上继续 SSH 主机里的对话。"
+                            ExecutionTargetKind.Computer, null -> stringResource(R.string.continue_chat)
+                        })
                     }
                 }
                 if (minimapShown) ConversationMinimap(rows, keys, list,

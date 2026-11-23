@@ -51,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
 import dev.codexpocket.app.data.*
+import dev.codexpocket.wire.ExecutionTargetKind
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collect
@@ -221,12 +222,22 @@ private fun LazyItemScope.homeItemMotion(motion: Boolean): Modifier =
 
 @Composable
 private fun HomeSyncState(s: PocketState, onRetry: () -> Unit) {
+    val locationKind = LocalExecutionLocation.current?.kind
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp).testTag("home-sync-state"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (s.restoringConnection || (s.online && s.directoryLoading && s.directoryError == null)) PocketLoader()
         else PIcon(if (s.directoryError != null) PocketIcons.ErrorOutline else PocketIcons.Computer, null, Modifier.size(18.dp),
             tint = if (s.directoryError != null) Pocket.colors.danger else Pocket.colors.inkMuted)
-        PText(when { s.restoringConnection -> "正在恢复连接 · 已保留本机记录"; s.directoryError != null -> s.directoryError; !s.online -> stringResource(R.string.v03_home_cached); else -> "正在读取会话列表…" },
+        PText(when {
+            s.restoringConnection -> "正在恢复连接 · 已保留本机记录"
+            s.directoryError != null -> s.directoryError
+            !s.online -> when (locationKind) {
+                ExecutionTargetKind.ThisPhone -> "此手机的 Codex 未连接，显示已缓存的会话"
+                ExecutionTargetKind.LinuxSsh -> "SSH 主机离线，显示已缓存的会话"
+                ExecutionTargetKind.Computer, null -> stringResource(R.string.v03_home_cached)
+            }
+            else -> "正在读取会话列表…"
+        },
             Modifier.weight(1f), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
         if (s.online && s.directoryError != null) PocketTextButton(onRetry, enabled = !s.directoryRefreshing) { PText(stringResource(R.string.v03_home_retry)) }
     }
@@ -547,6 +558,7 @@ internal fun EmptyState(title: String, detail: String) {
 @Composable
 internal fun DeviceOverview(s: PocketState, onInspect: () -> Unit, onSettings: () -> Unit, onReconnect: () -> Unit, onPair: (() -> Unit)? = null) {
     val context = LocalContext.current
+    val locationKind = LocalExecutionLocation.current?.kind
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(LocalHomeContentPadding.current).padding(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             PIcon(PocketIcons.Computer, null, Modifier.size(32.dp))
@@ -558,7 +570,7 @@ internal fun DeviceOverview(s: PocketState, onInspect: () -> Unit, onSettings: (
         s.runtimes.forEach { runtime ->
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Box(Modifier.size(7.dp).background(if (runtime.online) Pocket.colors.accent else Pocket.colors.inkFaint, CircleShape))
-                Column(Modifier.weight(1f)) { PText(context.sourceLabel(runtime.source)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted) }
+                Column(Modifier.weight(1f)) { PText(context.runtimeLabel(runtime, locationKind)); PText(runtimeVersionLabel(runtime.version), style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted) }
                 PText(context.stateLabel(if (runtime.online) "online" else "offline"), style = Pocket.type.labelSmall)
             }
         }

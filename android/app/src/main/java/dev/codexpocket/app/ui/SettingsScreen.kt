@@ -155,6 +155,7 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
     onUsageFilter: ((UsageFilter) -> Unit)? = null) {
     val context = LocalContext.current
     val chooseLocation = LocalExecutionLocationPicker.current
+    val locationKind = LocalExecutionLocation.current?.kind
     var forget by rememberSaveable { mutableStateOf(false) }
     var clear by rememberSaveable { mutableStateOf(false) }
     var revoke by remember { mutableStateOf<String?>(null) }
@@ -222,9 +223,9 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                         s.runtimes.forEachIndexed { index, runtime ->
                             Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                SettingsCircleIcon(if (runtime.source == "cli") PocketIcons.Terminal else PocketIcons.Computer)
+                                SettingsCircleIcon(runtimeIcon(runtime, locationKind))
                                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    PText(context.sourceLabel(runtime.source) + " · ${index + 1}", style = Pocket.type.body)
+                                    PText(context.runtimeLabel(runtime, locationKind) + " · ${index + 1}", style = Pocket.type.body)
                                     PText(runtimeVersionLabel(runtime.version), style = Pocket.type.caption,
                                         color = Pocket.colors.inkMuted)
                                 }
