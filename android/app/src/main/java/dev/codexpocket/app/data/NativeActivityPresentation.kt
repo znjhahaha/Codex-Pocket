@@ -33,6 +33,9 @@ data class PresentedActivity(
 data class ActivitySummary(val commands: Int = 0, val files: Int = 0, val tools: Int = 0, val agents: Int = 0, val commentary: Int = 0, val reasoning: Int = 0, val failed: Int = 0,
     val web: Int = 0, val images: Int = 0, val reads: Int = 0, val searches: Int = 0, val lists: Int = 0, val skills: Int = 0)
 
+internal enum class CodexAppActivityIcon { Chat, Folder, Attachment, Terminal, Edit, Archive, Pin, Delete, Refresh, Settings, Wait }
+internal data class CodexAppActivityLabel(val text: String, val icon: CodexAppActivityIcon)
+
 /** Presentation only: native identities are retained; arbitrary arguments and JSON are never UI text. */
 object NativeActivityPresentation {
     /** Legacy preview budget retained for API compatibility; projection no longer truncates text. */
@@ -206,6 +209,65 @@ object NativeActivityPresentation {
         return result.copy(files = nativeFiles.values.sum() + latestDiff.entries.sumOf { (turn, diff) ->
             if (turn in nativeFiles) 0 else activityFiles(diff).size
         })
+    }
+
+    /** Only an identified native Codex app call gets an action label; app display metadata is not identity. */
+    internal fun codexAppLabel(item: TimelineItem, state: ActivityStatus): CodexAppActivityLabel? {
+        if (item.type !in setOf("mcpToolCall", "dynamicToolCall", "functionCallOutput")) return null
+        val raw = item.raw
+        val namespace = raw.string("server").ifBlank { raw.string("namespace") }
+        val tool = raw.string("tool").ifBlank { raw.string("name") }
+        val name = when {
+            namespace == "codex_app" -> tool.removePrefix("codex_app.").removePrefix("mcp__codex_app__")
+            namespace.isBlank() || namespace == "functions" -> when {
+                tool.startsWith("codex_app.") -> tool.removePrefix("codex_app.")
+                tool.startsWith("mcp__codex_app__") -> tool.removePrefix("mcp__codex_app__")
+                else -> return null
+            }
+            else -> return null
+        }
+        // Read only the direction of known toggles. Paths, prompts, IDs and other arguments never become labels.
+        fun option(key: String): Boolean? = (raw.obj("arguments")[key] as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+        val (action, icon) = when (name) {
+            "list_threads" -> "列出聊天" to CodexAppActivityIcon.Chat
+            "list_archived_threads" -> "列出已归档聊天" to CodexAppActivityIcon.Archive
+            "read_thread" -> "读取聊天" to CodexAppActivityIcon.Chat
+            "list_projects" -> "列出项目" to CodexAppActivityIcon.Folder
+            "list_attachments" -> "列出附件" to CodexAppActivityIcon.Attachment
+            "read_thread_terminal" -> "读取终端" to CodexAppActivityIcon.Terminal
+            "set_thread_title" -> "重命名聊天" to CodexAppActivityIcon.Edit
+            "set_thread_archived" -> when (option("archived")) {
+                true -> "归档聊天"; false -> "恢复聊天"; null -> "更新聊天归档状态"
+            } to CodexAppActivityIcon.Archive
+            "set_thread_pinned" -> when (option("pinned")) {
+                true -> "置顶聊天"; false -> "取消置顶聊天"; null -> "更新聊天置顶状态"
+            } to CodexAppActivityIcon.Pin
+            "set_thread_read_state" -> when (option("read")) {
+                true -> "将聊天标为已读"; false -> "将聊天标为未读"; null -> "更新聊天阅读状态"
+            } to CodexAppActivityIcon.Chat
+            "navigate_to_codex_page" -> "打开聊天" to CodexAppActivityIcon.Chat
+            "delete_thread" -> "删除聊天" to CodexAppActivityIcon.Delete
+            "move_thread_to_project" -> "调整聊天所属项目" to CodexAppActivityIcon.Folder
+            "create_attachment" -> "添加附件" to CodexAppActivityIcon.Attachment
+            "remove_attachment" -> "移除附件" to CodexAppActivityIcon.Attachment
+            "check_app_update" -> "检查应用更新" to CodexAppActivityIcon.Refresh
+            // A wait can return on a timeout; completion describes the progress check, not the watched work.
+            "wait_threads" -> "检查聊天进度" to CodexAppActivityIcon.Wait
+            "update_sidebar_preferences" -> "调整侧栏设置" to CodexAppActivityIcon.Settings
+            else -> return null
+        }
+        val label = when (state) {
+            ActivityStatus.Running -> "正在$action"
+            ActivityStatus.Completed -> "已$action"
+            ActivityStatus.Failed -> "${action}失败"
+            ActivityStatus.Waiting -> "等待$action"
+            ActivityStatus.Interrupted -> {
+                val cancelled = item.status.ifBlank { raw.string("status") }.lowercase(Locale.ROOT) in setOf("cancelled", "canceled")
+                "$action · ${if (cancelled) "已取消" else "已中断"}"
+            }
+            ActivityStatus.Unknown -> action
+        }
+        return CodexAppActivityLabel(label, icon)
     }
 
     fun commandSteps(raw: JsonObject): List<CommandStep> = raw.array("commandActions").mapNotNull { element ->

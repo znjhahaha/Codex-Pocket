@@ -294,7 +294,10 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             }
             return@Column
         }
-        val (verb, subject) = traceSentence(item, value, state)
+        val appAction = remember(item, state, value?.kind) {
+            if (value?.kind == ActivityKind.Tool) NativeActivityPresentation.codexAppLabel(item, state) else null
+        }
+        val (verb, subject) = appAction?.let { it.text to "" } ?: traceSentence(item, value, state)
         // A finished thought with no recorded text has nothing to open; Codex shows it as a plain label.
         val empty = value?.kind == ActivityKind.Reasoning && value.output.text.isBlank() && !running
         val image = value?.kind == ActivityKind.Image
@@ -302,17 +305,18 @@ private fun NativeToolRow(item: TimelineItem, scope: String, completedTurn: Bool
             modifier = Modifier.testTag("activity-toggle:${item.key}").semantics { stateDescription = "$status · $expansionState" }) {
             // The robot glyph remains recognisable even while its native call is running.
             if (value?.kind == ActivityKind.Agents) TraceGlyph(PocketIcons.RobotOutline)
-            else StatusGlyph(running, kindIcon(value?.kind, value?.webAction))
+            else StatusGlyph(running, appAction?.icon?.let(::codexAppIcon) ?: kindIcon(value?.kind, value?.webAction))
             ActivityTextFlow(running,item.liveStarted,Modifier.weight(1f,fill=false)) {
             PText(verb, Modifier.then(if (subject.isBlank()) Modifier.weight(1f, fill = false) else Modifier),
-                style = Pocket.type.body, fontSize = 14.sp, color = toneText(), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                style = Pocket.type.body, fontSize = 14.sp, color = if (appAction != null && state == ActivityStatus.Failed) c.danger else toneText(),
+                maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
             if (subject.isNotBlank()) PText(subject, Modifier.weight(1f, fill = false), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
                 style = Pocket.type.body.copy(fontSize = 14.sp),
                 color = toneSubject())
             }
-            if (state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) PText(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
+            if (appAction == null && state == ActivityStatus.Failed && value?.kind != ActivityKind.Agents) PText(value?.command?.exitCode?.let { stringResource(R.string.v03_exit_code, it) } ?: status,
                 maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = c.danger)
-            else if (state == ActivityStatus.Interrupted) PText(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = toneText())
+            else if (appAction == null && state == ActivityStatus.Interrupted) PText(status, maxLines = 1, softWrap = false, fontSize = 14.sp, style = Pocket.type.caption, color = toneText())
             if (!empty && (value?.kind != ActivityKind.Agents || expanded)) ActivityExpansionIcon(expanded)
         }
         // Image activities have one disclosure owner; a collapsed preview would keep
@@ -368,6 +372,20 @@ internal fun kindIcon(kind: ActivityKind?, web: WebAction? = null) = when (kind)
     ActivityKind.Reasoning -> PocketIcons.Sparkle
     ActivityKind.Image -> PocketIcons.Image
     else -> PocketIcons.Wrench
+}
+
+internal fun codexAppIcon(icon: CodexAppActivityIcon) = when (icon) {
+    CodexAppActivityIcon.Chat -> PocketIcons.ChatBubbleOutline
+    CodexAppActivityIcon.Folder -> PocketIcons.Folder
+    CodexAppActivityIcon.Attachment -> PocketIcons.Link
+    CodexAppActivityIcon.Terminal -> PocketIcons.Terminal
+    CodexAppActivityIcon.Edit -> PocketIcons.Edit
+    CodexAppActivityIcon.Archive -> PocketIcons.Inventory2
+    CodexAppActivityIcon.Pin -> PocketIcons.PushPin
+    CodexAppActivityIcon.Delete -> PocketIcons.DeleteOutline
+    CodexAppActivityIcon.Refresh -> PocketIcons.Refresh
+    CodexAppActivityIcon.Settings -> PocketIcons.Settings
+    CodexAppActivityIcon.Wait -> PocketIcons.PendingActions
 }
 
 /** Codex names a skill by its folder; short ones read as acronyms ("pdf" → "PDF"). */
