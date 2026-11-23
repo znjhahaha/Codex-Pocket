@@ -80,19 +80,24 @@ internal fun PocketSegmented(options: List<String>, selected: Int, onSelect: (In
     val c = Pocket.colors
     val density = LocalDensity.current
     var widths by remember(options) { mutableStateOf(List(options.size) { 0 }) }
-    val target = with(density) { widths.take(selected).sum().toDp() }
-    val width = with(density) { (widths.getOrNull(selected) ?: 0).toDp() }
-    val motion = if (pocketMotionMillis(1) == 0) androidx.compose.animation.core.snap() else spring<androidx.compose.ui.unit.Dp>(dampingRatio = .78f, stiffness = 520f)
-    val offset by animateDpAsState(target, motion, label = "segment-x")
-    val thumb by animateDpAsState(width, motion, label = "segment-w")
+    val slide = rememberPSlide(options.size, selected, onSelect = onSelect)
+    // Items are as wide as their labels: an edge part-way through an item is that far across its width.
+    fun edge(at: Float): Float {
+        val index = at.toInt().coerceIn(0, (options.size - 1).coerceAtLeast(0))
+        return widths.take(index).sum() + (at - index).coerceIn(0f, 1f) * (widths.getOrNull(index) ?: 0)
+    }
+    val left = edge(slide.start.value.coerceIn(0f, options.size.toFloat()))
+    val right = edge(slide.end.value.coerceIn(0f, options.size.toFloat())).coerceAtLeast(left)
     Box(modifier.clip(PocketCapsule).background(c.fillStrong).padding(3.dp)) {
-        if (widths.any { it > 0 }) Box(Modifier.offset(x = offset).width(thumb).height(34.dp).shadow(1.dp, PocketCapsule).clip(PocketCapsule).background(c.surface))
-        Row {
+        if (widths.any { it > 0 }) Box(Modifier.offset { androidx.compose.ui.unit.IntOffset(left.toInt(), 0) }.width(with(density) { (right - left).toDp() }).height(34.dp)
+            .graphicsLayer { val held = 1f - .05f * slide.lift.value; scaleX = held; scaleY = held }
+            .shadow(1.dp, PocketCapsule).clip(PocketCapsule).background(c.surface))
+        Row(Modifier.pocketSlide(slide)) {
             options.forEachIndexed { index, label ->
-                val active = index == selected
+                val active = index == slide.shown
                 val color by animateColorAsState(if (active) c.ink else c.inkMuted, tween(pocketMotionMillis(140)), label = "segment-text")
                 Box(Modifier.height(34.dp).onSizeChanged { size -> if (widths.getOrNull(index) != size.width) widths = widths.toMutableList().also { it[index] = size.width } }
-                    .clip(PocketCapsule).clickable(role = Role.Tab) { onSelect(index) }.semantics { this.selected = active }
+                    .clip(PocketCapsule).clickable(role = Role.Tab) { onSelect(index) }.semantics { this.selected = index == selected }
                     .padding(horizontal = 16.dp), contentAlignment = Alignment.Center) {
                     PocketTabLabel(label, active, style = Pocket.type.label, color = color)
                 }

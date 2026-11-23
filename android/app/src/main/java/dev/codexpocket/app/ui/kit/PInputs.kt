@@ -184,33 +184,29 @@ internal fun PCheck(checked: Boolean, onCheckedChange: ((Boolean) -> Unit)?, mod
 
 /**
  * A few mutually exclusive views. The selection is one pill that slides between items; its leading
- * edge moves first and the trailing edge follows, so it stretches in the direction of travel.
+ * edge moves first and the trailing edge follows, so it stretches in the direction of travel. The
+ * pill can also be dragged: it follows the finger, presses in while held, flattens against either
+ * end, and selects the item it is let go over.
  */
 @Composable
 internal fun PSegmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
     val c = Pocket.colors
     val motion = rememberPocketMotion()
-    val last = remember { intArrayOf(selected) }
-    val forward = selected >= last[0]
-    last[0] = selected
-    val quick = spring<Float>(dampingRatio = .85f, stiffness = 640f).orSnap(motion)
-    val slow = spring<Float>(dampingRatio = .85f, stiffness = 300f).orSnap(motion)
-    val start = animateFloatAsState(selected.toFloat(), if (forward) slow else quick, label = "segment-start")
-    val end = animateFloatAsState(selected + 1f, if (forward) quick else slow, label = "segment-end")
+    val slide = rememberPSlide(options.size, selected, enabled, onSelect = onSelect)
     val thumb = c.surface
-    Row(modifier.fillMaxWidth().clip(PocketRadii.capsule).background(c.fill).padding(4.dp).drawBehind {
+    Row(modifier.fillMaxWidth().clip(PocketRadii.capsule).background(c.fill).padding(4.dp).pocketSlide(slide).drawBehind {
         if (options.isEmpty()) return@drawBehind
         val item = size.width / options.size
-        val left = (start.value * item).coerceIn(0f, size.width)
-        val right = (end.value * item).coerceIn(left, size.width)
-        drawRoundRect(thumb, Offset(left, 0f), Size(right - left, size.height), CornerRadius(size.height / 2))
+        val held = 1.5.dp.toPx() * slide.lift.value
+        val left = (slide.start.value * item).coerceIn(0f, size.width)
+        val right = (slide.end.value * item).coerceIn(left, size.width)
+        drawRoundRect(thumb, Offset(left + held, held), Size((right - left - held * 2).coerceAtLeast(0f), size.height - held * 2), CornerRadius(size.height / 2))
     }.selectableGroup()) {
         options.forEachIndexed { index, label ->
-            val active = index == selected
-            val ink by animateColorAsState(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (active) c.ink else c.inkMuted,
+            val ink by animateColorAsState(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (index == slide.shown) c.ink else c.inkMuted,
                 PocketMotion.color<Color>().orSnap(motion), label = "segment-ink")
             Box(Modifier.weight(1f).heightIn(min = 40.dp).clip(PocketRadii.capsule)
-                .pocketSelectable(active, enabled, Role.Tab, pressedScale = .96f) { onSelect(index) }
+                .pocketSelectable(index == selected, enabled, Role.Tab, pressedScale = .96f) { onSelect(index) }
                 .padding(horizontal = 8.dp), contentAlignment = Alignment.Center) {
                 PText(label, style = Pocket.type.labelSmall, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }

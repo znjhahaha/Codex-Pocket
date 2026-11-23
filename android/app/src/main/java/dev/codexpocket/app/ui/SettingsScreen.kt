@@ -30,6 +30,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -112,17 +113,20 @@ internal fun SettingsPageLayout(
 private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) -> Unit, modifier: Modifier) {
     val preferences = rememberPocketGlassPreferences()
     val motion = preferences.animatorsEnabled && !preferences.highContrast && !preferences.batterySaver
-    // The quick edge leads and the slow one follows, as in the kit's segmented control.
-    val lead by animateFloatAsState(page.ordinal.toFloat(), spring<Float>(dampingRatio = .85f, stiffness = 640f).orSnap(motion), label = "settings-selected-thumb")
-    val trail by animateFloatAsState(page.ordinal.toFloat(), spring<Float>(dampingRatio = .85f, stiffness = 300f).orSnap(motion), label = "settings-selected-thumb-trail")
-    val selection = minOf(lead, trail)
+    // The kit's sliding selection: the quick edge leads, the slow one follows, and the thumb can be carried by a finger.
+    val pages = SettingsPage.entries
+    val slide = rememberPSlide(pages.size, page.ordinal, haptic = null) { onSelect(pages[it]) }
     CompositionLocalProvider(LocalPocketClearGlass provides true) {
         PSurface(modifier.fillMaxWidth().testTag("settings-segments"), shape = RoundedCornerShape(28.dp), color = Pocket.colors.fill) {
             BoxWithConstraints(Modifier.fillMaxWidth().padding(5.dp)) {
                 val itemWidth = maxWidth / SettingsPage.entries.size
-                Box {
+                Box(Modifier.pocketSlide(slide)) {
                     Box(Modifier.matchParentSize()) {
-                        PSurface(Modifier.offset(x = itemWidth * selection).width(itemWidth * (1f + maxOf(lead, trail) - selection)).fillMaxHeight()
+                        // Pulled past an end the thumb flattens against it; held, it presses in.
+                        val left = slide.start.value.coerceIn(0f, pages.size.toFloat())
+                        val right = slide.end.value.coerceIn(left, pages.size.toFloat())
+                        PSurface(Modifier.offset(x = itemWidth * left).width(itemWidth * (right - left)).fillMaxHeight()
+                            .graphicsLayer { val held = 1f - .05f * slide.lift.value; scaleX = held; scaleY = held }
                             .border(1.dp, Pocket.colors.line.copy(alpha = .45f), RoundedCornerShape(24.dp))
                             .testTag("settings-selected-thumb"), shape = RoundedCornerShape(24.dp), color = Pocket.colors.accentSoft) { }
                     }
@@ -133,8 +137,9 @@ private fun SettingsPageSegments(page: SettingsPage, onSelect: (SettingsPage) ->
                                 .testTag("settings-tab:" + item.name).pocketSelectable(page == item, role = Role.Tab,
                                     interactionSource = interaction, pressedScale = .96f, haptic = null, onClick = { onSelect(item) })
                                 .padding(horizontal = 6.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
-                                PocketTabLabel(item.label, page == item, style = Pocket.type.labelSmall,
-                                    color = if (page == item) Pocket.colors.onAccentSoft else Pocket.colors.inkMuted)
+                                val shown = slide.shown == item.ordinal
+                                PocketTabLabel(item.label, shown, style = Pocket.type.labelSmall,
+                                    color = if (shown) Pocket.colors.onAccentSoft else Pocket.colors.inkMuted)
                             }
                         }
                     }

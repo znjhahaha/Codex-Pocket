@@ -118,21 +118,16 @@ internal fun UsageSegmented(segments: List<UsageSegment>, selected: Int, onSelec
     val width = rememberUsageTextWidth()
     val label = Pocket.type.labelSmall
     val shown = if (selected in segments.indices) selected else -1
-    val last = remember { intArrayOf(shown.coerceAtLeast(0)) }
-    val forward = shown >= last[0]
-    if (shown >= 0) last[0] = shown
-    val quick = spring<Float>(dampingRatio = .85f, stiffness = 640f).orSnap(motion)
-    val slow = spring<Float>(dampingRatio = .85f, stiffness = 300f).orSnap(motion)
-    val start = animateFloatAsState(last[0].toFloat(), if (forward) slow else quick, label = "usage-segment-start")
-    val end = animateFloatAsState(last[0] + 1f, if (forward) quick else slow, label = "usage-segment-end")
+    val slide = rememberPSlide(segments.size, shown, enabled, haptic = PocketHaptic.Tick, onSelect = onSelect)
     val present = animateFloatAsState(if (shown >= 0) 1f else 0f, PocketMotion.color<Float>().orSnap(motion), label = "usage-segment-thumb")
     val thumb = c.surface
-    BoxWithConstraints(modifier.fillMaxWidth().clip(PocketRadii.capsule).background(track).drawBehind {
+    BoxWithConstraints(modifier.fillMaxWidth().clip(PocketRadii.capsule).background(track).pocketSlide(slide).drawBehind {
         if (segments.isEmpty() || present.value <= 0f) return@drawBehind
-        val inset = 4.dp.toPx()
+        // Held, the thumb presses in; pulled past an end it flattens against it.
+        val inset = 4.dp.toPx() + 1.5.dp.toPx() * slide.lift.value
         val item = size.width / segments.size
-        val left = (start.value * item + inset).coerceIn(0f, size.width)
-        val right = (end.value * item - inset).coerceIn(left, size.width)
+        val left = (slide.start.value * item).coerceIn(0f, size.width) + inset
+        val right = ((slide.end.value * item).coerceIn(0f, size.width) - inset).coerceAtLeast(left)
         val height = size.height - inset * 2
         drawRoundRect(thumb.copy(alpha = present.value.coerceIn(0f, 1f)), Offset(left, inset), Size(right - left, height), CornerRadius(height / 2))
     }.selectableGroup()) {
@@ -144,7 +139,7 @@ internal fun UsageSegmented(segments: List<UsageSegment>, selected: Int, onSelec
         Row(Modifier.fillMaxWidth()) {
             segments.forEachIndexed { index, segment ->
                 val active = index == shown
-                val ink by animateColorAsState(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (active) c.ink else c.inkMuted,
+                val ink by animateColorAsState(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (index == slide.shown) c.ink else c.inkMuted,
                     PocketMotion.color<Color>().orSnap(motion), label = "usage-segment-ink")
                 Box(Modifier.weight(1f).heightIn(min = PocketSpace.touch).clip(PocketRadii.capsule)
                     .pocketSelectable(active, enabled, Role.Tab, pressedScale = .96f, haptic = segment.haptic) { onSelect(index) }

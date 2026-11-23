@@ -158,39 +158,45 @@ internal fun PocketHomeNavigation(tab: HomeTab, attention: Int, onNew: (() -> Un
     PocketGlassSurface(modifier = Modifier.weight(1f).testTag("home-navigation"), shape = PocketOval, dense = true) {
         BoxWithConstraints(Modifier.fillMaxWidth().padding(6.dp)) {
             val itemWidth = maxWidth / 3
-            // Two springs on one target: the quick edge leads and the slow one follows, so the pill stretches as it travels.
-            val lead by animateDpAsState(itemWidth * tab.ordinal, spring<Dp>(dampingRatio = .85f, stiffness = 640f).orSnap(motion), label = "navigation-selection")
-            val trail by animateDpAsState(itemWidth * tab.ordinal, spring<Dp>(dampingRatio = .85f, stiffness = 300f).orSnap(motion), label = "navigation-selection-trail")
-            val selectionX = minOf(lead, trail)
-            Box {
+            // The kit's sliding selection: the quick edge leads and the slow one follows, so the pill stretches as it
+            // travels. A finger can pick the pill up anywhere on the bar and carry it to another tab.
+            val tabs = HomeTab.entries
+            val slide = rememberPSlide(tabs.size, tab.ordinal) { onSelect(tabs[it]) }
+            Box(Modifier.pocketSlide(slide)) {
             Box(Modifier.matchParentSize()) {
-                Box(Modifier.offset(x = selectionX).width(itemWidth + (maxOf(lead, trail) - selectionX)).fillMaxHeight().clip(PocketOval)
+                val left = slide.start.value.coerceIn(0f, tabs.size.toFloat())
+                val right = slide.end.value.coerceIn(left, tabs.size.toFloat())
+                // Carried, the pill lifts a little off the bar.
+                Box(Modifier.offset(x = itemWidth * left).width(itemWidth * (right - left)).fillMaxHeight()
+                    .graphicsLayer { val lifted = 1f + .05f * slide.lift.value; scaleX = lifted; scaleY = lifted }.clip(PocketOval)
                     // Opaque: a translucent pill let the refracted list text read as a gray smudge at its end.
                     .background(Pocket.colors.accentSoft.copy(alpha = .65f).compositeOver(Pocket.colors.surface)).testTag("home-tab-selection"))
             }
             Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).selectableGroup()) {
                 HomeTab.entries.forEach { item ->
                     val selected = tab == item
+                    // The tab the pill is over looks chosen while it is carried; it becomes the selection on release.
+                    val shown = slide.shown == item.ordinal
                     val interaction = remember { MutableInteractionSource() }
                     val pressed by interaction.collectIsPressedAsState()
-                    val scale by animateFloatAsState(if (pressed) .96f else if (selected) 1.04f else 1f,
+                    val scale by animateFloatAsState(if (pressed) .96f else if (shown) 1.04f else 1f,
                         pocketPressSpring(), label = "nav-icon-size")
-                    val offset by animateDpAsState(if (selected) (-1).dp else 0.dp, tween(pocketMotionMillis(220)), label = "nav-icon-lift")
-                    val tint by animateColorAsState(if (selected) Pocket.colors.onAccentSoft else Pocket.colors.inkMuted,
+                    val offset by animateDpAsState(if (shown) (-1).dp else 0.dp, tween(pocketMotionMillis(220)), label = "nav-icon-lift")
+                    val tint by animateColorAsState(if (shown) Pocket.colors.onAccentSoft else Pocket.colors.inkMuted,
                         tween(pocketMotionMillis(180)), label = "nav-icon-tint")
                     val label = when(item) { HomeTab.Chats -> "会话"; HomeTab.Attention -> "待处理"; HomeTab.Devices -> "管理" }
-                    val play = rememberGlyphPulse(selected)
+                    val play = rememberGlyphPulse(shown)
                     Column(Modifier.weight(1f).fillMaxHeight().heightIn(min = 58.dp).clip(PocketOval)
                         .selectable(selected, interactionSource = interaction, indication = null, role = Role.Tab, onClick = { onSelect(item) })
                         .semantics { if (item == HomeTab.Attention && attention > 0) stateDescription = "$attention 项待处理" }
                         .testTag("home-tab-${item.name.lowercase()}"), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                         Box(Modifier.offset(y = offset).graphicsLayer { scaleX = scale; scaleY = scale }) {
                             // Only the tab being entered plays; the one left behind returns to rest at once.
-                            MotionIcon(HomeGlyphs.tab(item), { if (selected) play.value else 1f }, Modifier.size(21.dp), tint)
+                            MotionIcon(HomeGlyphs.tab(item), { if (shown) play.value else 1f }, Modifier.size(21.dp), tint)
                             if (item == HomeTab.Attention && attention > 0) Box(Modifier.align(Alignment.TopEnd).offset(x = 2.dp, y = (-1).dp).size(6.dp).background(Pocket.colors.accent, CircleShape))
                         }
                         Spacer(Modifier.height(2.dp))
-                        PocketTabLabel(label, selected, color = tint)
+                        PocketTabLabel(label, shown, color = tint)
                     }
                 }
             }
