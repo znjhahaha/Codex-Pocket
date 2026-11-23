@@ -341,6 +341,7 @@ internal fun PocketComposer(text: String, model: String, detail: String, running
                                 if (editorMounted && !compact && !expanded && inputActive() && (focused || value.text != editor.text)) updateInlineEditor(value)
                             }, editorReferences,
                                 Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(vertical = 5.dp)
+                                    .pocketSendSource(LocalPSendFlight.current)
                                     .focusRequester(inlineFocus)
                                     .focusProperties { canFocus = !compact && !expanded && !metadataHistoryFocusBlocked }
                                     .onFocusChanged {

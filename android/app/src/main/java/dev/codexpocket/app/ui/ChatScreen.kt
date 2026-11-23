@@ -28,6 +28,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -83,7 +85,14 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val nativeLive = s.online && (s.timeline.status.isBlank() || s.timeline.status in setOf("active", "inProgress", "running")) &&
             s.timeline.activeFlags.none { it in setOf("waitingOnApproval", "waitingOnUserInput") }
         val showSending = s.sendBusy && s.online && live == null && s.actionStatus["send:${chat.key.encoded}"]?.loading == true
-        val keys = remember(rows, live != null, showSending) { listOf("history-control") + rows.map { it.key } + listOfNotNull("live-status".takeIf { live != null || showSending }) + listOf("agent-working", "timeline-end") }
+        // A message is edited in its own bubble. Once its turn has been withdrawn there is no bubble left, so the editor takes the tail.
+        val messageEdit = s.messageEdit?.takeIf { it.key == chat.key }?.let { edit ->
+            MessageEditHost(edit, s.online, s.timeline.activeTurn != null, repo::changeMessageEdit, { repo.submitMessageEdit() }, repo::cancelMessageEdit,
+                { repo.checkMessageEdit() }, { repo.prepareMessageEditAgain() }, { repo.stop() })
+        }
+        val editingRow = messageEdit?.let { host -> rows.firstOrNull { it.kind == TranscriptKind.User && host.owns(it.items.first()) }?.key }
+        val editingKey = if (messageEdit == null) null else editingRow ?: "message-edit"
+        val keys = remember(rows, live != null, showSending, editingKey) { listOf("history-control") + rows.map { it.key } + listOfNotNull("message-edit".takeIf { editingKey == it }) + listOfNotNull("live-status".takeIf { live != null || showSending }) + listOf("agent-working", "timeline-end") }
         var anchorKey by rememberSaveable { mutableStateOf(s.draft?.scrollItemKey) }
         var anchorOffset by rememberSaveable { mutableIntStateOf(s.draft?.scrollOffset ?: 0) }
         val list = rememberLazyListState(TranscriptAnchor(anchorKey).resolve(keys, s.draft?.scrollIndex ?: 0), anchorOffset)
@@ -108,6 +117,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         LaunchedEffect(readingHistory) { reportReading(readingHistory) }
         DisposableEffect(Unit) { onDispose { reportReading(false) } }
         val scope = rememberCoroutineScope()
+        // The message being sent leaves the composer's field and lands as its bubble.
+        val flight = rememberPSendFlight(chat.key.encoded)
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { repo.attach(it) }
         var attachmentSheet by rememberSaveable { mutableStateOf(false) }
         var permissionPanel by remember { mutableStateOf(false) }
@@ -208,11 +219,27 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             }
         }
         FollowTranscriptEnd(list, { following }, { transcriptContact || minimapState.expanded || minimapState.isInteracting })
+        // The bubble being edited stays clear of the keyboard: it is brought up as the keyboard arrives.
+        LaunchedEffect(editingKey, composerHeight) {
+            val target = editingKey ?: return@LaunchedEffect
+            if (target == "message-edit") { following = true; return@LaunchedEffect }
+            val index = keys.indexOf(target)
+            if (index < 0) return@LaunchedEffect
+            pauseFollowing()
+            val shown = list.layoutInfo.visibleItemsInfo.firstOrNull { it.key == target }
+            if (shown == null) { list.scrollToItem(index); return@LaunchedEffect }
+            val over = shown.offset + shown.size - (list.layoutInfo.viewportEndOffset - list.layoutInfo.afterContentPadding)
+            if (over > 0) list.animateScrollBy(over.toFloat(), PocketMotion.page<Float>().orSnap(android.animation.ValueAnimator.areAnimatorsEnabled()))
+        }
         Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))) {
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                 val gutter = if (minimapShown) minOf(minimapState.reservedWidth, maxWidth * .18f) else 0.dp
                 val transcriptInset = maxOf(16.dp, (maxWidth - gutter - 720.dp) / 2)
                 val arrivals = rememberPocketArrivals(chat.key.encoded)
+                // While one message is being edited the rest of the conversation steps back.
+                val aside = androidx.compose.animation.core.animateFloatAsState(if (editingKey != null) .36f else 1f,
+                    PocketMotion.state<Float>().orSnap(rememberPocketMotion()), label = "edit-aside")
+                CompositionLocalProvider(LocalMessageEdit provides messageEdit) {
                 // Only transcript is captured: the glass composer is a sibling, never its own source.
                 LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter, top = statusInset).testTag("chat-transcript")
                     .transcriptUserGesture(list, transcriptGesture, pauseFollowing, { transcriptContact = it; if (it) jumpJob?.cancel() })
@@ -228,8 +255,10 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     itemsIndexed(rows, key = { _, row -> row.key }, contentType = { _, row -> row.kind }) { index, row ->
                         // Only the tail can be new: a sent message leaves from the composer's corner, a reply rises from the margin.
                         val tail = rows.size - index <= 2
+                        val launch = remember(row.key) { flight.take(row.key, tail && row.kind == TranscriptKind.User) }
                         Column(Modifier.fillMaxWidth().testTag("transcript-row:${row.key}")
-                            .pocketArrival(arrivals, row.key, tail, origin = if (row.kind == TranscriptKind.User) TransformOrigin(1f, 1f) else TransformOrigin(0f, 1f))
+                            .pocketArrival(arrivals, row.key, tail && launch == null, origin = if (row.kind == TranscriptKind.User) TransformOrigin(1f, 1f) else TransformOrigin(0f, 1f))
+                            .graphicsLayer { alpha = if (row.key == editingKey) 1f else aside.value }
                             .padding(top = when (row.kind) {
                             TranscriptKind.User -> 16.dp
                             TranscriptKind.Answer -> 10.dp
@@ -242,18 +271,23 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                                 onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline,
                                 onReopenPlan = proposedPlan?.takeIf { plan -> row.items.any { it.itemId == plan.itemId && it.turnId == plan.turnId } && PlanPresentation.unavailable(s, plan) == null }
                                     ?.let { plan -> { repo.reopenPlan(plan); following = true } },
-                                onEdit = { repo.beginMessageEdit(it); following = true }, online = s.online)
+                                onEdit = { repo.beginMessageEdit(it) }, online = s.online, sendLaunch = launch, sendFlight = flight)
                             changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary, onDetail) }
                         }
+                    }
+                    if (editingKey == "message-edit" && messageEdit != null) item(key = "message-edit", contentType = "message-edit") {
+                        MessageEditBubble(messageEdit, Modifier.padding(start = 48.dp, top = 16.dp))
                     }
                     if (live != null) item(key = "live-status", contentType = "live-status") {
                         LiveTurnStatus(live.first, live.second, reasoning = reasoning, timing = timing, online = nativeLive)
                     } else if (showSending) item(key = "live-status", contentType = "live-status") {
-                        PText("正在发送", Modifier.padding(vertical = 12.dp).testTag("live-sending-placeholder"),
-                            style = Pocket.type.body, color = Pocket.colors.inkMuted)
+                        Box(Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.CenterEnd) {
+                            PSendingBubble("正在发送", Modifier.testTag("live-sending-placeholder"))
+                        }
                     }
                     item(key = "agent-working", contentType = "agent-working") { NativeAgentWorkingStrip(agents, onOpen = { repo.showAgentReader() }) }
                     item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
+                }
                 }
                 if (read.empty && live == null && !showSending) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
                     Column(Modifier.widthIn(max = 420.dp).padding(30.dp)) {
@@ -264,7 +298,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     Modifier.align(Alignment.CenterStart).width(gutter).padding(top = topInset + 8.dp, bottom = bottomInset + 8.dp),
                     backdrop = transcriptBackdrop, onSeek = { transcriptGesture.cancelResume(); pauseFollowing() }, state = minimapState,
                     scope = chat.key.encoded, navigationEpoch = s.historyLoading to s.nextTurns?.toString(), onExpandProcess = repo::expandProcess)
-            CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop) {
+            CompositionLocalProvider(LocalPocketBackdrop provides transcriptBackdrop, LocalPSendFlight provides flight) {
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
                 CompositionLocalProvider(LocalPocketClearGlass provides true) {
                 val syncLabel = when {
@@ -331,12 +365,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 NativeQueue(s, { id, text -> repo.queueEdit(id, text) }, { repo.queueDelete(it) }, { id, before -> repo.queueMove(id, before) },
                     onSteer = { repo.queueSteer(it) }, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp).widthIn(max = 720.dp))
             }
-            s.messageEdit?.takeIf { it.key == chat.key }?.let { edit ->
-                MessageEditDock(edit, s.online, s.timeline.activeTurn != null, repo::changeMessageEdit,
-                    { repo.submitMessageEdit() }, repo::cancelMessageEdit, { repo.checkMessageEdit() },
-                    { repo.prepareMessageEditAgain() }, { repo.stop() },
-                    Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
-            }
+            // Editing happens in the message's own bubble; the dock only keeps the keyboard from covering it.
+            if (messageEdit != null) Spacer(Modifier.fillMaxWidth().navigationBarsPadding().imePadding().height(8.dp).testTag("message-edit-keyboard-space"))
             if (s.uncertainSend) Row(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 20.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 PText("正在确认上次发送，草稿已保留", style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
@@ -346,7 +376,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 listOfNotNull(s.effort?.let(context::effortLabel), s.mode?.takeUnless { it == "default" }?.let { context.modeLabel(it, it) }).filter(String::isNotBlank).joinToString(" · "),
                 s.timeline.activeTurn != null, composerAvailability(s), repo::editDraft, onModels,
                 { attachmentSheet = true }, onReferences,
-                { repo.send() }, { repo.send(steer = true) }, { repo.stop() }, s.online && s.supports("references/list"),
+                { if (s.timeline.activeTurn == null) flight.arm(rows.map { it.key }); repo.send() }, { repo.send(steer = true) }, { repo.stop() }, s.online && s.supports("references/list"),
                 attachmentCount = s.attachments.size,
                 stableLayout = s.attachments.isNotEmpty(),
                 onPermissions = { permissionPanel = true; repo.refreshPermissions() }, permissionsExpanded = permissionPanel,
@@ -389,13 +419,9 @@ internal fun ConversationReadStatus(read: ConversationReadPresentation, error: S
         if (read.skeleton) { kotlinx.coroutines.delay(150); showSkeleton = true }
     }
     Column(Modifier.fillMaxWidth()) {
-        if (read.skeleton && showSkeleton) Column(Modifier.fillMaxWidth().testTag("conversation-skeleton").padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            PocketProgressStatus(stringResource(R.string.v04_transcript_loading))
-            // Shapes echo a real transcript: a right-aligned request, then prose lines and a work-log line.
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) { SkeletonBar(.46f, 34.dp) }
-            listOf(.92f, .84f, .58f).forEach { fraction -> SkeletonBar(fraction, 12.dp) }
-            SkeletonBar(.34f, 10.dp)
-        }
+        // Shapes echo a real transcript and arrive one after another: a right-aligned request, then prose lines and a work-log line.
+        if (read.skeleton && showSkeleton) PChatSkeleton(Modifier.testTag("conversation-skeleton").padding(vertical = 16.dp),
+            label = stringResource(R.string.v04_transcript_loading))
         androidx.compose.animation.AnimatedVisibility(read.failed,
             enter = androidx.compose.animation.fadeIn(tween(pocketMotionMillis(180))),
             exit = androidx.compose.animation.fadeOut(tween(pocketMotionMillis(180)))) {
@@ -420,10 +446,4 @@ private fun ReadFailureCard(message: String, onRetry: () -> Unit) {
             PocketTextButton(onClick = onRetry) { PText(stringResource(R.string.v04_transcript_retry)) }
         }
     }
-}
-
-@Composable
-private fun SkeletonBar(fraction: Float, height: androidx.compose.ui.unit.Dp) {
-    Box(Modifier.fillMaxWidth(fraction).height(height).clip(RoundedCornerShape(height / 2))
-        .background(Pocket.colors.fillStrong).pocketShimmer())
 }

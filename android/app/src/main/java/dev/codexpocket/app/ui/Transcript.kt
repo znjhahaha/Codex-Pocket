@@ -33,7 +33,8 @@ import kotlinx.coroutines.delay
 @Composable
 internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit, onSideChat: (TimelineItem) -> Unit = {}, canFork: Boolean = false, onPlan: ((Boolean) -> Unit)? = null,
     activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null, onReopenPlan: (() -> Unit)? = null,
-    onEdit: ((TimelineItem) -> Unit)? = null, online: Boolean = false) {
+    onEdit: ((TimelineItem) -> Unit)? = null, online: Boolean = false,
+    sendLaunch: androidx.compose.ui.geometry.Rect? = null, sendFlight: PSendFlight? = null) {
     val item = row.items.first()
     val clipboard = LocalClipboardManager.current
     when (row.kind) {
@@ -66,8 +67,11 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             val prose = if (replies.isNotEmpty()) replies.joinToString("\n\n") { "${it.string("question")}\n${it.string("answer")}" }
                 else if (message.request.trimStart().startsWith("<send_user_message_question_reply>")) stringResource(R.string.submit_answers) else message.request.trim()
             val hasImages = remember(item.raw) { transcriptImageSources(item).isNotEmpty() }
+            // Being edited, the bubble is its own editor: no dialog, no panel, the text changes where it is.
+            val editing = LocalMessageEdit.current?.takeIf { it.owns(item) }
+            if (editing != null) { MessageEditBubble(editing); return@Column }
             if (prose.isNotBlank() || hasImages) PSurface(shape = RoundedCornerShape(22.dp), color = Pocket.colors.fillStrong,
-                modifier = Modifier.widthIn(max = 560.dp)) {
+                modifier = Modifier.widthIn(max = 560.dp).pocketSendLanding(sendLaunch, sendFlight)) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
                     val implementation = remember(item, timeline) { timeline?.let { PlanPresentation.implementedProposal(item, it) } }
                     if (implementation != null) {
@@ -82,7 +86,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                     TranscriptImages(item, includeLocal = false)
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.pocketSendTrail(sendLaunch), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
                 val context = LocalContext.current
                 val timestamp = remember(item.raw, item.key, timeline?.turns, timeline?.items?.keys) { messageTimestamp(item, timeline) }
                 timestamp?.let { time ->

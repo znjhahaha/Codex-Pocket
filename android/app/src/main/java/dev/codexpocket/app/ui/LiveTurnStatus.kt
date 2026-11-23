@@ -58,9 +58,13 @@ internal fun nativeThinkingAllowed(turnId: String, timing: NativeTurnInfo?): Boo
 /** Also used for an accepted active child whose new native turn ID has not arrived yet. */
 @Composable
 internal fun NativeThinkingPlaceholder(modifier: Modifier = Modifier) {
-    PText("正在思考", modifier.fillMaxWidth().padding(vertical = 12.dp)
-        .testTag("live-thinking-placeholder").reasoningSweep(true),
-        style = Pocket.type.body, color = Pocket.colors.inkMuted)
+    Row(modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // The star turns while the thought is forming; the words carry the status.
+        PLoopGlyph(ToolGlyphs.Thinking, true, Modifier.size(16.dp), Pocket.colors.inkMuted, millis = 1800)
+        PText("正在思考", Modifier.testTag("live-thinking-placeholder").reasoningSweep(true),
+            style = Pocket.type.body, color = Pocket.colors.inkMuted)
+    }
 }
 
 /** Native summary prose, without a thought badge, activity spinner or a transcript clock. */
