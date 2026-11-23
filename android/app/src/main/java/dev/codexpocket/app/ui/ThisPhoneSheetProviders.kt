@@ -1,6 +1,8 @@
 package dev.codexpocket.app.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -14,22 +16,27 @@ import dev.codexpocket.app.data.LocalAccess
 import dev.codexpocket.app.data.LocalProviderDraft
 import dev.codexpocket.app.data.LocalProviderRules
 import dev.codexpocket.app.data.LocalProviderSummary
+import dev.codexpocket.app.data.LocalProviderModelLoader
+import dev.codexpocket.app.data.LocalProviderModelRequest
+import dev.codexpocket.app.data.LocalProviderModelResult
+import dev.codexpocket.app.data.LocalProviderModelSearch
 import dev.codexpocket.app.ui.kit.*
 
 /** Which model service Codex on this phone uses: OpenAI's own sign-in, or a service the person has a key for. */
 @Composable
 internal fun ColumnScope.ThisPhoneProviders(access: LocalAccess, applying: Boolean, onUse: (String?) -> Unit,
-    onSave: (LocalProviderDraft) -> Boolean, onRemove: (String) -> Unit, official: @Composable ColumnScope.() -> Unit) {
+    onSave: (LocalProviderDraft) -> Boolean, onRemove: (String) -> Unit, onFetchModels: LocalProviderModelLoader,
+    official: @Composable ColumnScope.() -> Unit) {
     // Empty is a new service, an id is one being changed.
     var editing by remember { mutableStateOf<String?>(null) }
     PText("模型服务", style = Pocket.type.titleSmall)
     val target = editing
     if (target != null) {
         val existing = access.providers.firstOrNull { it.id == target }
-        key(target) { ProviderForm(existing, onSave, if (existing != null) ({ onRemove(existing.id) }) else null) { editing = null } }
+        key(target) { ProviderForm(existing, onSave, if (existing != null) ({ onRemove(existing.id) }) else null, onFetchModels) { editing = null } }
         return
     }
-    PText("可以登录 OpenAI 官方账号，也可以像 CC Switch 那样填写第三方服务的地址和 Key，随时切换。Key 加密保存在这台手机上，只交给手机上的 Codex。",
+    PText("可以登录 OpenAI 官方账号，也可以像 CC Switch 那样填写第三方服务的地址和 Key，随时切换。Key 加密保存在这台手机上，仅用于访问你填写的模型服务。",
         style = Pocket.type.caption, color = Pocket.colors.inkMuted)
     PCard(padding = PaddingValues(6.dp), spacing = 2.dp) {
         PRow("OpenAI 官方", { onUse(null) }, Modifier.testTag("this-phone-official"), subtitle = "用 ChatGPT 账号登录",
@@ -57,23 +64,64 @@ internal fun ColumnScope.ThisPhoneProviders(access: LocalAccess, applying: Boole
 }
 
 @Composable
-private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (LocalProviderDraft) -> Boolean, onRemove: (() -> Unit)?, onClose: () -> Unit) {
+private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (LocalProviderDraft) -> Boolean, onRemove: (() -> Unit)?,
+    onFetchModels: LocalProviderModelLoader, onClose: () -> Unit) {
     var name by remember { mutableStateOf(existing?.name.orEmpty()) }
     var url by remember { mutableStateOf(existing?.baseUrl.orEmpty()) }
     var model by remember { mutableStateOf(existing?.model.orEmpty()) }
     // A key is not placed in the Activity's unencrypted saved-state bundle, and a saved one is never shown again.
     var key by remember { mutableStateOf("") }
     var problem by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val loader by rememberUpdatedState(onFetchModels)
+    val discovery = remember { LocalProviderModelSearch(scope) { loader(it) } }
+    val search by discovery.state.collectAsState()
+    var query by remember { mutableStateOf("") }
+    DisposableEffect(discovery) { onDispose { discovery.close() } }
     val plain = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrectEnabled = false)
     PText(if (existing == null) "添加第三方服务" else "编辑「${existing.name}」", style = Pocket.type.body)
     PTextField(name, { name = it; problem = null }, Modifier.testTag("this-phone-provider-name"), label = "名称", placeholder = "例如：我的中转站", singleLine = true)
-    PTextField(url, { url = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-url"), label = "接口地址（Base URL）",
+    PTextField(url, { if (it.trim() != url) { discovery.clear(); query = "" }; url = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-url"), label = "接口地址（Base URL）",
         placeholder = "https://api.example.com/v1", singleLine = true, keyboardOptions = plain.copy(keyboardType = KeyboardType.Uri))
-    PTextField(key, { key = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-key"), label = "API Key",
+    PTextField(key, { if (it.trim() != key) { discovery.clear(); query = "" }; key = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-key"), label = "API Key",
         placeholder = if (existing != null) "留空则继续使用 ${existing.keyHint}" else "sk-…", singleLine = true,
         visualTransformation = PasswordVisualTransformation(), keyboardOptions = plain.copy(keyboardType = KeyboardType.Password))
     PTextField(model, { model = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-model"), label = "模型（可选）",
         placeholder = "留空使用 Codex 默认模型", singleLine = true, keyboardOptions = plain.copy(keyboardType = KeyboardType.Ascii))
+    PButton("获取模型列表", {
+        query = ""
+        discovery.fetch(LocalProviderModelRequest(existing?.id, url, key))
+    }, Modifier.fillMaxWidth().testTag("this-phone-provider-fetch-models"), kind = PButtonKind.Secondary,
+        enabled = LocalProviderRules.baseUrl(url) != null && ((existing != null && key.isBlank()) || LocalProviderRules.apiKey(key) != null),
+        busy = search.loading, leading = PocketIcons.Refresh)
+    if (search.loading) PText("正在获取模型列表…", Modifier.testTag("this-phone-provider-models-loading"),
+        style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+    when (val result = search.result) {
+        is LocalProviderModelResult.Failed -> PText(result.problem.message, Modifier.testTag("this-phone-provider-models-problem"),
+            style = Pocket.type.bodySmall, color = Pocket.colors.danger)
+        is LocalProviderModelResult.Models -> if (result.ids.isEmpty()) {
+            PText("服务返回了空列表，可以继续手动填写模型。", Modifier.testTag("this-phone-provider-models-empty"),
+                style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+        } else {
+            val matches = remember(result.ids, query) { result.ids.filter { it.contains(query.trim(), ignoreCase = true) } }
+            PCard(padding = PaddingValues(8.dp), spacing = 6.dp) {
+                PTextField(query, { query = it }, Modifier.testTag("this-phone-provider-model-search"), label = "搜索模型",
+                    placeholder = "按模型名称筛选", singleLine = true, keyboardOptions = plain,
+                    leading = { PIcon(PocketIcons.Search, null, Modifier.size(18.dp)) })
+                PText("${matches.size} / ${result.ids.size} 个模型", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                if (matches.isEmpty()) PText("没有匹配的模型", Modifier.padding(8.dp).testTag("this-phone-provider-models-no-match"), style = Pocket.type.bodySmall)
+                else LazyColumn(Modifier.fillMaxWidth().heightIn(max = 240.dp).testTag("this-phone-provider-model-list")) {
+                    items(matches, key = { it }) { id ->
+                        PRow(id, { model = id; problem = null }, Modifier.testTag("this-phone-provider-model-option:$id"),
+                            selected = model == id, accentSelection = true, trailing = {
+                                if (model == id) PIcon(PocketIcons.Check, null, Modifier.size(18.dp))
+                            })
+                    }
+                }
+            }
+        }
+        null -> Unit
+    }
     PText("服务需要兼容 OpenAI 的 Responses 接口，地址一般以 /v1 结尾。使用 OpenAI 官方 API Key 时填 https://api.openai.com/v1。",
         style = Pocket.type.caption, color = Pocket.colors.inkMuted)
     problem?.let { PText(it, Modifier.testTag("this-phone-provider-problem"), style = Pocket.type.bodySmall, color = Pocket.colors.danger) }

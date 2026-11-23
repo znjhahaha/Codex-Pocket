@@ -83,6 +83,8 @@ internal class LocalProviderStore(private val blob: LocationBlob) {
     }
 
     @Synchronized fun active(): LocalProvider? = providers.firstOrNull { it.id == activeId }
+    /** Data-layer lookups only; screens receive summaries, never this saved credential. */
+    @Synchronized fun find(id: String): LocalProvider? = providers.firstOrNull { it.id == id }
     /** Saves what was typed and puts it in use. Null when something typed cannot be used as it is. */
     @Synchronized fun save(draft: LocalProviderDraft): String? {
         val existing = draft.id?.let { id -> providers.firstOrNull { it.id == id } ?: return null }

@@ -17,6 +17,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import dev.codexpocket.app.data.LocalAccess
 import dev.codexpocket.app.data.LocalAccount
 import dev.codexpocket.app.data.LocalProviderDraft
+import dev.codexpocket.app.data.LocalProviderModelLoader
+import dev.codexpocket.app.data.LocalProviderModelResult
+import dev.codexpocket.app.data.LocalProviderModelProblem
 import dev.codexpocket.app.data.LocalProjects
 import dev.codexpocket.app.ui.kit.*
 
@@ -26,7 +29,8 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
     onChatGpt: () -> Unit, onRefresh: () -> Unit, onStop: () -> Unit,
     access: LocalAccess = LocalAccess(), applying: Boolean = false, onUseProvider: (String?) -> Unit = {},
     onSaveProvider: (LocalProviderDraft) -> Boolean = { false }, onRemoveProvider: (String) -> Unit = {}, onSignOut: () -> Unit = {},
-    projects: LocalProjects = LocalProjects(), onImport: (Uri) -> Unit = {}, onExport: (String, Uri) -> Unit = { _, _ -> }) {
+    projects: LocalProjects = LocalProjects(), onImport: (Uri) -> Unit = {}, onExport: (String, Uri) -> Unit = { _, _ -> },
+    onFetchModels: LocalProviderModelLoader = { LocalProviderModelResult.Failed(LocalProviderModelProblem.Network) }) {
     val context = LocalContext.current
     var exporting by remember { mutableStateOf<String?>(null) }
     val pickArchive = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) onImport(uri) }
@@ -43,7 +47,7 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
                 PButton("在此手机上运行", onStart, Modifier.fillMaxWidth().testTag("this-phone-start"), enabled = progress == null)
                 return@Column
             }
-            ThisPhoneProviders(access, applying, onUseProvider, onSaveProvider, onRemoveProvider) {
+            ThisPhoneProviders(access, applying, onUseProvider, onSaveProvider, onRemoveProvider, onFetchModels) {
                 when (account) {
                     LocalAccount.Unknown, LocalAccount.Checking -> PocketProgressStatus("正在读取登录状态", Modifier.testTag("this-phone-checking"))
                     is LocalAccount.SignedIn -> {

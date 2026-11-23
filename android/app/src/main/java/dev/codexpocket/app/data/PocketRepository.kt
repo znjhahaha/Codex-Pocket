@@ -119,6 +119,7 @@ class PocketRepository(
     historyCacheBudget: Long = 32L * 1024 * 1024,
     private val directoryTimeoutMillis: Long = 15_000,
     private val recoverInterruptedCommands: Boolean = true,
+    private val modelCatalogOverride: () -> ModelCatalogRequest? = { null },
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val dao = db.dao()
@@ -1888,8 +1889,10 @@ class PocketRepository(
         val selectedGeneration = selectionGeneration.get()
         val requestGeneration = catalogGeneration.incrementAndGet()
         val transport = client
+        val providerCatalog = modelCatalogOverride()
         fun current(s: PocketState = _state.value) = requestGeneration == catalogGeneration.get() && client === transport &&
-            selectedGeneration == selectionGeneration.get() && s.selected?.key == selected.key && s.selected.runtimeId == runtime
+            selectedGeneration == selectionGeneration.get() && s.selected?.key == selected.key && s.selected.runtimeId == runtime &&
+            (providerCatalog?.isCurrent?.invoke() ?: (modelCatalogOverride() == null))
         fun publish(transform: (PocketState) -> PocketState) { _state.update { if (current(it)) transform(it) else it } }
         suspend fun catalog(method: String, params: JsonObject = buildJsonObject {}): JsonObject {
             if (!current()) throw CancellationException("Superseded model catalog")
@@ -1903,27 +1906,31 @@ class PocketRepository(
             publish { it.copy(modelCatalogState = if (it.online) ModelCatalogState.RuntimeUnavailable else ModelCatalogState.Offline, modelCatalogError = null) }
             return
         }
-        if (!state.supports("model/list", selectedRuntime)) {
+        if (providerCatalog == null && !state.supports("model/list", selectedRuntime)) {
             publish { it.copy(modelCatalogState = ModelCatalogState.Unsupported, modelCatalogError = null) }
             return
         }
         publish { it.copy(modelCatalogState = ModelCatalogState.Loading, modelCatalogError = null) }
         try {
             val found = linkedMapOf<String, NativeModel>()
-            val seen = mutableSetOf<JsonElement>()
-            var cursor: JsonElement? = null
-            do {
-                val response = catalog("model/list", buildJsonObject { put("limit", 100); cursor?.let { put("cursor", it) } })
-                response.array("data").map { it.asObject() }.filterNot { it.flag("hidden") }.map(NativeModel::from).forEach { found[it.model] = it }
-                cursor = response["nextCursor"]?.takeUnless { it is JsonNull }
-                if (cursor != null && !seen.add(cursor)) throw WireException("invalid_response", "Model catalog cursor repeated")
-            } while (cursor != null && found.size < 1000)
+            if (providerCatalog != null) {
+                providerCatalog.load().forEach { found[it.model] = it }
+            } else {
+                val seen = mutableSetOf<JsonElement>()
+                var cursor: JsonElement? = null
+                do {
+                    val response = catalog("model/list", buildJsonObject { put("limit", 100); cursor?.let { put("cursor", it) } })
+                    response.array("data").map { it.asObject() }.filterNot { it.flag("hidden") }.map(NativeModel::from).forEach { found[it.model] = it }
+                    cursor = response["nextCursor"]?.takeUnless { it is JsonNull }
+                    if (cursor != null && !seen.add(cursor)) throw WireException("invalid_response", "Model catalog cursor repeated")
+                } while (cursor != null && found.size < 1000)
+            }
             publish { it.copy(models = found.values.toList(), modelCatalogState = if (found.isEmpty()) ModelCatalogState.Empty else ModelCatalogState.Ready, modelCatalogError = null) }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) {
             publish {
-                val unsupported = error is WireException && error.code in setOf("unsupported", "method_not_found", "unsupported_method", "-32601")
-                val unavailable = error is WireException && error.code in setOf("runtime_offline", "runtime_unavailable", "runtime_not_ready")
+                val unsupported = providerCatalog == null && error is WireException && error.code in setOf("unsupported", "method_not_found", "unsupported_method", "-32601")
+                val unavailable = providerCatalog == null && error is WireException && error.code in setOf("runtime_offline", "runtime_unavailable", "runtime_not_ready")
                 it.copy(modelCatalogState = when {
                         !it.online -> ModelCatalogState.Offline
                         unavailable -> ModelCatalogState.RuntimeUnavailable
@@ -2422,7 +2429,9 @@ class PocketRepository(
         scope.launch { loadNativeSettings(chat, generation) }
         transferSharedAttachments(chat.key)
         refreshRuntimes()
-        loadModels(runtime.id)
+        // A provider's HTTP catalog must not hold the completed native conversation on its creation page.
+        if (modelCatalogOverride() != null) scope.launch { loadModels(runtime.id) }
+        else loadModels(runtime.id)
         loadQueue(chat, generation)
     }
     private suspend fun classifyAgentChildren(parent: ChatEntity, timeline: NativeTimeline) {

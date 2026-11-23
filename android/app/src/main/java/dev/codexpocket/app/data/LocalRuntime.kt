@@ -114,6 +114,17 @@ internal class LocalRuntime(private val context: Context,
     val available: Boolean get() = layout.available
     /** The saved model services and which one is in use; none in use means OpenAI's own sign-in. */
     val access = providers.access
+    private val modelDiscovery by lazy { LocalProviderModelDiscovery(providers) }
+    suspend fun discoverProviderModels(request: LocalProviderModelRequest): LocalProviderModelResult = modelDiscovery.fetch(request)
+    internal fun modelCatalog(): ModelCatalogRequest? {
+        val captured = providers.active() ?: return null
+        return ModelCatalogRequest(isCurrent = { providers.active() === captured }, load = {
+            when (val result = modelDiscovery.fetch(LocalProviderModelRequest(captured.id, captured.baseUrl, captured.apiKey))) {
+                is LocalProviderModelResult.Models -> result.ids.map { id -> NativeModel(id, id, id, "", emptyList(), "", false, id == captured.model) }
+                is LocalProviderModelResult.Failed -> throw WireException("model_catalog_failed", result.problem.message)
+            }
+        })
+    }
     private val applyingState = MutableStateFlow(false)
     /** True while Codex here is being started again on another service. */
     val applying = applyingState.asStateFlow()

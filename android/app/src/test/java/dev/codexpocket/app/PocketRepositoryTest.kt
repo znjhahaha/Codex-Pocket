@@ -36,6 +36,7 @@ class PocketRepositoryTest {
     private val key = ThreadKey("computer", "store", "t")
     private val otherKey = ThreadKey("computer", "store", "other")
     private var traceCacheQueries = false
+    private var providerCatalog: ModelCatalogRequest? = null
     private val cacheQueries = CopyOnWriteArrayList<String>()
 
     @Before fun prepare() = runBlocking<Unit> {
@@ -50,7 +51,7 @@ class PocketRepositoryTest {
             override fun save(pair: PairedComputer) = Unit
             override fun forget() = Unit
         }
-        repo = PocketRepository(app, { server.connection() }, storage, db, network)
+        repo = PocketRepository(app, { server.connection() }, storage, db, network, modelCatalogOverride = { providerCatalog })
         await { it.initialized }
         repo.setForeground(true)
         try { await { it.online && it.chats.any { c -> c.key == key } } }
@@ -1835,6 +1836,116 @@ class PocketRepositoryTest {
         withTimeout(5_000) { entered.await() }
         try { assertTrue("Optional catalogs must not keep the synchronized chat offline", repo.state.value.online) }
         finally { unblock.complete(Unit) }
+    }
+
+    private fun providerModel(id: String) = NativeModel(id, id, id, "", emptyList(), "", false, false)
+
+    @Test fun phoneProviderCatalogReplacesOfficialModelsWithoutChangingConversationOwner() = runBlocking<Unit> {
+        val custom = providerModel("ccs-aggit/gpt-6.1-sol")
+        val owner = repo.state.value.selected!!
+        val nativeReads = server.calls.count { it.nativeMethod == "model/list" }
+        providerCatalog = ModelCatalogRequest({ true }) { listOf(custom) }
+        repo.refreshModels().join()
+        assertEquals(listOf(custom), repo.state.value.models)
+        assertEquals(nativeReads, server.calls.count { it.nativeMethod == "model/list" })
+        repo.chooseModel(custom, null)
+        assertEquals(custom.model, repo.state.value.model)
+        assertEquals(owner, repo.state.value.selected)
+        assertEquals(owner.key.computerId, repo.state.value.computerId)
+        assertTrue(repo.state.value.online)
+    }
+
+    @Test fun changingPhoneProviderDiscardsItsOutstandingModelCatalog() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var revision = 1
+        providerCatalog = ModelCatalogRequest({ revision == 1 }) {
+            entered.complete(Unit); release.await(); listOf(providerModel("old-provider/model"))
+        }
+        val older = repo.refreshModels()
+        try {
+            withTimeout(5_000) { entered.await() }
+            revision = 2
+            providerCatalog = ModelCatalogRequest({ revision == 2 }) { listOf(providerModel("new-provider/model")) }
+            repo.refreshModels().join()
+            release.complete(Unit); older.join()
+            assertEquals(listOf("new-provider/model"), repo.state.value.models.map { it.model })
+            assertEquals(ModelCatalogState.Ready, repo.state.value.modelCatalogState)
+        } finally { release.complete(Unit); older.cancelAndJoin() }
+    }
+
+    @Test fun phoneProviderModelFailureKeepsConnectionDraftAndChosenModel() = runBlocking<Unit> {
+        repo.editDraft("Keep the local draft")
+        val before = repo.state.value
+        providerCatalog = ModelCatalogRequest({ true }) { throw WireException("model_catalog_failed", "Fixture authentication failed") }
+        repo.refreshModels().join()
+        val after = repo.state.value
+        assertEquals(ModelCatalogState.Failed, after.modelCatalogState)
+        assertTrue(after.online)
+        assertEquals(before.selected, after.selected)
+        assertEquals(before.draft, after.draft)
+        assertEquals(before.model, after.model)
+        assertEquals(before.disabledMethods, after.disabledMethods)
+    }
+
+    @Test fun changingBackToOfficialIgnoresLatePhoneProviderFailure() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        providerCatalog = ModelCatalogRequest({ providerCatalog != null }) {
+            entered.complete(Unit); release.await(); throw WireException("unsupported", "Old provider has no model list")
+        }
+        val older = repo.refreshModels()
+        try {
+            withTimeout(5_000) { entered.await() }
+            providerCatalog = null
+            repo.refreshModels().join()
+            val official = repo.state.value.models
+            release.complete(Unit); older.join()
+            assertTrue(official.isNotEmpty())
+            assertEquals(official, repo.state.value.models)
+            assertEquals(ModelCatalogState.Ready, repo.state.value.modelCatalogState)
+            assertTrue(repo.state.value.supports("model/list"))
+        } finally { release.complete(Unit); older.cancelAndJoin() }
+    }
+
+    @Test fun nativeCatalogReadCannotPublishAfterPhoneProviderChanges() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "model/list") {
+                entered.complete(Unit); release.await()
+                buildJsonObject { put("data", buildJsonArray { add(buildJsonObject {
+                    put("id", "stale-official"); put("model", "stale-official")
+                }) }) }
+            } else null
+        }
+        val older = repo.refreshModels()
+        try {
+            withTimeout(5_000) { entered.await() }
+            providerCatalog = ModelCatalogRequest({ true }) { listOf(providerModel("provider-model")) }
+            // A service change can happen before reconnect issues a newer catalog request.
+            val before = repo.state.value.models
+            release.complete(Unit); older.join()
+            assertEquals(before, repo.state.value.models)
+            assertFalse(repo.state.value.models.any { it.model == "stale-official" })
+        } finally { release.complete(Unit); older.cancelAndJoin() }
+    }
+
+    @Test fun phoneProviderCatalogDoesNotHoldTheNewConversationPageOpen() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        providerCatalog = ModelCatalogRequest({ true }) {
+            entered.complete(Unit); release.await(); listOf(providerModel("provider-model"))
+        }
+        val creation = repo.create(repo.state.value.runtimes.first(), "D:/fixture")
+        try {
+            withTimeout(5_000) { entered.await() }
+            withTimeout(2_000) { creation.join() }
+            assertFalse(repo.state.value.actionStatus["create"]?.loading == true)
+            assertEquals(ConversationLoadState.Ready, repo.state.value.conversationLoadState)
+            assertEquals(ModelCatalogState.Loading, repo.state.value.modelCatalogState)
+            assertTrue(repo.state.value.online)
+        } finally { release.complete(Unit); creation.cancelAndJoin() }
     }
 
     @Test fun modelCatalogFailureIsDistinctAndRetryRecoversWithoutDisconnect() = runBlocking<Unit> {

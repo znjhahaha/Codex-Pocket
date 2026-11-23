@@ -63,6 +63,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
                 onStop = { locations.stopThisPhone(); thisPhone = false },
                 access = access, applying = applying, onUseProvider = locations.thisPhone::useProvider,
                 onSaveProvider = locations.thisPhone::saveProvider, onRemoveProvider = locations.thisPhone::removeProvider,
+                onFetchModels = locations.thisPhone::discoverProviderModels,
                 onSignOut = locations.thisPhone::signOut,
                 projects = projects, onImport = locations.thisPhone::importProject, onExport = locations.thisPhone::exportProject)
         }

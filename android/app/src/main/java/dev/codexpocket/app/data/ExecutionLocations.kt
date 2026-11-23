@@ -90,7 +90,9 @@ internal class ExecutionLocations(private val context: Context,
         }
         // Commands cut off by the last process end are marked once, by the first location to open.
         return PocketRepository(context, connectionFactory = connector, pairStore = store.pairing(target.id),
-            db = db, recoverInterruptedCommands = !recovered).also { recovered = true }
+            db = db, recoverInterruptedCommands = !recovered,
+            modelCatalogOverride = if (target.kind == ExecutionTargetKind.ThisPhone) thisPhone::modelCatalog else ({ null }))
+            .also { recovered = true }
     }
     fun addComputer() = scope.launch {
         try {
