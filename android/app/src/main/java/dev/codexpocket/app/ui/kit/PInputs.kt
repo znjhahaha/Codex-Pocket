@@ -1,5 +1,7 @@
 package dev.codexpocket.app.ui.kit
 
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
@@ -186,13 +188,15 @@ internal fun PCheck(checked: Boolean, onCheckedChange: ((Boolean) -> Unit)?, mod
  * A few mutually exclusive views. The selection is one pill that slides between items; its leading
  * edge moves first and the trailing edge follows, so it stretches in the direction of travel. The
  * pill can also be dragged: it follows the finger, presses in while held, flattens against either
- * end, and selects the item it is let go over.
+ * end, and selects the item it is let go over. [icons] puts a glyph before each label, [itemHeight]
+ * is the least height of an item, and [haptic] is what a change of selection feels like.
  */
 @Composable
-internal fun PSegmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
+internal fun PSegmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
+    icons: List<ImageVector>? = null, itemHeight: Dp = 40.dp, haptic: PocketHaptic? = PocketHaptic.Tick) {
     val c = Pocket.colors
     val motion = rememberPocketMotion()
-    val slide = rememberPSlide(options.size, selected, enabled, onSelect = onSelect)
+    val slide = rememberPSlide(options.size, selected, enabled, haptic, onSelect = onSelect)
     val thumb = c.surface
     Row(modifier.fillMaxWidth().clip(PocketRadii.capsule).background(c.fill).padding(4.dp).pocketSlide(slide).drawBehind {
         if (options.isEmpty()) return@drawBehind
@@ -205,10 +209,12 @@ internal fun PSegmented(options: List<String>, selected: Int, onSelect: (Int) ->
         options.forEachIndexed { index, label ->
             val ink by animateColorAsState(if (!enabled) c.inkMuted.copy(alpha = .6f) else if (index == slide.shown) c.ink else c.inkMuted,
                 PocketMotion.color<Color>().orSnap(motion), label = "segment-ink")
-            Box(Modifier.weight(1f).heightIn(min = 40.dp).clip(PocketRadii.capsule)
-                .pocketSelectable(index == selected, enabled, Role.Tab, pressedScale = .96f) { onSelect(index) }
-                .padding(horizontal = 8.dp), contentAlignment = Alignment.Center) {
-                PText(label, style = Pocket.type.labelSmall, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(Modifier.weight(1f).heightIn(min = itemHeight).clip(PocketRadii.capsule)
+                .pocketSelectable(index == selected, enabled, Role.Tab, pressedScale = .96f, haptic = haptic) { onSelect(index) }
+                .padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically) {
+                icons?.getOrNull(index)?.let { PIcon(it, null, Modifier.size(17.dp), tint = ink) }
+                PText(label, Modifier.weight(1f, fill = false), style = Pocket.type.labelSmall, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }

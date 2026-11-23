@@ -328,15 +328,7 @@ private fun SettingsPageTitle(title: String, subtitle: String) {
 }
 
 @Composable
-private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        PText(title, Modifier.padding(horizontal = 4.dp).semantics { heading() }, style = Pocket.type.titleSmall)
-        PSurface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = Pocket.colors.surface,
-            border = BorderStroke(1.dp, Pocket.colors.line.copy(alpha = .55f))) {
-            Column(Modifier.padding(6.dp), content = content)
-        }
-    }
-}
+private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) = PSection(title, content = content)
 
 @Composable
 internal fun SettingsCircleIcon(icon: ImageVector) {

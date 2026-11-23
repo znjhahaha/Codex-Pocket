@@ -22,8 +22,8 @@
 |---|---|
 | Text, icon | `PText`, `PIcon` |
 | Button, text action, icon button, pill, badge, row | `PButton`, `PTextAction`, `PIconButton`, `PPill`, `PBadge`, `PRow` |
-| Input, switch, checkbox, segmented control | `PTextField`, `PSwitch` (tap or drag), `PCheck`, `PSegmented` (tap or drag) |
-| Surface, card, divider | `PSurface`, `PCard`, `PDivider` |
+| Input, switch, checkbox, segmented control | `PTextField`, `PSwitch` (tap or drag), `PCheck`, `PSegmented` (tap or drag; optional `icons`, `itemHeight`, `haptic`) |
+| Surface, card, titled group of rows, divider | `PSurface`, `PCard`, `PSection` (the outlined group every settings-like page uses), `PDivider` |
 | Page frame with glass chrome, plain page with a top bar | `PFrame` + `PGlassBar` / `PGlassIconButton`, `PScaffold` |
 | Sheet, dialog, anchored menu, long-press hint | `PSheet`, `PDialog`, `PMenu` + `rememberPAnchor()` / `Modifier.pocketAnchor`, `PTooltip` |
 | Progress | `PSpinner`, `PRing`, `PLinearProgress`, `PDots`, `Modifier.pocketSkeleton()`, `PBrandLoader` (Pocket's own mark at work) |

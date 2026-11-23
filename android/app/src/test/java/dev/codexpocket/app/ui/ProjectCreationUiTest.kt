@@ -254,6 +254,72 @@ class ProjectCreationUiTest {
         assertEquals(raw, submitted.single()[1])
     }
 
+    private fun recent(count: Int) = (1..count).map { n -> ChatEntity(ThreadKey("pc", "store", "t$n"),
+        "desktop", "desktop", "Chat $n", "", "/home/dev/project-$n", n.toLong(), "idle", false) }
+    private fun capture(name: String) = compose.runOnIdle {
+        val view = compose.activity.window.decorView
+        val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+        view.draw(android.graphics.Canvas(bitmap))
+        java.io.File("build/reports/newchat/$name.png").also { it.parentFile!!.mkdirs() }.outputStream().use {
+            assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it))
+        }
+        bitmap.recycle()
+    }
+    private fun formScroll() = compose.onNodeWithTag("project-form-scroll").fetchSemanticsNode()
+        .config[androidx.compose.ui.semantics.SemanticsProperties.VerticalScrollAxisRange].value()
+
+    @Test @Config(qualifiers = "w360dp-h720dp-xxhdpi")
+    fun theProjectListIsAPageOverTheFormAndTheFormComesBackWhereItWas() {
+        state = state.copy(chats = recent(12))
+        show()
+        capture("form-light")
+        compose.onNodeWithTag("project-advanced").performScrollTo().performClick()
+        compose.onNodeWithTag("session-mode:cli").performScrollTo()
+        capture("form-advanced-light")
+        val left = formScroll()
+        assertTrue("The form is longer than the page, so it has somewhere to be left: $left", left > 0f)
+        compose.onNodeWithText("所有项目").performClick()
+        compose.onNodeWithTag("project-picker").assertIsDisplayed()
+        compose.onNodeWithTag("project-creation").assertDoesNotExist()
+        capture("projects-light")
+        compose.onNodeWithContentDescription("关闭").performClick()
+        compose.onNodeWithTag("project-picker").assertDoesNotExist()
+        compose.onNodeWithTag("project-creation").assertIsDisplayed()
+        assertEquals("Coming back shows the form as it was left", left, formScroll(), 1f)
+        assertTrue(submitted.isEmpty())
+    }
+
+    @Test fun aChosenRecentProjectIsMarkedAndIsTheOnlyOneMarked() {
+        state = state.copy(chats = recent(3))
+        show()
+        val first = "project-recent:${nativeProjectPathKey("/home/dev/project-1")}"
+        val second = "project-recent:${nativeProjectPathKey("/home/dev/project-2")}"
+        compose.onNodeWithTag(first).assertIsNotSelected()
+        compose.onNodeWithTag(first).performScrollTo().performClick()
+        compose.onNodeWithTag(first).assertIsSelected()
+        compose.onNodeWithTag(second).assertIsNotSelected().performClick()
+        compose.onNodeWithTag(second).assertIsSelected()
+        compose.onNodeWithTag(first).assertIsNotSelected()
+        compose.onNodeWithTag("project-picker-open").assertTextContains("/home/dev/project-2")
+        capture("form-chosen-light")
+        assertTrue("Choosing is not creating", submitted.isEmpty())
+    }
+
+    @Test fun theWholePageIsDrawnOnThePageBackgroundInBothThemes() {
+        state = state.copy(chats = recent(3))
+        show("dark")
+        capture("form-dark")
+        click("新建目录")
+        compose.onNodeWithTag("project-path").performTextInput("/home/dev/new-project")
+        capture("new-directory-dark")
+        click("已有目录")
+        openProjects()
+        compose.onNodeWithTag("project-search").performTextInput("project-2")
+        capture("projects-search-dark")
+        compose.onAllNodes(hasAnyAncestor(hasTestTag("project-list")) and hasText("/home/dev/project-2")).assertCountEquals(1)
+        compose.onAllNodes(hasAnyAncestor(hasTestTag("project-list")) and hasText("/home/dev/project-1")).assertCountEquals(0)
+    }
+
     @Test fun closingPickerDuringTheWavePreservesDraftAndNeverCreates() {
         show()
         compose.onNodeWithTag("project-path").performTextInput("D:\\keep-this-draft")

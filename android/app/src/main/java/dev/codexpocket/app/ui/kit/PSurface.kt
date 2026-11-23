@@ -1,5 +1,6 @@
 package dev.codexpocket.app.ui.kit
 
+import androidx.compose.ui.semantics.heading
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -35,6 +36,21 @@ internal fun PSurface(modifier: Modifier = Modifier, shape: Shape = RectangleSha
     Box(modifier.then(if (border != null) Modifier.border(border, shape) else Modifier).clip(shape).background(color)
         .semantics { isTraversalGroup = true }.pointerInput(Unit) { },
         propagateMinConstraints = true) { ProvidePInk(ink, content = content) }
+}
+
+/**
+ * A group of rows on a page: an optional heading above, and the rows together on one outlined
+ * surface. This is how every settings-like page lays its content out.
+ */
+@Composable
+internal fun PSection(title: String?, modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (title != null) PText(title, Modifier.padding(horizontal = 4.dp).semantics { heading() }, style = Pocket.type.titleSmall)
+        PSurface(Modifier.fillMaxWidth(), shape = PocketRadii.card, color = Pocket.colors.surface,
+            border = BorderStroke(1.dp, Pocket.colors.line.copy(alpha = .55f))) {
+            Column(Modifier.padding(6.dp), content = content)
+        }
+    }
 }
 
 /** A solid content card. Glass is kept for navigation and input chrome, never for reading areas. */
