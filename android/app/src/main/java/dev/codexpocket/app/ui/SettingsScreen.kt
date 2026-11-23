@@ -282,6 +282,11 @@ internal fun SettingsScreen(s: PocketState, repo: PocketRepository, onPair: (() 
                         enabled = s.pushConfigured && s.online && !s.busy,
                         trailing = { PText(context.getString(R.string.v02_push_enable), style = Pocket.type.labelSmall) })
                 }
+                LocalPocketTutorial.current?.let { tutorial ->
+                    SettingsSection("帮助") {
+                        PocketActionRow("使用教程", PocketIcons.Lightbulb, tutorial::show, subtitle = "重新看一遍配对、对话、确认和助理的用法")
+                    }
+                }
                 SettingsSection(context.getString(R.string.on_device)) {
                     PocketActionRow(context.getString(R.string.clear_histories), PocketIcons.DeleteOutline, { clear = true })
                     PocketActionRow(context.getString(R.string.forget_pairing), PocketIcons.Unplug, { forget = true }, destructive = true)

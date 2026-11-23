@@ -39,8 +39,11 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         return
     }
     val state by current.state.collectAsStateWithLifecycle()
-    PocketTheme(state.theme) { PocketOverlayHost {
-        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }, LocalExecutionLocation provides catalog.selected) {
+    // Shown once after installing, and again whenever it is asked for from settings.
+    val tutorial = rememberPocketTutorial()
+    PocketTheme(state.theme) { PocketTutorialHost(tutorial) { PocketOverlayHost {
+        CompositionLocalProvider(LocalExecutionLocationPicker provides { choosing = true }, LocalExecutionLocation provides catalog.selected,
+            LocalPocketTutorial provides tutorial) {
             pages.SaveableStateProvider(catalog.selectedId ?: "unpaired") { PocketRoot(state, current) }
         }
         if (choosing) PocketSheet("执行位置", { choosing = false }, subtitle = "项目、对话与用量跟随所选位置") {
@@ -81,7 +84,7 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
         if (error != null) PocketDialog(onDismissRequest = locations::dismissError,
             title = { PText("执行位置") }, text = { PText(error!!) },
             confirmButton = { PocketButton("知道了", locations::dismissError) })
-    } }
+    } } }
 }
 
 @Composable

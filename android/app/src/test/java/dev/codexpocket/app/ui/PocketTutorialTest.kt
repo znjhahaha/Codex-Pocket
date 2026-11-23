@@ -1,0 +1,136 @@
+package dev.codexpocket.app.ui
+
+import android.content.Context
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import dev.codexpocket.app.MainActivity
+import dev.codexpocket.app.ui.kit.*
+import org.junit.Assert.*
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+
+/** The tutorial covers every part of the app, can be walked by tapping or by dragging, and is shown once. */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+class PocketTutorialTest {
+    @get:Rule val compose = createAndroidComposeRule<MainActivity>()
+    private var preferences by mutableStateOf(PocketGlassPreferences(false, false, true))
+    private var theme by mutableStateOf("light")
+    private var finished = 0
+    private lateinit var view: android.view.View
+
+    private fun content(block: @Composable () -> Unit = { PocketTutorial({ finished++ }) }) {
+        compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme(theme) {
+            view = LocalView.current
+            CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalPocketGlass provides false) { block() }
+        } } }
+        compose.waitForIdle()
+    }
+    private fun advance(ms: Long) { repeat((ms / 16).toInt().coerceAtLeast(1)) { compose.mainClock.advanceTimeBy(16); compose.waitForIdle() } }
+    private fun pixels(name: String? = null): IntArray = compose.runOnIdle {
+        val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height, android.graphics.Bitmap.Config.ARGB_8888)
+        view.draw(android.graphics.Canvas(bitmap))
+        if (name != null) java.io.File("build/reports/tutorial/$name.png").also { it.parentFile.mkdirs() }.outputStream().use {
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+        }
+        IntArray(bitmap.width * bitmap.height).also { bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height); bitmap.recycle() }
+    }
+    private fun title() = compose.onNodeWithTag("tutorial-title").fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.Text].first().text
+
+    @Test fun everyPartOfTheAppHasAChapterWithItsOwnPicture() {
+        assertEquals("One scene to a chapter", TourScene.entries.toSet(), PocketTourChapters.map { it.scene }.toSet())
+        assertEquals(PocketTourChapters.size, PocketTourChapters.map { it.scene }.distinct().size)
+        val all = PocketTourChapters.joinToString(" ") { it.title + it.body + it.points.joinToString { point -> point.text } }
+        for (topic in listOf("配对", "执行位置", "SSH", "会话", "模型", "权限", "停止", "待处理", "计划", "通知", "铅笔", "助理", "记忆", "用量", "设置"))
+            assertTrue("The tutorial says nothing about $topic", topic in all)
+        PocketTourChapters.forEach { assertEquals("${it.title}: three points each", 3, it.points.size) }
+    }
+
+    @Test fun tappingNextWalksEveryChapterAndTheLastOneStarts() {
+        content()
+        compose.mainClock.autoAdvance = false
+        advance(1800)
+        val seen = mutableListOf<String>()
+        PocketTourChapters.forEachIndexed { index, chapter ->
+            assertEquals(chapter.title, title()); seen += title()
+            compose.onNodeWithTag("tutorial-scene:${chapter.scene.name}").assertExists()
+            pixels("chapter-${index + 1}-${chapter.scene.name.lowercase()}")
+            if (index < PocketTourChapters.lastIndex) {
+                compose.onNodeWithTag("tutorial-next").assertTextEquals("下一步").performClick()
+                advance(900)
+            }
+        }
+        assertEquals(PocketTourChapters.size, seen.distinct().size)
+        compose.onNodeWithTag("tutorial-skip").assertIsNotEnabled()
+        assertEquals(0, finished)
+        compose.onNodeWithTag("tutorial-next").assertTextEquals("开始使用").performClick()
+        advance(100)
+        assertEquals(1, finished)
+    }
+
+    @Test fun pagesFollowAFingerAndBackStepsToThePreviousChapterThenLeaves() {
+        content()
+        compose.mainClock.autoAdvance = false
+        advance(400)
+        compose.onNodeWithTag("tutorial-back").assertIsNotEnabled()
+        compose.onNodeWithTag("tutorial-pager").performTouchInput { down(center); moveBy(androidx.compose.ui.geometry.Offset(-width * .3f, 0f)); moveBy(androidx.compose.ui.geometry.Offset(-width * .25f, 0f)) }
+        advance(32)
+        compose.onNodeWithTag("pager-page:0").assertExists(); compose.onNodeWithTag("pager-page:1").assertExists()
+        pixels("drag-between-1-and-2")
+        compose.onNodeWithTag("tutorial-pager").performTouchInput { up() }
+        advance(900)
+        assertEquals(PocketTourChapters[1].title, title())
+        compose.onNodeWithTag("pager-page:0").assertDoesNotExist()
+        compose.onNodeWithTag("tutorial-back").assertIsEnabled().performClick()
+        advance(900)
+        assertEquals(PocketTourChapters[0].title, title())
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        advance(100)
+        assertEquals("Back on the first chapter leaves the tutorial", 1, finished)
+        compose.onNodeWithTag("tutorial-skip").performClick()
+        advance(100)
+        assertEquals(2, finished)
+    }
+
+    @Test fun withMotionOffEveryChapterIsAFinishedStillAndDarkThemeDrawsToo() {
+        preferences = PocketGlassPreferences(false, false, false); theme = "dark"
+        content()
+        compose.mainClock.autoAdvance = false
+        advance(64)
+        PocketTourChapters.forEachIndexed { index, chapter ->
+            val still = pixels("still-dark-${index + 1}-${chapter.scene.name.lowercase()}")
+            advance(700)
+            assertArrayEquals("${chapter.title} moves with motion off", still, pixels())
+            if (index < PocketTourChapters.lastIndex) { compose.onNodeWithTag("tutorial-next").performClick(); advance(32); assertEquals(PocketTourChapters[index + 1].title, title()) }
+        }
+    }
+
+    @Test fun itOpensOnceByItselfIsRememberedAndCanBeAskedForAgain() {
+        val context: Context = compose.activity.applicationContext
+        val store = context.getSharedPreferences(PocketTutorialController.Store, Context.MODE_PRIVATE)
+        store.edit().clear().commit()
+        val first = PocketTutorialController(context, first = true)
+        content { PocketTutorialHost(first) { PText("应用内容", Modifier.testTag("app")) } }
+        compose.onNodeWithTag("tutorial").assertExists()
+        compose.onNodeWithTag("app").assertDoesNotExist()
+        compose.onNodeWithTag("tutorial-skip").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("tutorial").assertDoesNotExist()
+        compose.onNodeWithTag("app").assertExists()
+        assertEquals(PocketTutorialController.Version, store.getInt(PocketTutorialController.Seen, 0))
+        compose.runOnIdle { first.show() }
+        compose.onNodeWithTag("tutorial").assertExists()
+        assertEquals(PocketTourChapters[0].title, title())
+    }
+}
