@@ -1965,6 +1965,475 @@ class PocketRepositoryTest {
         assertTrue(server.calls.filter { it.nativeMethod == "thread/queue/list" }.all { it.commandId == null && it.params.obj("params").keys.all { k -> k in setOf("threadId", "cursor", "limit") } })
     }
 
+    private fun optimisticUserRows(): List<TranscriptRow> = ConversationPresentation.rows(repo.state.value.timeline)
+        .filter { it.kind == TranscriptKind.User }
+
+    private fun onlyOptimisticUser(text: String): TranscriptRow {
+        val rows = optimisticUserRows()
+        assertEquals("The accepted click must already have one visible user row", 1, rows.size)
+        assertEquals(text, rows.single().items.single().text)
+        return rows.single()
+    }
+
+    // Native protocol: TurnStartParams.clientUserMessageId is echoed as UserMessage.clientId,
+    // while UserMessage.id remains a separately generated native ID. See upstream
+    // codex-rs/app-server-protocol/src/protocol/v2/item.rs (ThreadItemPayload::UserMessage)
+    // and app-server/tests/suite/v2/turn_start.rs::turn_start_emits_user_message_item_with_text_elements.
+    // Do not turn clientUserMessageId into a fabricated item field or overwrite the native id.
+    private fun echoedUser(clientId: String?, text: String = "sent once", id: String = "native-user") = buildJsonObject {
+        put("id", id); put("type", "userMessage")
+        put("clientId", clientId?.let(::JsonPrimitive) ?: JsonNull)
+        put("content", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", text) }) })
+    }
+
+    private fun echoedTurn(user: JsonObject) = buildJsonObject {
+        put("id", "sent"); put("status", "inProgress"); put("items", buildJsonArray { add(user) })
+    }
+
+    @Test fun optimisticSendAppearsBeforeResumeAndSurvivesItsEmptyHistoryRead() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val sent = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        update { s -> s.copy(runtimes = s.runtimes.map { it.copy(loadedThreadIds = emptySet()) }) }
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request") when (params.string("method")) {
+                "thread/resume" -> { entered.complete(Unit); release.await() }
+                "turn/start" -> { sent.complete(Unit); accept.await() }
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            val displayKey = onlyOptimisticUser("sent once").key
+            assertEquals("sent once", repo.state.value.draft?.text)
+            release.complete(Unit)
+            withTimeout(5_000) { sent.await() }
+            assertEquals("An empty pre-send snapshot must retain the optimistic row", displayKey, onlyOptimisticUser("sent once").key)
+        } finally { release.complete(Unit); accept.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendAppearsBeforeUploadAndDefiniteRejectionKeepsDraftAndAttachment() = runBlocking<Unit> {
+        repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
+        val original = repo.state.value.attachments.single()
+        repo.editDraft("sent once")
+        val entered = CompletableDeferred<Unit>(); val reject = CompletableDeferred<Unit>()
+        server.intercept = { method, _, _ ->
+            if (method == "attachment/upload") {
+                entered.complete(Unit); reject.await(); throw WireException("rejected", "fixture upload rejection")
+            }
+            null
+        }
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            onlyOptimisticUser("sent once")
+            assertEquals("sent once", repo.state.value.draft?.text)
+            assertEquals(listOf(original), repo.state.value.attachments)
+        } finally { reject.complete(Unit); job.join() }
+        assertTrue("A definite upload rejection removes only the temporary row", optimisticUserRows().isEmpty())
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals(listOf(original), repo.state.value.attachments)
+        assertTrue(repo.attachmentFile(original).exists())
+        assertTrue(server.calls.none { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun optimisticSendDefiniteNativeRejectionRemovesOnlyItsTemporaryRow() = runBlocking<Unit> {
+        repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
+        val attachment = repo.state.value.attachments.single()
+        val entered = CompletableDeferred<Unit>(); val reject = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                entered.complete(Unit); reject.await(); throw WireException("rejected", "fixture native rejection")
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            onlyOptimisticUser("sent once")
+        } finally { reject.complete(Unit); job.join() }
+        assertTrue(optimisticUserRows().isEmpty())
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals(listOf(attachment), repo.state.value.attachments)
+        assertTrue(repo.attachmentFile(attachment).exists())
+        assertTrue(db.dao().uncertain("computer").isEmpty())
+    }
+
+    @Test fun optimisticSendUnknownSurvivesOfflineRestartAndCannotBeReplayed() = runBlocking<Unit> {
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"; throw UnknownOutcomeException(id)
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        repo.send().join()
+        await { it.uncertainSend }
+        val displayKey = onlyOptimisticUser("sent once").key
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertTrue(optimisticUserRows().none { row -> row.items.any { it.status == "failed" } })
+        repo.send().join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+        restartOffline()
+        repo.select(db.dao().chat(key)!!).join()
+        assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertTrue(repo.state.value.uncertainSend)
+        repo.send().join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun optimisticSendBindsTheClickedDraftBeforeAccessPreparation() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        update { it.copy(capabilities = it.capabilities + "thread/access/read") }
+        server.intercept = { method, _, _ ->
+            if (method == "thread/access/read") {
+                entered.complete(Unit); release.await()
+                buildJsonObject {
+                    put("mode", "desktop"); put("phase", "ready"); put("source", "desktop")
+                    put("ownerRuntimeId", "runtime"); put("canSend", true)
+                }
+            } else null
+        }
+        repo.editDraft("clicked draft")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            onlyOptimisticUser("clicked draft")
+            repo.editDraft("new draft while preparing")
+        } finally { release.complete(Unit); job.join() }
+        val request = server.calls.single { it.nativeMethod == "turn/start" }.params.obj("params")
+        assertEquals("clicked draft", request.array("input").first().asObject().string("text"))
+        assertEquals("new draft while preparing", repo.state.value.draft?.text)
+    }
+
+    @Test fun optimisticSendAcceptedWithoutEchoSurvivesProcessRecoveryAndReconnect() = runBlocking<Unit> {
+        repo.editDraft("sent once")
+        repo.send().join()
+        val displayKey = onlyOptimisticUser("sent once").key
+        val clientId = server.calls.single { it.nativeMethod == "turn/start" }.params.obj("params").string("clientUserMessageId")
+        assertEquals("", repo.state.value.draft?.text)
+        restartOffline()
+        repo.select(db.dao().chat(key)!!).join()
+        assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+        server.pagedHistory = true; server.pageTurns = listOf(echoedTurn(echoedUser(clientId)))
+        repo.setForeground(true)
+        await { it.online && it.timeline.items.values.any { item -> item.itemId == "native-user" } }
+        assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun optimisticSendUnknownRejectedDuringReconciliationKeepsTheRecoverableDraft() = runBlocking<Unit> {
+        repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
+        val attachment = repo.state.value.attachments.single()
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"; throw UnknownOutcomeException(id)
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        repo.send().join()
+        onlyOptimisticUser("sent once")
+        val pending = db.dao().uncertain("computer").single { it.method == "turn/start" }
+        server.statuses[pending.id] = "rejected"
+        repo.checkCommands().join()
+        await { !it.uncertainSend }
+        assertTrue(optimisticUserRows().isEmpty())
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals(listOf(attachment), repo.state.value.attachments)
+        assertTrue(repo.attachmentFile(attachment).exists())
+        restartOffline()
+        repo.select(db.dao().chat(key)!!).join()
+        assertTrue(optimisticUserRows().isEmpty())
+        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals(listOf(attachment), repo.state.value.attachments)
+    }
+
+    @Test fun optimisticSendUnknownAcceptedReceiptAndLateClientEchoKeepOneDisplayKey() = runBlocking<Unit> {
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"; throw UnknownOutcomeException(id)
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        repo.send().join()
+        val displayKey = onlyOptimisticUser("sent once").key
+        val request = server.calls.single { it.nativeMethod == "turn/start" }
+        // crates/agent/src/broker.rs::status_value returns native_result under result.
+        server.intercept = { method, _, _ ->
+            if (method == "commands/status") buildJsonObject {
+                put("status", "accepted"); put("result", buildJsonObject { put("turn", echoedTurn(echoedUser(request.params.obj("params").string("clientUserMessageId")))) })
+            } else null
+        }
+        repo.checkCommands().join()
+        await { !it.uncertainSend }
+        assertEquals("", repo.state.value.draft?.text)
+        assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "sent")
+            put("item", echoedUser(request.params.obj("params").string("clientUserMessageId")))
+        })
+        await { it.timeline.items.values.any { item -> item.itemId == "native-user" } }
+        assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun optimisticSendDelayedReceiptDoesNotConsumeANewDraftWithTheSameText() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") { entered.complete(Unit); accept.await() }
+            null
+        }
+        repo.editDraft("repeat this")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            repo.editDraft("a new thought")
+            repo.editDraft("repeat this")
+        } finally { accept.complete(Unit); job.join() }
+        assertEquals("A new draft is not the submitted draft even when its text is equal", "repeat this", repo.state.value.draft?.text)
+        assertEquals("repeat this", db.dao().draft(key)?.text)
+    }
+
+    @Test fun optimisticSendRetainsItsRowWhileSwitchingChatsAndKeepsBothNewDrafts() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") { entered.complete(Unit); accept.await() }
+            null
+        }
+        repo.editDraft("sent once")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            val displayKey = onlyOptimisticUser("sent once").key
+            repo.editDraft("new draft in original chat")
+            repo.select(repo.state.value.chats.first { it.key == otherKey }).join()
+            repo.editDraft("other chat draft")
+            assertTrue(optimisticUserRows().isEmpty())
+            accept.complete(Unit); job.join()
+            assertEquals(otherKey, repo.state.value.selected?.key)
+            assertEquals("other chat draft", repo.state.value.draft?.text)
+            repo.select(repo.state.value.chats.first { it.key == key }).join()
+            assertEquals(displayKey, onlyOptimisticUser("sent once").key)
+            assertEquals("new draft in original chat", repo.state.value.draft?.text)
+            assertEquals("other chat draft", db.dao().draft(otherKey)?.text)
+        } finally { accept.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendEventSnapshotReceiptOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("ESR") }
+    @Test fun optimisticSendEventReceiptSnapshotOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("ERS") }
+    @Test fun optimisticSendSnapshotEventReceiptOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("SER") }
+    @Test fun optimisticSendSnapshotReceiptEventOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("SRE") }
+    @Test fun optimisticSendReceiptEventSnapshotOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("RES") }
+    @Test fun optimisticSendReceiptSnapshotEventOrderKeepsDisplayIdentity() = runBlocking<Unit> { optimisticEchoOrder("RSE") }
+
+    private suspend fun optimisticEchoOrder(order: String) {
+        val entered = CompletableDeferred<String>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                entered.complete(params.obj("params").string("clientUserMessageId")); accept.await()
+            }
+            null
+        }
+        repo.editDraft("sent once")
+        val job = repo.send()
+        try {
+            val clientId = withTimeout(5_000) { entered.await() }
+            assertTrue(clientId.isNotBlank())
+            val displayKey = onlyOptimisticUser("sent once").key
+            val native = echoedUser(clientId)
+            for (stage in order) {
+                when (stage) {
+                    'E' -> {
+                        server.emit("item/started", buildJsonObject { put("threadId", "t"); put("turnId", "sent"); put("item", native) })
+                        server.emit("item/completed", buildJsonObject { put("threadId", "t"); put("turnId", "sent"); put("item", native) })
+                        await { it.timeline.items.values.any { item -> item.itemId == "native-user" && item.complete } }
+                    }
+                    'S' -> {
+                        server.pagedHistory = true; server.pageTurns = listOf(echoedTurn(native))
+                        repo.reloadConversation().join()
+                        assertNull(repo.state.value.conversationLoadError)
+                    }
+                    'R' -> { accept.complete(Unit); job.join() }
+                }
+                assertEquals("Display identity changed at $stage in $order", displayKey, onlyOptimisticUser("sent once").key)
+            }
+            val item = repo.state.value.timeline.items.values.single { it.type == "userMessage" }
+            val nativeKey = JsonArray(listOf(JsonPrimitive("sent"), JsonPrimitive("native-user"))).toString()
+            assertEquals("Native item identity must retain its protocol meaning", nativeKey, item.key)
+            assertEquals(nativeKey, db.dao().items(key).single { it.type == "userMessage" }.itemKey)
+            assertEquals(clientId, item.raw.string("clientId"))
+            assertEquals("", repo.state.value.draft?.text)
+            assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+            assertEquals(setOf(clientId), server.calls.filter { it.nativeMethod == "turn/start" }
+                .map { it.params.obj("params").string("clientUserMessageId") }.toSet())
+            restartOffline()
+            repo.select(db.dao().chat(key)!!).join()
+            assertEquals("Display identity must survive process recovery", displayKey, onlyOptimisticUser("sent once").key)
+        } finally { accept.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendDoesNotMergeAnUnrelatedNativeUserWithIdenticalText() = runBlocking<Unit> {
+        val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") { entered.complete(Unit); accept.await() }
+            null
+        }
+        repo.editDraft("sent once")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            val localKey = onlyOptimisticUser("sent once").key
+            server.emit("item/completed", buildJsonObject {
+                put("threadId", "t"); put("turnId", "other-turn")
+                put("item", echoedUser("another-client", id = "another-user"))
+            })
+            await { it.timeline.items.values.any { item -> item.itemId == "another-user" } }
+            assertEquals("Text equality is not identity evidence", 2, optimisticUserRows().size)
+            assertTrue(optimisticUserRows().any { it.key == localKey })
+        } finally { accept.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendReconnectDuringResumeWithdrawsUnsentMessage() = runBlocking<Unit> {
+        optimisticReconnectBeforeSend("thread/resume")
+    }
+
+    @Test fun optimisticSendReconnectDuringUploadWithdrawsUnsentMessage() = runBlocking<Unit> {
+        optimisticReconnectBeforeSend("attachment/upload")
+    }
+
+    private suspend fun optimisticReconnectBeforeSend(stage: String) {
+        if (stage == "attachment/upload") repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
+        else update { state -> state.copy(runtimes = state.runtimes.map { it.copy(loadedThreadIds = emptySet()) }) }
+        val originalAttachments = repo.state.value.attachments
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val held = java.util.concurrent.atomic.AtomicBoolean(false)
+        server.intercept = { method, params, id ->
+            val matches = if (stage == "attachment/upload") method == stage
+                else method == "codex/request" && params.string("method") == stage
+            if (matches && held.compareAndSet(false, true)) {
+                server.statuses[id!!] = "accepted" // Only the preparation/upload was accepted, never turn/start.
+                entered.complete(Unit); release.await()
+            }
+            null
+        }
+        repo.editDraft("clicked before reconnect")
+        val before = server.links.last()
+        val epoch = repo.state.value.mediaConnectionEpoch
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            onlyOptimisticUser("clicked before reconnect")
+            // Exercise the real disconnect/hello/sync path with the SAME computer/store/thread.
+            repo.setForeground(false); repo.setForeground(true)
+            await { it.online && it.mediaConnectionEpoch > epoch && server.links.last() !== before }
+            assertEquals("computer", repo.state.value.computerId)
+            assertEquals(key, repo.state.value.selected?.key)
+            release.complete(Unit)
+            withTimeout(5_000) { job.join() }
+            assertTrue("An old click must not send on a replacement connection", server.calls.none { it.nativeMethod == "turn/start" })
+            assertTrue("The replacement transport must receive no user write", server.links.last().requests.none { it.nativeMethod == "turn/start" })
+            assertTrue("Definitely unsent local rows must be withdrawn", optimisticUserRows().isEmpty())
+            assertEquals("clicked before reconnect", repo.state.value.draft?.text)
+            assertEquals(originalAttachments, repo.state.value.attachments)
+            originalAttachments.forEach { assertTrue(repo.attachmentFile(it).exists()) }
+            val outgoing = db.dao().outgoingMessages().single()
+            assertEquals("rejected", outgoing.phase)
+            assertNull("The stale click must stop before durable turn submission", db.dao().command(outgoing.commandId))
+        } finally { release.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendReconnectAfterNativeWriteKeepsUnknownAndNeverReplays() = runBlocking<Unit> {
+        val entered = CompletableDeferred<String>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"
+                entered.complete(id); release.await(); throw UnknownOutcomeException(id)
+            }
+            null
+        }
+        repo.editDraft("written before reconnect")
+        val before = server.links.last()
+        val epoch = repo.state.value.mediaConnectionEpoch
+        val job = repo.send()
+        try {
+            val commandId = withTimeout(5_000) { entered.await() }
+            val displayKey = onlyOptimisticUser("written before reconnect").key
+            repo.setForeground(false); repo.setForeground(true)
+            await { it.online && it.mediaConnectionEpoch > epoch && server.links.last() !== before }
+            release.complete(Unit)
+            withTimeout(5_000) { job.join() }
+            repo.checkCommands().join()
+            await { it.uncertainSend }
+            assertEquals(displayKey, onlyOptimisticUser("written before reconnect").key)
+            assertEquals("unknown", db.dao().command(commandId)?.status)
+            assertEquals("written before reconnect", repo.state.value.draft?.text)
+            repo.send().join()
+            assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+            assertTrue(server.links.last().requests.none { it.nativeMethod == "turn/start" })
+        } finally { release.complete(Unit); job.join() }
+    }
+
+    @Test fun optimisticSendLegacyCachedUserKeepsItsNativeDisplayKey() {
+        val raw = JsonObject(echoedUser(null, "old cached text", "old-user") - "clientId")
+        val nativeKey = JsonArray(listOf(JsonPrimitive("old-turn"), JsonPrimitive("old-user"))).toString()
+        // A pre-optimistic Room row has no clientId and no local display metadata.
+        val restored = ItemEntity(key, nativeKey, "old-turn", "old-user", "userMessage", "old cached text",
+            "", raw, true, 0).item()
+        val timeline = NativeTimeline(items = linkedMapOf(restored.key to restored))
+        val row = ConversationPresentation.rows(timeline).single()
+        assertEquals(nativeKey, restored.key)
+        assertEquals(nativeKey, row.key)
+        assertEquals(raw, ItemEntity.from(key, restored, 0).item().raw)
+    }
+
+    @Test fun optimisticSendQueueDoesNotPublishATemporaryBodyBubble() = runBlocking<Unit> {
+        server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "running") }) })
+        await { it.timeline.activeTurn == "running" }
+        val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "thread/queue/add") { entered.complete(Unit); accept.await() }
+            null
+        }
+        repo.editDraft("queued next")
+        val job = repo.send()
+        try {
+            withTimeout(5_000) { entered.await() }
+            assertTrue(optimisticUserRows().isEmpty())
+            assertEquals("queued next", repo.state.value.draft?.text)
+        } finally { accept.complete(Unit); job.join() }
+        assertTrue(optimisticUserRows().isEmpty())
+        assertEquals("", repo.state.value.draft?.text)
+        assertTrue(server.calls.none { it.nativeMethod == "turn/steer" })
+    }
+
+    @Test fun optimisticSendSteerKeepsNativeExpectedTurnAndDoesNotCreateANewTurnBubble() = runBlocking<Unit> {
+        server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "running") }) })
+        await { it.timeline.activeTurn == "running" }
+        val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/steer") { entered.complete(Unit); accept.await() }
+            null
+        }
+        repo.editDraft("steer current")
+        val job = repo.send(true)
+        try {
+            withTimeout(5_000) { entered.await() }
+            assertTrue(optimisticUserRows().isEmpty())
+            val request = server.calls.single { it.nativeMethod == "turn/steer" }.params.obj("params")
+            assertEquals("running", request.string("expectedTurnId"))
+            assertTrue(request.string("clientUserMessageId").isNotBlank())
+            assertEquals("steer current", repo.state.value.draft?.text)
+        } finally { accept.complete(Unit); job.join() }
+        assertTrue(optimisticUserRows().isEmpty())
+        assertEquals("running", repo.state.value.timeline.activeTurn)
+        assertEquals("", repo.state.value.draft?.text)
+    }
+
     @Test fun ordinaryInputDuringTurnUsesNativeQueueInsteadOfSteering() = runBlocking<Unit> {
         server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "running") }) })
         await { it.timeline.activeTurn == "running" }
@@ -2798,13 +3267,15 @@ class PocketRepositoryTest {
         suspend fun emitRaw(event: JsonObject) = notify("codex/event", buildJsonObject { put("runtimeId", owner); put("cursor", buildJsonObject { put("epoch", epoch); put("sequence", sequence.incrementAndGet()) }); put("event", event) })
         inner class Link : PocketConnection {
             @Volatile var closed = false
+            val requests = CopyOnWriteArrayList<Call>()
             override val state = MutableStateFlow(LinkState.OFFLINE)
             val notes = Channel<JsonObject>(Channel.UNLIMITED)
             override val notifications = notes.receiveAsFlow()
             override suspend fun connect(config: ConnectionConfig) { attempts.incrementAndGet(); if (failConnections) throw WireException("offline", "Fixture offline"); state.value = LinkState.ONLINE }
             override fun close() { state.value = LinkState.OFFLINE; notes.close(WireException("disconnected", "Fixture disconnected")); closed = true }
             override suspend fun request(method: String, params: JsonObject, commandId: String?, timeoutMillis: Long): JsonElement {
-                calls += Call(method, params, commandId)
+                val call = Call(method, params, commandId)
+                calls += call; requests += call
                 intercept(method, params, commandId)?.let { return it }
                 return when (method) {
                     "hello" -> buildJsonObject { put("protocol", 1); put("computerId", "computer"); put("computerName", "Fixture"); put("runtimes", runtimes()); put("capabilities", JsonArray(capabilities.map(::JsonPrimitive))) }

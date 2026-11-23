@@ -66,7 +66,7 @@ class V051MigrationTest {
         } finally { helper.close() }
         database = PocketDatabase.create(application)
         // Force Room's real open/migration/schema-validation path; no test-only migration SQL.
-        assertEquals(3, database.openHelper.writableDatabase.version)
+        assertEquals(4, database.openHelper.writableDatabase.version)
     }
 
     @After fun close() {

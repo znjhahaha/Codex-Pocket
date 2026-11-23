@@ -59,7 +59,8 @@ data class CachedItemPosition(val itemKey: String, val ordinal: Long)
 
 @Entity(tableName = "drafts")
 data class DraftEntity(@PrimaryKey val chatKey: ThreadKey, val text: String = "", val attachments: String = "[]", val scrollIndex: Int = 0, val scrollOffset: Int = 0, val expansions: String = "[]", val followEnd: Boolean = true,
-    val scrollItemKey: String? = null, @ColumnInfo(defaultValue = "'[]'") val references: String = "[]")
+    val scrollItemKey: String? = null, @ColumnInfo(defaultValue = "'[]'") val references: String = "[]",
+    @ColumnInfo(defaultValue = "0") val textRevision: Long = 0)
 
 @Entity(tableName = "cursors", primaryKeys = ["computerId", "runtimeId"])
 data class CursorEntity(val computerId: String, val runtimeId: String, val epoch: String, val sequence: Long)
@@ -72,6 +73,9 @@ data class CommandEntity(@PrimaryKey val id: String, val computerId: String, val
 
 @Dao
 interface PocketDao {
+    @Query("SELECT * FROM outgoing_user_messages ORDER BY createdAt, clientId") suspend fun outgoingMessages(): List<OutgoingUserMessage>
+    @Upsert suspend fun putOutgoingMessage(message: OutgoingUserMessage)
+    @Query("SELECT * FROM commands WHERE id = :id") suspend fun command(id: String): CommandEntity?
     @Query("SELECT * FROM context_usage WHERE chatKey = :key") suspend fun contextUsage(key: ThreadKey): ContextEntity?
     @Upsert suspend fun putContextUsage(value: ContextEntity)
     @Query("UPDATE chats SET isSubagent = 1, parentThreadId = :parent, relationSource = :source WHERE `key` = :key")
@@ -115,7 +119,7 @@ interface PocketDao {
     @Query("DELETE FROM drafts") suspend fun clearDrafts()
 }
 
-@Database(entities = [ChatEntity::class, ContextEntity::class, ItemEntity::class, DraftEntity::class, CursorEntity::class, SnapshotEntity::class, CommandEntity::class], version = 3, exportSchema = true)
+@Database(entities = [ChatEntity::class, ContextEntity::class, ItemEntity::class, DraftEntity::class, CursorEntity::class, SnapshotEntity::class, CommandEntity::class, OutgoingUserMessage::class], version = 4, exportSchema = true)
 @TypeConverters(RoomConverters::class)
 abstract class PocketDatabase : RoomDatabase() {
     abstract fun dao(): PocketDao
@@ -134,6 +138,14 @@ abstract class PocketDatabase : RoomDatabase() {
                 db.execSQL("CREATE TABLE IF NOT EXISTS context_usage (chatKey TEXT NOT NULL PRIMARY KEY, snapshot TEXT NOT NULL)")
             }
         }
-        fun create(context: Context) = Room.databaseBuilder(context, PocketDatabase::class.java, "pocket.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE drafts ADD COLUMN textRevision INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("CREATE TABLE IF NOT EXISTS outgoing_user_messages (clientId TEXT NOT NULL PRIMARY KEY, chatKey TEXT NOT NULL, commandId TEXT NOT NULL, createdAt INTEGER NOT NULL, text TEXT NOT NULL, attachments TEXT NOT NULL, `references` TEXT NOT NULL, draftRevision INTEGER NOT NULL, phase TEXT NOT NULL, showPending INTEGER NOT NULL, nativeKey TEXT, blockingCommandId TEXT)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_outgoing_user_messages_chatKey ON outgoing_user_messages(chatKey)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_outgoing_user_messages_commandId ON outgoing_user_messages(commandId)")
+            }
+        }
+        fun create(context: Context) = Room.databaseBuilder(context, PocketDatabase::class.java, "pocket.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
     }
 }

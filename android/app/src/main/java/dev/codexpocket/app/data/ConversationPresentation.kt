@@ -96,6 +96,8 @@ object ConversationPresentation {
 
     fun rows(timeline: NativeTimeline, blockedTurns: Set<String> = emptySet(), foldTasks: Boolean = true, includeReasoning: Boolean = false,
         resolvedRequestIds: Set<String> = emptySet(), agentLiveStatuses: Map<String, AgentLiveStatus> = emptyMap()): List<TranscriptRow> {
+        if (timeline.outgoingMessages.isNotEmpty()) return rows(timeline.withOutgoingPresentation(), blockedTurns,
+            foldTasks, includeReasoning, resolvedRequestIds, agentLiveStatuses)
         if (foldTasks) return taskRows(timeline, blockedTurns, resolvedRequestIds, agentLiveStatuses)
         val rows = mutableListOf<TranscriptRow>()
         var span = mutableListOf<TimelineItem>()
@@ -131,7 +133,7 @@ object ConversationPresentation {
                 span += item
             } else {
                 span = mutableListOf(item)
-                rows += TranscriptRow(if (kind == TranscriptKind.Activity) "activity:${item.key}" else item.key, kind, span, completed)
+                rows += TranscriptRow(if (kind == TranscriptKind.Activity) "activity:${item.key}" else item.displayKey, kind, span, completed)
             }
             canAppend = groupable
         }
@@ -241,7 +243,7 @@ object ConversationPresentation {
                 val keptKeys = finals.map { it.key }.toSet()
                 val process = visibleItems.filter { it.key != firstUser?.key && it.key !in keptKeys }
                 val result = mutableListOf<TranscriptRow>()
-                firstUser?.let { result += TranscriptRow(it.key, TranscriptKind.User, listOf(it), true, foldReason = reason) }
+                firstUser?.let { result += TranscriptRow(it.displayKey, TranscriptKind.User, listOf(it), true, foldReason = reason) }
                 if (process.isNotEmpty()) {
                     val duration = meta.fold<NativeTurnInfo, Long?>(0L) { total, info ->
                         val elapsed = info.elapsedMs

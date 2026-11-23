@@ -83,7 +83,9 @@ private fun JsonObject.nativeSummaryParts(): List<String> = array("summary").map
 
 data class TimelineItem(val turnId: String, val itemId: String, val type: String, val text: String = "", val status: String = "", val raw: JsonObject = buildJsonObject {}, val complete: Boolean = false,
     // Live lifecycle, or a native timed start at the tail of an active snapshot. Cache defaults to unknown.
-    val liveStarted: Boolean = false) {
+    val liveStarted: Boolean = false,
+    // Local row identity only. key below always retains its native (turnId,itemId) meaning.
+    val presentationKey: String? = null) {
     val summaryParts: List<String> get() = when {
         "summary" in raw -> raw.nativeSummaryParts()
         // A native reasoning record without a summary contains no displayable thought text.
@@ -91,6 +93,7 @@ data class TimelineItem(val turnId: String, val itemId: String, val type: String
         else -> text.split(Regex("\\r?\\n[ \\t]*\\r?\\n")).filter(String::isNotBlank)
     }
     val key get() = JsonArray(listOf(JsonPrimitive(turnId), JsonPrimitive(itemId))).toString()
+    val displayKey get() = presentationKey ?: key
     val diff get() = if (type == "fileChange") raw.array("changes").joinToString("\n\n") { val c = it.asObject(); "--- ${c.string("path")}\n${c.string("diff")}" } else if (type == "turn/diff/updated") raw.obj("params").string("diff") else ""
     companion object {
         fun from(turn: String, item: JsonObject, complete: Boolean = true): TimelineItem {
@@ -109,7 +112,7 @@ data class TimelineItem(val turnId: String, val itemId: String, val type: String
 }
 
 data class NativeTimeline(val items: Map<String, TimelineItem> = linkedMapOf(), val activeTurn: String? = null, val status: String = "", val completedTurns: Set<String> = emptySet(), val turns: Map<String, NativeTurnInfo> = emptyMap(),
-    val activeFlags: Set<String> = emptySet())
+    val activeFlags: Set<String> = emptySet(), val outgoingMessages: List<OutgoingUserMessage> = emptyList())
 
 private fun JsonObject.nativeActiveFlags(): Set<String> = array("activeFlags").mapNotNull {
     (it as? JsonPrimitive)?.takeIf { value -> value.isString }?.content
