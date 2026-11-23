@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.util.Base64
 import java.io.File
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.util.UUID
@@ -23,6 +24,16 @@ internal fun readAssistantText(file:File):String {
     require(text.none {it=='\u0000' || it.code in 1..8 || it.code in 14..31}) {"此附件不是 UTF-8 文本"}
     return text
 }
+internal fun readAssistantAttachmentHeader(input:InputStream):ByteArray {
+    val header=ByteArray(12)
+    var size=0
+    while(size<header.size) {
+        val count=input.read(header,size,header.size-size)
+        if(count<0) break
+        size+=count
+    }
+    return header.copyOf(size)
+}
 internal suspend fun copyAssistantAttachments(context:Context,uris:List<Uri>,available:Int):List<LocalAttachment> = withContext(Dispatchers.IO) {
     require(uris.size<=available) {"每条消息最多 4 个附件"}
     val added=mutableListOf<LocalAttachment>()
@@ -38,7 +49,7 @@ internal suspend fun copyAssistantAttachments(context:Context,uris:List<Uri>,ava
                     val buffer=ByteArray(8192);var total=0
                     while(true) {val n=input.read(buffer);if(n<0) break;total+=n;require(total<=8*1024*1024) {"图片需小于 8 MiB"};out.write(buffer,0,n)}
                 }} ?: error("无法读取所选附件")
-                val header=file.inputStream().use {it.readNBytes(12)}
+                val header=file.inputStream().use(::readAssistantAttachmentHeader)
                 val mime=when {
                     header.size>=8 && header.take(8)==listOf(0x89.toByte(),80.toByte(),78.toByte(),71.toByte(),13.toByte(),10.toByte(),26.toByte(),10.toByte())->"image/png"
                     header.size>=3 && header[0]==0xff.toByte() && header[1]==0xd8.toByte() && header[2]==0xff.toByte()->"image/jpeg"
