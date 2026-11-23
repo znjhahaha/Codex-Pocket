@@ -94,6 +94,46 @@ class TranscriptScrollingUiTest {
     private fun scrollPosition(): Float = compose.onNodeWithTag("chat-transcript").fetchSemanticsNode()
         .config[SemanticsProperties.VerticalScrollAxisRange].value()
 
+    /** Counts only the sampled hotspot; background projection and other readers remain real. */
+    private class LiveStatusReads(private val source: Map<String, TimelineItem>) : Map<String, TimelineItem> by source {
+        var mainThreadReads = 0
+        override val values: Collection<TimelineItem>
+            get() {
+                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper() &&
+                    Thread.currentThread().stackTrace.any {
+                        it.className == ConversationPresentation::class.java.name && it.methodName == "liveStatus"
+                    }) mainThreadReads++
+                return source.values
+            }
+    }
+
+    @Test fun scrollingDoesNotRescanUnchangedLiveStatusButNewTimelineStillUpdates() {
+        val loaded = content()
+        val reads = LiveStatusReads(loaded.items)
+        compose.runOnIdle {
+            timeline = loaded.copy(items = reads, activeTurn = "last", completedTurns = loaded.completedTurns - "last")
+        }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertTrue("The initial active snapshot must compute its status", reads.mainThreadReads > 0)
+            reads.mainThreadReads = 0
+        }
+        compose.onNodeWithTag("chat-transcript").performTouchInput { swipeDown(durationMillis = 400) }
+        // A measured chrome change must also leave the same timeline's result reusable.
+        compose.runOnIdle { headerHeight += 16 }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertEquals("Scrolling/layout must not repeat the main-thread history scan", 0, reads.mainThreadReads)
+        }
+        val newWork = TimelineItem("last", "new-work", "commandExecution", "New native work", complete = false)
+        val next = LiveStatusReads(loaded.items + (newWork.key to newWork))
+        compose.runOnIdle { timeline = timeline.copy(items = next) }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertTrue("A new native snapshot must recompute live status", next.mainThreadReads > 0)
+        }
+    }
+
     @Test
     @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
     fun historyConnectionKeepsTranscriptAndFloatingComposerAvailable() {

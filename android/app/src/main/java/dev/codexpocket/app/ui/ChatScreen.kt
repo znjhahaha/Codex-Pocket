@@ -74,7 +74,9 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses)
         val changeCards = rememberTurnChangeCards(s.timeline, rows)
         val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty(), s.conversationCached)
-        val live = s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
+        val live = remember(s.timeline) {
+            s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
+        }
         val reasoning = remember(s.timeline) { ConversationPresentation.liveReasoning(s.timeline) }
         val agents = remember(s.timeline, s.agentStatuses, chat.key) { s.currentAgents() }
         LaunchedEffect(chat.key, s.online, agents.map { it.threadId }) {
