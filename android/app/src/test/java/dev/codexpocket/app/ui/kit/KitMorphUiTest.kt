@@ -176,7 +176,7 @@ class KitMorphUiTest {
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
             CompositionLocalProvider(LocalPocketGlassPreferences provides preferences, LocalPocketGlass provides false) {
                 PStage(page, depth = { if (it == "home") 0 else 1 }) { shown ->
-                    if (shown == "home") { val entrance = rememberPocketEntrance(); remember { opened += entrance.open } }
+                    if (shown == "home") { val entrance = rememberPocketEntrance(); remember { opened.add(entrance.open) } }
                     PText(shown)
                 }
             }
