@@ -7,7 +7,9 @@ param(
     [string]$UpdateTrustPath,
     [string]$TargetDirectory,
     [string]$DesktopTargetDirectory,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$OnDeviceRuntime,
+    [string[]]$OnDeviceAbis
 )
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 
@@ -112,6 +114,58 @@ function Assert-PocketApkSignerIdentity([string[]]$Verification,[string]$Expecte
         throw "Release APK signer does not match the existing release.jks identity. Expected: $ExpectedSigner; matched: $($signers.Count); actual: $actual"
     }
 }
+function Get-PocketOnDeviceRuntime([string]$RuntimeDirectory,[string[]]$Abis) {
+    if (-not $RuntimeDirectory) {
+        if ($Abis.Count -gt 0) { throw '-OnDeviceAbis requires -OnDeviceRuntime.' }
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $RuntimeDirectory -PathType Container)) { throw "On-device runtime directory missing: $RuntimeDirectory" }
+    $directory = (Get-Item -LiteralPath $RuntimeDirectory).FullName
+    $libraries = Join-Path $directory 'jniLibs'
+    if (-not [IO.Directory]::Exists($libraries)) { throw 'On-device runtime has no jniLibs directory.' }
+    $selected = if ($Abis.Count -gt 0) {
+        @($Abis | ForEach-Object { $_.Split(',') } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    } else {
+        @(Get-ChildItem -LiteralPath $libraries -Directory | ForEach-Object { $_.Name })
+    }
+    if ($selected.Count -eq 0) { throw 'On-device runtime has no staged ABIs.' }
+    $required = @('libpocket-agent.so','libpocket-runtime-host.so','libpocket-runtime-manifest.so','libcodex.so')
+    $files = foreach ($abi in $selected) {
+        if ($abi -cnotin @('arm64-v8a','x86_64')) { throw "Unsupported on-device runtime ABI: $abi" }
+        $abiDirectory = Join-Path $libraries $abi
+        foreach ($name in $required) {
+            $path = Join-Path $abiDirectory $name
+            if (-not [IO.File]::Exists($path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+                throw "On-device runtime staging missing or empty: $abi/$name"
+            }
+        }
+        foreach ($file in Get-ChildItem -LiteralPath $abiDirectory -Filter '*.so' -File) {
+            [pscustomobject]@{Entry="lib/$abi/$($file.Name)";Path=$file.FullName;Length=$file.Length}
+        }
+    }
+    return [pscustomobject]@{Directory=$directory;Abis=@($selected);Files=@($files)}
+}
+function Assert-PocketOnDeviceApk([string]$ApkPath,[string]$RuntimeDirectory,[string[]]$Abis) {
+    $runtime = Get-PocketOnDeviceRuntime $RuntimeDirectory $Abis
+    if (-not $runtime) { throw 'APK runtime inspection requires a runtime directory.' }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($ApkPath)
+    try {
+        foreach ($file in $runtime.Files) {
+            $entries = @($zip.Entries | Where-Object { $_.FullName -ceq $file.Entry })
+            if ($entries.Count -ne 1) { throw "APK runtime entry missing or duplicated: $($file.Entry)" }
+            $entry = $entries[0]
+            if ($entry.Length -ne $file.Length) { throw "APK runtime bytes differ from staging: $($file.Entry)" }
+            # JNI stripping or stale build outputs must not silently replace the
+            # staged executables. Stream the ZIP entry; large runtimes stay off heap.
+            $stream = $entry.Open()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $actual = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+            finally { $sha.Dispose(); $stream.Dispose() }
+            if ($actual -ne (Get-PocketFileHash $file.Path)) { throw "APK runtime bytes differ from staging: $($file.Entry)" }
+        }
+    } finally { $zip.Dispose() }
+}
 function Invoke-PocketDesktopBuild([string]$Root,[string]$Target,[string]$DesktopTargetDirectory,[switch]$SkipTests) {
     if (-not $DesktopTargetDirectory) { $DesktopTargetDirectory=Join-Path $Root 'desktop\target' }
     Push-Location (Join-Path $Root 'desktop')
@@ -131,8 +185,9 @@ function Invoke-PocketDesktopBuild([string]$Root,[string]$Target,[string]$Deskto
 }
 function Invoke-PocketReleaseBuild {
     [CmdletBinding()]
-    param([string]$Root,[string]$SigningDirectory,[string]$OutputDirectory,[string]$ApkSignerPath,[string]$UpdateTrustPath,[string]$TargetDirectory,[string]$DesktopTargetDirectory,[switch]$SkipTests)
+    param([string]$Root,[string]$SigningDirectory,[string]$OutputDirectory,[string]$ApkSignerPath,[string]$UpdateTrustPath,[string]$TargetDirectory,[string]$DesktopTargetDirectory,[switch]$SkipTests,[string]$OnDeviceRuntime,[string[]]$OnDeviceAbis)
     $ErrorActionPreference = 'Stop'
+    $onDevice = Get-PocketOnDeviceRuntime $OnDeviceRuntime $OnDeviceAbis
     if (-not $TargetDirectory) { $TargetDirectory = Join-Path $Root 'target' }
     if (-not $DesktopTargetDirectory) { $DesktopTargetDirectory = Join-Path $Root 'desktop\target' }
     $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -194,7 +249,12 @@ function Invoke-PocketReleaseBuild {
         if ($env:POCKET_EXPECTED_SIGNER -and $expectedSigner -ne $env:POCKET_EXPECTED_SIGNER) {
             throw "Configured public signing certificate differs from the approved identity: $expectedSigner"
         }
-        & (Join-Path $Root 'android\gradlew.bat') -p (Join-Path $Root 'android') :app:assembleRelease '-Pkotlin.compiler.execution.strategy=in-process' --no-daemon --max-workers=2 --console=plain
+        $gradleArguments = @('-p',(Join-Path $Root 'android'),':app:assembleRelease','-Pkotlin.compiler.execution.strategy=in-process','--no-daemon','--max-workers=2','--console=plain')
+        if ($onDevice) {
+            $gradleArguments += '-PpocketOnDeviceRuntime=' + $onDevice.Directory
+            $gradleArguments += '-PpocketOnDeviceAbis=' + ($onDevice.Abis -join ',')
+        }
+        & (Join-Path $Root 'android\gradlew.bat') @gradleArguments
         if ($LASTEXITCODE -ne 0) { throw 'Android Release build failed; no package published.' }
         $apk = Join-Path $Root 'android\app\build\outputs\apk\release\app-release.apk'
         $apkHash = Get-PocketFileHash $apk
@@ -203,12 +263,14 @@ function Invoke-PocketReleaseBuild {
         if ($LASTEXITCODE -ne 0) { throw 'Release APK signature verification failed (output omitted).' }
         Write-Host "APK verifier: $ApkSignerPath"
         Assert-PocketApkSignerIdentity -Verification $verification -ExpectedSigner $expectedSigner
+        if ($onDevice) { Assert-PocketOnDeviceApk -ApkPath $apk -RuntimeDirectory $onDevice.Directory -Abis $onDevice.Abis }
         if ((Get-PocketFileHash $apk) -ne $apkHash) { throw 'Release APK changed during signature verification.' }
         $evidence = @{builtThisInvocation=$true;windowsTarget=$target;windowsProfile='release';apkSignatureVerified=$true;apkSha256=$apkHash;apkSignerSha256=$expectedSigner;cargoLockSha256=(Get-PocketFileHash (Join-Path $Root 'Cargo.lock'));nativeLiveAcceptance='separate-parent-validation'}
         $evidence.desktopCargoLockSha256=Get-PocketFileHash (Join-Path $Root 'desktop\Cargo.lock')
         $evidence.buildId=$env:POCKET_BUILD_ID
         $evidence.frontendLockSha256=Get-PocketFileHash (Join-Path $Root 'desktop\package-lock.json')
         $evidence.desktopProfile='release'; $evidence.frontendTestsPassed=(-not $SkipTests)
+        if ($onDevice) { $evidence.onDeviceRuntime=@{abis=$onDevice.Abis;apkContentVerified=$true} }
         if ((Get-PocketSourceDigest $Root) -ne $sourceDigest) { throw 'Source files changed while building; no candidate package published. Rebuild after all edits finish.' }
         $evidence.sourceTreeSha256=$sourceDigest
         New-PocketReleasePackage -Root $Root -BinaryDirectory (Join-Path $TargetDirectory ($target + '\release')) -DesktopBinaryDirectory (Join-Path $DesktopTargetDirectory 'release') -ApkPath $apk -OutputDirectory $OutputDirectory -Version $version -BuildEvidence $evidence -UpdateTrustPath $UpdateTrustPath
@@ -218,5 +280,5 @@ function Invoke-PocketReleaseBuild {
     }
 }
 if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-PocketReleaseBuild -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -SigningDirectory $SigningDirectory -OutputDirectory $OutputDirectory -ApkSignerPath $ApkSignerPath -UpdateTrustPath $UpdateTrustPath -TargetDirectory $TargetDirectory -DesktopTargetDirectory $DesktopTargetDirectory -SkipTests:$SkipTests
+    Invoke-PocketReleaseBuild -Root ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) -SigningDirectory $SigningDirectory -OutputDirectory $OutputDirectory -ApkSignerPath $ApkSignerPath -UpdateTrustPath $UpdateTrustPath -TargetDirectory $TargetDirectory -DesktopTargetDirectory $DesktopTargetDirectory -SkipTests:$SkipTests -OnDeviceRuntime $OnDeviceRuntime -OnDeviceAbis $OnDeviceAbis
 }
