@@ -55,6 +55,17 @@ class AgentRosterUiTest {
         compose.onNodeWithTag("agent-roster-chip").assertDoesNotExist()
     }
 
+    @Test fun theChipHugsItsLabelAndStillKeepsAFingersHeightToItself() {
+        content { AgentRosterChip(listOf(current), true, false, {}) }
+        val chip = compose.onNodeWithTag("agent-roster-chip")
+        val drawn = chip.getUnclippedBoundsInRoot()
+        assertTrue("The capsule is drawn around its label, not stretched to the touch height: ${drawn.bottom - drawn.top}", drawn.bottom - drawn.top < 36.dp)
+        val touch = chip.fetchSemanticsNode().touchBoundsInRoot
+        assertTrue("A finger still finds it: ${touch.height}px", touch.height >= 48f * compose.density.density - 1f)
+        // The room it reserves is the finger's, so what follows cannot sit under the touch.
+        compose.onNodeWithText("Conversation title").assertExists()
+    }
+
     @Test fun anchoredRosterShowsNamesSectionsAndReturnsOriginalNativeId() {
         var refreshes = 0
         var opened = ""

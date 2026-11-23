@@ -19,7 +19,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.layout.systemBars
-import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -48,6 +47,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -155,8 +155,17 @@ internal fun PScaffold(modifier: Modifier = Modifier, topBar: @Composable () -> 
     }
 }
 
-/** At least a finger's width in both directions, whatever is drawn inside. */
-internal fun Modifier.pocketMinTouch(): Modifier = sizeIn(minWidth = PocketSpace.touch, minHeight = PocketSpace.touch)
+/**
+ * A finger's width of room in both directions around what is drawn inside. The drawing keeps its
+ * own size, centred in that room; only the space it reserves grows, so a small capsule stays small.
+ */
+internal fun Modifier.pocketMinTouch(): Modifier = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    val touch = PocketSpace.touch.roundToPx()
+    val width = maxOf(placeable.width, touch)
+    val height = maxOf(placeable.height, touch)
+    layout(width, height) { placeable.place((width - placeable.width) / 2, (height - placeable.height) / 2) }
+}
 
 /**
  * Holding the content shows a short label above it; lifting lets it linger a moment and go. The
