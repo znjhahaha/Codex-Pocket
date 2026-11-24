@@ -108,6 +108,28 @@ class KitMorphUiTest {
         assertEquals(0f, bounds("stage-page").left, .5f)
     }
 
+    @Test fun theRowIsCarriedInThePagesFrameAndIsNeverSeenTwice() {
+        content()
+        compose.mainClock.autoAdvance = false
+        val lifted = { stage.sources.find("row:chat")?.first?.lifted }
+        assertEquals(false, lifted())
+        compose.runOnIdle { page = "chat" }
+        advance(96)
+        assertEquals("On the way out the row is in the page's frame, not in the list as well", true, lifted())
+        assertNotNull("Its picture is what the frame shows first", stage.morph?.picture)
+        advance(1200)
+        compose.runOnIdle { page = "home" }
+        advance(96)
+        assertEquals("On the way back the row stays out of the list until the page has become it", true, lifted())
+        advance(1200)
+        assertEquals("Home again, the row is drawn where it stands", false, lifted())
+        // The frame holds the row's picture at the start and the whole page at the end, and never neither.
+        assertEquals(1f, pocketMorphPicture(0f), 0f); assertEquals(0f, pocketMorphPage(0f), 0f)
+        assertEquals(0f, pocketMorphPicture(1f), 0f); assertEquals(1f, pocketMorphPage(1f), 0f)
+        assertEquals("A page held by a back gesture is still all there", 1f, pocketMorphPage(.7f), 0f)
+        for (step in 0..20) assertTrue(pocketMorphPicture(step / 20f) + pocketMorphPage(step / 20f) > .35f)
+    }
+
     @Test fun itFoldsBackToWhereTheRowIsNowNotWhereItWas() {
         content()
         compose.runOnIdle { page = "chat" }

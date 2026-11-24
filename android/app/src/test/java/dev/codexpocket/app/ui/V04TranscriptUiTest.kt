@@ -125,6 +125,27 @@ class V04TranscriptUiTest {
         compose.onNodeWithText(compose.activity.getString(R.string.offline_history)).assertDoesNotExist()
     }
 
+    @Test fun theLoadingPictureHoldsBackForAQuickReadAndFadesAsTheRowsCome() {
+        var reading by mutableStateOf(true)
+        val frames = { millis: Int -> repeat(millis / 16) { compose.mainClock.advanceTimeBy(16); compose.waitForIdle() } }
+        compose.mainClock.autoAdvance = false
+        content { ConversationLoading(reading) }
+        frames(96)
+        compose.onNodeWithTag("conversation-skeleton").assertDoesNotExist()
+        // A conversation read within that moment never shows the picture at all.
+        compose.runOnIdle { reading = false }
+        frames(320)
+        compose.onNodeWithTag("conversation-skeleton").assertDoesNotExist()
+        compose.runOnIdle { reading = true }
+        frames(240)
+        compose.onNodeWithTag("conversation-skeleton").assertExists()
+        compose.runOnIdle { reading = false }
+        frames(48)
+        compose.onNodeWithTag("conversation-skeleton").assertExists("It is still fading while the rows come in")
+        frames(400)
+        compose.onNodeWithTag("conversation-skeleton").assertDoesNotExist()
+    }
+
     @Test fun emptyLoadingShowsSkeletonAndReadFailureOffersRetryWithoutEmptyPrompt() {
         var state by mutableStateOf(ConversationLoadState.Loading)
         content { ConversationReadStatus(conversationReadPresentation(state, false), null) { state = ConversationLoadState.Loading } }

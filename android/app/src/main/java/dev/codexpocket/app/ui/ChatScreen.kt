@@ -70,10 +70,14 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val agentLiveStatuses = remember(s.agentStatuses, chat.key) {
             s.agentStatuses.filterKeys { it.computerId == chat.key.computerId && it.configStoreId == chat.key.configStoreId }.mapKeys { it.key.nativeId }
         }
-        val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns,
+        val projection = remember { TranscriptProjectionMemory() }
+        val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns, retained = projection,
             resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses)
+        // Items that have arrived but have not been projected into rows yet are still being read.
+        val projecting = projection.scope != chat.key.encoded && s.timeline.items.isNotEmpty()
         val changeCards = rememberTurnChangeCards(s.timeline, rows)
-        val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty(), s.conversationCached)
+        // Rows are projected off the main thread: a conversation with items is not an empty one while that is under way.
+        val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty() || projecting, s.conversationCached)
         val live = remember(s.timeline) {
             s.timeline.activeTurn?.let { turn -> ConversationPresentation.liveStatus(s.timeline)?.let { turn to it } }
         }
@@ -103,6 +107,17 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val minimapState = rememberConversationMinimapState(list, chat.key.encoded)
         val minimapShown = rememberConversationMinimapVisibility(chat.key.encoded, rows, list)
         var following by rememberSaveable { mutableStateOf(s.draft?.followEnd ?: true) }
+        // The list is first laid out before its rows have been projected. They are put where the reader left off in the
+        // same pass that first measures them, so a conversation never opens at its head and then jumps to its end.
+        var placed by remember { mutableStateOf(false) }
+        if (!placed && rows.isNotEmpty()) SideEffect {
+            if (following) list.requestScrollToItem(keys.lastIndex)
+            else list.requestScrollToItem(TranscriptAnchor(anchorKey).resolve(keys, s.draft?.scrollIndex ?: 0), anchorOffset)
+            placed = true
+        }
+        val motion = rememberPocketMotion()
+        val revealed = remember { androidx.compose.animation.core.Animatable(0f) }
+        LaunchedEffect(placed, motion) { if (placed) { if (motion) revealed.animateTo(1f, PocketMotion.enter()) else revealed.snapTo(1f) } }
         var transcriptContact by remember { mutableStateOf(false) }
         val transcriptGesture = remember(list) { TranscriptGestureState() }
         var jumpJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
@@ -254,7 +269,6 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     .transcriptUserGesture(list, transcriptGesture, pauseFollowing, { transcriptContact = it; if (it) jumpJob?.cancel() })
                     .layerBackdrop(transcriptBackdrop), contentPadding = PaddingValues(start = transcriptInset, end = transcriptInset, top = topInset - statusInset + 12.dp, bottom = bottomInset + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item(key = "history-control") {
-                        ConversationReadStatus(read.copy(failed = false, refreshing = false), null, onRetry = {})
                         if (rows.isNotEmpty() && s.online && (s.supports("thread/turns/list") || s.conversationReadSource == "persisted") && !s.historyExhausted) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                             PocketTextButton(onClick = { transcriptGesture.cancelResume(); pauseFollowing(); repo.older() }, enabled = !s.historyLoading) {
                                 PText(stringResource(if (s.historyLoading) R.string.delivery_history_loading else R.string.earlier_messages), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
@@ -267,7 +281,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                         val launch = remember(row.key) { flight.take(row.key, tail && row.kind == TranscriptKind.User) }
                         Column(Modifier.fillMaxWidth().testTag("transcript-row:${row.key}")
                             .pocketArrival(arrivals, row.key, tail && launch == null, origin = if (row.kind == TranscriptKind.User) TransformOrigin(1f, 1f) else TransformOrigin(0f, 1f))
-                            .graphicsLayer { alpha = if (row.key == editingKey) 1f else aside.value }
+                            .graphicsLayer { alpha = (if (row.key == editingKey) 1f else aside.value) * revealed.value }
                             .padding(top = when (row.kind) {
                             TranscriptKind.User -> 16.dp
                             TranscriptKind.Answer -> 10.dp
@@ -298,6 +312,9 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                     item(key = "timeline-end") { Spacer(Modifier.height(1.dp)) }
                 }
                 }
+                // The picture of the conversation being read stays where the rows will be and gives way to them as they come in.
+                ConversationLoading((read.skeleton || projecting) && !placed,
+                    Modifier.padding(start = gutter + transcriptInset, end = transcriptInset, top = topInset + 12.dp))
                 if (read.empty && live == null && !showSending) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
                     Column(Modifier.widthIn(max = 420.dp).padding(30.dp)) {
                         EmptyState(stringResource(R.string.what_working), when (locationKind) {
@@ -421,6 +438,28 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             runCatching { captureUri(context).also { capture = it.toString(); camera.launch(it) } }.onFailure { capture = null; repo.reportError(context.getString(R.string.v02_camera_unavailable)) }
         }, onImages = { attachmentSheet = false; picker.launch(arrayOf("image/jpeg", "image/png", "image/webp")) }, onText = { attachmentSheet = false; picker.launch(arrayOf("text/plain", "text/markdown", "application/json")) })
     }
+}
+
+/**
+ * A conversation still being read, drawn over the place its rows will take. It holds back a moment, so a
+ * conversation that opens at once never flashes it, and fades as the rows arrive instead of vanishing.
+ */
+@Composable
+internal fun ConversationLoading(reading: Boolean, modifier: Modifier = Modifier) {
+    val motion = rememberPocketMotion()
+    val shown = remember { androidx.compose.animation.core.Animatable(1f) }
+    var present by remember { mutableStateOf(false) }
+    LaunchedEffect(reading, motion) {
+        if (reading) {
+            if (!present) { pocketPause(150); present = true }
+            shown.snapTo(1f)
+        } else if (present) {
+            shown.animateTo(0f, PocketMotion.exit<Float>().orSnap(motion))
+            present = false
+        }
+    }
+    if (present) PChatSkeleton(modifier.graphicsLayer { alpha = shown.value }.testTag("conversation-skeleton").padding(vertical = 16.dp),
+        label = stringResource(R.string.v04_transcript_loading))
 }
 
 /** Read status belongs to the selected transcript; cached rows remain mounted throughout retry. */

@@ -125,6 +125,9 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
     var createOrigin by remember { mutableStateOf<ThreadKey?>(null) }
     LaunchedEffect(home) { if (home) { repo.clearSourcePreview(); repo.closeAgentReader() } }
     val backToParent: () -> Unit = { repo.clearSourcePreview(); repo.closeAgentReader(); if(assistantReturn) {assistantOpen=true;assistantReturn=false} else home=true }
+    // The page opens once the conversation asked for is the one selected, so it never shows the last one read on its
+    // way in. Selecting publishes within a frame or two, and the effect below turns the page as it does.
+    val openChat: (ChatEntity) -> Unit = { repo.markRead(it); repo.select(it); if (s.selected?.key == it.key) home = false }
     val openAgent: (String) -> Unit = { id -> repo.clearSourcePreview(); repo.openAgentReader(id); detail = null }
     val openSettings: () -> Unit = { settings = true }
     val closeSettings: () -> Unit = { settings = false }
@@ -249,8 +252,8 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                         }, label = "home-section") { shownTab ->
                             homeHolder.SaveableStateProvider(shownTab.name) {
                                 when (shownTab) {
-                                    HomeTab.Chats -> ChatsHome(s, { repo.markRead(it); repo.select(it); home = false }, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention }, onEnsureDirectory = { q, a -> repo.ensureDirectory(q, a) })
-                                    HomeTab.Attention -> AttentionHome(s, repo) { repo.markRead(it); repo.select(it); home = false }
+                                    HomeTab.Chats -> ChatsHome(s, openChat, { newChat = true }, { q, a, m -> repo.refresh(q, a, m) }, { repo.pin(it) }, { repo.archive(it) }, runtimeFilter, onScrollState = { homeScrolled = it }, onAttention = { tab = HomeTab.Attention }, onEnsureDirectory = { q, a -> repo.ensureDirectory(q, a) })
+                                    HomeTab.Attention -> AttentionHome(s, repo, openChat)
                                     HomeTab.Devices -> SettingsScreen(s, repo, { repo.preparePairing(); repairPairing = true }, Modifier.padding(LocalHomeContentPadding.current), management = true, usageState = s.usage, onUsageRefresh = { repo.loadUsage(refresh = true) }, onUsageFilter = { repo.loadUsage(it) })
                                 }
                             }

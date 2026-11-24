@@ -164,6 +164,25 @@ class TranscriptScrollingUiTest {
         assertEquals(position,scrollPosition(),.1f)
     }
 
+    @Test fun aConversationOpensAtItsEndAndIsNeverSeenAtItsHeadFirst() {
+        val loaded = content(deferHistory = true)
+        compose.mainClock.autoAdvance = false
+        compose.runOnIdle { timeline = loaded }
+        var frames = 0
+        // Rows are projected on another thread; from the frame they first exist, the reader is at the end.
+        val deadline = System.currentTimeMillis() + 10_000
+        while (frames < 4 && System.currentTimeMillis() < deadline) {
+            compose.mainClock.advanceTimeBy(16); compose.waitForIdle()
+            if (compose.onAllNodes(hasText("Recorded paragraph", substring = true)).fetchSemanticsNodes().isEmpty()) { Thread.sleep(10); continue }
+            frames++
+            assertTrue("Frame $frames after the rows arrived shows the head of the conversation",
+                compose.onAllNodes(hasText("Recorded paragraph 0", substring = true)).fetchSemanticsNodes().isEmpty())
+            assertFalse("Frame $frames after the rows arrived is not at the end",
+                compose.onNodeWithTag("chat-transcript").fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].let { it.value() < it.maxValue() - 1f })
+        }
+        assertEquals("The rows never arrived", 4, frames)
+    }
+
     @Test fun firstHistoryProjectionWaitsForContactBeforeRestoringAndPersistingAnchor() {
         val anchor = TimelineItem("turn-12", "message", "agentMessage").key
         val saved = DraftEntity(key, text = "Keep this draft", scrollIndex = 13, scrollOffset = 31,

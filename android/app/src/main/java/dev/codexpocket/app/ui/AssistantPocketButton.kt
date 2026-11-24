@@ -53,7 +53,7 @@ fun AssistantPocketButton(onClick: () -> Unit, modifier: Modifier = Modifier, en
     }
     val circling = rememberGlyphLoop(attention && enabled, 2400)
     val disc = c.accentSoft.compositeOver(c.surface)
-    Box(modifier.requiredSize(60.dp).pocketMorphSource("assistant", 30.dp).testTag("assistant-pocket-button")
+    Box(modifier.requiredSize(60.dp).pocketMorphSource("assistant", 30.dp, picture = false).testTag("assistant-pocket-button")
         // The ring is drawn outside the button, so it is never clipped and moves nothing.
         .drawBehind {
             val t = ring.value

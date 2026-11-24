@@ -81,10 +81,17 @@ internal class PStageState<K : Any>(initial: K) {
     /** Pages that opened out of a source and are still on the stack: they fold back the way they came. */
     private val opened = HashMap<K, PStageMorph>()
 
+    /** The element a page moves out of or into is lifted from its own page for as long as that lasts. */
+    private fun carry(next: PStageMorph?) {
+        morph?.takeIf { it.key != next?.key }?.let { sources.lift(it.key, false) }
+        next?.let { sources.lift(it.key, true) }
+        morph = next
+    }
+
     internal suspend fun show(page: K, motion: Boolean, source: (K) -> Any? = { null }, between: (K, K) -> PStageMove) {
         if (page == target && from == null) return
         target = page
-        if (!motion) { from = null; to = page; held = false; morph = null; opened.clear(); progress.snapTo(1f); return }
+        if (!motion) { from = null; to = page; held = false; carry(null); opened.clear(); progress.snapTo(1f); return }
         var velocity = 0f
         var fresh = false
         when {
@@ -101,13 +108,13 @@ internal class PStageState<K : Any>(initial: K) {
                 // Under a held gesture the page still in front is the one being left, not the one peeking beneath.
                 val leaving = if (held) from ?: to else to
                 val step = between(leaving, page)
-                morph = when (step) {
+                carry(when (step) {
                     PStageMove.Push -> source(page)?.let { key -> sources.bounds(key)?.let { PStageMorph(key, it) } }
                         .also { if (it != null) opened[page] = it else opened.remove(page) }
                     // Only into the source it came from: a page now showing something else slides away.
                     PStageMove.Pop -> opened[leaving]?.takeIf { source(leaving).let { key -> key == null || key == it.key } }
                     else -> null
-                }
+                })
                 from = leaving; to = page; move = step; progress.snapTo(0f)
                 fresh = true
             }
@@ -119,16 +126,17 @@ internal class PStageState<K : Any>(initial: K) {
         // A page still loading as it arrives stretches the transition rather than cutting steps out of it.
         pocketSteadyFrames { progress.animateTo(1f, PocketMotion.page(), velocity) }
         if (move != PStageMove.Push) from?.let { opened.remove(it) }
-        from = null; morph = null
+        from = null; carry(null)
     }
 
     /** A back gesture at [amount] of its travel: [peek] shows beneath the page being dragged away. */
     internal suspend fun hold(peek: K, amount: Float) {
         if (!held) {
             if (peek == target) return
-            from = target; to = peek; move = PStageMove.Pop; morph = opened[target]; held = true
+            from = target; to = peek; move = PStageMove.Pop; carry(opened[target]); held = true
         }
-        progress.snapTo(amount.coerceIn(0f, 1f) * HeldTravel)
+        // A page that folds into a row is only loosened by the gesture; letting go is what sends it home.
+        progress.snapTo(amount.coerceIn(0f, 1f) * if (morph != null) MorphHeldTravel else HeldTravel)
     }
 
     /** The gesture was abandoned: the page comes back. */
@@ -137,7 +145,7 @@ internal class PStageState<K : Any>(initial: K) {
         pocketSteadyFrames { progress.animateTo(0f, PocketMotion.page()) }
         if (!held) return
         from?.let { to = it }
-        from = null; held = false; morph = null
+        from = null; held = false; carry(null)
         progress.snapTo(1f)
     }
 
@@ -155,6 +163,8 @@ internal class PStageState<K : Any>(initial: K) {
     private companion object {
         /** A held page stops short of leaving, so letting go always has somewhere to travel. */
         const val HeldTravel = .86f
+        /** How far a back gesture draws a page toward the element it opened out of. */
+        const val MorphHeldTravel = .3f
         /** A frame this late was held up by work, on a 60 Hz display or a faster one. */
         const val LongFrameNanos = 34_000_000L
         const val SettleNanos = 280_000_000L
@@ -260,7 +270,6 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                                 val fit = (frame.width / size.width).coerceAtLeast(.01f)
                                 transformOrigin = TransformOrigin(0f, 0f)
                                 scaleX = fit; scaleY = fit; translationX = frame.left; translationY = frame.top
-                                alpha = GlyphMotion.window(grown, 0f, MorphFade)
                                 shape = PMorphShape(frame.height / fit, morph.radius * (1f - grown) / fit); clip = true
                                 shadowElevation = 20.dp.toPx() * GlyphMotion.pulse(grown)
                             }
@@ -278,7 +287,14 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         }
                     }
                 }.testTag(if (active) "stage-page" else "stage-page-leaving")) {
+                    // The frame is solid from the first moment; what changes is what it holds. The page comes
+                    // up inside it as the element's own picture goes, and the other way round on the way back.
                     Box(Modifier.fillMaxSize().onPlaced { morphPage.coordinates = it }.background(background)
+                        .graphicsLayer {
+                            if (from == null || !above || state.morph == null || (state.move != PStageMove.Push && state.move != PStageMove.Pop)) return@graphicsLayer
+                            val at = state.progress.value.coerceIn(0f, 1f)
+                            alpha = pocketMorphPage(if (arriving) at else 1f - at)
+                        }
                         .then(if (active) Modifier else Modifier.clearAndSetSemantics { }.pointerInput(Unit) {
                             awaitPointerEventScope { while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() } }
                         })) { CompositionLocalProvider(LocalPStageGesture provides gesture, LocalPMorphPage provides morphPage,
@@ -289,6 +305,16 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         val at = state.progress.value.coerceIn(0f, 1f)
                         alpha = (if (arriving) 1f - at else at) * Dim
                     }.background(Color.Black))
+                    if (stacked && above && state.morph != null) Box(Modifier.matchParentSize().graphicsLayer {
+                        val at = state.progress.value.coerceIn(0f, 1f)
+                        alpha = pocketMorphPicture(if (arriving) at else 1f - at)
+                    }.drawBehind {
+                        val morph = state.morph ?: return@drawBehind
+                        // Read here so a picture recorded after the transition began is still the one drawn.
+                        state.progress.value
+                        val rect = morph.resolve(state.sources)
+                        morph.picture?.let { drawMorphPicture(it, rect, size.width) }
+                    })
                     // A page opening out of a row keeps a hairline round it until it fills the stage, so its edge reads on any background.
                     if (stacked && above && state.morph != null) Box(Modifier.matchParentSize().drawBehind {
                         val morph = state.morph ?: return@drawBehind
@@ -316,5 +342,3 @@ private const val Parallax = .28f
 private const val Dim = .14f
 /** How much the page beneath draws back while another opens out of one of its rows. */
 private const val MorphRecede = .05f
-/** The share of the way over which a page opening out of a row becomes opaque. */
-private const val MorphFade = .22f
