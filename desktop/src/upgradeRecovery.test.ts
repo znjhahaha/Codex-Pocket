@@ -87,6 +87,30 @@ describe('home upgrade and background recovery policy',()=>{
   s.updates.generation='c'.repeat(64);
   expect(upgradeRecovery(s,100).kind).toBe('ui_outdated');
  });
+ it.each(['waiting_cold_start','restarting_legacy','switching','cold_starting'])('shows an installer at work rather than sending its own window away during %s',phase=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase,generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1};
+  const model=upgradeRecovery(s,100);
+  expect(model).toMatchObject({kind:'installing',tone:'progress',blockMutations:true});
+  expect(model.action).toBeUndefined();
+  expect(model.title+model.description).not.toContain('开始菜单');
+  s.updates.generation='c'.repeat(64);
+  expect(upgradeRecovery(s,100).kind).toBe('ui_outdated');
+ });
+ it('says what a queued installer is waiting for, and that nothing else is needed',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'waiting_idle',generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1,coordinator:{phase:'waiting',reason:'restart_cli_task_active'}};
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'installing',tone:'progress'});
+  expect(upgradeRecovery(s,100).description).toContain('CLI');
+  s.updates.coordinator={phase:'waiting',reason:'restart_write_in_flight'};
+  expect(upgradeRecovery(s,100).description).toContain('送达');
+  s.updates.coordinator={phase:'queued'};
+  expect(upgradeRecovery(s,100).description).toContain('自动');
+  s.updates.coordinator={phase:'waiting_login',reason:'independent_dispatch_failed'};
+  expect(upgradeRecovery(s,100).kind).toBe('staged_dashboard');
+ });
  it('keeps the retry button usable after a cancelled legacy handoff',()=>{
   const s=snapshot();
   s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};

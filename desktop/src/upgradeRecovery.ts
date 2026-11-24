@@ -1,6 +1,6 @@
 import {freshHeartbeat,type InstalledComponent,type Snapshot} from './domain';
 
-export type RecoveryKind='current'|'staged_dashboard'|'inconsistent'|'ui_outdated'|'unknown'|'old_backend'|'backend_missing'|'starting'|'paused'|'handoff'|'waiting_restart'|'failed'|'rolled_back'|'succeeded'|'bridge'|'retry_waiting'|'retry_starting'|'retry_exhausted'|'retry_blocked'|'recovered';
+export type RecoveryKind='current'|'staged_dashboard'|'installing'|'inconsistent'|'ui_outdated'|'unknown'|'old_backend'|'backend_missing'|'starting'|'paused'|'handoff'|'waiting_restart'|'failed'|'rolled_back'|'succeeded'|'bridge'|'retry_waiting'|'retry_starting'|'retry_exhausted'|'retry_blocked'|'recovered';
 export interface RecoveryModel {
  kind:RecoveryKind;
  visible:boolean;
@@ -27,6 +27,13 @@ const failureReasons:Record<string,string>={
  dispatch_failed:'更新检查进程未能启动，后台更新尚未完成。',journal_invalid:'交接记录未通过核验。',
  startup_context_invalid:'启动交接记录未通过核验。',
 };
+const installerPhases=['waiting_cold_start','restarting_legacy','switching','cold_starting'];
+const installerWaits:Record<string,string>={
+ restart_cli_task_active:'Pocket 自己启动的 Codex CLI 任务还在运行。任务结束后自动完成更新，无需其他操作。',
+ restart_write_in_flight:'手机刚发出的操作正在送达 Codex。送达后自动完成更新，无需其他操作。',
+ live_owner_not_verified:'新版后台已启动，正在等待它通过核验。',
+ previous_helper_not_verified:'新版后台未通过核验，正在恢复之前的后台。',
+};
 const validGeneration=(generation?:string)=>typeof generation==='string'&&/^[a-f0-9]{64}$/.test(generation);
 const restartInstruction='请运行新版 Pocket 安装包。安装器会在当前会话中核对任务并重启 Pocket 后台。';
 
@@ -45,8 +52,18 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  if(!installation||!validGeneration(target))return unknown('安装目标尚未核验，暂时无法判断新版是否已生效。请从 Windows 开始菜单打开 Codex Pocket，再刷新状态。');
  if(upgrade&&Object.hasOwn(progress,upgrade.phase))return model('handoff',progress[upgrade.phase],'交接仍在进行中，请等待状态核验。此时可以刷新进度或检查诊断。',{tone:'progress'});
  const ui=installation.ui;
- if(ui?.state==='staged_dashboard'&&ui.runningVerified===true&&validGeneration(ui.generation)
-  &&s.updates&&ui.generation===s.updates.generation&&(['staged','waiting_idle'].includes(s.updates.phase)||s.updates.phase==='failed'&&s.updates.failure==='legacy_restart_unverified')){
+ const dashboard=ui?.state==='staged_dashboard'&&ui.runningVerified===true&&validGeneration(ui.generation)&&!!s.updates&&ui.generation===s.updates.generation;
+ // This window is the new version's own, opened by its installer. While that installer is at work
+ // the window says so; it is never told to go and open itself.
+ if(dashboard&&s.updates){
+  const queued=['staged','waiting_idle'].includes(s.updates.phase),working=s.updates.coordinator&&['queued','waiting'].includes(s.updates.coordinator.phase);
+  if(installerPhases.includes(s.updates.phase)||queued&&working){
+   const reason=s.updates.coordinator?.reason||'';
+   return model('installing',queued?'正在准备更新 Pocket 后台':s.updates.phase==='cold_starting'?'正在核验新版后台':'正在重启 Pocket 后台',
+    Object.hasOwn(installerWaits,reason)?installerWaits[reason]:'安装包已核验。Pocket 只重启自己的后台，完成后本窗口自动刷新；Codex 和正在运行的任务不受影响，无需其他操作。',{tone:'progress'});
+  }
+ }
+ if(dashboard&&s.updates&&(['staged','waiting_idle'].includes(s.updates.phase)||s.updates.phase==='failed'&&s.updates.failure==='legacy_restart_unverified')){
   return model('staged_dashboard','新版界面已打开，后台尚未切换','可以查看本机 Codex 运行状态。当前任务与连接仍由原后台处理。',{tone:'neutral',blockMutations:false});
  }
  if(ui?.state==='restart_required'||(validGeneration(ui?.generation)&&ui?.generation!==target))return model('ui_outdated','请打开新版 Pocket 界面','当前管理界面仍属于旧安装代次。请关闭此界面，从 Windows 开始菜单打开新版 Codex Pocket。');
