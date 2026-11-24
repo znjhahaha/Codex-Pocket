@@ -87,7 +87,11 @@ internal class PocketTutorialController(private val context: Context?, first: Bo
         private set
     /** True on the visit that follows installing, when it opens by itself. */
     val firstRun = first
-    fun show() { open = true }
+    /** The chapter being read, kept here so the tutorial is where it was if the screen under it is rebuilt. */
+    var chapter = 0
+    /** Chapters whose words have already come in during this showing. They come in once; after that they are simply there. */
+    val entered = HashSet<Int>()
+    fun show() { chapter = 0; entered.clear(); open = true }
     fun finish() {
         open = false
         context?.getSharedPreferences(Store, Context.MODE_PRIVATE)?.edit()?.putInt(Seen, Version)?.apply()
@@ -131,10 +135,11 @@ internal fun PocketTutorialHost(controller: PocketTutorialController, content: @
     // Both boxes hand their own size down, so the app is measured exactly as it was without them.
     Box(Modifier.fillMaxSize(), propagateMinConstraints = true) {
         Box(if (controller.open) Modifier.clearAndSetSemantics { } else Modifier, propagateMinConstraints = true) { content() }
-        if (visible) PocketTutorial(controller::finish, Modifier.graphicsLayer {
+        if (visible) PocketTutorial(controller::finish, controller = controller, modifier = Modifier.graphicsLayer {
             val t = shown.value
-            alpha = t; translationY = (1f - t) * 28.dp.toPx()
-            val size = .97f + .03f * t; scaleX = size; scaleY = size
+            // It comes forward rather than up: the words of the first chapter do the rising, once.
+            alpha = t
+            val size = .96f + .04f * t; scaleX = size; scaleY = size
         })
     }
 }
@@ -145,10 +150,13 @@ internal fun PocketTutorialHost(controller: PocketTutorialController, content: @
  * rather tap. Back steps to the previous chapter and leaves from the first.
  */
 @Composable
-internal fun PocketTutorial(onDone: () -> Unit, modifier: Modifier = Modifier, chapters: List<TourChapter> = PocketTourChapters) {
+internal fun PocketTutorial(onDone: () -> Unit, modifier: Modifier = Modifier, chapters: List<TourChapter> = PocketTourChapters,
+    controller: PocketTutorialController? = null) {
     val c = Pocket.colors
     val scope = rememberCoroutineScope()
-    val pager = rememberPPager(chapters.size)
+    val pager = rememberPPager(chapters.size, controller?.chapter ?: 0)
+    val entered = controller?.entered ?: remember { HashSet() }
+    SideEffect { controller?.chapter = pager.page }
     val last = pager.page == chapters.lastIndex
     val backShown = rememberGlyphToggle(pager.page > 0, PocketMotion.state())
     val skipShown = rememberGlyphToggle(!last, PocketMotion.state())
@@ -160,7 +168,7 @@ internal fun PocketTutorial(onDone: () -> Unit, modifier: Modifier = Modifier, c
             PTextAction("跳过", onDone, Modifier.graphicsLayer { alpha = skipShown.value }.testTag("tutorial-skip"), enabled = !last)
         }
         PPager(pager, Modifier.weight(1f).fillMaxWidth().testTag("tutorial-pager")) { index, offset ->
-            TourPage(chapters[index], index, chapters.size, pager.page == index, offset)
+            TourPage(chapters[index], index, chapters.size, pager.page == index, offset, entered)
         }
         Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp).padding(top = 10.dp, bottom = 14.dp), horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -179,9 +187,16 @@ internal fun PocketTutorial(onDone: () -> Unit, modifier: Modifier = Modifier, c
 }
 
 @Composable
-private fun TourPage(chapter: TourChapter, index: Int, count: Int, active: Boolean, offset: () -> Float) {
+private fun TourPage(chapter: TourChapter, index: Int, count: Int, active: Boolean, offset: () -> Float, entered: MutableSet<Int>) {
     val c = Pocket.colors
-    val entrance = rememberPocketEntrance(windowMillis = 520)
+    // The words of a chapter rise in the first time it is turned to. Turned back to, or drawn again
+    // because the screen beneath was rebuilt, they are already there and stay still.
+    val first = remember { entered.add(index) }
+    val entrance = if (first) rememberPocketEntrance(windowMillis = 520) else remember { PEntrance(false) }
+    // An icon answers its chapter coming to rest, not its leaving.
+    var arrivals by remember { mutableIntStateOf(0) }
+    val shown = remember { booleanArrayOf(active) }
+    LaunchedEffect(active) { if (active && !shown[0]) arrivals++; shown[0] = active }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp).padding(top = 10.dp, bottom = 8.dp)) {
         // The picture runs a little ahead of the page and the words a little behind it, which gives the turn its depth.
         Box(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp).fillMaxWidth().graphicsLayer {
@@ -204,7 +219,7 @@ private fun TourPage(chapter: TourChapter, index: Int, count: Int, active: Boole
                     Row(Modifier.pocketEntrance(entrance, 3 + row), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(Modifier.size(36.dp).background(c.fill, CircleShape), contentAlignment = Alignment.Center) {
                             // Each point's icon plays once as its chapter comes to rest.
-                            PTapIcon(point.icon, active, Modifier.size(18.dp), tint = c.ink)
+                            PTapIcon(point.icon, arrivals, Modifier.size(18.dp), tint = c.ink)
                         }
                         PText(point.text, Modifier.weight(1f), style = Pocket.type.bodySmall.copy(fontSize = Pocket.type.titleSmall.fontSize), color = c.ink)
                     }

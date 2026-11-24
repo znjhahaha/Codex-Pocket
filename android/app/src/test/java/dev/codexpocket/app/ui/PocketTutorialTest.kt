@@ -108,6 +108,31 @@ class PocketTutorialTest {
         assertTrue("The revised tutorial can still be opened from settings", nextVisit.open)
     }
 
+    @Test fun wordsThatHaveComeInStayStillWhenTheScreenIsBuiltAgain() {
+        val controller = PocketTutorialController(null, true)
+        var build by mutableStateOf(0)
+        compose.mainClock.autoAdvance = false
+        content { key(build) { PocketTutorial({ finished++ }, controller = controller) } }
+        advance(1600)
+        compose.onNodeWithTag("tutorial-next").performClick()
+        advance(1600)
+        val second = title()
+        val settled = pixels()
+        assertEquals(setOf(0, 1), controller.entered.toSet())
+        // Whatever rebuilds the screen under the tutorial, the reader stays on the chapter and its words do not rise again.
+        compose.runOnIdle { build++ }
+        compose.mainClock.advanceTimeBy(16); compose.waitForIdle()
+        assertEquals(second, title())
+        advance(64)
+        val rebuilt = pixels()
+        val words = compose.onNodeWithTag("tutorial-title").fetchSemanticsNode().boundsInRoot
+        val width = view.width
+        val changed = (words.top.toInt() until words.bottom.toInt()).sumOf { y -> (0 until width).count { x -> settled[y * width + x] != rebuilt[y * width + x] } }
+        assertEquals("The title moved again after it had already come in", 0, changed)
+        controller.show()
+        assertTrue("Asked for again, it starts over", controller.entered.isEmpty() && controller.chapter == 0)
+    }
+
     @Test fun tappingNextWalksEveryChapterAndTheLastOneStarts() {
         content()
         compose.mainClock.autoAdvance = false
