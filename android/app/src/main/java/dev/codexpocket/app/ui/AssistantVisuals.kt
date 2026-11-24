@@ -75,6 +75,12 @@ internal fun AssistantFace(modifier: Modifier = Modifier.size(24.dp), tint: Colo
 
 /** The assistant's mark in motion. Every curve is a function of progress, so each pose can be checked on its own. */
 internal object AssistantGlyphs {
+    /** The assistant's outline: a speech bubble with soft corners and a short tail, the thing you talk to. */
+    const val Head = "M9 4.6h6a5.2 5.2 0 0 1 5.2 5.2v2.6a5.2 5.2 0 0 1-5.2 5.2h-3.6l-3.3 2.5a.5.5 0 0 1-.8-.4v-2.4A5.2 5.2 0 0 1 3.8 12.4V9.8A5.2 5.2 0 0 1 9 4.6z"
+    /** Where the eyes sit, and how tall they stand when wide open. */
+    private const val EyeY = 10.9f
+    private const val EyeOpen = 1.15f
+
     /** How shut an eye is at [t] for a blink centred on [at]. */
     private fun shut(t: Float, at: Float, half: Float = .028f): Float = GlyphMotion.smooth(1f - kotlin.math.abs(t - at) / half)
 
@@ -88,15 +94,14 @@ internal object AssistantGlyphs {
         val glad = maxOf(held.coerceIn(0f, 1f), GlyphMotion.window(hop, .04f, .2f) * (1f - GlyphMotion.window(hop, .7f, .92f)))
         val open = 1f - maxOf(shut(idle, .32f), shut(idle, .84f), shut(idle, .9f))
         val glance = .8f * (GlyphMotion.window(idle, .5f, .56f) - GlyphMotion.window(idle, .68f, .74f))
-        move(0f, -1.7f * up) { stretch(1f + .05f * land, 1f - .06f * land, 12f, 20.4f) {
-            path(BrandGlyphs.Pocket)
-            if (glad < 1f) for (x in floatArrayOf(9.4f, 14.6f)) {
-                val half = .12f + .9f * open
-                line(x + glance, 10.6f - half, x + glance, 10.6f + half, 1f - glad)
+        move(0f, -1.7f * up) { stretch(1f + .05f * land, 1f - .06f * land, 12f, 20.1f) {
+            path(Head)
+            // Two eyes and nothing else: they blink, glance aside, and curve into a smile of their own when pleased.
+            if (glad < 1f) for (x in floatArrayOf(9.5f, 14.5f)) {
+                val half = .15f + (EyeOpen - .15f) * open
+                line(x + glance, EyeY - half, x + glance, EyeY + half, 1f - glad)
             }
-            if (glad > 0f) { path("M8.3 11.3q1.1-1.7 2.2 0", glad); path("M13.5 11.3q1.1-1.7 2.2 0", glad) }
-            // One outline, widened and deepened: a path made per frame would never leave the cache.
-            stretch(1f + .22f * glad, 1f + .7f * glad, 12f, 14.3f) { path("M9.6 14.3q2.4 1.9 4.8 0") }
+            if (glad > 0f) { path("M8.3 11.7q1.2-2 2.4 0", glad); path("M13.3 11.7q1.2-2 2.4 0", glad) }
         } }
         val spark = GlyphMotion.pulse(GlyphMotion.window(hop, .12f, .8f))
         if (spark > 0f) {
@@ -108,14 +113,13 @@ internal object AssistantGlyphs {
     }
 }
 
-/** Original assistant artwork: Pocket's own pocket with a face, and a matching, compact outline set. */
+/** Original assistant artwork: a speech bubble with two eyes, and a matching, compact outline set. */
 object AssistantIcons {
     val Mark: ImageVector by lazy {
         icon(
             "Mark",
-            "M5 6.5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8c0 1.7-.9 2.9-2.3 3.7l-3.4 1.9a2.6 2.6 0 0 1-2.6 0l-3.4-1.9C5.9 17.4 5 16.2 5 14.5z",
-            "M9.4 9.58V11.62M14.6 9.58V11.62",
-            "M9.6 14.3q2.4 1.9 4.8 0",
+            AssistantGlyphs.Head,
+            "M9.5 9.75V12.05M14.5 9.75V12.05",
         )
     }
     val Tasks: ImageVector by lazy {
