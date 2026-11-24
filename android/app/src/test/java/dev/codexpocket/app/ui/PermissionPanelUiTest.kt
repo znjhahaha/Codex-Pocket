@@ -127,6 +127,17 @@ class PermissionPanelUiTest {
         compose.onNodeWithTag("permission-preset:request").assertDoesNotExist()
     }
 
+    @Test fun savedPermissionsShowTheirSourceWithoutEnablingChanges() {
+        val state = ready().copy(status = "saved", revision = null,
+            presets = ready().presets.map { it.copy(enabled = false) })
+        content { PermissionPanel(state, true, false, {}, {}, { fail("Saved permissions are display-only") }) }
+        compose.onNodeWithText("会话已保存的权限 · 连接原生会话后可修改").assertIsDisplayed()
+        compose.onNodeWithTag("permission-preset:request").assertIsSelected().assertIsNotEnabled()
+        compose.onNodeWithTag("permission-preset:full").assertIsNotEnabled().performTouchInput { click() }
+        compose.onNodeWithTag("permission-loading").assertDoesNotExist()
+        compose.onNodeWithText("会话权限未同步").assertDoesNotExist()
+    }
+
     @Test fun anchoredLargeFontCatalogStaysBoundedAndCustomChoicesScrollInside() {
         var density = 1f
         var selected = ""

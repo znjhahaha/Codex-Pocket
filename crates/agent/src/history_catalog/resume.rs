@@ -56,7 +56,7 @@ pub(crate) fn params(home:&Path,thread:&str)->Result<Value> {
     Ok(p)
 }
 
-fn read_settings_line(reader:&mut impl BufRead,line:&mut Vec<u8>)->Result<usize> {
+pub(super) fn read_settings_line(reader:&mut impl BufRead,line:&mut Vec<u8>)->Result<usize> {
     let count=reader.take(64*1024*1024+1).read_until(b'\n',line)?;
     ensure!(count<=64*1024*1024,"Native settings record exceeds limit");
     Ok(count)
@@ -67,7 +67,7 @@ fn same_path(a:&str,b:&str)->bool {
         b.trim_start_matches(r"\\?\").replace('\\',"/").trim_end_matches('/'))
 }
 
-fn legacy_policy(p:&Value,cwd:&str)->Result<Value> {
+pub(super) fn legacy_policy(p:&Value,cwd:&str)->Result<Value> {
     match p["type"].as_str() {
         Some("danger-full-access"|"dangerFullAccess"|"disabled")=>return Ok(json!({"type":"dangerFullAccess"})),
         Some("read-only"|"readOnly")=>{

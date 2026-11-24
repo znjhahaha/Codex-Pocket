@@ -49,6 +49,7 @@ internal fun PermissionPanel(state: PermissionState, online: Boolean, running: B
         state.status == "initializing" -> "正在读取原生能力，请稍候"
         state.status == "update_required" -> "电脑仍在使用旧桥接，重启 Codex 后启用"
         state.status == "unsupported" -> "当前运行时不支持会话权限选择"
+        state.status == "saved" -> "会话已保存的权限 · 连接原生会话后可修改"
         state.status in setOf("error", "failed") -> "读取会话权限失败，请重试"
         state.status != "ready" -> "会话权限未同步"
         state.presets.isEmpty() -> "当前运行时未提供可选权限"

@@ -24,6 +24,8 @@ use tokio::{
 pub mod host;
 #[cfg(windows)]
 pub mod desktop_ipc;
+#[cfg(windows)]
+pub(crate) mod desktop_catalog;
 
 #[derive(Debug, Clone)]
 pub enum RpcFailure {

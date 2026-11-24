@@ -209,7 +209,7 @@ class PocketRepositoryTest {
     }
 
     @Test fun existingDesktopHistoryAttachesToOriginalOwnerAndLoadsNativeControlsWithoutResume() = runBlocking<Unit> {
-        update { it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read")) }
+        update { it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read","threads/settings/read","threads/catalog/read")) }
         val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
         server.intercept={method,params,_->when(method){
             "threads/control/read"->buildJsonObject {
@@ -249,6 +249,36 @@ class PocketRepositoryTest {
             await {it.selected?.runtimeId==server.owner&&it.settingsFresh}
             assertTrue(server.calls.drop(before).none {it.nativeMethod in setOf("thread/start","thread/resume","turn/start")||it.commandId!=null})
         } finally {observe.cancelAndJoin()}
+    }
+
+    @Test fun historyModelChoiceSurvivesTheOriginalOwnerBecomingAvailable() = runBlocking<Unit> {
+        update { it.copy(capabilities=it.capabilities+setOf("threads/control/read","threads/history/read","threads/settings/read","threads/catalog/read")) }
+        val disk=repo.state.value.selected!!.copy(runtimeId="history:store")
+        val entered=CompletableDeferred<Unit>()
+        val release=CompletableDeferred<Unit>()
+        server.intercept={method,_,_->when(method) {
+            "threads/control/read"->{entered.complete(Unit);release.await();buildJsonObject {
+                put("runtimeId",server.owner);put("runtimes",server.runtimes())
+            }}
+            "threads/history/read"->buildJsonObject {put("thread",server.thread("t"));put("data",buildJsonArray {});put("nextCursor",JsonNull)}
+            else->null
+        }}
+        val job=repo.select(disk,true)
+        try {
+            withTimeout(5_000){entered.await()}
+            repo.chooseModel(NativeModel("phone-choice","phone-choice","Phone choice","",emptyList(),"",false,false),null)
+            repo.editDraft("保留这条草稿")
+            release.complete(Unit)
+            withTimeout(5_000){job.join()}
+            await {it.selected?.runtimeId==server.owner && it.conversationLoadState==ConversationLoadState.Ready}
+            repo.refreshNativeSettings().join()
+            assertEquals("phone-choice",repo.state.value.model)
+            assertTrue(NativeSettingsField.Model in repo.state.value.pendingSettings)
+            // Both returned fields are unsent phone edits, so the native snapshot
+            // must not certify them as the original owner's applied settings.
+            assertFalse(repo.state.value.settingsFresh)
+            assertEquals("保留这条草稿",repo.state.value.draft?.text)
+        } finally {release.complete(Unit)}
     }
 
     @Test fun nativeRestartReconnectsWhileOldHistoryReadIsLoadingAndPreservesDraft() = runBlocking<Unit> {
@@ -1703,7 +1733,7 @@ class PocketRepositoryTest {
         val rejected = repo.respond(approval, buildJsonObject { put("decision", "decline") })
         firstEntered.await()
         try {
-            repo.setForeground(false)
+            repo.setForeground(false, retainConnection = false)
             val attempts = server.attempts.get()
             server.pending.clear(); server.moveEpoch("replacement-connection", 0)
             repo.setForeground(true)
@@ -2095,7 +2125,7 @@ class PocketRepositoryTest {
     @Test fun offlineApprovalsStayVisibleButCannotBeSubmittedUntilResync() = runBlocking<Unit> {
         val event=server.approval();server.pending+=event;server.emitRaw(event)
         val approval=await{it.approvals.isNotEmpty()}.approvals.single()
-        repo.setForeground(false)
+        repo.setForeground(false, retainConnection = false)
         await{!it.online}
         assertFalse(repo.state.value.approvalsFresh)
         assertEquals(approval.key,repo.state.value.approvals.single().key)
@@ -2118,7 +2148,7 @@ class PocketRepositoryTest {
 
     @Test fun revokedAuthorizationShowsPairingRecoveryWithoutDeletingLocalHistory() = runBlocking<Unit> {
         repo.editDraft("保留撤销后的草稿")
-        repo.setForeground(false)
+        repo.setForeground(false, retainConnection = false)
         server.intercept={method,_,_->if(method=="hello") throw WireException("unauthorized","fixture") else null}
         repo.setForeground(true)
         await{it.connectionPhase=="authorization_required"}
@@ -2508,7 +2538,7 @@ class PocketRepositoryTest {
             withTimeout(5_000) { entered.await() }
             onlyOptimisticUser("clicked before reconnect")
             // Exercise the real disconnect/hello/sync path with the SAME computer/store/thread.
-            repo.setForeground(false); repo.setForeground(true)
+            repo.setForeground(false, retainConnection = false); repo.setForeground(true)
             await { it.online && it.mediaConnectionEpoch > epoch && server.links.last() !== before }
             assertEquals("computer", repo.state.value.computerId)
             assertEquals(key, repo.state.value.selected?.key)
@@ -2542,7 +2572,7 @@ class PocketRepositoryTest {
         try {
             val commandId = withTimeout(5_000) { entered.await() }
             val displayKey = onlyOptimisticUser("written before reconnect").key
-            repo.setForeground(false); repo.setForeground(true)
+            repo.setForeground(false, retainConnection = false); repo.setForeground(true)
             await { it.online && it.mediaConnectionEpoch > epoch && server.links.last() !== before }
             release.complete(Unit)
             withTimeout(5_000) { job.join() }

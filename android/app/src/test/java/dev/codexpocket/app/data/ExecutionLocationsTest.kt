@@ -105,6 +105,23 @@ class ExecutionLocationsTest {
         assertSame(original, locations.active.value)
     }
 
+    @Test fun aBackgroundDirectoryRefreshDoesNotDismissAnActionFailure() = runBlocking<Unit> {
+        val store = twoComputers()
+        val locations = locations(store)
+        locations.awaitComputer("pc-a")
+        locations.select("missing").join()
+        val message = "暂时无法切换执行位置，请重试。"
+        assertEquals(message, locations.error.value)
+
+        store.pairing("a").save(pair("pc-a", "Updated computer"))
+        withTimeout(5_000) { locations.activeLocation.filterNotNull().first { it.target.label == "Updated computer" } }
+        // Publication happens inside activate's monitor; wait for that refresh to finish.
+        synchronized(locations) { assertEquals(message, locations.error.value) }
+
+        locations.select("b").join()
+        assertNull("A successful explicit retry dismisses the previous error", locations.error.value)
+    }
+
     @Test fun anUnpairedPhoneOpensItsPairingPageEvenWhenNothingCanBeWritten() = runBlocking<Unit> {
         val locations = locations(ExecutionLocationStore(Blob(fail = true), NoLegacy))
         val repository = checkNotNull(locations.active.value).also(opened::add)

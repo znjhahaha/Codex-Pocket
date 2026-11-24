@@ -6,8 +6,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::windows::named_pipe::{Client
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 const STREAM_VERSION: u64 = 13;
-#[path = "desktop_catalog.rs"]
-mod catalog;
+use super::desktop_catalog as catalog;
 #[derive(Debug)]
 struct DesktopRejected(String);
 impl std::fmt::Display for DesktopRejected {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(&self.0)}}

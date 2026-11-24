@@ -29,12 +29,13 @@ data class PermissionState(
 ) {
     val label: String
         get() = presets.singleOrNull { it.id == currentPresetId }?.label?.takeIf(String::isNotBlank)
-            ?: currentLabel?.takeIf { status == "ready" && revision != null && currentPresetId in setOf(null, "custom") && it.isNotBlank() }
+            ?: currentLabel?.takeIf { (status == "saved" || status == "ready" && revision != null) && currentPresetId in setOf(null, "custom") && it.isNotBlank() }
             ?: when (status) {
                 "ready" -> if (revision != null && currentPresetId in setOf(null, "custom")) "自定义权限" else "会话权限未同步"
                 "initializing" -> "正在同步权限"
                 "update_required" -> "电脑桥接待更新"
                 "unsupported" -> "权限选择不可用"
+                "saved" -> "会话已保存的权限"
                 else -> "会话权限未同步"
             }
 
@@ -52,14 +53,14 @@ data class PermissionState(
             val counts = parsed.groupingBy { it.id }.eachCount()
             val presets = parsed.filter { counts[it.id] == 1 }
             val status = text(response["status"], 32)?.takeIf {
-                it in setOf("ready", "unknown", "unsupported", "error", "initializing", "update_required")
+                it in setOf("ready", "saved", "unknown", "unsupported", "error", "initializing", "update_required")
             } ?: "unknown"
             val failed = status == "error" || (response["error"] != null && response["error"] != JsonNull)
             return PermissionState(
                 status = if (failed) "error" else status,
-                revision = opaque(response["revision"], 1024)?.let(::JsonPrimitive),
+                revision = opaque(response["revision"], 1024)?.takeUnless { status == "saved" }?.let(::JsonPrimitive),
                 currentPresetId = opaque(response["currentPresetId"], 512),
-                presets = presets,
+                presets = if (status == "saved") presets.map { it.copy(enabled = false) } else presets,
                 // Never preserve a generic upstream error object, credentials or config text.
                 error = "读取会话权限失败，请重试".takeIf { failed },
                 currentLabel = text(response["currentLabel"], 160),

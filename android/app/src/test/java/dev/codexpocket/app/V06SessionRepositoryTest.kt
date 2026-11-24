@@ -495,7 +495,7 @@ class V06SessionRepositoryTest {
         val reads = server.calls.count { it.method == "workspace/image" }
         val fetches = PocketRepository::class.java.getDeclaredField("imageFetches").apply { isAccessible = true }.get(repo) as Map<*, *>
         withTimeout(5_000) { while(fetches.isNotEmpty()) delay(10) }
-        repo.setForeground(false)
+        repo.setForeground(false, retainConnection = false)
         PocketRepository::class.java.getDeclaredField("client").apply { isAccessible = true }.set(repo, null)
         assertEquals(image, repo.desktopImage(path, owner))
         assertEquals(reads, server.calls.count { it.method == "workspace/image" })

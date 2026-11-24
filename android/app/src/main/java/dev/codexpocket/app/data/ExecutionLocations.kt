@@ -62,12 +62,12 @@ internal class ExecutionLocations(private val context: Context,
         try {
             // Choosing this phone is the request to run Codex here again after it was stopped.
             if (store.directory().targets.firstOrNull { it.id == id }?.kind == ExecutionTargetKind.ThisPhone) thisPhone.resume()
-            activate(id)
+            activate(id, dismissFailure = true)
         }
         catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { failure.value = "暂时无法切换执行位置，请重试。" }
     }
-    @Synchronized private fun activate(id: String) {
+    @Synchronized private fun activate(id: String, dismissFailure: Boolean = false) {
         val catalog = store.directory()
         val target = catalog.targets.firstOrNull { it.id == id } ?: error("Unknown location")
         // A forgotten location's repository has already disconnected and reset itself.
@@ -78,7 +78,7 @@ internal class ExecutionLocations(private val context: Context,
         catalog.selected?.takeIf { it.id != id && it.endpointId == null }?.let { store.remove(it.id) }
         val old = selected.value
         if (old !== repository) {
-            old?.setForeground(false)
+            old?.setForeground(false, retainConnection = false)
             // Appearance is the phone's, not a location's: carry it over rather than show what this one last saw.
             repository.reloadAppearance()
             selected.value = repository
@@ -87,7 +87,8 @@ internal class ExecutionLocations(private val context: Context,
         // Directory selection is persisted earlier and can emit while activation is still busy.
         // UI consumers must take the target and repository from this one publication instead.
         activated.value = ActiveExecutionLocation(target, repository)
-        failure.value = null
+        // Directory emissions can race a failed user action; only an explicit success dismisses it.
+        if (dismissFailure) failure.value = null
     }
     private fun createRepository(target: ExecutionTarget): PocketRepository {
         val connector: (() -> PocketConnection)? = when (target.kind) {
@@ -106,7 +107,7 @@ internal class ExecutionLocations(private val context: Context,
         try {
             val target = ExecutionTarget(UUID.randomUUID().toString(), ExecutionTargetKind.Computer, "新电脑")
             store.add(target)
-            activate(target.id)
+            activate(target.id, dismissFailure = true)
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { failure.value = "新电脑未能保存，请重试。" }
     }
@@ -146,7 +147,7 @@ internal class ExecutionLocations(private val context: Context,
             val target = ExecutionTarget(existing?.id ?: UUID.randomUUID().toString(), ExecutionTargetKind.LinuxSsh, label.ifBlank { config.host },
                 existing?.endpointId)
             store.register(target, pair, connected.toJson())
-            activate(target.id)
+            activate(target.id, dismissFailure = true)
             advice.value = listOfNotNull(
                 "这台主机不允许后台在重启后自行启动。主机重启后，重新打开此位置即可恢复；在主机上执行一次 sudo loginctl enable-linger ${config.username} 可让后台随开机启动。"
                     .takeIf { !prepared.persistent },
@@ -194,7 +195,7 @@ internal class ExecutionLocations(private val context: Context,
             require(existing == null || existing.kind == ExecutionTargetKind.ThisPhone)
             val target = ExecutionTarget(existing?.id ?: UUID.randomUUID().toString(), ExecutionTargetKind.ThisPhone, "此手机")
             store.register(target, pair)
-            activate(target.id)
+            activate(target.id, dismissFailure = true)
             thisPhone.refreshAccount()
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) { failure.value = when ((error as? WireException)?.code) {

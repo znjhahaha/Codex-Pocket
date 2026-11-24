@@ -41,6 +41,9 @@ mod history;
 mod history_native;
 mod history_takeover;
 mod desktop_control;
+mod history_settings;
+#[cfg(test)]
+mod history_settings_tests;
 #[path = "broker_usage.rs"]
 mod usage_backend;
 #[path = "broker_usage_v2.rs"]
@@ -2211,6 +2214,8 @@ impl Broker {
                 "routes/list",
                 "threads/list",
                 "threads/history/read",
+                "threads/settings/read",
+                "threads/catalog/read",
                 "threads/control/read",
                 "assistant/artifact/read",
                 "threads/takeover",
@@ -3334,6 +3339,8 @@ impl Broker {
             self.reject_coordinator_access(runtime, thread).await?;
         }
         match method {
+            "threads/settings/read" => return self.saved_session_settings(device, &p).await,
+            "threads/catalog/read" => return self.session_catalog(device, &p).await,
             "threads/control/read" => return self.desktop_control(&p).await,
             "usage/read" | "usage/sources" | "usage/dashboard/read" | "usage/requests/read" => return self.usage_request(device, method, &p).await,
             "usage/v2/sources" | "usage/v2/read" | "usage/v2/requests/read" => return self.usage_v2_request(device, method, &p).await,

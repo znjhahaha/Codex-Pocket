@@ -120,6 +120,7 @@ pub fn read(home: &Path, thread: &str, cursor: Option<&str>, limit: usize) -> Re
 #[path="history_catalog/legacy.rs"]
 mod legacy;
 pub(crate) mod resume;
+pub(crate) mod settings;
 
 #[path="history_catalog/lineage.rs"]
 mod lineage;

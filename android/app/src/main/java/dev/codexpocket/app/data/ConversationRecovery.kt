@@ -56,6 +56,8 @@ fun PocketState.automaticConnectionLabel(): String? {
     if (uncertainSend || recovery?.uncertain==true) return "确认结果中"
     if (ownershipVerifiedFor(chat) && !chat.conflict) return null
     if (recovery?.phase=="waiting_idle") return "等待本轮结束"
+    if (chat.runtimeId.startsWith("history:") && !chat.conflict && recovery?.pending != true &&
+        conversationLoadState == ConversationLoadState.Ready && conversationReadSource == "persisted") return "历史会话"
     if (chat.conflict || chat.runtimeId.startsWith("history:") || activeRuntime?.online!=true ||
         supports(BrokerCapability.AccessRead)&&!accessAllowsSending(chat)) return "连接中"
     return null

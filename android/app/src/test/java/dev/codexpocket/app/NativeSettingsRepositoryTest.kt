@@ -214,7 +214,7 @@ class NativeSettingsRepositoryTest {
         }
         val old = repo.refreshNativeSettings(); entered.await()
         try {
-            repo.setForeground(false); await { !it.online }
+            repo.setForeground(false, retainConnection = false); await { !it.online }
             repo.setForeground(true)
             await { it.online && it.settingsFresh && it.model == "new-link" && it.mode == "plan" }
         } finally { release.complete(Unit); old.join() }

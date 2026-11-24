@@ -103,7 +103,7 @@ class AssistantProjectReadTest {
     }
     @Test fun reconnectInvalidatesSuccessAndDoesNotAutomaticallyRecheck()=runBlocking<Unit> {
         repo.readAssistantProject(workspace).join();assertTrue(writable())
-        repo.setForeground(false)
+        repo.setForeground(false, retainConnection = false)
         assign("client",transport);assign("foreground",true);generation().incrementAndGet()
         state().update {it.copy(online=true)}
         repo.loadAssistant(automaticPrepare=false).join()

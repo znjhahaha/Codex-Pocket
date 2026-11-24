@@ -92,6 +92,8 @@ data class PocketState(
     val effortSelectionLabel get() = effort ?: ""
     val modeSelectionLabel get() = mode ?: ""
     fun supports(method: String, runtime: RuntimeInfo? = activeRuntime): Boolean {
+        if (runtime == null && selected?.runtimeId?.startsWith("history:") == true && online &&
+            method in setOf("model/list", "collaborationMode/list") && "threads/catalog/read" in capabilities) return true
         if (runtime == null || !runtime.online || "${runtime.id}:$method" in disabledMethods) return false
         val advertised = runtime.capabilities ?: capabilities
         return method in advertised || "native:$method" in advertised
@@ -136,6 +138,7 @@ class PocketRepository(
     private val runtimeSnapshotGate = Any()
     private val runtimeReadGeneration = AtomicLong()
     private var nativeSnapshotJob: Job? = null
+    private var backgroundDisconnectJob: Job? = null
     private val persistedHistoryRead = Mutex()
     private val persistedHistoryEpochs = BoundedCache<ThreadKey, String>(12)
     private val historyRecoveries = ConcurrentHashMap.newKeySet<ThreadKey>()
@@ -803,7 +806,7 @@ class PocketRepository(
                             catch (cancelled: CancellationException) { throw cancelled }
                             catch (_: Exception) { if (client === current) current.close() }
                         }
-                    } else reconnect()
+                    } else startConnection(restartPending = false)
                 }
             }
         }
@@ -879,13 +882,27 @@ class PocketRepository(
         } } }
     }
 
-    fun setForeground(value: Boolean) {
+    fun setForeground(value: Boolean, retainConnection: Boolean = true): Unit = synchronized(connectionGate) {
         val returning = value && !foreground
         foreground = value
+        backgroundDisconnectJob?.cancel(); backgroundDisconnectJob = null
         if(!value) invalidateAssistantProject()
         if (value) startRouteDiscovery() else if (!_state.value.watch) { routeDiscovery?.cancel(); routeDiscovery = null }
         if (_state.value.online) scope.launch { runCatching { sendPresence() } }
-        if (value) reconnect() else if (!_state.value.watch) disconnect()
+        if (value) startConnection(restartPending = false) else if (!_state.value.watch) {
+            if (retainConnection && _state.value.online) {
+                // A short app switch can reuse the authenticated socket; location changes cannot.
+                val stop = scope.launch(start = CoroutineStart.LAZY) {
+                    delay(8_000)
+                    val owner = currentCoroutineContext()[Job]
+                    synchronized(connectionGate) {
+                        if (backgroundDisconnectJob === owner && !foreground && !_state.value.watch) disconnect()
+                    }
+                }
+                backgroundDisconnectJob = stop
+                stop.start()
+            } else disconnect()
+        }
         if (returning && _state.value.online) refreshNativeSnapshot()
     }
 
@@ -895,16 +912,31 @@ class PocketRepository(
         val transport = client ?: return
         val link = connectionGeneration.get()
         val selected = _state.value.selected
-        _state.update { it.copy(accessFresh = it.accessFresh - setOfNotNull(selected?.key)) }
+        val selection = selectionGeneration.get()
+        fun current() = client === transport && link == connectionGeneration.get() &&
+            (selected == null || isSelected(selected, selection))
+        synchronized(settingsGate) {
+            selected?.let { chat -> settingsByChat[chat.key]?.let { settingsByChat[chat.key] = it.copy(verifiedLink = null) } }
+            _state.update { it.copy(accessFresh = it.accessFresh - setOfNotNull(selected?.key), settingsFresh = false) }
+        }
         nativeSnapshotJob = scope.launch {
             try {
                 withTimeout(15_000) {
-                    refreshRuntimes()
-                    if (client !== transport || link != connectionGeneration.get()) return@withTimeout
-                    coroutineScope {
-                        launch { refreshThreadAccess().join() }
-                        launch { refreshPermissions().join() }
-                        launch { refreshNativeSettings().join() }
+                    supervisorScope {
+                        launch {
+                            try { if (current()) refreshRuntimes() }
+                            catch (cancelled: CancellationException) { throw cancelled }
+                            catch (_: Exception) { /* Scoped reads below can still verify the captured owner. */ }
+                        }
+                        launch { if (current()) refreshThreadAccess().join() }
+                        launch { if (current() && selected?.runtimeId?.startsWith("history:") != true) refreshPermissions().join() }
+                        launch { if (current() && selected != null) loadNativeSettings(selected, selection) }
+                        launch {
+                            if (current() && selected != null && _state.value.modelCatalogState in setOf(
+                                    ModelCatalogState.Idle, ModelCatalogState.Offline, ModelCatalogState.Failed, ModelCatalogState.RuntimeUnavailable)) {
+                                loadModels(selected.runtimeId)
+                            }
+                        }
                     }
                 }
             } catch (_: TimeoutCancellationException) {
@@ -915,7 +947,7 @@ class PocketRepository(
             catch (_: Exception) { /* Each capability keeps its own unavailable state. */ }
         }
     }
-    fun setWatch(value: Boolean) { _state.update { it.copy(watch = value) }; if (value) reconnect() else if (!foreground) disconnect() }
+    fun setWatch(value: Boolean) { _state.update { it.copy(watch = value) }; if (value) startConnection(restartPending = false) else if (!foreground) disconnect() }
     fun theme(value: String) { require(value in setOf("system", "light", "dark")); preferences.edit().putString("theme", value).apply(); _state.update { it.copy(theme = value) } }
     fun glassEffects(value: Boolean) { preferences.edit().putBoolean("glassEffects", value).apply(); _state.update { it.copy(glassEffects = value) } }
     internal fun reloadAppearance() = _state.update { it.copy(theme = preferences.getString("theme", "system") ?: "system", glassEffects = preferences.getBoolean("glassEffects", true)) }
@@ -1028,6 +1060,10 @@ class PocketRepository(
                         launch {
                             try {
                                 restoredSelection?.takeIf { isSelected(it, restoredSelectionGeneration) }?.let { chat ->
+                                    if (hasSavedMetadata(chat)) {
+                                        loadHistorySelection(chat, restoredSelectionGeneration)
+                                        return@let
+                                    }
                                     // A new helper may know the old runtime ID before its desktop
                                     // subscription is ready. Revalidate the original owner first.
                                     if (chat.runtimeId.startsWith("history:") || chat.source == "desktop" ||
@@ -1595,24 +1631,37 @@ class PocketRepository(
         transferSharedAttachments(chat.key)
         if (_state.value.online) {
             if (chat.runtimeId.startsWith("history:")) {
+                if (hasSavedMetadata(chat)) {
+                    loadHistorySelection(chat, generation)
+                    return@action
+                }
                 val owner = attachExistingControl(chat, generation)
                 if (owner != null) { select(owner, forceRefresh).join(); return@action }
                 loadConversation(chat, generation)
                 return@action
             }
-            try { loadThreadAccess(chat) }
-            catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: Exception) { _state.update { it.copy(accessFresh = it.accessFresh - chat.key,
-                actionStatus = it.actionStatus + ("access:${chat.key.encoded}" to ActionStatus(error = safeError(failure)))) } }
-            if (!isSelected(chat, generation)) return@action
-            refreshContext()
-            refreshPermissions()
-            if (!reusable || verifiedHistoryLinks[chat.key] != connectionGeneration.get()) loadConversation(chat, generation)
-            else scope.launch { loadNativeSettings(chat, generation) }
-            if (isSelected(chat, generation)) supervisorScope {
-                launch { loadModels(chat.runtimeId) }
-                launch { runCatching { loadQueue(chat, generation) } }
-                launch { runCatching { loadGoal(chat) } }
+            // These reads have always continued after the selection job finishes.
+            // Start them independently without making callers wait for permission/context replies.
+            if (isSelected(chat, generation)) {
+                refreshContext()
+                refreshPermissions(chat, generation)
+            }
+            supervisorScope {
+                launch {
+                    if (!isSelected(chat, generation)) return@launch
+                    try { loadThreadAccess(chat) }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) { _state.update { if (isSelected(chat, generation)) it.copy(accessFresh = it.accessFresh - chat.key,
+                        actionStatus = it.actionStatus + ("access:${chat.key.encoded}" to ActionStatus(error = safeError(failure)))) else it } }
+                }
+                launch {
+                    if (!isSelected(chat, generation)) return@launch
+                    if (!reusable || verifiedHistoryLinks[chat.key] != connectionGeneration.get()) loadConversation(chat, generation)
+                    else loadNativeSettings(chat, generation)
+                }
+                launch { if (isSelected(chat, generation)) loadModels(chat.runtimeId) }
+                launch { if (isSelected(chat, generation)) runCatching { loadQueue(chat, generation) } }
+                launch { if (isSelected(chat, generation)) runCatching { loadGoal(chat) } }
             }
         }
         }
@@ -1883,30 +1932,68 @@ class PocketRepository(
         loadModels(runtime)
     }
 
+    private fun hasSavedMetadata(chat: ChatEntity) = chat.runtimeId.startsWith("history:") &&
+        "threads/settings/read" in _state.value.capabilities
+
+    private suspend fun loadHistorySelection(chat: ChatEntity, generation: Long) = supervisorScope {
+        launch { if (isSelected(chat, generation)) loadConversation(chat, generation) }
+        launch { if (isSelected(chat, generation)) loadNativeSettings(chat, generation) }
+        launch { if (isSelected(chat, generation)) loadModels(chat.runtimeId) }
+        // Existing desktop control is independent of display metadata. Keep its normal
+        // read-only attachment, without making saved settings/history wait for it.
+        scope.launch {
+            val transport = client
+            val link = connectionGeneration.get()
+            if (!isSelected(chat, generation)) return@launch
+            val owner = attachExistingControl(chat, generation) ?: return@launch
+            if (client === transport && link == connectionGeneration.get() &&
+                _state.value.selected?.let { it.key == chat.key && it.runtimeId in setOf(chat.runtimeId, owner.runtimeId) } == true) {
+                select(owner, forceRefresh = true).join()
+            }
+        }
+    }
+
+    private fun historyIdentity(chat: ChatEntity) = buildJsonObject {
+        put("computerId", chat.key.computerId); put("configStoreId", chat.key.configStoreId); put("threadId", chat.key.nativeId)
+    }
+
+    private fun matchesHistoryIdentity(response: JsonObject, chat: ChatEntity) =
+        response.string("computerId") == chat.key.computerId &&
+            response.string("configStoreId") == chat.key.configStoreId && response.string("threadId") == chat.key.nativeId
+
     private suspend fun loadModels(runtime: String) {
         val selected = _state.value.selected ?: return
         if (selected.runtimeId != runtime) return
         val selectedGeneration = selectionGeneration.get()
         val requestGeneration = catalogGeneration.incrementAndGet()
         val transport = client
+        val link = connectionGeneration.get()
         val providerCatalog = modelCatalogOverride()
+        val historyCatalog = providerCatalog == null && runtime.startsWith("history:") && "threads/catalog/read" in _state.value.capabilities
         fun current(s: PocketState = _state.value) = requestGeneration == catalogGeneration.get() && client === transport &&
+            link == connectionGeneration.get() &&
             selectedGeneration == selectionGeneration.get() && s.selected?.key == selected.key && s.selected.runtimeId == runtime &&
             (providerCatalog?.isCurrent?.invoke() ?: (modelCatalogOverride() == null))
         fun publish(transform: (PocketState) -> PocketState) { _state.update { if (current(it)) transform(it) else it } }
         suspend fun catalog(method: String, params: JsonObject = buildJsonObject {}): JsonObject {
             if (!current()) throw CancellationException("Superseded model catalog")
+            if (historyCatalog) {
+                val response = (transport ?: throw WireException("offline", "Offline")).request("threads/catalog/read",
+                    JsonObject(historyIdentity(selected) + buildJsonObject { put("method", method); put("params", params) })).asObject()
+                require(matchesHistoryIdentity(response, selected)) { "Catalog identity mismatch" }
+                return response
+            }
             return (transport ?: throw WireException("offline", "Offline")).request("codex/request", buildJsonObject {
                 put("runtimeId", runtime); put("method", method); put("params", params)
             }).asObject()
         }
         val state = _state.value
         val selectedRuntime = state.runtimes.firstOrNull { it.id == runtime }
-        if (!state.online || selectedRuntime?.online != true) {
+        if (!state.online || !historyCatalog && selectedRuntime?.online != true) {
             publish { it.copy(modelCatalogState = if (it.online) ModelCatalogState.RuntimeUnavailable else ModelCatalogState.Offline, modelCatalogError = null) }
             return
         }
-        if (providerCatalog == null && !state.supports("model/list", selectedRuntime)) {
+        if (providerCatalog == null && !historyCatalog && !state.supports("model/list", selectedRuntime)) {
             publish { it.copy(modelCatalogState = ModelCatalogState.Unsupported, modelCatalogError = null) }
             return
         }
@@ -1943,7 +2030,7 @@ class PocketRepository(
         }
         if (!current()) return
         val r = _state.value.runtimes.firstOrNull { it.id == runtime }
-        if (_state.value.supports("collaborationMode/list", r)) {
+        if (historyCatalog || _state.value.supports("collaborationMode/list", r)) {
             try {
                 val modes = catalog("collaborationMode/list").array("data").mapNotNull { NativeMode.from(it.asObject()) }
                 publish { it.copy(modes = modes) }
@@ -1962,10 +2049,17 @@ class PocketRepository(
 
     private fun settingsEntry(chat: ChatEntity): CachedSettings {
         settingsByChat[chat.key]?.takeIf { it.runtimeId == chat.runtimeId }?.let { return it }
+        val previous = settingsByChat[chat.key]
         val saved = preferences.getString("nativeSettings:${chat.key.encoded}", null)?.let { value ->
             runCatching { NativeSettingsRecord.restore(pocketJson.parseToJsonElement(value).asObject(), chat.runtimeId) }.getOrNull()
         }
-        return CachedSettings(chat.runtimeId, saved ?: NativeSettingsRecord()).also { settingsByChat[chat.key] = it }
+        // A newly found owner must still verify its own settings, but a model the user
+        // just chose for this same history thread remains their unsent choice.
+        val pendingHistory = previous?.takeIf { it.runtimeId.startsWith("history:") && !chat.runtimeId.startsWith("history:") }
+        val record = if (pendingHistory != null && pendingHistory.record.pending.isNotEmpty())
+            (saved ?: NativeSettingsRecord()).edit(pendingHistory.record.settings.only(pendingHistory.record.pending))
+        else saved ?: NativeSettingsRecord()
+        return CachedSettings(chat.runtimeId, record).also { settingsByChat[chat.key] = it }
     }
 
     private fun publishSettings(chat: ChatEntity, entry: CachedSettings) {
@@ -2017,6 +2111,7 @@ class PocketRepository(
     }
 
     private suspend fun loadNativeSettings(chat: ChatEntity, selection: Long) {
+        if (hasSavedMetadata(chat)) { loadSavedMetadata(chat, selection); return }
         val transport = client ?: return
         val linkGeneration = connectionGeneration.get()
         fun viewCurrent() = client === transport && connectionGeneration.get() == linkGeneration && isSelected(chat, selection) &&
@@ -2041,6 +2136,41 @@ class PocketRepository(
             }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { /* Older helpers or unknown settings retain honest cache/unknown state. */ }
+    }
+
+    private suspend fun loadSavedMetadata(chat: ChatEntity, selection: Long) {
+        val transport = client ?: return
+        val link = connectionGeneration.get()
+        fun viewCurrent() = client === transport && link == connectionGeneration.get() &&
+            isSelected(chat, selection) && pair?.computerId == chat.key.computerId && _state.value.online
+        if (!viewCurrent()) return
+        val read = settingsReadGeneration.incrementAndGet()
+        fun current() = viewCurrent() && settingsReadGeneration.get() == read
+        val ticket = synchronized(settingsGate) { settingsEntry(chat).record.revisions }
+        _state.update { if (current()) it.copy(permissions = it.permissions.copy(loading = true, error = null)) else it }
+        try {
+            val response = withTimeout(15_000) { transport.request("threads/settings/read", historyIdentity(chat)).asObject() }
+            if (!current()) return
+            require(matchesHistoryIdentity(response, chat) && response.string("readSource") == "persisted")
+            val patch = if (response.flag("savedKnown")) NativeSettings.parse(response.obj("savedSettings")) else NativeSettings()
+            val permissions = PermissionState.from(response.obj("savedPermissions")).let {
+                it.copy(status = if (it.status == "saved") "saved" else "unknown", revision = null,
+                    presets = it.presets.map { preset -> preset.copy(enabled = false) }, loading = false, updating = false)
+            }
+            synchronized(settingsGate) {
+                if (current()) {
+                    val entry = settingsEntry(chat)
+                    saveSettings(chat, entry.copy(record = entry.record.snapshot(patch, ticket), verifiedLink = null))
+                    _state.update { if (current()) it.copy(permissions = permissions) else it }
+                }
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) {
+            _state.update { if (current()) it.copy(permissions = it.permissions.copy(loading = false,
+                error = "无法读取会话已保存的配置，请重试")) else it }
+        } finally {
+            _state.update { if (current()) it.copy(permissions = it.permissions.copy(loading = false)) else it }
+        }
     }
 
     fun refreshSessionPreferences(): Job = action(lock = null, statusKey = "preferences", globalBusy = false) { readSessionPreferences() }
@@ -2602,7 +2732,7 @@ class PocketRepository(
     }
 
     private fun refreshPermissions(chat: ChatEntity, selection: Long, background: Boolean = false): Job {
-        if (chat.runtimeId.startsWith("history:")) return scope.launch {}
+        if (chat.runtimeId.startsWith("history:")) return scope.launch { if (hasSavedMetadata(chat)) loadNativeSettings(chat, selection) }
         val connection = client
         val link = connectionGeneration.get()
         fun viewCurrent() = isSelected(chat, selection) && client === connection &&
