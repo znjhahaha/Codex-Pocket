@@ -317,7 +317,9 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
                     status.native_entry_ready=Some(crate::native_entry::reconcile(root).is_ok());
                 }
             }
-            native_entry_retry=Instant::now()+Duration::from_secs(30);
+            // A busy installer is the usual reason this fails, and it is over in a moment; an update
+            // waits on this flag before it calls the new background verified.
+            native_entry_retry=Instant::now()+Duration::from_secs(if status.native_entry_ready==Some(false) {3} else {30});
         }
         let enabled = storage::desired(state);
         if let Some(failure) = startup_attempt.as_ref().and_then(|a| a.read(state)) {

@@ -69,6 +69,114 @@ fn tombstones(ledger: &Value, questions: &Value) -> Result<BTreeMap<CommandKey, 
     );
     Ok(keys)
 }
+/// How long a closed fence waits for writes that are already on their way to Codex.
+const DRAIN: Duration = Duration::from_secs(20);
+/// A write recorded as sent this long ago is not on its way anywhere. Its receipt stays on disk and
+/// the next helper reports it as unconfirmed, which is all that waiting could have achieved.
+const STALE_WRITE: u64 = 120;
+/// Fences that may fail, or stay busy with the same write, before an explicit restart stops asking.
+const FENCE_ATTEMPTS: u64 = 6;
+
+/// What is still travelling between a phone and Codex: writes sent and not yet answered, and
+/// answers to questions that have not reached their runtime. A receipt that only lacks later
+/// evidence (`Unknown`, `awaiting_confirmation`) is on disk for the next helper; no amount of
+/// waiting delivers it, so it never holds an installer back.
+fn travelling(ledger: &Value, questions: &Value, now: u64) -> Result<Vec<CommandKey>> {
+    ensure!(ledger["version"] == 1, "restart_ledger_unverified");
+    let mut recent = BTreeMap::new();
+    for row in ledger["entries"].as_array().context("restart_ledger_unverified")? {
+        if !row["created_at"].as_u64().is_some_and(|at| now.saturating_sub(at) < STALE_WRITE) { continue; }
+        let key: CommandKey = serde_json::from_value(row["key"].clone())?;
+        recent.insert(key, matches!(serde_json::from_value::<Status>(row["status"].clone())?, Status::Submitted));
+    }
+    let mut moving: Vec<CommandKey> = recent.iter().filter(|(_, sent)| **sent).map(|(key, _)| key.clone()).collect();
+    for record in questions["records"].as_array().into_iter().flatten() {
+        if !matches!(record["phase"].as_str(), Some("dispatching" | "forwarded")) { continue; }
+        let key: CommandKey = serde_json::from_value(record["command"].clone())?;
+        if recent.contains_key(&key) && !moving.contains(&key) { moving.push(key); }
+    }
+    Ok(moving)
+}
+fn unknown_tombstones(ledger: &Value) -> Result<BTreeMap<CommandKey, [u8; 32]>> {
+    ensure!(ledger["version"] == 1, "restart_ledger_unverified");
+    let mut keys = BTreeMap::new();
+    for row in ledger["entries"].as_array().context("restart_ledger_unverified")? {
+        if matches!(serde_json::from_value::<Status>(row["status"].clone())?, Status::Unknown) {
+            ensure!(keys.insert(serde_json::from_value(row["key"].clone())?, serde_json::from_value(row["fingerprint"].clone())?).is_none(),
+                "restart_ledger_unverified");
+        }
+    }
+    Ok(keys)
+}
+fn question_receipts(state: &Path) -> Result<Value> {
+    let path = state.join("question-receipts.json");
+    storage::unredirected(&path)?;
+    if path.try_exists()? { private_json(&path) } else { Ok(json!({"records": []})) }
+}
+/// The fence an explicit restart asked for is still the one in force, on the helper it was asked of.
+fn closed_fence(i: &Intent, r: &Value, h: &Value, now: u64) -> bool {
+    r["protocol"] == 1 && r["id"] == i.fence && r["generation"] == i.run
+        && matches!(r["phase"].as_str(), Some("draining" | "ready" | "failed"))
+        && r["acceptingWrites"] == false && r["shutdownRequested"] == false && r["remoteEnabled"] == false
+        && h["protocol"] == 1 && h["acceptingWrites"] == false
+        && h["handoffCapabilities"]["generation"] == i.run
+        && h["helperRuntime"]["pid"] == i.agent.pid
+        && h["helperRuntime"]["processIdentity"]["createdAt"] == i.agent.created_at
+        && crate::connection::fresh(h["updatedAt"].as_u64().unwrap_or(0), now)
+}
+/// Why an explicit restart has to wait, or None when Pocket's two processes can be stopped now.
+/// Runtime Hosts, the Codex desktop app and CLI daemons are other processes that this restart never
+/// touches, so their turns and their unanswered questions carry on and are read back by the next
+/// helper. Only a task Pocket runs as its own child ends with it, and a write caught mid-way would
+/// lose its answer; those two are worth waiting for. `attempts` is how many fences in a row have
+/// already found a write still moving: one that never lands is released as unconfirmed.
+fn explicit_wait(i: &Intent, r: &Value, h: &Value, moving: &[CommandKey], attempts: u64, now: u64) -> Result<Option<&'static str>> {
+    ensure!(closed_fence(i, r, h, now), "restart_fence_changed");
+    if r["blockers"].as_array().is_some_and(|items| items.iter().any(|b| b == "legacy_cli_active")) {
+        return Ok(Some("restart_cli_task_active"));
+    }
+    let held = h["handoffCapabilities"]["unconfirmedWrites"].as_u64().unwrap_or(1) > 0;
+    if (held || !moving.is_empty()) && attempts < FENCE_ATTEMPTS { return Ok(Some("restart_write_in_flight")); }
+    Ok(None)
+}
+enum Verdict { Stop(Option<preservation::Proof>), Wait(&'static str) }
+/// Closes the helper to new writes, gives the ones in flight a bounded time to land, and says
+/// whether Pocket can be stopped. The caller reopens the helper unless the answer is `Stop`.
+fn explicit_fence(root: &Path, state: &Path, from: &str, i: &Intent, attempts: u64) -> Result<Verdict> {
+    let mut r = upgrade::local::legacy_gate(state, "upgrade/quiesce", &i.fence, &i.run).context("restart_fence_unavailable")?;
+    let until = std::time::Instant::now() + DRAIN;
+    let (moving, h) = loop {
+        let moving = travelling(&private_json(&state.join("commands.json"))?, &question_receipts(state)?, storage::now())?;
+        let h = crate::native_update::authenticated_helper(root, state, from)?;
+        let held = h["handoffCapabilities"]["unconfirmedWrites"].as_u64().unwrap_or(1) > 0;
+        if (moving.is_empty() && !held) || std::time::Instant::now() >= until { break (moving, h); }
+        std::thread::sleep(Duration::from_millis(250));
+        r = upgrade::local::legacy_gate(state, "upgrade/status", &i.fence, &i.run)?;
+    };
+    if let Some(reason) = explicit_wait(i, &r, &h, &moving, attempts, storage::now())? { return Ok(Verdict::Wait(reason)); }
+    // Kept as evidence when it can be had. Its absence does not make another process part of Pocket.
+    Ok(Verdict::Stop(preservation::prove(root, state, &h, [&i.supervisor, &i.agent]).ok()))
+}
+fn failure_path(state: &Path, operation: &str) -> PathBuf {
+    updates::directory(state).join(format!("restart-failure-{operation}.json"))
+}
+/// How many fences in a row have ended the same way for this operation.
+fn attempts(state: &Path, operation: &str, reason: &str) -> u64 {
+    storage::read::<Value>(&failure_path(state, operation)).ok()
+        .filter(|f| f["operationId"] == operation && f["reason"] == reason)
+        .and_then(|f| f["attempts"].as_u64()).unwrap_or(0)
+}
+/// What an explicit restart is waiting for, for the management window to say in words.
+pub(super) fn wait_reason(state: &Path, operation: &str) -> Option<&'static str> {
+    let f: Value = storage::read(&failure_path(state, operation)).ok()?;
+    if f["operationId"] != operation { return None; }
+    ["restart_cli_task_active", "restart_write_in_flight"].into_iter().find(|r| f["reason"] == *r).or(Some("restart_retrying"))
+}
+fn failure_code(error: &anyhow::Error) -> String {
+    error.chain().map(|e| e.to_string()).find(|text|
+        (text.starts_with("preservation_") || text.starts_with("restart_")) &&
+            text.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).unwrap_or("restart_proof_failed".into())
+}
 fn fenced_only_unknown(r: &Value, n: u64) -> bool {
     n > 0
         && r["phase"] == "draining"
@@ -297,9 +405,8 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
         if !(updates::explicit_cold_required(&h, storage::now()) || manual_restart
             && h["protocol"]==1 && h["acceptingWrites"]==true
             && h["handoffCapabilities"]["writeFence"]==true
-            && h["handoffCapabilities"]["preservesIdentity"]==true
-            && h["handoffCapabilities"]["unconfirmedWrites"]==0
-            && ["pendingWrites","pendingQuestions"].iter().all(|k| h["lifecycle"][k]==0)) {
+            && h["handoffCapabilities"]["preservesIdentity"]==true) {
+            // Writes in flight are what the fence and its drain are for; a quiet instant is not required to ask.
             return Ok(());
         }
         verify_candidate(&bin, state, &s)?;
@@ -319,7 +426,7 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
             .filter(|v| upgrade::local::canonical_uuid(v))
             .context("restart_fence_unavailable")?;
         let unknown_receipts = if manual_restart {
-            Some(persisted_unknowns(state)?.into_iter().collect::<Vec<_>>())
+            Some(unknown_tombstones(&private_json(&state.join("commands.json"))?)?.into_iter().collect::<Vec<_>>())
         } else { None };
         let n = if let Some(receipts)=&unknown_receipts { receipts.len() as u64 }
             else {h["lifecycle"]["unknownOperations"].as_u64().context("restart_activity_unverified")?};
@@ -361,7 +468,42 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
         updates::save(state, &mut s, "waiting_cold_start")?;
         return Ok(());
     }
-    if !i.stop_authorized || i.preservation.is_some() {
+    if i.manual_restart && !i.stop_authorized && maintenance::presence(&i.agent) == Presence::Gone {
+        // The helper this fence was asked of has been replaced, and the fence went with it.
+        // Ask the one that is running now, with a new intent.
+        return updates::save(state, &mut s, "waiting_idle");
+    }
+    if i.manual_restart {
+        if !i.stop_authorized {
+            let before = attempts(state, operation, "restart_write_in_flight");
+            match explicit_fence(root, state, &from, &i, before) {
+                Ok(Verdict::Stop(proof)) => {
+                    i.preservation = proof;
+                    i.stop_authorized = true;
+                    storage::atomic(&path, &i)?;
+                    let _ = std::fs::remove_file(failure_path(state, operation));
+                }
+                outcome => {
+                    // The fence is this operation's own: the helper is reopened before anything else.
+                    upgrade::local::legacy_gate(state, "upgrade/cancel", &i.fence, &i.run)?;
+                    let (reason, failed) = match &outcome {
+                        Ok(Verdict::Wait(reason)) => ((*reason).to_owned(), false),
+                        Err(error) => (failure_code(error), true),
+                        Ok(Verdict::Stop(_)) => unreachable!(),
+                    };
+                    let tried = attempts(state, operation, &reason) + 1;
+                    storage::atomic(&failure_path(state, operation),
+                        &json!({"operationId":operation,"reason":reason,"attempts":tried,"at":storage::now()}))?;
+                    if failed && tried >= FENCE_ATTEMPTS {
+                        s.failure = Some("legacy_restart_unverified".into());
+                        return updates::save(state, &mut s, "failed");
+                    }
+                    // Tried again on the coordinator's next turn, with the helper as it is then.
+                    return updates::save(state, &mut s, "waiting_idle");
+                }
+            }
+        }
+    } else if !i.stop_authorized || i.preservation.is_some() {
         let proof = (|| -> Result<Option<preservation::Proof>> {
             let method=if i.stop_authorized {"upgrade/status"} else {"upgrade/quiesce"};
             let mut r=upgrade::local::legacy_gate(state,method,&i.fence,&i.run)
@@ -401,10 +543,8 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
         })();
         let proof=match proof {Ok(proof)=>proof,Err(error)=> {
             upgrade::local::legacy_gate(state, "upgrade/cancel", &i.fence, &i.run)?;
-            let code=error.chain().map(|e|e.to_string()).find(|text|
-                (text.starts_with("preservation_") || text.starts_with("restart_")) &&
-                    text.bytes().all(|b|b.is_ascii_lowercase() || b==b'_')).unwrap_or("restart_proof_failed".into());
-            storage::atomic(&updates::directory(state).join(format!("restart-failure-{operation}.json")),
+            let code=failure_code(&error);
+            storage::atomic(&failure_path(state, operation),
                 &json!({"operationId":operation,"reason":code,"at":storage::now()}))?;
             // The exact fence has been cancelled and the original broker is usable.
             // Do not fence it repeatedly for the same incompatible snapshot.
@@ -567,6 +707,85 @@ mod tests {
             supervisor:owner(1),agent:owner(2),unknown:1,stop_authorized:false,manual_restart:true,
             unknown_receipts:Some(vec![(CommandKey{caller_id:"caller".into(),command_id:"unknown".into()},[1;32])]),
             preservation:None}
+    }
+    fn explicit_fixture(i:&Intent) -> (Value, Value) {
+        (json!({"protocol":1,"id":i.fence,"generation":i.run,"phase":"draining","safeToExit":false,"checkpoint":null,
+            "acceptingWrites":false,"shutdownRequested":false,"remoteEnabled":false,"unconfirmedWrites":1,
+            "nativeTasksPreserved":false,"blockers":["reconciliation_required","runtime_inventory_unverified","unconfirmed_writes"]}),
+         json!({"protocol":1,"updatedAt":100,"acceptingWrites":false,
+            "handoffCapabilities":{"generation":i.run,"writeFence":true,"preservesIdentity":true,"unconfirmedWrites":0},
+            "helperRuntime":{"pid":2,"processIdentity":{"createdAt":2}},
+            "lifecycle":{"pendingWrites":1,"pendingQuestions":2,"activeTurns":null,"nativeTasksPreserved":false}}))
+    }
+    fn key(id:&str) -> Value { json!({"caller_id":"caller","command_id":id}) }
+    #[test]
+    fn a_receipt_that_only_lacks_later_evidence_is_not_travelling() {
+        let row=|id:&str,status:&str,at:u64| json!({"key":key(id),"status":status,"fingerprint":vec![1;32],"created_at":at});
+        let ledger=json!({"version":1,"entries":[row("old-unknown","Unknown",10),row("new-unknown","Unknown",990),
+            row("stuck","Submitted",10),row("moving","Submitted",990),row("answer","Unknown",995),row("old-answer","Unknown",10)]});
+        // The receipt that held the RC48 installer for good: answered a day earlier, never confirmed.
+        let questions=json!({"records":[{"command":key("stale"),"phase":"awaiting_confirmation"},
+            {"command":key("old-answer"),"phase":"forwarded"},{"command":key("answer"),"phase":"dispatching"},
+            {"command":key("moving"),"phase":"confirmed"}]});
+        let moving=travelling(&ledger,&questions,1000).unwrap();
+        let ids=moving.iter().map(|k|k.command_id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids,["moving","answer"]);
+        assert!(travelling(&ledger,&json!({"records":[{"command":key("stale"),"phase":"awaiting_confirmation"}]}),2000).unwrap().is_empty(),
+            "a write sent long ago has stopped travelling");
+        assert!(travelling(&json!({"version":2,"entries":[]}),&questions,1000).is_err());
+        assert_eq!(unknown_tombstones(&ledger).unwrap().len(),4);
+    }
+    #[test]
+    fn an_explicit_restart_waits_only_for_what_stopping_pocket_would_cut_short() {
+        let i=intent_fixture();
+        let (r,h)=explicit_fixture(&i);
+        // Unverified inventories, reconciliation, unanswered questions and stale receipts belong to
+        // processes that are not stopped, or are already on disk.
+        assert_eq!(explicit_wait(&i,&r,&h,&[],0,100).unwrap(),None);
+        let moving=[CommandKey{caller_id:"caller".into(),command_id:"moving".into()}];
+        assert_eq!(explicit_wait(&i,&r,&h,&moving,0,100).unwrap(),Some("restart_write_in_flight"));
+        assert_eq!(explicit_wait(&i,&r,&h,&moving,FENCE_ATTEMPTS,100).unwrap(),None,"a write that never lands is released as unconfirmed");
+        let mut held=h.clone();held["handoffCapabilities"]["unconfirmedWrites"]=json!(1);
+        assert_eq!(explicit_wait(&i,&r,&held,&[],0,100).unwrap(),Some("restart_write_in_flight"));
+        held["handoffCapabilities"]["unconfirmedWrites"]=Value::Null;
+        assert_eq!(explicit_wait(&i,&r,&held,&[],0,100).unwrap(),Some("restart_write_in_flight"),"an unreadable count is not zero");
+        let mut owned=r.clone();owned["blockers"]=json!(["legacy_cli_active"]);
+        assert_eq!(explicit_wait(&i,&owned,&h,&[],FENCE_ATTEMPTS,100).unwrap(),Some("restart_cli_task_active"),
+            "a task Pocket runs as its own child is never cut short, however long it takes");
+    }
+    #[test]
+    fn an_explicit_restart_never_stops_pocket_through_an_open_or_foreign_fence() {
+        let i=intent_fixture();
+        let (r,h)=explicit_fixture(&i);
+        assert!(closed_fence(&i,&r,&h,100));
+        for phase in ["ready","failed"] { let mut ok=r.clone();ok["phase"]=json!(phase);assert!(closed_fence(&i,&ok,&h,100),"{phase}"); }
+        for (field,value) in [("acceptingWrites",json!(true)),("shutdownRequested",json!(true)),("remoteEnabled",json!(true)),
+            ("phase",json!("cancelled")),("phase",json!("released")),("id",json!("other")),("generation",json!("other")),("protocol",json!(2))] {
+            let mut invalid=r.clone();invalid[field]=value;
+            assert!(!closed_fence(&i,&invalid,&h,100),"{field}");
+            assert!(explicit_wait(&i,&invalid,&h,&[],0,100).is_err(),"{field}");
+        }
+        for (pointer,value) in [("/acceptingWrites",json!(true)),("/handoffCapabilities/generation",json!("other")),
+            ("/helperRuntime/pid",json!(3)),("/helperRuntime/processIdentity/createdAt",json!(3)),("/updatedAt",json!(1)),("/protocol",json!(2))] {
+            let mut invalid=h.clone();*invalid.pointer_mut(pointer).unwrap()=value;
+            assert!(!closed_fence(&i,&r,&invalid,100),"{pointer}");
+        }
+    }
+    #[test]
+    fn repeated_fences_are_counted_per_operation_and_reason() {
+        let root=crate::test_support::tempdir();let state=root.path().join("state");
+        storage::private_dir(&updates::directory(&state)).unwrap();
+        assert_eq!(attempts(&state,"operation","restart_write_in_flight"),0);
+        assert_eq!(wait_reason(&state,"operation"),None);
+        storage::atomic(&failure_path(&state,"operation"),&json!({"operationId":"operation","reason":"restart_write_in_flight","attempts":3,"at":1})).unwrap();
+        assert_eq!(attempts(&state,"operation","restart_write_in_flight"),3);
+        assert_eq!(attempts(&state,"operation","restart_fence_changed"),0,"another reason starts its own count");
+        assert_eq!(wait_reason(&state,"operation"),Some("restart_write_in_flight"));
+        storage::atomic(&failure_path(&state,"operation"),&json!({"operationId":"operation","reason":"restart_fence_unavailable","attempts":1,"at":1})).unwrap();
+        assert_eq!(wait_reason(&state,"operation"),Some("restart_retrying"));
+        storage::atomic(&failure_path(&state,"operation"),&json!({"operationId":"another","reason":"restart_write_in_flight","attempts":9,"at":1})).unwrap();
+        assert_eq!(attempts(&state,"operation","restart_write_in_flight"),0);
+        assert_eq!(wait_reason(&state,"operation"),None);
     }
     #[test]
     fn reconciliation_admission_binds_original_unknowns_owner_and_fence() {

@@ -541,7 +541,7 @@ fn advance(root: &Path,state: &Path,operation: &str) -> Result<(bool, Option<&'s
     if cold_start(root, state, operation)? { return Ok((current(state, operation)?.is_none(), None)) }
     let Some(s)=current(state,operation)? else{return Ok((true, None))};
     let reason = (apply_requested(state,&s) && matches!(s.phase.as_str(), "staged" | "waiting_idle" | "waiting_cold_start"))
-        .then_some("restart_fence_pending");
+        .then(|| legacy_restart::wait_reason(state, operation).unwrap_or("restart_fence_pending"));
     Ok((current(state, operation)?.is_none(), reason))
 }
 
