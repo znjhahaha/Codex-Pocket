@@ -17,9 +17,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 @Composable
-internal fun rememberTurnChangeCards(timeline: NativeTimeline, rows: List<TranscriptRow>): Map<String, List<TurnChangeSummary>> {
+internal fun rememberTurnChangeCards(timeline: NativeTimeline, rows: List<TranscriptRow>,
+    summarized: MutableState<List<TranscriptRow>?>? = null): Map<String, List<TurnChangeSummary>> {
     val cards by produceState(emptyMap<String, List<TurnChangeSummary>>(), timeline, rows) {
         value = withContext(Dispatchers.Default) { changeSummaryRows(timeline, rows) }
+        // The rows these cards were worked out for: until it is the rows on screen, their heights are still to change.
+        summarized?.value = rows
     }
     // produceState retains the previous value while recomputing. Never leave a
     // terminal card visible for a turn the fresh snapshot now reports running.

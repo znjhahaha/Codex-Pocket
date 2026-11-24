@@ -33,6 +33,8 @@ internal object PocketMotion {
     fun <T> page(): SpringSpec<T> = PocketSprings.of(response = .44f, damping = 1f)
     /** A sheet or menu growing out of its source: a trace of overshoot in position and size. */
     fun <T> morph(): SpringSpec<T> = PocketSprings.of(response = .36f, damping = .84f)
+    /** A page opening out of a row or folding back into it: it reaches its place with a little speed left and stops there. */
+    fun <T> unfold(): SpringSpec<T> = PocketSprings.of(response = .46f, damping = .86f)
     /** Something trailing a finger: quick enough to feel attached, damped enough not to wobble. */
     fun <T> follow(): SpringSpec<T> = PocketSprings.of(response = .24f, damping = .86f)
     /** Returning after being pulled past a limit. */

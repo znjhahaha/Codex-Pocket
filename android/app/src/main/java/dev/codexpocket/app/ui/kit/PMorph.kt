@@ -91,7 +91,8 @@ internal val LocalPMorphPage = staticCompositionLocalOf<PMorphPage?> { null }
  * While the page is on its way the element is not drawn where it stands: it is the thing that is
  * moving. Its [picture] rides at the head of the page's frame and gives way to the page, so the
  * element is seen to become the page and the page to become the element again. Turn [picture] off
- * for an element that samples what is behind it, which cannot be drawn anywhere but in its place.
+ * for an element that samples what is behind it, which cannot be drawn anywhere but in its place:
+ * it then stays where it is, and the frame's ground closes over it and opens off it again.
  */
 @Composable
 internal fun Modifier.pocketMorphSource(key: Any?, radius: Dp = 16.dp, picture: Boolean = true): Modifier {
@@ -107,7 +108,8 @@ internal fun Modifier.pocketMorphSource(key: Any?, radius: Dp = 16.dp, picture: 
         onDispose { page.sources.remove(key, source); source.picture = null }
     }
     return onPlaced { source.coordinates = it }.drawWithContent {
-        if (drawn == null) { if (!source.lifted) drawContent(); return@drawWithContent }
+        // With no picture to carry, the element stays where it is and the frame's ground closes over it.
+        if (drawn == null) { drawContent(); return@drawWithContent }
         drawn.record { this@drawWithContent.drawContent() }
         if (!source.lifted) drawLayer(drawn)
     }
@@ -135,6 +137,9 @@ internal class PStageMorph(val key: Any, bounds: PMorphBounds) {
 
 /** How much of the page itself shows when its frame is [grown] of the way out of its source. */
 internal fun pocketMorphPage(grown: Float): Float = GlyphMotion.window(grown, .1f, .46f)
+
+/** How solid the frame's own ground is. It is clear while the frame is still the element, and solid well before the page shows. */
+internal fun pocketMorphGround(grown: Float): Float = GlyphMotion.window(grown, 0f, .14f)
 
 /** How much of the source's own picture shows at the head of the frame. It has gone before the page is whole. */
 internal fun pocketMorphPicture(grown: Float): Float = 1f - GlyphMotion.window(grown, .04f, .38f)

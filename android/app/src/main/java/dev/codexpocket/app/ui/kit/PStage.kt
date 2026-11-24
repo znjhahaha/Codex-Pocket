@@ -72,7 +72,8 @@ internal class PStageState<K : Any>(initial: K) {
     /** A back gesture is holding the transition part-way and has not been let go. */
     var held by mutableStateOf(false)
         private set
-    val progress = Animatable(1f)
+    // Bounded, so a page that opens with a little spring in it stops as it arrives instead of being held past its place.
+    val progress = Animatable(1f).apply { updateBounds(0f, 1f) }
     /** What the pages of this stage can open out of. */
     val sources = PMorphSources()
     /** Set while the page in front is growing out of a source or folding back into it, rather than sliding. */
@@ -124,7 +125,8 @@ internal class PStageState<K : Any>(initial: K) {
         // Moving starts once they are over, so the first steps of the way are seen rather than skipped.
         if (fresh) settleIn()
         // A page still loading as it arrives stretches the transition rather than cutting steps out of it.
-        pocketSteadyFrames { progress.animateTo(1f, PocketMotion.page(), velocity) }
+        // A page out of a row lands: it reaches its place at speed and is there, where a sliding page eases to a stop.
+        pocketSteadyFrames { progress.animateTo(1f, if (morph != null) PocketMotion.unfold() else PocketMotion.page(), velocity) }
         if (move != PStageMove.Push) from?.let { opened.remove(it) }
         from = null; carry(null)
     }
@@ -181,6 +183,12 @@ internal interface PStageGesture {
 }
 
 internal val LocalPStageGesture = staticCompositionLocalOf<PStageGesture?> { null }
+
+/**
+ * True while the page reading it is still on its way in. A page with a great deal to compose waits for
+ * this to turn false before it does, so the work lands after the transition and not in the middle of it.
+ */
+internal val LocalPStageArriving = staticCompositionLocalOf<() -> Boolean> { { false } }
 
 @Composable
 internal fun <K : Any> rememberPStageState(initial: K): PStageState<K> = remember { PStageState(initial) }
@@ -287,9 +295,14 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         }
                     }
                 }.testTag(if (active) "stage-page" else "stage-page-leaving")) {
-                    // The frame is solid from the first moment; what changes is what it holds. The page comes
-                    // up inside it as the element's own picture goes, and the other way round on the way back.
-                    Box(Modifier.fillMaxSize().onPlaced { morphPage.coordinates = it }.background(background)
+                    // The frame holds the element's own picture first and the page after it. Its ground comes in
+                    // just as it leaves the element and is gone just before it is the element again, so what lies
+                    // beside the element is never covered by a blank card at either end.
+                    Box(Modifier.fillMaxSize().onPlaced { morphPage.coordinates = it }.drawBehind {
+                            val morphing = from != null && above && state.morph != null && (state.move == PStageMove.Push || state.move == PStageMove.Pop)
+                            val at = state.progress.value.coerceIn(0f, 1f)
+                            drawRect(background, alpha = if (morphing) pocketMorphGround(if (arriving) at else 1f - at) else 1f)
+                        }
                         .graphicsLayer {
                             if (from == null || !above || state.morph == null || (state.move != PStageMove.Push && state.move != PStageMove.Pop)) return@graphicsLayer
                             val at = state.progress.value.coerceIn(0f, 1f)
@@ -298,7 +311,8 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         .then(if (active) Modifier else Modifier.clearAndSetSemantics { }.pointerInput(Unit) {
                             awaitPointerEventScope { while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() } }
                         })) { CompositionLocalProvider(LocalPStageGesture provides gesture, LocalPMorphPage provides morphPage,
-                            LocalPocketEntranceQuiet provides returning) { content(shown) } }
+                            LocalPocketEntranceQuiet provides returning,
+                            LocalPStageArriving provides remember(shown) { { state.from != null && state.to == shown && state.move != PStageMove.Pop } }) { content(shown) } }
                     val stacked = from != null && (state.move == PStageMove.Push || state.move == PStageMove.Pop)
                     // The page beneath dims as it is covered; the page above casts a soft edge onto it.
                     if (stacked && !above) Box(Modifier.matchParentSize().graphicsLayer {
@@ -320,7 +334,8 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         val morph = state.morph ?: return@drawBehind
                         val at = state.progress.value.coerceIn(0f, 1f)
                         val grown = if (arriving) at else 1f - at
-                        val edge = 1f - GlyphMotion.window(grown, .7f, 1f)
+                        // It is not there while the frame is still the element, nor once it is the whole stage.
+                        val edge = GlyphMotion.window(grown, 0f, .12f) * (1f - GlyphMotion.window(grown, .7f, 1f))
                         if (edge <= 0f) return@drawBehind
                         val frame = pocketMorphFrame(morph.rect, size.width, size.height, grown)
                         val fit = (frame.width / size.width).coerceAtLeast(.01f)

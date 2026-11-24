@@ -71,11 +71,17 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             s.agentStatuses.filterKeys { it.computerId == chat.key.computerId && it.configStoreId == chat.key.configStoreId }.mapKeys { it.key.nativeId }
         }
         val projection = remember { TranscriptProjectionMemory() }
+        // The page is brought in before its rows are composed: a long conversation costs frames, and they are not
+        // taken out of the transition. Projection goes on meanwhile, off the main thread.
+        val arriving = LocalPStageArriving.current
+        var landed by remember { mutableStateOf(!arriving()) }
+        LaunchedEffect(arriving) { snapshotFlow { arriving() }.first { !it }; landed = true }
         val rows = rememberTranscriptRows(chat.key.encoded, s.timeline, expansions, blockedTurns, retained = projection,
-            resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses)
+            resolvedRequestIds = s.resolvedRequests[chat.runtimeId].orEmpty(), agentLiveStatuses = agentLiveStatuses).takeIf { landed }.orEmpty()
         // Items that have arrived but have not been projected into rows yet are still being read.
-        val projecting = projection.scope != chat.key.encoded && s.timeline.items.isNotEmpty()
-        val changeCards = rememberTurnChangeCards(s.timeline, rows)
+        val projecting = (!landed || projection.scope != chat.key.encoded) && s.timeline.items.isNotEmpty()
+        val summarized = remember { mutableStateOf<List<TranscriptRow>?>(null) }
+        val changeCards = rememberTurnChangeCards(s.timeline, rows, summarized)
         // Rows are projected off the main thread: a conversation with items is not an empty one while that is under way.
         val read = conversationReadPresentation(s.conversationLoadState, rows.isNotEmpty() || projecting, s.conversationCached)
         val live = remember(s.timeline) {
@@ -117,7 +123,30 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         }
         val motion = rememberPocketMotion()
         val revealed = remember { androidx.compose.animation.core.Animatable(0f) }
-        LaunchedEffect(placed, motion) { if (placed) { if (motion) revealed.animateTo(1f, PocketMotion.enter()) else revealed.snapTo(1f) } }
+        // Rows go on growing for a few frames after they are first measured (change cards, rendered text) and the end
+        // is followed as they do. They are shown once that has come to rest, so they are never seen to shift.
+        var settled by remember { mutableStateOf(false) }
+        val rowsNow by rememberUpdatedState(rows)
+        LaunchedEffect(placed, motion) {
+            if (!placed) return@LaunchedEffect
+            if (!settled) {
+                val start = withFrameNanos { it }
+                var still = 0
+                var last: List<Any?>? = null
+                while (still < 2) {
+                    val now = withFrameNanos { it }
+                    if (now - start > TranscriptSettleNanos) break
+                    val info = list.layoutInfo
+                    val end = info.visibleItemsInfo.lastOrNull()
+                    val at = listOf(info.totalItemsCount, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, end?.index, end?.offset, end?.size)
+                    val resting = summarized.value === rowsNow && !list.isScrollInProgress && !(following && list.canScrollForward)
+                    still = if (resting && at == last) still + 1 else 0
+                    last = at
+                }
+                settled = true
+            }
+            if (motion) revealed.animateTo(1f, PocketMotion.enter()) else revealed.snapTo(1f)
+        }
         var transcriptContact by remember { mutableStateOf(false) }
         val transcriptGesture = remember(list) { TranscriptGestureState() }
         var jumpJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
@@ -313,7 +342,7 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                 }
                 }
                 // The picture of the conversation being read stays where the rows will be and gives way to them as they come in.
-                ConversationLoading((read.skeleton || projecting) && !placed,
+                ConversationLoading(!settled && (read.skeleton || projecting || placed),
                     Modifier.padding(start = gutter + transcriptInset, end = transcriptInset, top = topInset + 12.dp))
                 if (read.empty && live == null && !showSending) Box(Modifier.fillMaxSize().padding(top = topInset, bottom = bottomInset), contentAlignment = Alignment.Center) {
                     Column(Modifier.widthIn(max = 420.dp).padding(30.dp)) {
@@ -439,6 +468,9 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         }, onImages = { attachmentSheet = false; picker.launch(arrayOf("image/jpeg", "image/png", "image/webp")) }, onText = { attachmentSheet = false; picker.launch(arrayOf("text/plain", "text/markdown", "application/json")) })
     }
 }
+
+/** The longest a conversation's rows are held back while they come to rest. After that they are shown as they are. */
+private const val TranscriptSettleNanos = 900_000_000L
 
 /**
  * A conversation still being read, drawn over the place its rows will take. It holds back a moment, so a
