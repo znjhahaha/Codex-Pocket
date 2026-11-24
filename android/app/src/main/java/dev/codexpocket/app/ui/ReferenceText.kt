@@ -79,29 +79,44 @@ internal fun ReferenceEditor(value: TextFieldValue, onValueChange: (TextFieldVal
     decorationBox: @Composable (innerTextField: @Composable () -> Unit) -> Unit = { it() },
     onMetadataOpenChange: (Boolean) -> Unit = {}) {
     val valid = remember(value.text, spans) { validReferenceSpans(value.text, spans) }
-    val transformed = remember(valid) { ReferenceVisualTransformation(valid, ReferenceBlue) }
-    val renderedText = remember(value.annotatedString, transformed) { transformed.filter(value.annotatedString).text.text }
+    val title = rememberThreadTitles()
+    val threads = remember(value.text, valid, title, value.composition) {
+        threadTextLinks(value.text, valid.map { it.start until it.end } + listOfNotNull(value.composition?.let { it.min until it.max }))
+            .map { EditorThreadLink(it, title(it)) }
+    }
+    val transformed = remember(valid, threads) { ThreadLinkVisualTransformation(ReferenceVisualTransformation(valid, ReferenceBlue), threads, ReferenceBlue) }
+    val display = remember(value.annotatedString, transformed) { transformed.filter(value.annotatedString) }
+    val renderedText = display.text.text
     val currentRenderedText by rememberUpdatedState(renderedText)
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     var anchor by remember { mutableStateOf<Rect?>(null) }
     var selected by remember { mutableStateOf<ReferenceSpan?>(null) }
     val painters = valid.map { rememberVectorPainter(referenceIcon(it.reference.string("type"))) }
+    val threadPainter = rememberVectorPainter(PocketIcons.Link2)
     val currentSpans by rememberUpdatedState(valid)
+    val currentDisplay by rememberUpdatedState(display)
     val reportMetadata by rememberUpdatedState(onMetadataOpenChange)
     val inputActive by rememberUpdatedState(LocalPocketInputActive.current)
     val closeMetadata: () -> Unit = { selected = null; reportMetadata(false) }
     LaunchedEffect(valid) { if (selected != null && selected !in valid) closeMetadata() }
     DisposableEffect(Unit) { onDispose { if (selected != null) reportMetadata(false) } }
-    BasicTextField(value, onValueChange, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }
+    BasicTextField(value, { onValueChange(editThreadLinkToken(value, it, threads)) }, modifier.onGloballyPositioned { anchor = it.boundsInRoot() }
         .drawWithContent {
             drawContent()
             val result = layout ?: return@drawWithContent
             if (result.layoutInput.text.text != renderedText) return@drawWithContent
             valid.forEachIndexed { index, span ->
-                val box = result.getBoundingBox(span.start + index)
+                val box = result.getBoundingBox(display.offsetMapping.originalToTransformed(span.start) - 1)
                 val size = minOf(box.width, box.height) * .85f
                 translate(box.left + (box.width - size) / 2, box.top + (box.height - size) / 2) {
                     with(painters[index]) { draw(Size(size, size), colorFilter = ColorFilter.tint(ReferenceBlue)) }
+                }
+            }
+            threads.forEach { thread ->
+                val box = result.getBoundingBox(display.offsetMapping.originalToTransformed(thread.link.start) - 1)
+                val size = minOf(box.width, box.height) * .85f
+                translate(box.left + (box.width - size) / 2, box.top + (box.height - size) / 2) {
+                    with(threadPainter) { draw(Size(size, size), colorFilter = ColorFilter.tint(ReferenceBlue)) }
                 }
             }
         }.pointerInput(readOnly) {
@@ -113,10 +128,10 @@ internal fun ReferenceEditor(value: TextFieldValue, onValueChange: (TextFieldVal
                 val result = layout?.takeIf { it.layoutInput.text.text == currentRenderedText }
                 val hit = result?.let { textLayout ->
                     val offset = textLayout.getOffsetForPosition(down.position)
-                    currentSpans.withIndex().firstOrNull { (index, span) ->
-                        offset in (span.start + index)..(span.end + index) &&
+                    currentSpans.firstOrNull { span ->
+                        offset in (currentDisplay.offsetMapping.originalToTransformed(span.start) - 1)..currentDisplay.offsetMapping.originalToTransformed(span.end) &&
                             textLayout.getBoundingBox(offset).contains(down.position)
-                    }?.value
+                    }
                 }
                 if (hit != null) {
                     val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
@@ -140,13 +155,10 @@ internal fun ReferenceText(text: String, spans: List<ReferenceSpan>, modifier: M
     val valid = remember(text, spans) { validReferenceSpans(text, spans) }
     val threads = remember(text, valid) {threadTextLinks(text, valid.map {it.start until it.end})}
     val binding = LocalThreadLinkBinding.current
-    val pocket = binding?.repository?.state?.collectAsState()?.value
+    val threadTitle = rememberThreadTitles()
     val clipboard = LocalClipboardManager.current
     val handler = rememberMarkdownLinkHandler(null)
     var selectedThread by remember {mutableStateOf<ThreadTextLink?>(null)}
-    fun threadTitle(link: ThreadTextLink): String = (pocket?.chats.orEmpty()+pocket?.agentChats.orEmpty()).firstOrNull {
-        it.key.nativeId == link.nativeId && it.key.computerId == binding?.origin?.computerId && it.key.configStoreId == binding?.origin?.configStoreId
-    }?.title?.takeIf {it.isNotBlank()} ?: link.label ?: "打开会话"
     var selected by remember { mutableStateOf<ReferenceSpan?>(null) }
     var anchor by remember { mutableStateOf<Rect?>(null) }
     val inputActive by rememberUpdatedState(LocalPocketInputActive.current)

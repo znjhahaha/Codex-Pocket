@@ -32,7 +32,8 @@ fn metadata(db: &Connection, id: &str) -> Result<Value> {
     let cols=columns(db,"threads", &["id","source","title","preview","cwd","updated_at","archived","rollout_path"])?;
     let mode=if cols.contains("history_mode") {"history_mode"} else {"'legacy'"};
     let first=if cols.contains("first_user_message") {"first_user_message"} else {"''"};
-    let sql=format!("SELECT id,source,title,preview,cwd,updated_at,archived,rollout_path,{mode},{first} FROM threads WHERE id=?1");
+    let name=if cols.contains("name") && cols.contains("history_mode") {"CASE WHEN history_mode='paginated' THEN COALESCE(name,'') ELSE title END"} else {"title"};
+    let sql=format!("SELECT id,source,{name},preview,cwd,updated_at,archived,rollout_path,{mode},{first} FROM threads WHERE id=?1");
     db.query_row(&sql,[id], |r|Ok(json!({"id":r.get::<_,String>(0)?,"source":r.get::<_,String>(1)?,"name":r.get::<_,String>(2)?,"preview":r.get::<_,String>(3)?,"cwd":r.get::<_,String>(4)?,"updatedAt":r.get::<_,i64>(5)?,"archived":r.get::<_,bool>(6)?,"path":r.get::<_,String>(7)?,"historyMode":r.get::<_,String>(8)?,"firstUserMessage":r.get::<_,String>(9)?,"status":{"type":"notLoaded"},"turns":[]})))
         .optional()?.context("Native thread not found")
 }
@@ -52,7 +53,9 @@ fn decode(value: &str) -> Result<Value> {
 }
 pub fn list(home: &Path, p: &Value) -> Result<Value> {
     let db=open(home,"state_5.sqlite")?;
-    columns(&db,"threads", &["id","source","title","preview","cwd","updated_at","archived"])?;
+    let names=titles::read(home)?;
+    let cols=columns(&db,"threads", &["id","source","title","preview","cwd","updated_at","archived"])?;
+    let sqlite_name=cols.contains("name") && cols.contains("history_mode");
     let archived=p["archived"].as_bool().unwrap_or(false);
     let search=p["search"].as_str().unwrap_or("");ensure!(search.len()<=4096,"Search too long");
     let source=p["source"].as_str().unwrap_or("");
@@ -63,16 +66,21 @@ pub fn list(home: &Path, p: &Value) -> Result<Value> {
     if let Some(c)=&cursor {ensure!(c["scope"]==scope&&c["at"].is_i64()&&c["id"].is_string(),"History cursor does not match query");}
     let after=cursor.as_ref().and_then(|c|c["at"].as_i64()).unwrap_or(i64::MAX);
     let after_id=cursor.as_ref().and_then(|c|c["id"].as_str()).unwrap_or("\u{10ffff}");
-    let mut stmt=db.prepare("SELECT id FROM threads WHERE archived=?1 AND source IN ('cli','vscode','appServer','unknown','desktop') AND (?2='' OR instr(lower(title || ' ' || preview || ' ' || cwd),lower(?2))>0) AND (?3='' OR source=?3) AND (updated_at<?4 OR (updated_at=?4 AND id<?5)) ORDER BY updated_at DESC,id DESC LIMIT ?6")?;
-    let ids=stmt.query_map(params![archived,search,source,after,after_id,limit+1],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let matching_names:Vec<_>=names.iter().filter(|(_,name)|name.to_lowercase().contains(&search.to_lowercase())).map(|(id,_)|id).collect();
+    let title=if sqlite_name {"CASE WHEN history_mode='paginated' THEN COALESCE(name,'') ELSE title END"} else {"title"};
+    let legacy=if sqlite_name {"history_mode<>'paginated'"} else {"1"};
+    let sql=format!("SELECT id FROM threads WHERE archived=?1 AND source IN ('cli','vscode','appServer','unknown','desktop') AND (?2='' OR instr(lower(({title}) || ' ' || preview || ' ' || cwd),lower(?2))>0 OR ({legacy} AND id IN (SELECT value FROM json_each(?7)))) AND (?3='' OR source=?3) AND (updated_at<?4 OR (updated_at=?4 AND id<?5)) ORDER BY updated_at DESC,id DESC LIMIT ?6");
+    let mut stmt=db.prepare(&sql)?;
+    let ids=stmt.query_map(params![archived,search,source,after,after_id,limit+1,serde_json::to_string(&matching_names)?],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let more=ids.len()>limit;
-    let data=ids.iter().take(limit).map(|id|metadata(&db,id)).collect::<Result<Vec<_>>>()?;
+    let data=ids.iter().take(limit).map(|id| {let mut row=metadata(&db,id)?;titles::apply(&mut row,&names,sqlite_name);Ok(row)}).collect::<Result<Vec<_>>>()?;
     let next=if more {let row=data.last().unwrap();Some(token(json!({"scope":scope,"at":row["updatedAt"],"id":row["id"]})))}else{None};
     Ok(json!({"data":data,"nextCursor":next}))
 }
 pub fn read(home: &Path, thread: &str, cursor: Option<&str>, limit: usize) -> Result<Value> {
     ensure!(crate::settings::valid_thread(thread),"Invalid thread identity");
     let db=open(home,"state_5.sqlite")?;let mut meta=metadata(&db,thread)?;
+    titles::apply(&mut meta,&titles::read(home)?,columns(&db,"threads", &["id"])?.contains("name"));
     // Persisted history does not establish whether a runtime has loaded a thread.
     meta["status"]=json!({"type":"unknown"});
     ensure!(matches!(meta["historyMode"].as_str(),Some("legacy"|"paginated")),"Unsupported native history mode");
@@ -119,6 +127,7 @@ pub fn read(home: &Path, thread: &str, cursor: Option<&str>, limit: usize) -> Re
 
 #[path="history_catalog/legacy.rs"]
 mod legacy;
+mod titles;
 pub(crate) mod resume;
 pub(crate) mod settings;
 
@@ -174,5 +183,44 @@ mod tests {
         assert!(read(d.path(),"not-found",None,10).is_err());
         Connection::open(d.path().join("thread_history_1.sqlite")).unwrap().execute_batch("DROP TABLE thread_items").unwrap();
         assert!(read(d.path(),"cli-a",None,10).is_err());
+    }
+    #[test]
+    fn desktop_session_names_replace_initial_prompts_in_list_and_history() {
+        let d = fixture();
+        std::fs::write(d.path().join("session_index.jsonl"), concat!(
+            "{\"id\":\"cli-a\",\"thread_name\":\"Previous title\",\"updated_at\":\"2026-11-23T00:00:00Z\"}\n",
+            "{\"id\":\"cli-a\",\"thread_name\":\"Finish Pocket release\",\"updated_at\":\"2026-11-24T00:00:00Z\"}\n",
+            "{\"id\":\"foreign\",\"thread_name\":\"Unrelated title\",\"updated_at\":\"2026-11-24T00:00:00Z\"}\n",
+            "{\"id\":\"cli-a\",\"thread_name\":\"Incomplete write"
+        )).unwrap();
+        let listed = list(d.path(), &json!({})).unwrap();
+        assert_eq!(listed["data"][0]["name"], "Finish Pocket release");
+        assert_eq!(listed["data"][0]["preview"], "hello");
+        assert_eq!(listed["data"][1]["name"], "Desktop notes");
+        let searched = list(d.path(), &json!({"search":"Pocket release"})).unwrap();
+        assert_eq!(searched["data"].as_array().unwrap().len(), 1);
+        assert_eq!(searched["data"][0]["id"], "cli-a");
+        assert_eq!(read(d.path(), "cli-a", None, 1).unwrap()["thread"]["name"], "Finish Pocket release");
+    }
+    #[test]
+    fn paginated_sqlite_name_wins_over_legacy_index_and_is_searchable() {
+        let d = fixture();
+        Connection::open(d.path().join("state_5.sqlite")).unwrap().execute_batch(
+            "ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET name='Current desktop title' WHERE id='cli-a';"
+        ).unwrap();
+        std::fs::write(d.path().join("session_index.jsonl"), "{\"id\":\"cli-a\",\"thread_name\":\"Stale indexed title\"}\n").unwrap();
+        assert_eq!(list(d.path(), &json!({})).unwrap()["data"][0]["name"], "Current desktop title");
+        assert_eq!(read(d.path(), "cli-a", None, 1).unwrap()["thread"]["name"], "Current desktop title");
+        assert_eq!(list(d.path(), &json!({"search":"Current desktop"})).unwrap()["data"].as_array().unwrap().len(), 1);
+        assert!(list(d.path(), &json!({"search":"Stale indexed"})).unwrap()["data"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn valid_index_record_at_eof_does_not_require_a_newline() {
+        let d = fixture();
+        std::fs::write(d.path().join("session_index.jsonl"), concat!(
+            "{\"id\":\"cli-a\",\"thread_name\":\"Old title\"}\n",
+            "{\"id\":\"cli-a\",\"thread_name\":\"Current title\"}"
+        )).unwrap();
+        assert_eq!(list(d.path(), &json!({})).unwrap()["data"][0]["name"], "Current title");
     }
 }

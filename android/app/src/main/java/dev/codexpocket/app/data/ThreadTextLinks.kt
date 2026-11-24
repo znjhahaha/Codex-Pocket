@@ -4,6 +4,11 @@ data class ThreadTextLink(val start: Int, val end: Int, val nativeId: String, va
     val url get() = "codex://threads/$nativeId"
 }
 
+fun threadTextTitle(link: ThreadTextLink, origin: ThreadKey?, chats: List<ChatEntity>): String =
+    link.label?.takeIf(String::isNotBlank) ?: chats.firstOrNull {
+        it.key.nativeId == link.nativeId && it.key.computerId == origin?.computerId && it.key.configStoreId == origin.configStoreId
+    }?.title?.takeIf { it.isNotBlank() && '\n' !in it && '\r' !in it && it.length <= 512 } ?: "打开会话"
+
 /** Recognize conversation references without interpreting snippets, file paths or arbitrary URIs. */
 fun threadTextLinks(text: String, protected: List<IntRange> = emptyList()): List<ThreadTextLink> {
     val id = "[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
