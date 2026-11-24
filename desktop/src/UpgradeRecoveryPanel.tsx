@@ -36,7 +36,7 @@ export function UpgradeRecoveryPanel({snapshot,now,busy,onAction,onRefresh,onDia
   </dl>
   {recovery.bridge&&<div className="recovery-bridge" aria-label="Codex bridge 单独核验">
    <strong>Codex bridge 单独核验</strong>
-   <p>{recovery.bridge==='pending'?'正在运行的 Codex bridge 仍等待重启生效。':'Codex bridge 的运行版本尚未核验。'}后台交接只核验后台监督和电脑助手。完成并保存当前 Codex 任务后，重新打开 Codex，再核验 bridge 版本。</p>
+   <p>{recovery.bridge==='pending'?'正在运行的 Codex bridge 仍等待重启生效。':'Codex bridge 的运行版本尚未核验。'}Codex 可以继续使用；下次打开 Codex 时自动换成新版，无需现在重启。</p>
   </div>}
   {installation?.upgrade&&<p className="subtle">更新记录 · 操作 <code>{installation.upgrade.operationId}</code></p>}
   </details>

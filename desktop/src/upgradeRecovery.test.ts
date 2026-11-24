@@ -111,6 +111,14 @@ describe('home upgrade and background recovery policy',()=>{
   s.updates.coordinator={phase:'waiting_login',reason:'independent_dispatch_failed'};
   expect(upgradeRecovery(s,100).kind).toBe('staged_dashboard');
  });
+ it('calls an update finished while a running Codex keeps its older bridge, and asks for nothing',()=>{
+  const s=snapshot();
+  s.processes=[{state:'在线',bridgeUpdatePending:true} as never];
+  const model=upgradeRecovery(s,100);
+  expect(model).toMatchObject({kind:'bridge',tone:'success',blockMutations:false});
+  expect(model.title).toBe('更新已完成');
+  expect(model.description).toContain('不需要现在重启');
+ });
  it('keeps the retry button usable after a cancelled legacy handoff',()=>{
   const s=snapshot();
   s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};

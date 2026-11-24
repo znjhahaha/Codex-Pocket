@@ -126,7 +126,7 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  }:undefined;
  if(currentBackground&&!criticalReadFailed){
   if(background?.phase==='recovered')return model('recovered','后台已恢复并核验',`后台监督与电脑助手已运行当前安装代次。${connectionDescription(s)}`,{tone:'success',blockMutations:false,retry});
-  return bridge?model('bridge','Codex 运行环境需要单独核验','后台已运行最新版。请保存当前任务后重新打开 Codex，再查看版本详情。',{blockMutations:false})
+  return bridge?model('bridge','更新已完成','Pocket 后台已是最新版，现在可以照常使用。正在运行的 Codex 仍通过旧版连接组件工作，下次打开 Codex 时自动换成新版，不需要现在重启。',{tone:'success',blockMutations:false})
    :model('current','','',{visible:false,tone:'neutral',blockMutations:false});
  }
  if(currentHelper&&noVerifiedOldOwner&&!criticalReadFailed)return model('unknown','电脑助手已核验，后台监督待核验','电脑助手正在运行当前安装版本；后台监督的运行证据仍需刷新核验。',{tone:'neutral'});
