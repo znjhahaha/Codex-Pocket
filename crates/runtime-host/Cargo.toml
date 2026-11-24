@@ -3,7 +3,7 @@ resolver = "2"
 
 [package]
 name = "pocket-runtime-host"
-version = "0.7.1-rc.20261124.49"
+version = "0.7.1-rc.20261124.50"
 edition = "2024"
 license = "MIT"
 
