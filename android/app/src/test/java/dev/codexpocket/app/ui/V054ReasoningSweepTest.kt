@@ -19,7 +19,8 @@ class V054ReasoningSweepTest {
         assertFalse(nativeSummaryActive("turn", summary.copy(turnId = "old"), timing))
         assertFalse(nativeSummaryActive("turn", summary, timing.copy(id = "other")))
         assertFalse(nativeSummaryActive("turn", summary.copy(type = "agentMessage"), timing))
-        assertFalse(nativeSummaryActive("turn", summary.copy(complete = true), timing))
+        assertTrue("Completed snapshot summaries still belong to an actively thinking turn",
+            nativeSummaryActive("turn", summary.copy(complete = true), timing))
     }
     @Test fun everyAccessibilityPowerAndForegroundFallbackIsStatic() {
         for (highContrast in listOf(false, true)) {

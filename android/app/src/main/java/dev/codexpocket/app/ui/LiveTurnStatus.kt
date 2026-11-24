@@ -46,9 +46,9 @@ internal fun elapsedLabel(seconds: Long): String {
 internal fun liveStatusLabel(status: LiveStatus): String =
     when(status) { LiveStatus.Compacting -> "正在压缩上下文"; LiveStatus.Thinking -> "正在思考"; LiveStatus.Working -> "" }
 
-/** Missing or mismatched native timing keeps prose readable but supplies no live-motion proof. */
+/** The current native turn controls motion; snapshot item completion only describes the summary. */
 internal fun nativeSummaryActive(turnId: String, reasoning: TimelineItem?, timing: NativeTurnInfo?): Boolean =
-    reasoning?.type == "reasoning" && reasoning.turnId == turnId && !reasoning.complete &&
+    reasoning?.type == "reasoning" && reasoning.turnId == turnId &&
         timing?.id == turnId && timing.status == "inProgress"
 
 /** The owner supplies an accepted active identity; optional metadata can veto a stale pointer. */

@@ -75,9 +75,10 @@ class V054NativeMotionUiTest {
 
     private fun frame(millis: Long) {
         compose.runOnIdle { androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications() }
-        compose.mainClock.advanceTimeByFrame()
-        compose.mainClock.advanceTimeBy(millis)
-        compose.waitForIdle()
+        repeat(((millis + 15) / 16).toInt().coerceAtLeast(1)) {
+            compose.mainClock.advanceTimeBy(16)
+            compose.waitForIdle()
+        }
     }
     private fun pixels(tag: String): PixelMap {
         // Robolectric has no platform redraw/PixelCopy fence. Draw the actual Compose view
@@ -216,6 +217,28 @@ class V054NativeMotionUiTest {
         val completed = pixels("native-summary-paragraph:1")
         frame(700)
         assertEquals(0, differences(completed, pixels("native-summary-paragraph:1")))
+    }
+
+    @Test fun snapshotSummaryKeepsItsSweepUntilTheNativeTurnStopsThinking() {
+        val timeline = NativeReducer.snapshot(pocketJson.parseToJsonElement("""
+            {"id":"thread","status":{"type":"active"},"turns":[{"id":"turn","status":"inProgress",
+             "items":[{"id":"reason","type":"reasoning","summary":["当前原生思维摘要 Native summary"],"completedAtMs":200}]}]}
+        """).jsonObject)
+        val reasoning = ConversationPresentation.liveReasoning(timeline)!!
+        assertTrue("Snapshot completion describes the item, not its live turn", reasoning.complete)
+        var timing by mutableStateOf(timeline.turns.getValue("turn"))
+        compose.mainClock.autoAdvance = false
+        content { LiveTurnStatus("turn", ConversationPresentation.liveStatus(timeline)!!,
+            reasoning = reasoning, timing = timing) }
+        frame(64)
+        val before = pixels("live-turn-status")
+        frame(640)
+        assertTrue("A restored current summary must retain the moving highlight", differences(before, pixels("live-turn-status")) > 5)
+        compose.runOnIdle { timing = timing.copy(status = "completed") }
+        frame(32)
+        val stopped = pixels("live-turn-status")
+        frame(640)
+        assertEquals(0, differences(stopped, pixels("live-turn-status")))
     }
 
     @Test fun visibilityUsesClippedViewportInsteadOfCompositionPresence() {
