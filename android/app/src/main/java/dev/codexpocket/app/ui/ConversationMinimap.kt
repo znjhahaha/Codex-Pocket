@@ -148,7 +148,21 @@ internal fun ConversationMinimap(
                     if (ready != true) return@collectLatest
                 }
                 val index = latestMap.listIndex(plan.scrollKey) ?: return@collectLatest
-                listState.scrollToItem(index)
+                // A visible exact-key row already has a measured height. Seek straight to its
+                // fraction instead of composing its top only to immediately scroll away again.
+                val known = if (plan.expandProcessKey == null && plan.scrollKey == resolvedTarget.key)
+                    listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == plan.scrollKey && it.index == index }
+                else null
+                var initialOffset = if (known != null && resolvedTarget.withinRow > 0f)
+                    (known.size * resolvedTarget.withinRow).toInt().coerceIn(0, (known.size - 1).coerceAtLeast(0))
+                else 0
+                listState.scrollToItem(index, initialOffset)
+                // A shrinking row can put the old offset beyond its new end. Recover the same
+                // key's height before correcting its fraction, as for an unmeasured target.
+                if (initialOffset > 0 && listState.layoutInfo.visibleItemsInfo.none { it.key == plan.scrollKey }) {
+                    initialOffset = 0
+                    listState.scrollToItem(latestMap.listIndex(plan.scrollKey) ?: return@collectLatest)
+                }
                 val measured = withTimeoutOrNull(2_000L) {
                     snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == plan.scrollKey } }.first { it != null }
                 } ?: return@collectLatest
@@ -156,7 +170,8 @@ internal fun ConversationMinimap(
                     val offset = (measured.size * resolvedTarget.withinRow).toInt()
                         .coerceIn(0, (measured.size - 1).coerceAtLeast(0))
                     val currentIndex = latestMap.listIndex(plan.scrollKey) ?: return@collectLatest
-                    if (offset > 0) listState.scrollToItem(currentIndex, offset)
+                    // Width reflow/streaming may have changed the size during that first seek.
+                    if (offset != initialOffset || currentIndex != index) listState.scrollToItem(currentIndex, offset)
                 }
                 finished = true
             } finally {

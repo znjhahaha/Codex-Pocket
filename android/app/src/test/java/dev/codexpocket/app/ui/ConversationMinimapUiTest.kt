@@ -14,6 +14,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
@@ -52,7 +53,8 @@ class ConversationMinimapUiTest {
             listOf(TimelineItem("turn", "$it", "agentMessage", "Loaded row $it\nA second line")))
     }
     private fun content(theme: String = "light", motion: Boolean = false, rowHeight: Dp? = 72.dp,
-        railCap: Dp? = null, useVisibility: Boolean = false, onSeek: () -> Unit = {}) {
+        railCap: Dp? = null, useVisibility: Boolean = false, onSeek: () -> Unit = {},
+        onTranscriptMeasure: (() -> Unit)? = null, rowModifier: Modifier = Modifier) {
         compose.activity.runOnUiThread { compose.activity.setContent {
             PocketTheme(theme) {
                 CompositionLocalProvider(LocalPocketGlassPreferences provides PocketGlassPreferences(false, false, motion)) {
@@ -68,11 +70,16 @@ class ConversationMinimapUiTest {
                             val visible = !useVisibility || shown
                             val gutter = if (visible) minOf(minimapState.reservedWidth, railCap ?: maxWidth * .18f) else 0.dp
                             val keys = listOf("history") + rows.map { it.key } + listOf("live", "end")
-                            LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter).testTag("transcript"),
+                            LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(start = gutter)
+                                .then(if (onTranscriptMeasure == null) Modifier else Modifier.layout { measurable, constraints ->
+                                    onTranscriptMeasure()
+                                    val placeable = measurable.measure(constraints)
+                                    layout(placeable.width, placeable.height) { placeable.placeRelative(0, 0) }
+                                }).testTag("transcript"),
                                 contentPadding = PaddingValues(horizontal = 16.dp)) {
                                 item(key = "history") { Spacer(Modifier.height(32.dp)) }
                                 items(rows, key = { it.key }) { row ->
-                                    Box(Modifier.fillMaxWidth().then(rowHeight?.let { Modifier.height(it) } ?: Modifier)
+                                    Box(Modifier.fillMaxWidth().then(rowModifier).then(rowHeight?.let { Modifier.height(it) } ?: Modifier)
                                         .testTag("transcript-row-${row.key}")) { Text(row.items.first().text) }
                                 }
                                 item(key = "live") { Spacer(Modifier.height(24.dp)) }
@@ -147,6 +154,90 @@ class ConversationMinimapUiTest {
             assertTrue(hasVisibleKey("row-0"))
             assertEquals(1, list.firstVisibleItemIndex)
             assertTrue(list.firstVisibleItemScrollOffset > 600f * density)
+        }
+    }
+
+    @Test fun seekingWithinAnAlreadyMeasuredRowDoesNotRemeasureItsTopFirst() {
+        rows = rows.take(1)
+        var forcedMeasures = 0
+        content(rowHeight = 1200.dp, onTranscriptMeasure = {
+            // Count the synchronous seek cost seen in the device trace, not unrelated layouts.
+            if (Thread.currentThread().stackTrace.any {
+                    it.className == LazyListState::class.java.name && it.methodName == "scrollToItem"
+                }) forcedMeasures++
+        })
+        open()
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.3f) }
+        compose.runOnIdle {
+            assertEquals(1, list.firstVisibleItemIndex)
+            assertEquals(360f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
+            forcedMeasures = 0
+        }
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.4f) }
+        compose.runOnIdle {
+            assertEquals(1, list.firstVisibleItemIndex)
+            assertEquals(480f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
+            assertEquals("A measured row needs only the final fractional seek, without a row-top round trip", 1, forcedMeasures)
+        }
+    }
+
+    @Test fun measuredFractionalSeekCorrectsAHeightChangeDuringItsFirstMeasurement() {
+        rows = rows.take(1)
+        var measuredHeight by mutableStateOf(1200.dp)
+        var resizeOnSeek = false
+        content(rowHeight = null, onSeek = {
+            if (resizeOnSeek) {
+                measuredHeight = 1800.dp; resizeOnSeek = false
+                // Deliver this fixture's layout invalidation before the forced measurement.
+                androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+            }
+        }, rowModifier = Modifier.layout { measurable, constraints ->
+            // Like wrapped/streaming text, the new size becomes available during measurement.
+            val height = measuredHeight.roundToPx()
+            val placeable = measurable.measure(constraints.copy(minHeight = height, maxHeight = height))
+            layout(placeable.width, placeable.height) { placeable.placeRelative(0, 0) }
+        })
+        open()
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.3f) }
+        compose.runOnIdle {
+            assertEquals(360f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
+            resizeOnSeek = true
+        }
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.4f) }
+        compose.runOnIdle {
+            assertEquals("row-0", list.layoutInfo.visibleItemsInfo.first().key)
+            assertEquals(1800f * density, list.layoutInfo.visibleItemsInfo.first().size.toFloat(), 1f)
+            assertEquals(720f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
+        }
+    }
+
+    @Test fun measuredFractionalSeekKeepsItsKeyWhenTheOldOffsetExceedsTheNewHeight() {
+        rows = rows.take(2)
+        var measuredHeight by mutableStateOf(1200.dp)
+        var shrinkOnSeek = false
+        content(rowHeight = null, onSeek = {
+            if (shrinkOnSeek) {
+                measuredHeight = 600.dp; shrinkOnSeek = false
+                androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+            }
+        }, rowModifier = Modifier.layout { measurable, constraints ->
+            val height = measuredHeight.roundToPx()
+            val placeable = measurable.measure(constraints.copy(minHeight = height, maxHeight = height))
+            layout(placeable.width, placeable.height) { placeable.placeRelative(0, 0) }
+        })
+        open()
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.15f) }
+        compose.runOnIdle {
+            assertEquals("row-0", list.layoutInfo.visibleItemsInfo.first().key)
+            assertEquals(360f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
+            shrinkOnSeek = true
+        }
+        // Two equal-weight rows: 40% of the map is 80% through the first row.
+        rail().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(.4f) }
+        compose.runOnIdle {
+            assertEquals("row-0", list.layoutInfo.visibleItemsInfo.first().key)
+            assertEquals(600f * density, list.layoutInfo.visibleItemsInfo.first().size.toFloat(), 1f)
+            assertEquals(480f * density, list.firstVisibleItemScrollOffset.toFloat(), 1f)
         }
     }
 

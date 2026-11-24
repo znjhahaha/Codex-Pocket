@@ -334,7 +334,23 @@ class TranscriptScrollingUiTest {
         compose.waitForIdle()
         assertFalse(repo.state.value.draft!!.followEnd)
         compose.onNodeWithContentDescription(compose.activity.getString(dev.codexpocket.app.R.string.jump_latest)).performClick()
-        compose.waitUntil(2_000) { repo.state.value.draft?.followEnd == true }
+        // The button first resumes local follow and scrolls. Its settled position is persisted
+        // by the 200 ms debounce, unlike the immediate intent write from a real drag to tail.
+        compose.waitForIdle()
+        repeat(16) { compose.mainClock.advanceTimeBy(16); compose.waitForIdle() }
+        try { compose.waitUntil(2_000) { repo.state.value.draft?.followEnd == true } }
+        catch (failure: Throwable) {
+            throw AssertionError("Jump follow did not persist: follow=${repo.state.value.draft?.followEnd}; " +
+                "historyPreview=${compose.onAllNodesWithTag("composer-history-preview").fetchSemanticsNodes().size}; " +
+                "position=${scrollPosition()}; " + transcript.printToString().take(1200), failure)
+        }
+        compose.onNodeWithTag("composer-history-preview").assertDoesNotExist()
+        // The expanded minimap deliberately holds automatic follow while the composer
+        // changes height. Let its existing 2.5 s idle collapse finish before checking
+        // the settled end position; the follow intent above must already be saved.
+        repeat(180) { compose.mainClock.advanceTimeBy(16); compose.waitForIdle() }
+        val tail = transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        assertEquals("Jump to latest must reach the tail as well as persist follow", tail.maxValue(), tail.value(), 1f)
     }
 
     @Test fun fastFlingToTailExpandsTheComposerWithoutAnotherGesture() {
