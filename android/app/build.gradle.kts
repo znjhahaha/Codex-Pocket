@@ -36,8 +36,8 @@ android {
         }
         minSdk = 28
         targetSdk = 36
-        versionCode = 50
-        versionName = "0.7.1-rc.20261122.48"
+        versionCode = 51
+        versionName = "0.7.1-rc.20261124.49"
         buildConfigField("String", "POCKET_BUILD_ID", "\"${providers.environmentVariable("POCKET_BUILD_ID").orElse("development").get().also { require(it.matches(Regex("[A-Za-z0-9._-]{1,96}"))) }}\"")
         buildConfigField("String", "HUAWEI_APP_ID", "\"$huaweiAppId\"")
         manifestPlaceholders["pocketHuaweiAppId"] = huaweiAppId
