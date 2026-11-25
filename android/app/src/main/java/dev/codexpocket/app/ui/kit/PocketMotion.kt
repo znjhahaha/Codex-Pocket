@@ -50,6 +50,8 @@ internal object PocketMotion {
     fun <T> enter(): FiniteAnimationSpec<T> = tween(EnterMillis, easing = EaseOut)
     fun <T> exit(): FiniteAnimationSpec<T> = tween(ExitMillis, easing = EaseOut)
     fun <T> color(): FiniteAnimationSpec<T> = tween(ColorMillis, easing = EaseOut)
+    /** Dimming changes evenly and never follows the panel's spring or overshoot. */
+    fun scrim(entering: Boolean): FiniteAnimationSpec<Float> = tween(if (entering) EnterMillis else ExitMillis, easing = LinearEasing)
 }
 
 /**

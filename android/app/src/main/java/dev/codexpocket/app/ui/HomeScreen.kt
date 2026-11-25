@@ -36,6 +36,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalInputModeManager
+import androidx.compose.ui.input.InputMode
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -388,8 +390,9 @@ internal fun ChatHomeRow(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val focused by interaction.collectIsFocusedAsState()
-    val pressColor by animateColorAsState(if (pressed || focused) Pocket.colors.sunken else Color.Transparent,
-        tween(pocketMotionMillis(120)), label = "home-row-press")
+    // Touch feedback belongs to the held row and ends with the press, without a trailing gray flash.
+    val keyboardFocused = focused && LocalInputModeManager.current.inputMode == InputMode.Keyboard
+    val pressColor = if (pressed || keyboardFocused) Pocket.colors.sunken else Color.Transparent
     val scale by animateFloatAsState(if (pressed) .985f else 1f, pocketPressSpring(), label = "home-row-scale")
     val relative = remember(chat.updatedAt, timestamp) { homeRelativeTime(homeUpdatedAtMillis(chat.updatedAt), System.currentTimeMillis()) ?: timestamp }
     val c = Pocket.colors

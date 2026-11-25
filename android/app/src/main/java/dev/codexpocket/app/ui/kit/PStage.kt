@@ -22,10 +22,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -249,7 +245,6 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
         }
     }
     val background = Pocket.colors.bg
-    val hairline = Pocket.colors.line
     Box(modifier.fillMaxSize()) {
         val from = state.from?.takeIf { it != state.to }
         val to = state.to
@@ -279,7 +274,7 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                                 transformOrigin = TransformOrigin(0f, 0f)
                                 scaleX = fit; scaleY = fit; translationX = frame.left; translationY = frame.top
                                 shape = PMorphShape(frame.height / fit, morph.radius * (1f - grown) / fit); clip = true
-                                shadowElevation = 20.dp.toPx() * GlyphMotion.pulse(grown)
+                                // The source keeps its own contour; the transition must not add a gray frame around a plain row.
                             }
                             else -> { val scale = 1f - MorphRecede * shift; scaleX = scale; scaleY = scale }
                         }
@@ -314,7 +309,7 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                             LocalPocketEntranceQuiet provides returning,
                             LocalPStageArriving provides remember(shown) { { state.from != null && state.to == shown && state.move != PStageMove.Pop } }) { content(shown) } }
                     val stacked = from != null && (state.move == PStageMove.Push || state.move == PStageMove.Pop)
-                    // The page beneath dims as it is covered; the page above casts a soft edge onto it.
+                    // The page beneath dims as it is covered; sliding pages cast a soft edge onto it.
                     if (stacked && !above) Box(Modifier.matchParentSize().graphicsLayer {
                         val at = state.progress.value.coerceIn(0f, 1f)
                         alpha = (if (arriving) 1f - at else at) * Dim
@@ -328,19 +323,6 @@ internal fun <K : Any> PStage(page: K, modifier: Modifier = Modifier, depth: (K)
                         state.progress.value
                         val rect = morph.resolve(state.sources)
                         morph.picture?.let { drawMorphPicture(it, rect, size.width) }
-                    })
-                    // A page opening out of a row keeps a hairline round it until it fills the stage, so its edge reads on any background.
-                    if (stacked && above && state.morph != null) Box(Modifier.matchParentSize().drawBehind {
-                        val morph = state.morph ?: return@drawBehind
-                        val at = state.progress.value.coerceIn(0f, 1f)
-                        val grown = if (arriving) at else 1f - at
-                        // It is not there while the frame is still the element, nor once it is the whole stage.
-                        val edge = GlyphMotion.window(grown, 0f, .12f) * (1f - GlyphMotion.window(grown, .7f, 1f))
-                        if (edge <= 0f) return@drawBehind
-                        val frame = pocketMorphFrame(morph.rect, size.width, size.height, grown)
-                        val fit = (frame.width / size.width).coerceAtLeast(.01f)
-                        drawRoundRect(hairline.copy(alpha = hairline.alpha * edge), Offset.Zero, Size(size.width, frame.height / fit),
-                            CornerRadius(morph.radius * (1f - grown) / fit), style = Stroke(2.dp.toPx() / fit))
                     })
                     if (stacked && above && state.morph == null) Box(Modifier.offset(x = (-18).dp).width(18.dp).fillMaxHeight().graphicsLayer {
                         val at = state.progress.value.coerceIn(0f, 1f)

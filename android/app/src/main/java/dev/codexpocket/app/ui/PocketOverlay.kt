@@ -75,7 +75,9 @@ private class OverlayRegistry {
 }
 private val LocalOverlayRegistry = staticCompositionLocalOf<OverlayRegistry?> { null }
 private val LocalModalBackdrop = staticCompositionLocalOf<Backdrop?> { null }
-private val LocalOverlayProgress = staticCompositionLocalOf { 1f }
+// Keep frame values in the drawing layers instead of recomposing the modal and its glass each frame.
+private val LocalOverlayProgress = staticCompositionLocalOf<State<Float>> { mutableStateOf(1f) }
+private val LocalOverlayScrim = staticCompositionLocalOf<State<Float>> { mutableStateOf(1f) }
 // Read at callback time: registry changes can precede the covered editor's recomposition.
 internal val LocalPocketInputActive = staticCompositionLocalOf<() -> Boolean> { { true } }
 // False once the owner has dropped the layer and only its exit is still playing.
@@ -86,6 +88,7 @@ private val LocalOverlayPresent = staticCompositionLocalOf<() -> Boolean> { { tr
 internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), content: @Composable () -> Unit) {
     val registry = remember { OverlayRegistry() }
     val preferences = rememberPocketGlassPreferences()
+    val motion = rememberPocketMotion()
     val page = rememberLayerBackdrop()
     val background = Pocket.colors.bg
     // The default backdrop is a constant color, not page content. Recording a render layer
@@ -117,7 +120,7 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
                     val state = remember { MutableTransitionState(false) }
                     state.targetState = entry.present
                     val transition = updateTransition(state, label = "modal-presence")
-                    val progress by transition.animateFloat(
+                    val progress = transition.animateFloat(
                         // Enter on a softly damped spring (iOS sheet feel, ~0.35s to settle); exit fast and linear-out.
                         transitionSpec = {
                             when {
@@ -129,10 +132,15 @@ internal fun PocketOverlayHost(modifier: Modifier = Modifier.fillMaxSize(), cont
                         },
                         label = "modal-progress",
                     ) { if (it) 1f else 0f }
+                    val scrim = transition.animateFloat(
+                        transitionSpec = { PocketMotion.scrim(entering = targetState).orSnap(motion) },
+                        label = "modal-scrim",
+                    ) { if (it) 1f else 0f }
                     LaunchedEffect(state.isIdle, state.currentState, entry.present) {
                         if (state.isIdle && !state.currentState && !entry.present) registry.entries.remove(entry)
                     }
-                    CompositionLocalProvider(LocalOverlayProgress provides progress, LocalOverlayPresent provides { entry.present },
+                    CompositionLocalProvider(LocalOverlayProgress provides progress, LocalOverlayScrim provides scrim,
+                        LocalOverlayPresent provides { entry.present },
                         LocalPocketInputActive provides { entry.present && registry.entries.lastOrNull() === entry }) {
                         entry.content(index == registry.entries.lastIndex)
                     }
@@ -182,6 +190,7 @@ internal fun PocketModal(
         val drag = remember { Animatable(0f) }
         val currentDismiss by rememberUpdatedState(onDismiss)
         val progress = LocalOverlayProgress.current
+        val scrim = LocalOverlayScrim.current
         val inputActive by rememberUpdatedState(LocalPocketInputActive.current)
         val interactive = inputActive()
         val haptics by rememberUpdatedState(rememberPocketHaptics())
@@ -233,7 +242,7 @@ internal fun PocketModal(
             }) {
             // Scrim and hit interception remain entirely outside the capture layer.
             Box(Modifier.matchParentSize().drawBehind {
-                    val shown = progress.coerceIn(0f, 1f)
+                    val shown = scrim.value.coerceIn(0f, 1f)
                     drawRect(Color.Black, alpha = if (screen) .14f * shown * (1f - pull.value.coerceIn(0f, 1f)) else .18f * shown)
                 }
                 .focusProperties { canFocus = false }
@@ -247,7 +256,7 @@ internal fun PocketModal(
             BoxWithConstraints(Modifier.fillMaxSize()
                 // The page colour travels with the page, so what it covers stays visible until it arrives.
                 .then(if (screen) Modifier.drawBehind {
-                    val aside = (1f - progress.coerceIn(0f, 1f)) * size.width + pull.value.coerceIn(0f, 1f) * size.width * PageHeldTravel
+                    val aside = (1f - progress.value.coerceIn(0f, 1f)) * size.width + pull.value.coerceIn(0f, 1f) * size.width * PageHeldTravel
                     drawRect(pageColor, topLeft = Offset(aside, 0f))
                 } else Modifier)
                 .safeDrawingPadding().imePadding().padding(if (screen) 0.dp else if (sheet) 8.dp else if (maxWidthDp > 360f) 16.dp else 12.dp),
@@ -281,31 +290,32 @@ internal fun PocketModal(
                 val panelModifier = Modifier
                         .then(if (screen) Modifier.fillMaxSize() else Modifier.widthIn(max = maxWidthDp.dp).fillMaxWidth())
                         .heightIn(max = if (screen || anchored) maxHeight else maxHeight * maxHeightFraction.coerceIn(.1f, 1f)).graphicsLayer {
+                            val at = progress.value
                             // A back gesture previews the way out: sheets sink, pages start toward the trailing edge, the rest recede.
                             val leaving = pull.value.coerceIn(0f, 1f)
                             val bottomSheet = sheet && !screen && !anchored
                             // A sheet rises from below the screen by its whole height and leaves the same way; it never fades in place.
                             translationY = drag.value + when {
                                 screen -> 0f
-                                bottomSheet -> (1f - progress) * (size.height + 24.dp.toPx()) + leaving * 28.dp.toPx()
+                                bottomSheet -> (1f - at) * (size.height + 24.dp.toPx()) + leaving * 28.dp.toPx()
                                 // A menu stays pinned to its control while it grows; a dialog settles upward a little.
                                 anchored -> 0f
-                                else -> (1f - progress) * 10.dp.toPx()
+                                else -> (1f - at) * 10.dp.toPx()
                             }
                             // Pages push in across the whole width from the trailing edge, like UINavigationController.
-                            translationX = if (screen) (1f - progress) * size.width + leaving * size.width * PageHeldTravel else 0f
-                            alpha = if (screen || bottomSheet) 1f else (progress * 1.6f).coerceIn(0f, 1f)
+                            translationX = if (screen) (1f - at) * size.width + leaving * size.width * PageHeldTravel else 0f
+                            alpha = if (screen || bottomSheet) 1f else (at * 1.6f).coerceIn(0f, 1f)
                             val recede = if (sheet) 1f else 1f - .05f * leaving
                             if (anchored) {
                                 // A popover starts as the shape of the control that opened it and stretches into its own,
                                 // from the corner nearest that control; what it holds appears once it is nearly formed.
                                 val wide = anchor?.let { (it.width / size.width.coerceAtLeast(1f)).coerceIn(.34f, 1f) } ?: .62f
                                 val tall = anchor?.let { (it.height / size.height.coerceAtLeast(1f)).coerceIn(.2f, 1f) } ?: .62f
-                                scaleX = (wide + progress * (1f - wide)) * recede
-                                scaleY = (tall + progress * (1f - tall)) * recede
+                                scaleX = (wide + at * (1f - wide)) * recede
+                                scaleY = (tall + at * (1f - tall)) * recede
                                 transformOrigin = TransformOrigin(if (alignStart) 0f else 1f, if (below) 0f else 1f)
                             } else if (!screen && !bottomSheet) {
-                                val size = (.92f + progress * .08f) * recede
+                                val size = (.92f + at * .08f) * recede
                                 scaleX = size; scaleY = size
                             }
                         }
