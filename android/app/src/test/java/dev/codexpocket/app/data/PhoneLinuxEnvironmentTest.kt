@@ -33,7 +33,7 @@ class PhoneLinuxEnvironmentTest {
     }
     @Test fun badArchiveCannotMarkInstallationComplete() {
         val bytes=archive(); val corrupted=bytes.copyOf().also { it[20]=(it[20].toInt() xor 1).toByte() }; val root=temporary.newFolder()
-        assertThrows(IllegalArgumentException::class.java) {
+        assertThrows(PhoneEnvironmentIntegrityException::class.java) {
             PhoneLinuxInstaller.install(manifest(bytes),{ByteArrayInputStream(corrupted)},root,{_,_->})
         }
         assertFalse(File(root,".pocket-environment.json").exists())

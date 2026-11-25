@@ -44,14 +44,22 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             PText("在应用私有目录中使用 Bash、Git、Python 和 Node。工具遵循会话中选择的权限；支持的隔离模式会在启动时验证，可在对话的权限菜单中查看。",
                 style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
+            environment?.let { PhoneEnvironmentStatus(it) }
             if (!added) {
-                if (environment?.failed == true) PText(environment.message, style = Pocket.type.bodySmall, color = Pocket.colors.danger)
-                else (environment?.let { it.message + (it.fraction?.let { value -> " ${(value * 100).toInt()}%" } ?: "") } ?: progress)?.let { PocketProgressStatus(it) }
-                PButton("在此手机上运行", onStart, Modifier.fillMaxWidth().testTag("this-phone-start"), enabled = progress == null && environment?.failed != false)
+                if (environment == null) progress?.let { PocketProgressStatus(it) }
+                val label = when {
+                    environment?.paused == true -> "继续下载"
+                    environment?.failed == true -> "重试"
+                    else -> "在此手机上运行"
+                }
+                PButton(label, onStart, Modifier.fillMaxWidth().testTag("this-phone-start"), enabled = progress == null && environment?.active != true)
                 return@Column
             }
-            if (environment?.failed == true) PText(environment.message, style = Pocket.type.bodySmall, color = Pocket.colors.danger)
-            else environment?.let { PocketProgressStatus(it.message) }
+            if (environment?.failed == true || environment?.paused == true || environment?.pending == true) {
+                PButton(if (environment.pending) "下载手机环境" else if (environment.paused) "继续下载" else "重试", onStart,
+                    Modifier.fillMaxWidth().testTag("this-phone-environment-retry"), enabled = progress == null)
+            }
+            if (environment?.active == true) return@Column
             ThisPhoneProviders(access, applying, onUseProvider, onSaveProvider, onRemoveProvider, onFetchModels) {
                 when (account) {
                     LocalAccount.Unknown, LocalAccount.Checking -> PocketProgressStatus("正在读取登录状态", Modifier.testTag("this-phone-checking"))
@@ -96,4 +104,28 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
             PText("停止会结束手机上正在进行的任务；会话记录和登录信息会保留，再次选择“此手机”即可继续。", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
         }
     }
+}
+
+@Composable
+private fun PhoneEnvironmentStatus(environment: PhoneLinuxProgress) {
+    Column(Modifier.fillMaxWidth().testTag("this-phone-environment"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PText(environment.message, style = Pocket.type.bodySmall,
+            color = if (environment.failed) Pocket.colors.danger else Pocket.colors.inkMuted)
+        environment.totalBytes?.let { total ->
+            val bytes = environment.downloadedBytes
+            PText(if (bytes == null) "下载大小 ${phoneEnvironmentBytes(total)}" else "${phoneEnvironmentBytes(bytes)} / ${phoneEnvironmentBytes(total)}",
+                Modifier.testTag("this-phone-download-size"), style = Pocket.type.bodySmall)
+        }
+        if (environment.active) {
+            PLinearProgress(environment.fraction, Modifier.fillMaxWidth().testTag("this-phone-download-progress"))
+            environment.cancel?.let { cancel ->
+                PTextAction("暂停下载", cancel, Modifier.testTag("this-phone-download-pause"))
+            }
+        }
+    }
+}
+
+private fun phoneEnvironmentBytes(bytes: Long): String = when {
+    bytes >= 1024L * 1024 * 1024 -> String.format(java.util.Locale.ROOT, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
+    else -> String.format(java.util.Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024))
 }

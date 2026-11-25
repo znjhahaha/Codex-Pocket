@@ -140,10 +140,14 @@ internal fun QuestionCard(
     onDelete: ((String) -> Unit)? = null,
 ) {
     var revision by remember(session) { mutableIntStateOf(0) }
+    var failureDetails by remember(session) { mutableStateOf(false) }
     // The session is plain memory so it can be tested without Compose or a persistence runtime.
     @Suppress("UNUSED_VARIABLE") val observedRevision = revision
     val phase = session.presentationPhase(availability)
     val interactive = enabled && phase == QuestionPhase.Waiting
+    val submit = { session.beginSubmission(phase)?.let { answers -> revision++; onSubmit(answers) }; Unit }
+    if (failureDetails && session.submissionRejected) PDialog("回答未提交", { failureDetails = false }, "重新提交",
+        { failureDetails = false; submit() }, text = "这次提交未被接收，回答已保留。", confirmEnabled = interactive && session.complete, dismissLabel = "关闭")
     val question = session.currentQuestion
     val reveal = revealState ?: remember(session) { QuestionRevealState() }
     QuestionReveal(question?.id, reveal, modifier.fillMaxWidth().testTag("question-card")) {
@@ -161,6 +165,11 @@ internal fun QuestionCard(
                     }
                 }
                 QuestionStatus(phase, enabled)
+                if (session.submissionRejected && phase == QuestionPhase.Waiting) Row(verticalAlignment = Alignment.CenterVertically) {
+                    PIconButton(PocketIcons.ErrorOutline, "回答提交失败，查看或重试", { failureDetails = true },
+                        Modifier.testTag("question-send-failed"), tint = Pocket.colors.danger)
+                    PText("回答未提交", style = Pocket.type.caption, color = Pocket.colors.danger)
+                }
                 if (question != null) {
                     val scroll = key(batch.id, question.id) { rememberScrollState() }
                     Column(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -206,9 +215,8 @@ internal fun QuestionCard(
                     if (session.page < batch.questions.lastIndex) {
                         PocketButton("下一题", { session.move(1); revision++ }, Modifier.weight(1f).testTag("question-next"))
                     } else {
-                        PocketButton(stringResource(R.string.submit_answers), {
-                            session.beginSubmission(phase)?.let { answers -> revision++; onSubmit(answers) }
-                        }, Modifier.weight(1f).testTag("question-submit"), enabled = interactive && session.complete)
+                        PocketButton(if (session.submissionRejected) "重新提交" else stringResource(R.string.submit_answers), submit,
+                            Modifier.weight(1f).testTag("question-submit"), enabled = interactive && session.complete)
                     }
                 }
             }
@@ -240,6 +248,8 @@ private fun QuestionOptionRow(label: String, description: String, recommended: B
 
 @Composable
 internal fun QuestionStatus(phase: QuestionPhase, enabled: Boolean = true) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    if (phase == QuestionPhase.Submitting) PDots(Modifier.testTag("question-sending"), dot = 4.dp)
     PText(when (phase) {
         QuestionPhase.Waiting -> if (enabled) "等待回答 · 完成后提交全部答案" else "等待当前操作完成"
         QuestionPhase.Submitting -> "正在提交 · 等待电脑确认"
@@ -254,4 +264,5 @@ internal fun QuestionStatus(phase: QuestionPhase, enabled: Boolean = true) {
         QuestionPhase.Unsupported -> "此问题包含敏感字段，当前异步协议会保存为聊天消息，请在电脑端处理"
     }, Modifier.testTag("question-status").semantics { liveRegion = LiveRegionMode.Polite },
         style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+    }
 }

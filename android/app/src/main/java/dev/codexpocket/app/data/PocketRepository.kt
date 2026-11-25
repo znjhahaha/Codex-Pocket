@@ -124,6 +124,7 @@ class PocketRepository(
     private val recoverInterruptedCommands: Boolean = true,
     private val modelCatalogOverride: () -> ModelCatalogRequest? = { null },
     private val backgroundRetentionMillis: Long = 30_000,
+    private val sendAckTimeoutMillis: Long = 15_000,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val dao = db.dao()
@@ -1567,7 +1568,12 @@ class PocketRepository(
             // Always use the captured transport. A reconnect after this check cannot redirect
             // the write; an uncertain write on the old link remains an unknown command.
             assistantSendScope?.requireCurrent()
-            val result = transport.request(method, brokerParams, commandId = id)
+            // Streaming activity may keep the transport's quiet timer alive for minutes.
+            // A message's delivery feedback has a fixed bound; a lost ACK remains unknown.
+            val result = if (outgoing != null || questionReceipt != null) try {
+                withTimeout(sendAckTimeoutMillis) { transport.request(method, brokerParams, commandId = id) }
+            } catch (_: TimeoutCancellationException) { throw UnknownOutcomeException(id) }
+            else transport.request(method, brokerParams, commandId = id)
             if(nativeMethod=="assistant/send") {
                 when(assistantSendAckStatus(result,id)) {
                     "accepted" -> {dao.commandStatus(id,"accepted");return result}
@@ -1589,6 +1595,11 @@ class PocketRepository(
             dao.commandStatus(id, "rejected")
             throw WireException("question_capacity", "Local question answer retention is full")
         } catch (e: WireException) {
+            if ((outgoing != null || questionReceipt != null) && e.code in setOf("timeout", "request_timeout", "unknown", "not_found", "disconnected", "network_changed", "internal_error")) {
+                dao.commandStatus(id, "unknown")
+                questionReceipt?.awaitingConfirmation()?.let { retainQuestionReceipt(questionStore, it, p.computerId) }
+                throw UnknownOutcomeException(id)
+            }
             if (chat != null && planRevision != null) resolvePlan(chat, planRevision, false, id)
             questionReceipt?.let { receipt ->
                 questionDeliveryLock.withLock {
@@ -3876,10 +3887,30 @@ class PocketRepository(
     }
 
     fun send(): Job = send(false)
-    fun send(steer: Boolean): Job {
+    fun send(steer: Boolean): Job = send(steer, null)
+
+    fun retryOutgoing(clientId: String): Job = scope.launch {
+        val key = _state.value.selected?.key ?: return@launch
+        val message = outgoingMessages[key]?.firstOrNull { it.clientId == clientId } ?: return@launch
+        if (message.nativeKey != null) return@launch
+        if (message.phase == "unknown") { checkCommands().join(); return@launch }
+        if (message.phase != "rejected" || !_state.value.online) return@launch
+        val replies = AsyncQuestions.replies(message.text)
+        if (replies.isNotEmpty()) {
+            val pending = _state.value.advanced.asyncQuestions.associateBy { it.string("id") }
+            val answers = replies.map { reply ->
+                val question = pending[reply.string("questionItemId")] ?: return@launch
+                question to reply.string("answer")
+            }
+            answerAsyncBatch(answers, message).join()
+        } else send(dao.command(message.commandId)?.method == "turn/steer", message).join()
+    }
+
+    private fun send(steer: Boolean, retry: OutgoingUserMessage?): Job {
         val s = _state.value
         var chat = s.selected ?: return scope.launch {}
-        if (s.uncertainSend || (s.draft?.text.isNullOrBlank() && s.attachments.isEmpty())) return scope.launch {}
+        if (s.uncertainSend || (retry == null && s.draft?.text.isNullOrBlank() && s.attachments.isEmpty())) return scope.launch {}
+        if (retry != null && (retry.chatKey != chat.key || outgoingMessages[chat.key]?.firstOrNull { it.clientId == retry.clientId }?.phase != "rejected")) return scope.launch {}
         val clickedPair = pair ?: return scope.launch {}
         val clickedTransport = client ?: return scope.launch {}
         val clickedConnection = connectionGeneration.get()
@@ -3890,19 +3921,24 @@ class PocketRepository(
         }
         if (!sending.tryLock()) return scope.launch {}
         // Bind once, at the click. Recovery can suspend, and the user can edit/switch meanwhile.
-        val draft = s.draft?.takeIf { it.chatKey == chat.key } ?: DraftEntity(chat.key)
+        val draft = retry?.let { DraftEntity(chat.key, text = it.text, references = it.references, textRevision = it.draftRevision) }
+            ?: s.draft?.takeIf { it.chatKey == chat.key } ?: DraftEntity(chat.key)
         val text = draft.text
-        val attachments = s.attachments.toList()
-        val message = OutgoingUserMessage(UUID.randomUUID().toString(), chat.key, UUID.randomUUID().toString(),
+        val attachments = retry?.localAttachments() ?: s.attachments.toList()
+        val message = retry?.copy(commandId = UUID.randomUUID().toString(), phase = "preparing", showPending = true, blockingCommandId = null)
+            ?: OutgoingUserMessage(UUID.randomUUID().toString(), chat.key, UUID.randomUUID().toString(),
             System.currentTimeMillis(), text, JsonArray(attachments.map { it.json() }).toString(), draft.references,
-            draft.textRevision, showPending = !steer && s.timeline.activeTurn == null)
-        outgoingMessages.compute(chat.key) { _, existing -> existing.orEmpty() + message }
+            draft.textRevision)
+        outgoingMessages.compute(chat.key) { _, existing -> existing.orEmpty().filterNot { it.clientId == message.clientId } + message }
         _state.update { current -> current.copy(sendBusy = true,
             timeline = if (current.selected?.key == chat.key) withOutgoing(chat.key, current.timeline) else current.timeline) }
         return action(lock = null, statusKey = "send:${chat.key.encoded}", globalBusy = false) {
         try {
         persistDraft(chat.key)
         eventLock.withLock { sendScope.requireCurrent(); dao.putOutgoingMessage(message) }
+        // Transfer ownership to the durable bubble before any preparation or network wait.
+        // Keep its files for an explicit retry; the composer can now hold the next draft.
+        if (retry == null) clearAcceptedDraft(chat.key, text, attachments, message.draftRevision, deleteAttachments = false)
         require(dao.uncertain(chat.key.computerId).none { it.method != "approvals/respond" && (it.chatKey == chat.key || it.chatKey == null) }) { "Check the previous command outcome before sending again" }
         require(s.online)
         require(text.isNotBlank() || attachments.isNotEmpty())
@@ -3952,7 +3988,6 @@ class PocketRepository(
         require(!steer || running != null) { "The turn has finished; send a new message instead" }
         val method = when { steer -> "turn/steer"; running != null -> "thread/queue/add"; else -> "turn/start" }
         require(_state.value.supports(method, _state.value.runtimes.firstOrNull { it.id == chat.runtimeId })) { "This runtime does not support this action" }
-        if (method != "turn/start") changeOutgoing(message) { it.copy(showPending = false) }
         val result = native(chat.runtimeId, method, buildJsonObject {
             put("threadId", chat.key.nativeId); put("input", JsonArray(input))
             put("clientUserMessageId", message.clientId)
@@ -3960,9 +3995,9 @@ class PocketRepository(
                 selection.nativeSettings.turnSelection(selection.model, selection.effort, selection.mode, selection.pendingSettings).forEach { (key, value) -> put(key, value) }
             }
         }, true, chat.key, message.draftReceipt(), commandId = message.commandId, sendScope = sendScope).asObject()
-        changeOutgoing(message) { it.copy(phase = "accepted") }
+        changeOutgoing(message) { it.copy(phase = if (method == "thread/queue/add") "queued" else "accepted") }
         clearAcceptedDraft(chat.key, text, attachments, message.draftRevision)
-        if (method == "thread/queue/add") loadQueue(chat, selectionGeneration.get())
+        if (method == "thread/queue/add") scope.launch { runCatching { loadQueue(chat, selectionGeneration.get()) } }
         val turnId = result.obj("turn").string("id").ifBlank { result.string("turnId") }.ifBlank { if (steer) running.orEmpty() else "" }
         if (turnId.isNotBlank()) eventLock.withLock {
             val old = applyOutgoingReceiptItems(timelineBase(chat.key), result)
@@ -3976,7 +4011,7 @@ class PocketRepository(
                 val command = dao.command(message.commandId)
                 val uncertain = command?.status in setOf("submitted", "unknown", "not_found") || failure is UnknownOutcomeException
                 changeOutgoing(message) { current -> current.copy(
-                    phase = when { command?.status == "accepted" -> "accepted"; uncertain -> "unknown"; else -> "rejected" },
+                    phase = when { command?.status == "accepted" -> if (command.method == "thread/queue/add") "queued" else "accepted"; uncertain -> "unknown"; else -> "rejected" },
                     blockingCommandId = (failure as? UnknownOutcomeException)?.commandId?.takeIf { it != message.commandId }) }
             }
             throw failure
@@ -3984,7 +4019,7 @@ class PocketRepository(
         }
     }
 
-    private suspend fun clearAcceptedDraft(key: ThreadKey, text: String, attachments: List<LocalAttachment>, expectedRevision: Long? = null) {
+    private suspend fun clearAcceptedDraft(key: ThreadKey, text: String, attachments: List<LocalAttachment>, expectedRevision: Long? = null, deleteAttachments: Boolean = true) {
         val saved = drafts[key] ?: dao.draft(key)
         if (saved != null) {
             drafts.putIfAbsent(key, saved)
@@ -3994,7 +4029,7 @@ class PocketRepository(
                 current.copy(text = if (sameDraft) "" else current.text, references = if (sameDraft) "[]" else current.references,
                     attachments = JsonArray(parseAttachments(current.attachments).filterNot { it.id in ids }.map { it.json() }).toString()) }
             persistDraft(key)
-            attachments.forEach { attachmentFile(it).delete() }
+            if (deleteAttachments) attachments.forEach { attachmentFile(it).delete() }
         }
     }
     private fun stopKey(key: ThreadKey, turn: String?) = "${key.encoded}:$turn"
@@ -4632,6 +4667,7 @@ class PocketRepository(
             val originalSend = message.commandId == command.id
             val phase = when {
                 !originalSend && status in setOf("accepted", "rejected") -> "rejected" // Only preparation ran; no user send followed it.
+                status == "accepted" && command.method == "thread/queue/add" -> "queued"
                 status in setOf("accepted", "rejected") -> status
                 else -> "unknown"
             }
@@ -4658,7 +4694,8 @@ class PocketRepository(
             val blocking = message.blockingCommandId?.let { dao.command(it) }
             val phase = when {
                 command != null -> when (command.status) {
-                    "accepted", "rejected", "reconciled" -> command.status
+                    "accepted" -> if (command.method == "thread/queue/add") "queued" else "accepted"
+                    "rejected", "reconciled" -> command.status
                     else -> "unknown"
                 }
                 blocking?.status in setOf("submitted", "unknown", "not_found") -> "unknown"
@@ -4667,7 +4704,7 @@ class PocketRepository(
                 else -> message.phase
             }
             storeOutgoingLocked(message.chatKey, message.clientId) { it.copy(phase = phase) }
-            if (phase == "accepted") clearAcceptedDraft(message.chatKey, message.text, message.localAttachments(), message.draftRevision)
+            if (phase in setOf("accepted", "queued")) clearAcceptedDraft(message.chatKey, message.text, message.localAttachments(), message.draftRevision)
         }
     }
 
@@ -5026,7 +5063,8 @@ class PocketRepository(
         }
         return answerAsyncBatch(listOf(pending to answer))
     }
-    fun answerAsyncBatch(answers: List<Pair<JsonObject, String>>): Job {
+    fun answerAsyncBatch(answers: List<Pair<JsonObject, String>>): Job = answerAsyncBatch(answers, null)
+    private fun answerAsyncBatch(answers: List<Pair<JsonObject, String>>, retry: OutgoingUserMessage?): Job {
         val chat = selected()
         val transport = client
         val paired = pair
@@ -5036,6 +5074,7 @@ class PocketRepository(
             client === transport && connectionGeneration.get() == link && _state.value.online
         return action {
             require(transport != null && paired != null && current() && isSelected(chat, selection))
+            require(retry == null || outgoingMessages[chat.key]?.firstOrNull { it.clientId == retry.clientId }?.phase == "rejected")
             val sendScope = AssistantSendScope(paired, transport) { current() && isSelected(chat, selection) }
             val timeline = timelineBase(chat.key)
             val pending = pendingAsyncQuestions(chat.key, timeline).associateBy { it.string("id") }
@@ -5052,6 +5091,9 @@ class PocketRepository(
                 put("questionItemId", question.string("questionItemId")); put("question", question.string("title")); put("answer", answer)
             }) } }
             val text = "<send_user_message_question_reply>\n$payload\n</send_user_message_question_reply>"
+            val message = retry?.copy(commandId = UUID.randomUUID().toString(), phase = "preparing", blockingCommandId = null)
+                ?: OutgoingUserMessage(UUID.randomUUID().toString(), chat.key, UUID.randomUUID().toString(),
+                    System.currentTimeMillis(), text, "[]", "[]", -1)
             val running = timeline.activeTurn
             val method = if (running == null) "turn/start" else "turn/steer"
             validateMutation(chat, method)
@@ -5060,19 +5102,36 @@ class PocketRepository(
             check(preferences.edit().putStringSet("questions:${chat.key.encoded}", submitted).commit())
             updateAsyncState(chat.key, timeline)
             try {
+                eventLock.withLock {
+                    sendScope.requireCurrent()
+                    dao.putOutgoingMessage(message)
+                    outgoingMessages.compute(chat.key) { _, existing -> existing.orEmpty().filterNot { it.clientId == message.clientId } + message }
+                    publishOutgoingLocked(chat.key)
+                }
                 val response = native(chat.runtimeId, method, buildJsonObject {
                     put("threadId", chat.key.nativeId)
                     put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", text) }) })
-                    put("clientUserMessageId", UUID.randomUUID().toString())
+                    put("clientUserMessageId", message.clientId)
                     running?.let { put("expectedTurnId", it) }
                 }, true, chat.key, buildJsonObject {
                     // Versioned identity-only journal metadata; never persist question/answer prose here.
                     put("pocketAsyncQuestions", 1); put("questionIds", JsonArray(ids.map(::JsonPrimitive)))
-                }.toString(), sendScope = sendScope).asObject()
+                }.toString(), commandId = message.commandId, sendScope = sendScope).asObject()
+                changeOutgoing(message) { it.copy(phase = "accepted") }
                 mergeAsyncAnswerReceipt(chat.key, response, ::current)
                 if (running != null && current()) recordSteerRelation(chat, running, response)
-            } catch (e: WireException) {
-                releaseAsyncSubmission(chat.key, ids) { true }; throw e
+            } catch (e: Exception) {
+                withContext(NonCancellable) {
+                    val command = dao.command(message.commandId)
+                    val phase = when (command?.status) {
+                        "accepted" -> "accepted"
+                        "submitted", "unknown", "not_found" -> "unknown"
+                        else -> "rejected"
+                    }
+                    changeOutgoing(message) { it.copy(phase = phase) }
+                    if (phase == "rejected") releaseAsyncSubmission(chat.key, ids) { true }
+                }
+                throw e
             }
         }
     }

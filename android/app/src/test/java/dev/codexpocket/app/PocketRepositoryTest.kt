@@ -2245,14 +2245,14 @@ class PocketRepositoryTest {
         try {
             withTimeout(5_000) { entered.await() }
             val displayKey = onlyOptimisticUser("sent once").key
-            assertEquals("sent once", repo.state.value.draft?.text)
+            assertEquals("", repo.state.value.draft?.text)
             release.complete(Unit)
             withTimeout(5_000) { sent.await() }
             assertEquals("An empty pre-send snapshot must retain the optimistic row", displayKey, onlyOptimisticUser("sent once").key)
         } finally { release.complete(Unit); accept.complete(Unit); job.join() }
     }
 
-    @Test fun optimisticSendAppearsBeforeUploadAndDefiniteRejectionKeepsDraftAndAttachment() = runBlocking<Unit> {
+    @Test fun optimisticSendAppearsBeforeUploadAndDefiniteRejectionKeepsBubbleAndAttachment() = runBlocking<Unit> {
         repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
         val original = repo.state.value.attachments.single()
         repo.editDraft("sent once")
@@ -2267,17 +2267,20 @@ class PocketRepositoryTest {
         try {
             withTimeout(5_000) { entered.await() }
             onlyOptimisticUser("sent once")
-            assertEquals("sent once", repo.state.value.draft?.text)
-            assertEquals(listOf(original), repo.state.value.attachments)
+            assertEquals("", repo.state.value.draft?.text)
+            assertTrue(repo.state.value.attachments.isEmpty())
+            assertEquals(listOf(original), db.dao().outgoingMessages().single().localAttachments())
         } finally { reject.complete(Unit); job.join() }
-        assertTrue("A definite upload rejection removes only the temporary row", optimisticUserRows().isEmpty())
-        assertEquals("sent once", repo.state.value.draft?.text)
-        assertEquals(listOf(original), repo.state.value.attachments)
+        onlyOptimisticUser("sent once")
+        assertEquals("rejected", db.dao().outgoingMessages().single().phase)
+        assertEquals("", repo.state.value.draft?.text)
+        assertTrue(repo.state.value.attachments.isEmpty())
+        assertEquals(listOf(original), db.dao().outgoingMessages().single().localAttachments())
         assertTrue(repo.attachmentFile(original).exists())
         assertTrue(server.calls.none { it.nativeMethod == "turn/start" })
     }
 
-    @Test fun optimisticSendDefiniteNativeRejectionRemovesOnlyItsTemporaryRow() = runBlocking<Unit> {
+    @Test fun optimisticSendDefiniteNativeRejectionKeepsItsFailedBubble() = runBlocking<Unit> {
         repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
         val attachment = repo.state.value.attachments.single()
         val entered = CompletableDeferred<Unit>(); val reject = CompletableDeferred<Unit>()
@@ -2293,9 +2296,11 @@ class PocketRepositoryTest {
             withTimeout(5_000) { entered.await() }
             onlyOptimisticUser("sent once")
         } finally { reject.complete(Unit); job.join() }
-        assertTrue(optimisticUserRows().isEmpty())
-        assertEquals("sent once", repo.state.value.draft?.text)
-        assertEquals(listOf(attachment), repo.state.value.attachments)
+        onlyOptimisticUser("sent once")
+        assertEquals("rejected", db.dao().outgoingMessages().single().phase)
+        assertEquals("", repo.state.value.draft?.text)
+        assertTrue(repo.state.value.attachments.isEmpty())
+        assertEquals(listOf(attachment), db.dao().outgoingMessages().single().localAttachments())
         assertTrue(repo.attachmentFile(attachment).exists())
         assertTrue(db.dao().uncertain("computer").isEmpty())
     }
@@ -2311,14 +2316,14 @@ class PocketRepositoryTest {
         repo.send().join()
         await { it.uncertainSend }
         val displayKey = onlyOptimisticUser("sent once").key
-        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals("", repo.state.value.draft?.text)
         assertTrue(optimisticUserRows().none { row -> row.items.any { it.status == "failed" } })
         repo.send().join()
         assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
         restartOffline()
         repo.select(db.dao().chat(key)!!).join()
         assertEquals(displayKey, onlyOptimisticUser("sent once").key)
-        assertEquals("sent once", repo.state.value.draft?.text)
+        assertEquals("", repo.state.value.draft?.text)
         assertTrue(repo.state.value.uncertainSend)
         repo.send().join()
         assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
@@ -2364,7 +2369,7 @@ class PocketRepositoryTest {
         assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
     }
 
-    @Test fun optimisticSendUnknownRejectedDuringReconciliationKeepsTheRecoverableDraft() = runBlocking<Unit> {
+    @Test fun optimisticSendUnknownRejectedDuringReconciliationKeepsTheRecoverableBubble() = runBlocking<Unit> {
         repo.attach(listOf(Uri.fromFile(repo.attachmentFile(image())))).join()
         val attachment = repo.state.value.attachments.single()
         server.intercept = { method, params, id ->
@@ -2380,15 +2385,19 @@ class PocketRepositoryTest {
         server.statuses[pending.id] = "rejected"
         repo.checkCommands().join()
         await { !it.uncertainSend }
-        assertTrue(optimisticUserRows().isEmpty())
-        assertEquals("sent once", repo.state.value.draft?.text)
-        assertEquals(listOf(attachment), repo.state.value.attachments)
+        onlyOptimisticUser("sent once")
+        assertEquals("rejected", db.dao().outgoingMessages().single().phase)
+        assertEquals("", repo.state.value.draft?.text)
+        assertTrue(repo.state.value.attachments.isEmpty())
+        assertEquals(listOf(attachment), db.dao().outgoingMessages().single().localAttachments())
         assertTrue(repo.attachmentFile(attachment).exists())
         restartOffline()
         repo.select(db.dao().chat(key)!!).join()
-        assertTrue(optimisticUserRows().isEmpty())
-        assertEquals("sent once", repo.state.value.draft?.text)
-        assertEquals(listOf(attachment), repo.state.value.attachments)
+        onlyOptimisticUser("sent once")
+        assertEquals("rejected", db.dao().outgoingMessages().single().phase)
+        assertEquals("", repo.state.value.draft?.text)
+        assertTrue(repo.state.value.attachments.isEmpty())
+        assertEquals(listOf(attachment), db.dao().outgoingMessages().single().localAttachments())
     }
 
     @Test fun optimisticSendUnknownAcceptedReceiptAndLateClientEchoKeepOneDisplayKey() = runBlocking<Unit> {
@@ -2537,11 +2546,11 @@ class PocketRepositoryTest {
         } finally { accept.complete(Unit); job.join() }
     }
 
-    @Test fun optimisticSendReconnectDuringResumeWithdrawsUnsentMessage() = runBlocking<Unit> {
+    @Test fun optimisticSendReconnectDuringResumeRetainsUnsentMessage() = runBlocking<Unit> {
         optimisticReconnectBeforeSend("thread/resume")
     }
 
-    @Test fun optimisticSendReconnectDuringUploadWithdrawsUnsentMessage() = runBlocking<Unit> {
+    @Test fun optimisticSendReconnectDuringUploadRetainsUnsentMessage() = runBlocking<Unit> {
         optimisticReconnectBeforeSend("attachment/upload")
     }
 
@@ -2576,9 +2585,10 @@ class PocketRepositoryTest {
             withTimeout(5_000) { job.join() }
             assertTrue("An old click must not send on a replacement connection", server.calls.none { it.nativeMethod == "turn/start" })
             assertTrue("The replacement transport must receive no user write", server.links.last().requests.none { it.nativeMethod == "turn/start" })
-            assertTrue("Definitely unsent local rows must be withdrawn", optimisticUserRows().isEmpty())
-            assertEquals("clicked before reconnect", repo.state.value.draft?.text)
-            assertEquals(originalAttachments, repo.state.value.attachments)
+            onlyOptimisticUser("clicked before reconnect")
+            assertEquals("", repo.state.value.draft?.text)
+            assertTrue(repo.state.value.attachments.isEmpty())
+            assertEquals(originalAttachments, db.dao().outgoingMessages().single().localAttachments())
             originalAttachments.forEach { assertTrue(repo.attachmentFile(it).exists()) }
             val outgoing = db.dao().outgoingMessages().single()
             assertEquals("rejected", outgoing.phase)
@@ -2610,7 +2620,7 @@ class PocketRepositoryTest {
             await { it.uncertainSend }
             assertEquals(displayKey, onlyOptimisticUser("written before reconnect").key)
             assertEquals("unknown", db.dao().command(commandId)?.status)
-            assertEquals("written before reconnect", repo.state.value.draft?.text)
+            assertEquals("", repo.state.value.draft?.text)
             repo.send().join()
             assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
             assertTrue(server.links.last().requests.none { it.nativeMethod == "turn/start" })
@@ -2630,7 +2640,7 @@ class PocketRepositoryTest {
         assertEquals(raw, ItemEntity.from(key, restored, 0).item().raw)
     }
 
-    @Test fun optimisticSendQueueDoesNotPublishATemporaryBodyBubble() = runBlocking<Unit> {
+    @Test fun optimisticSendQueuePublishesBodyAndReleasesDraftBeforeAcknowledgement() = runBlocking<Unit> {
         server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "running") }) })
         await { it.timeline.activeTurn == "running" }
         val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
@@ -2642,15 +2652,26 @@ class PocketRepositoryTest {
         val job = repo.send()
         try {
             withTimeout(5_000) { entered.await() }
-            assertTrue(optimisticUserRows().isEmpty())
-            assertEquals("queued next", repo.state.value.draft?.text)
+            onlyOptimisticUser("queued next")
+            assertEquals("", repo.state.value.draft?.text)
+            assertEquals("submitted", db.dao().outgoingMessages().single().phase)
         } finally { accept.complete(Unit); job.join() }
-        assertTrue(optimisticUserRows().isEmpty())
+        onlyOptimisticUser("queued next")
+        assertEquals("queued", db.dao().outgoingMessages().single().phase)
         assertEquals("", repo.state.value.draft?.text)
         assertTrue(server.calls.none { it.nativeMethod == "turn/steer" })
+        val outgoing = db.dao().outgoingMessages().single()
+        val display = onlyOptimisticUser("queued next").key
+        server.emit("item/completed", buildJsonObject {
+            put("threadId", "t"); put("turnId", "sent")
+            put("item", echoedUser(outgoing.clientId, "queued next"))
+        })
+        await { it.timeline.items.values.any { item -> item.itemId == "native-user" } }
+        assertEquals(display, onlyOptimisticUser("queued next").key)
+        assertEquals(1, server.calls.count { it.nativeMethod == "thread/queue/add" })
     }
 
-    @Test fun optimisticSendSteerKeepsNativeExpectedTurnAndDoesNotCreateANewTurnBubble() = runBlocking<Unit> {
+    @Test fun optimisticSendSteerKeepsNativeExpectedTurnAndPublishesTheClickedMessage() = runBlocking<Unit> {
         server.emit("turn/started", buildJsonObject { put("threadId", "t"); put("turn", buildJsonObject { put("id", "running") }) })
         await { it.timeline.activeTurn == "running" }
         val entered = CompletableDeferred<Unit>(); val accept = CompletableDeferred<Unit>()
@@ -2662,15 +2683,125 @@ class PocketRepositoryTest {
         val job = repo.send(true)
         try {
             withTimeout(5_000) { entered.await() }
-            assertTrue(optimisticUserRows().isEmpty())
+            onlyOptimisticUser("steer current")
             val request = server.calls.single { it.nativeMethod == "turn/steer" }.params.obj("params")
             assertEquals("running", request.string("expectedTurnId"))
             assertTrue(request.string("clientUserMessageId").isNotBlank())
-            assertEquals("steer current", repo.state.value.draft?.text)
+            assertEquals("", repo.state.value.draft?.text)
         } finally { accept.complete(Unit); job.join() }
-        assertTrue(optimisticUserRows().isEmpty())
+        onlyOptimisticUser("steer current")
         assertEquals("running", repo.state.value.timeline.activeTurn)
         assertEquals("", repo.state.value.draft?.text)
+    }
+
+    @Test fun outgoingRejectedRetryKeepsOneBubbleAndDoesNotConsumeTheNewDraft() = runBlocking<Unit> {
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") throw WireException("rejected", "fixture")
+            null
+        }
+        repo.editDraft("retry this")
+        repo.send().join()
+        val failed = db.dao().outgoingMessages().single()
+        assertEquals("rejected", failed.phase)
+        val display = onlyOptimisticUser("retry this").key
+        repo.editDraft("next thought")
+        server.intercept = { _, _, _ -> null }
+        repo.retryOutgoing(failed.clientId).join()
+        assertEquals(display, onlyOptimisticUser("retry this").key)
+        assertEquals("next thought", repo.state.value.draft?.text)
+        val attempts = server.calls.filter { it.nativeMethod == "turn/start" }
+        assertEquals(2, attempts.size)
+        assertEquals(1, attempts.map { it.params.obj("params").string("clientUserMessageId") }.toSet().size)
+        assertEquals(2, attempts.map { it.commandId }.toSet().size)
+        repo.retryOutgoing(failed.clientId).join()
+        assertEquals(2, server.calls.count { it.nativeMethod == "turn/start" })
+    }
+
+    @Test fun outgoingTimeoutStopsSendingAndRetryOnlyChecksTheOriginalCommand() = runBlocking<Unit> {
+        PocketRepository::class.java.getDeclaredField("sendAckTimeoutMillis").apply { isAccessible = true }.setLong(repo, 100L)
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"
+                awaitCancellation()
+            }
+            null
+        }
+        repo.editDraft("slow acknowledgement")
+        withTimeout(5_000) { repo.send().join() }
+        val outgoing = db.dao().outgoingMessages().single()
+        assertEquals("unknown", outgoing.phase)
+        assertFalse(repo.state.value.sendBusy)
+        assertEquals("", repo.state.value.draft?.text)
+        onlyOptimisticUser("slow acknowledgement")
+        repo.retryOutgoing(outgoing.clientId).join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+        assertEquals("unknown", db.dao().command(outgoing.commandId)?.status)
+    }
+
+    @Test fun outgoingAsyncAnswerAppearsBeforeAckAndLateEchoKeepsOneIdentity() = runBlocking<Unit> {
+        question()
+        val q = await { it.advanced.asyncQuestions.isNotEmpty() }.advanced.asyncQuestions.single()
+        val entered = CompletableDeferred<String>(); val release = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                entered.complete(params.obj("params").string("clientUserMessageId")); release.await()
+            }
+            null
+        }
+        val job = repo.answerAsync(q.string("id"), buildJsonObject { put("answer", "Phone") })
+        try {
+            val clientId = withTimeout(5_000) { entered.await() }
+            val display = optimisticUserRows().single().key
+            assertEquals("Phone", AsyncQuestions.replies(optimisticUserRows().single().items.single().text).single().string("answer"))
+            server.emit("item/completed", buildJsonObject {
+                put("threadId", "t"); put("turnId", "sent")
+                put("item", echoedUser(clientId, AsyncQuestions.reply(q, "Phone")))
+            })
+            await { it.advanced.asyncQuestions.isEmpty() }
+            assertEquals(display, optimisticUserRows().single().key)
+            release.complete(Unit); job.join()
+            assertEquals(display, optimisticUserRows().single().key)
+            assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+        } finally { release.complete(Unit); job.join() }
+    }
+
+    @Test fun outgoingAsyncRejectedAnswerRetriesTheSameBubbleOnce() = runBlocking<Unit> {
+        question()
+        val q = await { it.advanced.asyncQuestions.isNotEmpty() }.advanced.asyncQuestions.single()
+        server.intercept = { method, params, _ ->
+            if (method == "codex/request" && params.string("method") == "turn/start") throw WireException("rejected", "fixture")
+            null
+        }
+        repo.answerAsync(q.string("id"), buildJsonObject { put("answer", "Phone") }).join()
+        val failed = db.dao().outgoingMessages().single()
+        assertEquals("rejected", failed.phase)
+        assertFalse(repo.state.value.advanced.asyncQuestions.single().flag("submitted"))
+        val display = optimisticUserRows().single().key
+        server.intercept = { _, _, _ -> null }
+        repo.retryOutgoing(failed.clientId).join()
+        assertEquals(display, optimisticUserRows().single().key)
+        assertEquals("accepted", db.dao().outgoingMessages().single().phase)
+        repo.retryOutgoing(failed.clientId).join()
+        assertEquals(2, server.calls.count { it.nativeMethod == "turn/start" })
+        assertEquals(1, server.calls.filter { it.nativeMethod == "turn/start" }
+            .map { it.params.obj("params").string("clientUserMessageId") }.toSet().size)
+    }
+
+    @Test fun outgoingWireTimeoutKeepsUnknownAndDoesNotEnableAnotherSubmission() = runBlocking<Unit> {
+        server.intercept = { method, params, id ->
+            if (method == "codex/request" && params.string("method") == "turn/start") {
+                server.statuses[id!!] = "unknown"
+                throw WireException("timeout", "fixture")
+            }
+            null
+        }
+        repo.editDraft("wire timeout")
+        repo.send().join()
+        val message = db.dao().outgoingMessages().single()
+        assertEquals("unknown", message.phase)
+        repo.retryOutgoing(message.clientId).join()
+        assertEquals(1, server.calls.count { it.nativeMethod == "turn/start" })
+        onlyOptimisticUser("wire timeout")
     }
 
     @Test fun ordinaryInputDuringTurnUsesNativeQueueInsteadOfSteering() = runBlocking<Unit> {

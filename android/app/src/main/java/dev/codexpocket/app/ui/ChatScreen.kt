@@ -98,7 +98,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
         val timing = live?.first?.let { s.timeline.turns[it] }
         val nativeLive = s.online && (s.timeline.status.isBlank() || s.timeline.status in setOf("active", "inProgress", "running")) &&
             s.timeline.activeFlags.none { it in setOf("waitingOnApproval", "waitingOnUserInput") }
-        val showSending = s.sendBusy && s.online && live == null && s.actionStatus["send:${chat.key.encoded}"]?.loading == true
+        val showSending = s.sendBusy && s.online && live == null && s.timeline.outgoingMessages.none { it.visible } &&
+            s.actionStatus["send:${chat.key.encoded}"]?.loading == true
         // A message is edited in its own bubble. Once its turn has been withdrawn there is no bubble left, so the editor takes the tail.
         val messageEdit = s.messageEdit?.takeIf { it.key == chat.key }?.let { edit ->
             MessageEditHost(edit, s.online, s.timeline.activeTurn != null, repo::changeMessageEdit, { repo.submitMessageEdit() }, repo::cancelMessageEdit,
@@ -323,7 +324,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
                                 onPlan = null, activityExpansions = expansions, onActivityExpansion = repo::toggleExpansion, timeline = s.timeline,
                                 onReopenPlan = proposedPlan?.takeIf { plan -> row.items.any { it.itemId == plan.itemId && it.turnId == plan.turnId } && PlanPresentation.unavailable(s, plan) == null }
                                     ?.let { plan -> { repo.reopenPlan(plan); following = true } },
-                                onEdit = { repo.beginMessageEdit(it) }, online = s.online, sendLaunch = launch, sendFlight = flight)
+                                onEdit = { repo.beginMessageEdit(it) }, online = s.online, sendLaunch = launch, sendFlight = flight,
+                                onRetrySend = { repo.retryOutgoing(it) }, onCheckSend = { repo.checkCommands() })
                             changeCards[row.key].orEmpty().forEach { summary -> TurnChangesCard(summary, onDetail) }
                         }
                     }

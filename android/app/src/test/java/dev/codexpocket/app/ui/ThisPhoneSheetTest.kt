@@ -8,6 +8,7 @@ import dev.codexpocket.app.MainActivity
 import dev.codexpocket.app.data.LocalAccess
 import dev.codexpocket.app.data.LocalAccount
 import dev.codexpocket.app.data.LocalProviderSummary
+import dev.codexpocket.app.data.PhoneLinuxProgress
 import dev.codexpocket.wire.ExecutionTarget
 import dev.codexpocket.wire.ExecutionTargetDirectory
 import dev.codexpocket.wire.ExecutionTargetKind
@@ -153,5 +154,44 @@ class ThisPhoneSheetTest {
         compose.onNodeWithText("重新读取登录状态").performScrollTo().performClick()
         compose.onNodeWithTag("this-phone-chatgpt").performScrollTo().performClick()
         assertEquals(listOf("refresh", "chatgpt"), events)
+    }
+
+    @Test fun downloadShowsSizeProgressAndPauseThenCanResume() {
+        var state by mutableStateOf(PhoneLinuxProgress("正在下载手机运行环境", .25f,
+            downloadedBytes = 16L * 1024 * 1024, totalBytes = 64L * 1024 * 1024, cancel = { events += "pause" }))
+        content { ThisPhoneSheet(false, LocalAccount.Unknown, null, {}, { events += "start" }, {}, {}, {}, environment = state) }
+        compose.onNodeWithTag("this-phone-download-size").assertTextEquals("16.0 MB / 64.0 MB")
+        compose.onNodeWithTag("this-phone-start").assertIsNotEnabled()
+        compose.onNodeWithTag("this-phone-download-progress").assertExists()
+        val bitmap = compose.runOnIdle {
+            val decor = compose.activity.window.decorView
+            android.graphics.Bitmap.createBitmap(decor.width, decor.height, android.graphics.Bitmap.Config.ARGB_8888).also {
+                decor.draw(android.graphics.Canvas(it))
+            }
+        }
+        java.io.File("build/reports/phone-environment/downloading.png").also { it.parentFile.mkdirs() }.outputStream().use {
+            assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it))
+        }
+        bitmap.recycle()
+        compose.onNodeWithTag("this-phone-download-pause").performClick()
+        assertEquals(listOf("pause"), events)
+        state = state.copy(message = "下载已暂停，可继续下载", paused = true, cancel = null)
+        compose.waitForIdle()
+        compose.onNodeWithTag("this-phone-start").assertTextContains("继续下载").assertIsEnabled().performClick()
+        assertEquals(listOf("pause", "start"), events)
+    }
+
+    @Test fun downloadIsAnExplicitActionAndFailureCanRetryEvenForAnAddedPhone() {
+        var state by mutableStateOf(PhoneLinuxProgress("首次使用需下载 Codex 和 Linux 工具", totalBytes = 64L * 1024 * 1024, pending = true))
+        content { ThisPhoneSheet(false, LocalAccount.Unknown, null, {}, { events += "start" }, {}, {}, {}, environment = state) }
+        compose.onNodeWithTag("this-phone-download-size").assertTextEquals("下载大小 64.0 MB")
+        compose.onNodeWithTag("this-phone-start").assertIsEnabled()
+        assertEquals(emptyList<String>(), events)
+        state = state.copy(message = "下载中断，已保留进度，请重试", failed = true, pending = false)
+        compose.waitForIdle()
+        compose.onNodeWithTag("this-phone-start").assertTextContains("重试").performClick()
+        content { ThisPhoneSheet(true, LocalAccount.Unknown, null, {}, { events += "retry" }, {}, {}, {}, environment = state) }
+        compose.onNodeWithTag("this-phone-environment-retry").performScrollTo().assertIsEnabled().performClick()
+        assertEquals(listOf("start", "retry"), events)
     }
 }

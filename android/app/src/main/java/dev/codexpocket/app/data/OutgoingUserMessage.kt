@@ -22,7 +22,7 @@ data class OutgoingUserMessage(
     val blockingCommandId: String? = null,
 ) {
     val displayKey: String get() = "pocket-user:$clientId"
-    val visible: Boolean get() = phase !in setOf("rejected", "reconciled")
+    val visible: Boolean get() = phase != "reconciled"
     fun localAttachments(): List<LocalAttachment> = pocketJson.parseToJsonElement(attachments).jsonArray
         .map { LocalAttachment.from(it.asObject()) }
 
@@ -68,7 +68,9 @@ internal fun NativeTimeline.withOutgoingPresentation(): NativeTimeline {
     val projected = items.mapValuesTo(linkedMapOf()) { (key, item) ->
         displayKeys[key]?.let { item.copy(presentationKey = it) } ?: item
     }
-    associated.filter { it.visible && it.nativeKey == null && it.showPending }.forEach { message ->
+    // Queued and steered messages are still the user's messages. Older persisted intents
+    // may have showPending=false; that legacy display preference must not hide them now.
+    associated.filter { it.visible && it.nativeKey == null }.forEach { message ->
         val pending = message.pendingItem()
         projected[pending.key] = pending
     }

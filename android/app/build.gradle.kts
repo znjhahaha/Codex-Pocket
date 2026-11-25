@@ -36,8 +36,8 @@ android {
         }
         minSdk = 28
         targetSdk = 36
-        versionCode = 55
-        versionName = "0.7.1-rc.20261125.53"
+        versionCode = 56
+        versionName = "0.7.1-rc.20261125.55"
         buildConfigField("String", "POCKET_BUILD_ID", "\"${providers.environmentVariable("POCKET_BUILD_ID").orElse("development").get().also { require(it.matches(Regex("[A-Za-z0-9._-]{1,96}"))) }}\"")
         buildConfigField("String", "HUAWEI_APP_ID", "\"$huaweiAppId\"")
         manifestPlaceholders["pocketHuaweiAppId"] = huaweiAppId
@@ -64,13 +64,31 @@ android {
     sourceSets.getByName("main").assets.srcDir(providers.gradleProperty("pocketExecutionRuntimeAssets").orNull
         ?.let(::file) ?: rootProject.file("../.local/execution-runtime/assets"))
     // The on-device variant: a directory staged by scripts/android-native (fetch_official.py, package_agent.py).
-    // Android runs executables only from the extracted native library directory, hence legacy packaging.
+    // Android starts the native PRoot/bootstrap from extracted libraries; PRoot loads downloaded Linux ELF.
     providers.gradleProperty("pocketOnDeviceRuntime").orNull?.let { staged ->
         val libraries = file(staged).resolve("jniLibs")
         require(libraries.isDirectory) { "pocketOnDeviceRuntime has no jniLibs directory" }
         sourceSets.getByName("main").jniLibs.srcDir(libraries)
         val assets = file(staged).resolve("assets")
         require(assets.resolve("phone-linux").isDirectory) { "pocketOnDeviceRuntime has no phone Linux environment assets" }
+        val selectedAbis = providers.gradleProperty("pocketOnDeviceAbis").orNull?.split(',')
+            ?: libraries.listFiles().orEmpty().filter { it.isDirectory }.map { it.name }
+        val downloadable = selectedAbis.any { assets.resolve("phone-linux/$it/download.json").isFile }
+        if (downloadable) {
+            selectedAbis.forEach { abi ->
+                val metadata = assets.resolve("phone-linux/$abi")
+                require(metadata.resolve("manifest.json").isFile && metadata.resolve("download.json").isFile) {
+                    "On-demand phone runtime requires signed manifest.json and download.json for $abi"
+                }
+                require(!metadata.resolve("rootfs.zip").exists()) { "On-demand phone runtime must not package rootfs.zip" }
+                listOf("libcodex.so", "libcodex-code-mode-host.so", "libpocket-agent.so", "libpocket-runtime-host.so", "libpocket-runtime-manifest.so").forEach { name ->
+                    require(!libraries.resolve("$abi/$name").exists()) { "Downloaded phone ELF must not be packaged in the APK: $abi/$name" }
+                }
+                listOf("libproot.so", "libproot-loader.so", "libtalloc.so", "libandroid-shmem.so").forEach { name ->
+                    require(libraries.resolve("$abi/$name").isFile) { "Missing phone bootstrap: $abi/$name" }
+                }
+            }
+        }
         sourceSets.getByName("main").assets.srcDir(assets)
         packaging.jniLibs.useLegacyPackaging = true
         packaging.jniLibs.keepDebugSymbols += "**/lib*.so"

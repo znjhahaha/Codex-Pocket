@@ -115,6 +115,8 @@ class QuestionSession(initial: QuestionBatch) {
     var phase: QuestionPhase = QuestionPhase.Waiting
         private set
     private var sawSubmission = false
+    var submissionRejected = false
+        private set
     val currentQuestion get() = batch.questions.getOrNull(page)
     val complete get() = batch.valid && !batch.privateReplyRequired && batch.questions.all { it.accepts(answer(it.id)) }
     fun presentationPhase(availability: QuestionPhase): QuestionPhase = when {
@@ -178,13 +180,14 @@ class QuestionSession(initial: QuestionBatch) {
         if (availability != QuestionPhase.Waiting || phase != QuestionPhase.Waiting || !complete || page != batch.questions.lastIndex) return null
         val result = batch.questions.map { it.id to answer(it.id)!! }
         phase = QuestionPhase.Submitting
+        submissionRejected = false
         sawSubmission = false
         return result
     }
 
     /** Local encoding or size validation failed before the repository received an action. */
     fun rejectBeforeDispatch() {
-        if (phase == QuestionPhase.Submitting && !sawSubmission) phase = QuestionPhase.Waiting
+        if (phase == QuestionPhase.Submitting && !sawSubmission) { phase = QuestionPhase.Waiting; submissionRejected = true }
     }
 
     /** A callback dispatch is not an acknowledgement. Reopen only after observed processing ends in refusal. */
@@ -197,6 +200,7 @@ class QuestionSession(initial: QuestionBatch) {
             batch.questions.filter { it.secret }.forEach { answers.remove(it.id) }
         } else if (pendingConfirmed && ((phase == QuestionPhase.Submitting && sawSubmission) || phase == QuestionPhase.Submitted)) {
             phase = QuestionPhase.Waiting
+            submissionRejected = true
             sawSubmission = false
         }
     }

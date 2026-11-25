@@ -31,8 +31,11 @@ internal sealed interface LocalAccount {
 
 /** Where the packaged executables are and where this phone's own Codex data lives. */
 internal class LocalRuntimeLayout(val libraries: File, val root: File) {
-    val agent = File(libraries, "libpocket-agent.so")
-    val codex = File(libraries, "libcodex.so")
+    var runtime: File = libraries
+        private set
+    fun useRuntime(directory: File) { runtime = directory }
+    val agent get() = File(runtime, "libpocket-agent.so")
+    val codex get() = File(runtime, "libcodex.so")
     val home = File(root, "home")
     val codexHome = File(home, ".codex")
     val projects = File(home, "projects")
@@ -41,6 +44,7 @@ internal class LocalRuntimeLayout(val libraries: File, val root: File) {
     val trustRoots = File(root, "trust-roots.pem")
     val backendPort = File(root, "backend-port")
     val available: Boolean get() = REQUIRED.all { File(libraries, it).isFile }
+    val bootstrapAvailable: Boolean get() = BOOTSTRAP_FILES.all { File(libraries, it).isFile }
 
     /** The static executables read none of Android's own configuration, so everything they need is named here. */
     fun environment(proxyUrl: String, provider: LocalProvider? = null): Map<String, String> = mapOf(
@@ -77,8 +81,9 @@ internal class LocalRuntimeLayout(val libraries: File, val root: File) {
     }
 
     companion object {
-        val REQUIRED = listOf("libpocket-agent.so", "libpocket-runtime-host.so", "libpocket-runtime-manifest.so", "libcodex.so", "libcodex-code-mode-host.so",
-            "libproot.so", "libproot-loader.so", "libtalloc.so", "libandroid-shmem.so")
+        val RUNTIME_FILES = listOf("libpocket-agent.so", "libpocket-runtime-host.so", "libpocket-runtime-manifest.so", "libcodex.so", "libcodex-code-mode-host.so")
+        val BOOTSTRAP_FILES = listOf("libproot.so", "libproot-loader.so", "libtalloc.so", "libandroid-shmem.so")
+        val REQUIRED = RUNTIME_FILES + BOOTSTRAP_FILES
         /** New installations request a workspace sandbox. Unsupported devices require an explicit permission choice. */
         const val DEFAULT_CONFIG = "sandbox_mode = \"workspace-write\"\napproval_policy = \"on-request\"\n"
         /** The backend answers health before its listener is bound, and a connection made then is refused. */
@@ -112,15 +117,17 @@ internal class LocalRuntime(private val context: Context,
     private var restartJob: Job? = null
     /** Set when the person stops Codex on this phone; nothing restarts it until they ask. */
     @Volatile private var stopped = false
+    /** Only the person's explicit phone-location action may start or update a download. */
+    @Volatile private var downloadRequested = false
     @Volatile private var signInCodex: Process? = null
     private val accountState = MutableStateFlow<LocalAccount>(LocalAccount.Unknown)
     val account = accountState.asStateFlow()
     private val projectState = MutableStateFlow(LocalProjects())
     val projects = projectState.asStateFlow()
-    private val environmentProgress = MutableStateFlow<PhoneLinuxProgress?>(null)
+    private val linux: PhoneLinuxEnvironment by lazy { PhoneLinuxEnvironment(layout, context.assets) { environmentProgress.value = it } }
+    private val environmentProgress: MutableStateFlow<PhoneLinuxProgress?> = MutableStateFlow(linux.preview())
     val preparation = environmentProgress.asStateFlow()
-    private val linux by lazy { PhoneLinuxEnvironment(layout, context.assets) { environmentProgress.value = it } }
-    val available: Boolean get() = layout.available
+    val available: Boolean get() = layout.available || (layout.bootstrapAvailable && linux.downloadable)
     /** The saved model services and which one is in use; none in use means OpenAI's own sign-in. */
     val access = providers.access
     private val modelDiscovery by lazy { LocalProviderModelDiscovery(providers) }
@@ -152,17 +159,21 @@ internal class LocalRuntime(private val context: Context,
     }
     private fun command(executable: File, vararg arguments: String) = ProcessBuilder(phoneLinuxCommand(layout, executable, arguments.toList()))
         .directory(layout.home).apply { environment().putAll(this@LocalRuntime.environment()) }
-    private fun prepareEnvironment() {
-        layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots()), providers.active())
-        try { linux.prepare() }
+    private fun prepareEnvironment(allowDownload: Boolean = false) {
+        try {
+            linux.prepare(allowDownload)
+            layout.prepare(LocalRuntimeLayout.pem(systemTrustRoots()), providers.active())
+        }
+        catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) {
             val message = when ((error as? WireException)?.code) {
                 "local_environment_space" -> "手机空间不足，请腾出空间后重试"
                 "local_environment_missing" -> "安装包缺少此手机的 Linux 工具环境"
                 "local_environment_invalid" -> "Linux 环境未完成安装，原有目录已保留"
+                "local_environment_download_required" -> "请点击在此手机上运行，下载手机环境"
                 else -> "Linux 工具环境准备失败，请重试"
             }
-            environmentProgress.value = PhoneLinuxProgress(message, failed = true)
+            if (environmentProgress.value?.failed != true) environmentProgress.value = PhoneLinuxProgress(message, failed = true)
             throw error
         }
     }
@@ -186,11 +197,13 @@ internal class LocalRuntime(private val context: Context,
     @Synchronized fun start(): Int {
         if (!available) throw WireException("local_runtime_missing", "This package does not include the on-device runtime")
         if (stopped) throw WireException("local_runtime_stopped", "Codex on this phone was stopped")
+        val download = downloadRequested
+        downloadRequested = false
         val savedPort = layout.backendPort.takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
         // Reentry reuses this owned process; the normal authenticated connection
         // still verifies protocol readiness. Do not spawn a health CLI per reconnect.
         if (agent?.isAlive == true && savedPort != null && listening(savedPort)) return savedPort
-        prepareEnvironment()
+        prepareEnvironment(download)
         sandboxVerified = PhoneSandbox.verify(layout)
         if (!File(layout.state, "config.json").isFile) {
             val port = ServerSocket(0, 1, java.net.InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))).use { it.localPort }
@@ -216,6 +229,8 @@ internal class LocalRuntime(private val context: Context,
 
     /** A one-time code for this application to pair with its own backend. */
     @Synchronized fun pairing(): PairingCode {
+        // Only connectThisPhone's explicit start/retry action calls pairing; selecting a saved location does not.
+        downloadRequested = true
         start()
         if (agentCommand("pair", "--json").first != 0) throw WireException("local_runtime_unavailable", "Local pairing was refused")
         return PairingCode.parse(File(layout.state, "pairing-qr.json").readText())
@@ -233,11 +248,11 @@ internal class LocalRuntime(private val context: Context,
     private fun cancelRestart() { restartJob?.cancel(); restartJob = null; applyingState.value = false }
     private fun endProcesses() {
         agent?.destroy(); agent = null
-        val prefix = layout.libraries.path + "/"
+        val prefixes = listOf(layout.libraries.path + "/", File(layout.root, "linux/runtimes").path + "/")
         File("/proc").listFiles { file -> file.name.all(Char::isDigit) }.orEmpty().forEach { entry ->
             val pid = entry.name.toIntOrNull() ?: return@forEach
             val executable = runCatching { File(entry, "cmdline").readText().substringBefore('\u0000') }.getOrDefault("")
-            if (pid != android.os.Process.myPid() && executable.startsWith(prefix)) android.os.Process.killProcess(pid)
+            if (pid != android.os.Process.myPid() && prefixes.any(executable::startsWith)) android.os.Process.killProcess(pid)
         }
         proxy?.close(); proxy = null
     }

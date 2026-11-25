@@ -141,6 +141,7 @@ class QuestionFormsTest {
         assertNotNull(session.beginSubmission(QuestionPhase.Waiting))
         session.observe(submitted = false, submitting = true)
         session.observe(submitted = false, submitting = false)
+        assertTrue(session.submissionRejected)
         assertEquals(QuestionPhase.Waiting, session.phase)
         assertEquals("Desktop", session.answer("client"))
     }
@@ -151,6 +152,7 @@ class QuestionFormsTest {
         assertNotNull(session.beginSubmission(QuestionPhase.Waiting))
         session.observe(submitted = false, submitting = true)
         session.observe(submitted = false, submitting = false, pendingConfirmed = false)
+        assertFalse(session.submissionRejected)
         assertEquals(QuestionPhase.Submitting, session.phase)
         assertNull(session.beginSubmission(QuestionPhase.Waiting))
         session.observe(submitted = false, submitting = false, pendingConfirmed = true)

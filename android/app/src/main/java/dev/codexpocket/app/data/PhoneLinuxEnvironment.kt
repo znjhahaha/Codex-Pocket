@@ -13,12 +13,73 @@ import java.util.UUID
 import java.util.zip.ZipInputStream
 import kotlinx.serialization.json.*
 
-internal data class PhoneLinuxProgress(val message: String, val fraction: Float? = null, val failed: Boolean = false)
+internal data class PhoneLinuxProgress(val message: String, val fraction: Float? = null, val failed: Boolean = false,
+    val downloadedBytes: Long? = null, val totalBytes: Long? = null, val paused: Boolean = false,
+    val cancel: (() -> Unit)? = null, val pending: Boolean = false) {
+    val active: Boolean get() = !failed && !paused && !pending
+}
 
 /** An installed Linux home is kept across APK updates, including packages added by the user. */
 internal class PhoneLinuxEnvironment(private val layout: LocalRuntimeLayout,
     private val assets: AssetManager, private val progress: (PhoneLinuxProgress?) -> Unit) {
-    fun prepare(): File {
+    private val abi: String? get() = Build.SUPPORTED_ABIS.firstOrNull { candidate ->
+        runCatching { assets.open("phone-linux/$candidate/manifest.json").close() }.isSuccess
+    }
+    val downloadable: Boolean get() = abi?.let { runCatching {
+        assets.open("phone-linux/$it/download.json").bufferedReader().use { reader -> PhoneEnvironmentDownload.parse(reader.readText()) }
+    }.isSuccess } == true
+
+    fun preview(): PhoneLinuxProgress? = runCatching {
+        val selected = abi ?: return@runCatching null
+        if (!downloadable) return@runCatching null
+        val manifest = assets.open("phone-linux/$selected/manifest.json").bufferedReader().use { PhoneLinuxManifest.parse(it.readText()) }
+        if (File(layout.root, "linux/runtimes/${manifest.revision}/.pocket-environment.json").isFile &&
+            File(layout.root, "linux/rootfs/.pocket-environment.json").isFile) return@runCatching null
+        PhoneLinuxProgress("首次使用需下载 Codex 和 Linux 工具", totalBytes = manifest.archiveBytes, pending = true)
+    }.getOrNull()
+
+    fun prepare(allowDownload: Boolean = false): File {
+        val prefix = abi?.let { "phone-linux/$it" }
+        if (prefix == null || "download.json" !in assets.list(prefix).orEmpty()) return prepareLegacy()
+        val manifest = assets.open("$prefix/manifest.json").bufferedReader().use { PhoneLinuxManifest.parse(it.readText()) }
+        require(manifest.abi == abi)
+        val store = PhoneEnvironmentStore(layout, manifest) { target, link -> Os.symlink(target, link.path) }
+        if (store.reuseCurrent(allowOlder = !allowDownload)) { mountPoints(store.image); progress(null); return store.image }
+        if (!allowDownload) throw WireException("local_environment_download_required", "请点击在此手机上运行，下载手机环境")
+        val source = assets.open("$prefix/download.json").bufferedReader().use { PhoneEnvironmentDownload.parse(it.readText()) }
+        val cancellation = PhonePreparationCancellation()
+        fun report(message: String, fraction: Float? = null, bytes: Long? = null) {
+            progress(PhoneLinuxProgress(message, fraction, downloadedBytes = bytes, totalBytes = manifest.archiveBytes,
+                cancel = cancellation::cancel))
+        }
+        try {
+            store.checkSpace()
+            report("正在下载手机运行环境", 0f, store.partial.takeIf(File::isFile)?.length() ?: 0L)
+            PhoneEnvironmentDownloader().download(source, manifest.archiveBytes, store.partial, cancellation) { bytes, total ->
+                report("正在下载手机运行环境", bytes.toFloat() / total, bytes)
+            }
+            report("正在校验手机运行环境")
+            store.install(cancellation) { fraction -> report("正在安装 Codex 和 Linux 工具", fraction) }
+            mountPoints(store.image)
+            progress(null)
+            return store.image
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            progress(PhoneLinuxProgress("下载已暂停，可继续下载", paused = true,
+                downloadedBytes = store.partial.takeIf(File::isFile)?.length(), totalBytes = manifest.archiveBytes))
+            throw cancelled
+        } catch (error: Exception) {
+            val message = when (error) {
+                is PhoneEnvironmentIntegrityException -> "环境包校验失败，请重新下载"
+                is java.io.IOException -> "下载中断，已保留进度，请重试"
+                else -> if ((error as? WireException)?.code == "local_environment_space") "手机空间不足，请腾出空间后重试" else "环境安装未完成，请重试"
+            }
+            progress(PhoneLinuxProgress(message, failed = true, downloadedBytes = store.partial.takeIf(File::isFile)?.length(),
+                totalBytes = manifest.archiveBytes))
+            throw error
+        }
+    }
+
+    private fun prepareLegacy(): File {
         val root = File(layout.root, "linux")
         root.mkdirs()
         val image = File(root, "rootfs")
@@ -132,7 +193,7 @@ internal data class PhoneLinuxManifest(val schema: Int, val revision: String, va
             require(executables.distinct().size == executables.size && links.map { it.first }.distinct().size == links.size)
             executables.forEach(PhoneLinuxInstaller::relative)
             links.forEach { (path, target) -> PhoneLinuxInstaller.relative(path); PhoneLinuxInstaller.link(path, target) }
-            val revision = string("revision"); require(revision.matches(Regex("[A-Za-z0-9._-]{1,96}")))
+            val revision = string("revision"); require(revision.matches(Regex("[A-Za-z0-9._-]{1,96}")) && revision !in setOf(".", ".."))
             val abi = string("abi"); require(abi in setOf("arm64-v8a", "x86_64"))
             val bytes = number("archiveBytes"); val unpacked = number("unpackedBytes")
             require(bytes in 1..2_147_483_648L && unpacked in 1..4_294_967_296L)
@@ -142,7 +203,9 @@ internal data class PhoneLinuxManifest(val schema: Int, val revision: String, va
     }
 }
 
-/** The manifest and archive are from the signed APK; lengths and digest detect interrupted/corrupt inputs. */
+internal class PhoneEnvironmentIntegrityException : java.io.IOException("Environment archive does not match the signed manifest")
+
+/** The signed APK pins lengths and digest, including when the archive is downloaded. */
 internal object PhoneLinuxInstaller {
     fun relative(path: String): String {
         require(path.isNotBlank() && !path.startsWith('/') && !path.contains('\\') && path.getOrNull(1) != ':' && !path.contains('\u0000'))
@@ -165,17 +228,32 @@ internal object PhoneLinuxInstaller {
         symlink: (String, File) -> Unit, progress: (Float) -> Unit = {}) {
         require(destination.isDirectory && destination.listFiles().orEmpty().isEmpty())
         val archive = File(destination, ".pocket-install.zip")
-        val digest = MessageDigest.getInstance("SHA-256")
         var copied = 0L
         source().use { input -> archive.outputStream().buffered().use { output ->
             val bytes = ByteArray(128 * 1024)
             while (true) {
                 val count = input.read(bytes); if (count < 0) break
                 copied += count; require(copied <= manifest.archiveBytes)
-                digest.update(bytes, 0, count); output.write(bytes, 0, count)
+                output.write(bytes, 0, count)
             }
         } }
-        require(copied == manifest.archiveBytes && digest.digest().joinToString("") { "%02x".format(it) } == manifest.archiveSha256)
+        try { installArchive(manifest, archive, destination, symlink, progress) }
+        finally { archive.delete() }
+    }
+
+    fun installArchive(manifest: PhoneLinuxManifest, archive: File, destination: File,
+        symlink: (String, File) -> Unit, progress: (Float) -> Unit = {}, checkCancelled: () -> Unit = {}) {
+        val digest = MessageDigest.getInstance("SHA-256")
+        archive.inputStream().buffered().use { input ->
+            val buffer = ByteArray(128 * 1024)
+            while (true) {
+                checkCancelled()
+                val count = input.read(buffer); if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        if (archive.length() != manifest.archiveBytes || digest.digest().joinToString("") { "%02x".format(it) } != manifest.archiveSha256)
+            throw PhoneEnvironmentIntegrityException()
         val names = mutableSetOf<String>(); var unpacked = 0L
         val linkPaths = manifest.links.map { it.first }.toSet()
         fun child(path: String): File {
@@ -187,6 +265,7 @@ internal object PhoneLinuxInstaller {
         }
         ZipInputStream(archive.inputStream().buffered()).use { zip ->
             while (true) {
+                checkCancelled()
                 val entry = zip.nextEntry ?: break
                 val path = entry.name.removeSuffix("/"); val file = child(path)
                 require(names.add(path) && names.size <= manifest.entryCount && path !in linkPaths)
@@ -195,6 +274,7 @@ internal object PhoneLinuxInstaller {
                 file.outputStream().buffered().use { output ->
                     val buffer = ByteArray(128 * 1024)
                     while (true) {
+                        checkCancelled()
                         val count = zip.read(buffer); if (count < 0) break
                         unpacked += count; require(unpacked <= manifest.unpackedBytes)
                         output.write(buffer, 0, count)
@@ -209,7 +289,6 @@ internal object PhoneLinuxInstaller {
             val file = child(path); file.parentFile!!.mkdirs()
             require(!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)); symlink(target, file)
         }
-        archive.delete()
         File(destination, ".pocket-environment.json").writeText(manifest.raw)
     }
 }
@@ -220,5 +299,5 @@ internal fun phoneLinuxCommand(layout: LocalRuntimeLayout, executable: File, arg
         "-b", layout.libraries.path,
         // The unmodified Linux Codex resolves its helper beside itself by this filename.
         // Android installs only lib*.so files; PRoot supplies the Linux name without copying it.
-        "-b", "${File(layout.libraries, "libcodex-code-mode-host.so").path}:${File(layout.libraries, "codex-code-mode-host").path}",
+        "-b", "${File(layout.runtime, "libcodex-code-mode-host.so").path}:${File(layout.runtime, "codex-code-mode-host").path}",
         "-b", layout.root.path, "-w", layout.home.path, executable.path) + arguments

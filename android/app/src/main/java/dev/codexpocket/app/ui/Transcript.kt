@@ -34,7 +34,8 @@ import kotlinx.coroutines.delay
 internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expanded: Boolean, onExpand: () -> Unit, onDetail: (TimelineItem) -> Unit, onSideChat: (TimelineItem) -> Unit = {}, canFork: Boolean = false, onPlan: ((Boolean) -> Unit)? = null,
     activityExpansions: Set<String>? = null, onActivityExpansion: ((String) -> Unit)? = null, timeline: NativeTimeline? = null, onReopenPlan: (() -> Unit)? = null,
     onEdit: ((TimelineItem) -> Unit)? = null, online: Boolean = false,
-    sendLaunch: androidx.compose.ui.geometry.Rect? = null, sendFlight: PSendFlight? = null) {
+    sendLaunch: androidx.compose.ui.geometry.Rect? = null, sendFlight: PSendFlight? = null,
+    onRetrySend: (String) -> Unit = {}, onCheckSend: () -> Unit = {}) {
     val item = row.items.first()
     val clipboard = LocalClipboardManager.current
     when (row.kind) {
@@ -54,6 +55,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
         }
         TranscriptKind.User -> Column(Modifier.fillMaxWidth().padding(start = 48.dp), horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            val outgoing = timeline?.outgoingMessages?.firstOrNull { it.displayKey == row.key }
             val message = remember(item.text) { UserMessageParsing.parse(item.text) }
             // Attachments sit above the bubble, Codex-style, listed once whichever source named them.
             val attachments = remember(item.raw, message.files) { userAttachments(item, message.files) }
@@ -70,8 +72,10 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
             // Being edited, the bubble is its own editor: no dialog, no panel, the text changes where it is.
             val editing = LocalMessageEdit.current?.takeIf { it.owns(item) }
             if (editing != null) { MessageEditBubble(editing); return@Column }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+            outgoing?.let { OutgoingMessageStatus(it, online, { onRetrySend(it.clientId) }, onCheckSend) }
             if (prose.isNotBlank() || hasImages) PSurface(shape = RoundedCornerShape(22.dp), color = Pocket.colors.fillStrong,
-                modifier = Modifier.widthIn(max = 560.dp).pocketSendLanding(sendLaunch, sendFlight)) {
+                modifier = Modifier.weight(1f, fill = false).widthIn(max = 560.dp).pocketSendLanding(sendLaunch, sendFlight)) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
                     val implementation = remember(item, timeline) { timeline?.let { PlanPresentation.implementedProposal(item, it) } }
                     if (implementation != null) {
@@ -86,6 +90,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                     TranscriptImages(item, includeLocal = false)
                 }
             }
+            }
             Row(Modifier.pocketSendTrail(sendLaunch), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
                 val context = LocalContext.current
                 val timestamp = remember(item.raw, item.key, timeline?.turns, timeline?.items?.keys) { messageTimestamp(item, timeline) }
@@ -98,7 +103,7 @@ internal fun TranscriptRowView(row: TranscriptRow, messageScope: String, expande
                         style = Pocket.type.caption, color = Pocket.colors.inkMuted)
                 }
                 CopyAction(prose) { clipboard.setText(AnnotatedString(prose)) }
-                if (onEdit != null) QuietAction(PocketIcons.Edit, "编辑此消息") { onEdit(item) }
+                if (onEdit != null && !item.raw.flag("_pocketOptimistic")) QuietAction(PocketIcons.Edit, "编辑此消息") { onEdit(item) }
             }
         }
         TranscriptKind.Answer, TranscriptKind.Commentary -> Column(Modifier.fillMaxWidth()) {

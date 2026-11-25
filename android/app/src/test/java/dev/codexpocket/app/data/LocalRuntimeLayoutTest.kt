@@ -42,6 +42,19 @@ class LocalRuntimeLayoutTest {
         assertFalse(environment.containsKey(LocalCodexConfig.KEY_VARIABLE))
     }
 
+    @Test fun downloadedElfUsesItsRuntimeDirectoryAndBootstrapStaysNative() {
+        val layout = layout()
+        LocalRuntimeLayout.BOOTSTRAP_FILES.forEach { File(layout.libraries, it).writeText("bootstrap") }
+        assertTrue(layout.bootstrapAvailable)
+        assertFalse(layout.available)
+        val runtime = File(layout.root, "linux/runtimes/test")
+        layout.useRuntime(runtime)
+        val environment = layout.environment("http://127.0.0.1:1")
+        assertEquals(File(runtime, "libcodex.so").path, environment["CODEX_CLI_PATH"])
+        assertEquals(File(runtime, "libpocket-agent.so"), layout.agent)
+        assertEquals(File(layout.libraries, "libproot-loader.so").path, environment["PROOT_LOADER"])
+    }
+
     @Test fun keyOfTheServiceInUseReachesCodexThroughItsEnvironmentAndNoFile() {
         val layout = layout()
         val provider = LocalProvider("p", "Relay", "https://relay.example/v1", "sk-secret-0123456789", "gpt-5.5")

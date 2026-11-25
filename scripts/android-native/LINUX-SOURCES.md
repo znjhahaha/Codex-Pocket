@@ -92,3 +92,26 @@ stages both by default. PRoot binds the packaged host to the sibling filename
 rebuilt as part of the Pocket build. Preserve their
 official digest/signature verification and Apache-2.0 notice/source reference.
 No dsh-Go source code is included in these components or packaging scripts.
+
+## Download the phone environment on first use
+
+`package_on_demand.py` splits an existing staged runtime into a small APK input
+tree and one complete environment archive per ABI:
+
+```sh
+python package_on_demand.py --source <full-stage> --output <apk-stage> \
+  --downloads <release-assets> --revision <immutable-revision> \
+  --asset-base https://github.com/znjhahaha/Codex-Pocket/releases/download/<tag>
+```
+
+Pass `<apk-stage>` as Gradle's `pocketOnDeviceRuntime`. The APK retains the native
+PRoot bootstrap and notices, plus `manifest.json` and `download.json` under
+`assets/phone-linux/<abi>`. The signed APK pins the download's size and digest.
+The ZIP contains `rootfs/` and `runtime/`; the latter keeps the original Codex,
+Code Mode, Pocket agent/host and runtime manifest bytes. Upload both ABI archives
+at their declared URLs before publishing the APK. Ship the corresponding source
+archives beside the release, as for the bundled variant.
+
+Only the explicit phone-runtime preparation downloads this payload. Remote
+computer connections retain their existing startup path. The installed Linux
+home and user project directories are kept when the APK is updated.
