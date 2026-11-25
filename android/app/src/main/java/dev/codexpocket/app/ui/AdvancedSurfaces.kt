@@ -9,6 +9,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import dev.codexpocket.app.R
@@ -19,7 +21,8 @@ import kotlinx.serialization.json.*
 internal fun canMutate(s: PocketState, method: String) = s.online && s.accessAllowsSending() && !s.busy && !s.sendBusy && !s.uncertainSend && s.selected?.conflict == false && s.selected?.archived == false && s.selected?.isSubagent == false && s.supports(method)
 
 @Composable
-internal fun AsyncQuestionForm(question: JsonObject, s: PocketState, onAnswer: (String, JsonObject) -> Any) {
+internal fun AsyncQuestionForm(question: JsonObject, s: PocketState, onDelete: ((String) -> Unit)? = null,
+    onAnswer: (String, JsonObject) -> Any) {
     val batch = QuestionBatches.async(s.selected?.key?.encoded.orEmpty(), listOf(question)).single()
     val session = remember(batch.id) { QuestionSession(batch) }
     DisposableEffect(session) { onDispose { session.clear() } }
@@ -29,17 +32,18 @@ internal fun AsyncQuestionForm(question: JsonObject, s: PocketState, onAnswer: (
         pendingConfirmed = availability == QuestionPhase.Waiting)
     QuestionCard(batch, session, availability, onSubmit = { answers ->
         answers.singleOrNull()?.let { (_, answer) -> onAnswer(question.string("id"), buildJsonObject { put("answer", answer) }) }
-    }, modifier = Modifier.padding(vertical = 12.dp), enabled = !s.busy && !s.sendBusy)
+    }, modifier = Modifier.padding(vertical = 12.dp), enabled = !s.busy && !s.sendBusy, onDelete = onDelete)
 }
 
 @Composable
 internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (ChatEntity) -> Unit) {
-    val approvals = s.approvals.filter { !ConversationPresentation.hookType(it.method) }
-    val questions = s.pendingQuestions.flatMap { (key, values) -> values.map { key to it } }
+    val approvals = s.approvals.filter { approvalNeedsAction(s, it) }.distinctBy { it.key }
+    val questions = s.pendingQuestions.flatMap { (key, values) -> values.filter { !it.flag("submitted") }.distinctBy { it.string("id") }.map { key to it } }
+    val fallbackQuestions = if (s.pendingQuestions.isEmpty()) s.advanced.asyncQuestions.filter { !it.flag("submitted") }.distinctBy { it.string("id") } else emptyList()
     val results = s.chats.filter { it.key.encoded in s.unreadKeys || it.status == "failed" }
     val insets = LocalHomeContentPadding.current
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = insets.calculateTopPadding() + 20.dp, bottom = insets.calculateBottomPadding() + 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (approvals.isEmpty() && questions.isEmpty() && s.advanced.asyncQuestions.isEmpty() && results.isEmpty()) item {
+        if (approvals.isEmpty() && questions.isEmpty() && fallbackQuestions.isEmpty() && results.isEmpty()) item {
             EmptyState(stringResource(R.string.v02_all_clear), stringResource(R.string.v02_all_clear_detail))
         }
         items(approvals, key = { it.key }, contentType = { "approval" }) { approval ->
@@ -53,14 +57,24 @@ internal fun AttentionHome(s: PocketState, repo: PocketRepository, onOpenChat: (
         }
         items(questions, key = { it.first + it.second.string("id") }, contentType = { "question" }) { (key, question) ->
             s.chats.firstOrNull { it.key.encoded == key }?.let { chat ->
-                if (chat.key == s.selected?.key) AsyncQuestionForm(question, s, repo::answerAsync)
-                else Box(Modifier.pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(
-                    question.string("title"), PocketIcons.ChatBubbleOutline, { onOpenChat(chat) }, subtitle = chat.title,
-                    trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
-                ) }
+                if (chat.key == s.selected?.key) AsyncQuestionForm(question, s,
+                    onDelete = { repo.deleteAsyncQuestion(chat.key, it) }, onAnswer = repo::answerAsync)
+                else Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f).pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(
+                        question.string("title"), PocketIcons.ChatBubbleOutline, {
+                            repo.restoreAsyncQuestions(chat.key, setOf(question.string("id")))
+                            onOpenChat(chat)
+                        }, subtitle = chat.title, trailing = { PIcon(PocketIcons.ChevronRight, null, Modifier.size(18.dp)) },
+                    ) }
+                    PIconButton(PocketIcons.DeleteOutline, "从待回答中删除", { repo.deleteAsyncQuestion(chat.key, question.string("id")) },
+                        Modifier.testTag("attention-delete:${question.string("id")}"))
+                }
             }
         }
-        if (questions.isEmpty()) items(s.advanced.asyncQuestions, key = { it.string("id") }, contentType = { "question" }) { AsyncQuestionForm(it, s, repo::answerAsync) }
+        items(fallbackQuestions, key = { it.string("id") }, contentType = { "question" }) { question ->
+            AsyncQuestionForm(question, s, onDelete = { id -> s.selected?.key?.let { repo.deleteAsyncQuestion(it, id) } },
+                onAnswer = repo::answerAsync)
+        }
         items(results, key = { "result:${it.key.encoded}" }, contentType = { "result" }) { chat ->
             Box(Modifier.pocketMorphSource("chat:${chat.key.encoded}")) { PocketActionRow(
                 title = chat.title,

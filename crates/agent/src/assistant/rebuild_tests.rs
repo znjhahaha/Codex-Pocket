@@ -17,7 +17,7 @@ fn assistant_attachment_large_text_messages_are_batched_without_dropping_content
         let op=f.op(Role::Coordinator);
         f.observe(&op,ExecutionStatus::Completed(op.mapping.clone().unwrap(),"read".into()),&format!("done-{n}"),11+n*2);
     }
-    assert!(f.service.state.inbox.is_empty());assert_eq!(f.service.executor.requests.len(),4);
+    assert!(f.service.state.coordinator.inbox.is_empty());assert_eq!(f.service.executor.requests.len(),4);
 }
 
 #[test]

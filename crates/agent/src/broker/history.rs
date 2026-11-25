@@ -20,6 +20,7 @@ impl Broker {
         let mut roots=image_roots(&self.state_dir);roots.push(home.join("generated_images"));
         let result=tokio::task::spawn_blocking(move|| -> Result<Value> {
             let mut result=match native_page {Some(page)=>page,None=>crate::history_catalog::read(&home,&thread,cursor.as_deref(),limit)?};
+            crate::history_catalog::mark_internal_context(&home,&thread,&mut result);
             let mut native=result["thread"].clone();native["turns"]=result["data"].clone();
             if let Some(cwd)=native["cwd"].as_str(){roots.push(PathBuf::from(cwd));}
             let roots=roots.into_iter().filter_map(|r|crate::workspace::native_image_root(&r).ok()).take(32).collect();

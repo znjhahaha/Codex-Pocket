@@ -233,7 +233,7 @@ private fun PocketContent(s: PocketState, repo: PocketRepository) {
                 availableAgentIds = if (s.online) NativeActivityPresentation.describe(item).agents.map { it.threadId }.toSet() else emptySet(),
                 onAgent = openAgent) }
             PocketPage.Home -> Box(Modifier.fillMaxSize()) { PocketHomeFrame(s, tab,
-                s.approvals.count { !it.submitted && !ConversationPresentation.hookType(it.method) } + s.pendingQuestions.values.sumOf { values -> values.count { !it.flag("submitted") } },
+                questionAttentionCount(s),
                 homeScrolled && tab == HomeTab.Chats, hostSheet, { hostSheet = true }, { newChat = true },
                 { openSettings(); if (s.online) repo.devices() }, { tab = it; if (it == HomeTab.Devices && s.online) repo.devices() }, onAssistant = { assistantOpen=true }) {
                 val insets = LocalHomeContentPadding.current

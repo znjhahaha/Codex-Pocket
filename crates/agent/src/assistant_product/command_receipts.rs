@@ -20,9 +20,11 @@ pub(super) fn record(db: &Connection, request: &Request, receipt: &Value) -> Res
     let fingerprint = pocket_core::ledger::CommandLedger::fingerprint(&serde_json::to_vec(
         &json!({"method":request.method,"params":wire_parameters}),
     )?);
-    let result = serde_json::to_string(&json!({
+    let mut result = json!({
         "accepted":true,"commandId":request.id,"result":receipt
-    }))?;
+    });
+    if let Some(conversation)=receipt.get("conversation") {result["conversation"]=conversation.clone();}
+    let result=serde_json::to_string(&result)?;
     ensure!(result.len() <= 65536, "Product command receipt too large");
     db.execute(
         "INSERT OR IGNORE INTO product_command_completions_v1(caller_id,command_id,fingerprint,result) VALUES(?1,?2,?3,?4)",

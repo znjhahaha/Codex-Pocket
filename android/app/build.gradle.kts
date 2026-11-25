@@ -36,8 +36,8 @@ android {
         }
         minSdk = 28
         targetSdk = 36
-        versionCode = 52
-        versionName = "0.7.1-rc.20261124.50"
+        versionCode = 55
+        versionName = "0.7.1-rc.20261125.53"
         buildConfigField("String", "POCKET_BUILD_ID", "\"${providers.environmentVariable("POCKET_BUILD_ID").orElse("development").get().also { require(it.matches(Regex("[A-Za-z0-9._-]{1,96}"))) }}\"")
         buildConfigField("String", "HUAWEI_APP_ID", "\"$huaweiAppId\"")
         manifestPlaceholders["pocketHuaweiAppId"] = huaweiAppId
@@ -61,13 +61,17 @@ android {
     buildFeatures { compose = true; buildConfig = true }
     // Built from locked sources by scripts/build-p2p-product.ps1. Never load from downloads.
     sourceSets.getByName("main").jniLibs.srcDir(rootProject.file("../.local/p2p/product-libs"))
-    sourceSets.getByName("main").assets.srcDir(rootProject.file("../.local/execution-runtime/assets"))
+    sourceSets.getByName("main").assets.srcDir(providers.gradleProperty("pocketExecutionRuntimeAssets").orNull
+        ?.let(::file) ?: rootProject.file("../.local/execution-runtime/assets"))
     // The on-device variant: a directory staged by scripts/android-native (fetch_official.py, package_agent.py).
     // Android runs executables only from the extracted native library directory, hence legacy packaging.
     providers.gradleProperty("pocketOnDeviceRuntime").orNull?.let { staged ->
         val libraries = file(staged).resolve("jniLibs")
         require(libraries.isDirectory) { "pocketOnDeviceRuntime has no jniLibs directory" }
         sourceSets.getByName("main").jniLibs.srcDir(libraries)
+        val assets = file(staged).resolve("assets")
+        require(assets.resolve("phone-linux").isDirectory) { "pocketOnDeviceRuntime has no phone Linux environment assets" }
+        sourceSets.getByName("main").assets.srcDir(assets)
         packaging.jniLibs.useLegacyPackaging = true
         packaging.jniLibs.keepDebugSymbols += "**/lib*.so"
         providers.gradleProperty("pocketOnDeviceAbis").orNull?.let { defaultConfig.ndk.abiFilters += it.split(',') }

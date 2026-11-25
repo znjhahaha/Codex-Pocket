@@ -52,7 +52,7 @@ internal val AssistantUiState.unconfirmedFeedback: String? get() =
 
 /** Room's uncertain commands survive refreshes and app restarts; snapshots are not command receipts. */
 internal fun AssistantUiState.withCommandFeedback(commands: List<CommandEntity>): AssistantUiState {
-    val methods=commands.filter {it.method.startsWith("assistant/") && CommandPolicy.blocksNewSend(it.status) &&
+    val methods=commands.filter {it.method.startsWith("assistant/") && it.method != "assistant/send" && CommandPolicy.blocksNewSend(it.status) &&
         (it.status!="submitted" || it.method !in pendingActions)}.map {it.method}.toSet()
     val next=copy(unconfirmedActions=methods)
     return next.copy(error=next.unconfirmedFeedback ?: if(error == unconfirmedFeedback && unconfirmedFeedback != null) snapshot?.preparationIssue else error)

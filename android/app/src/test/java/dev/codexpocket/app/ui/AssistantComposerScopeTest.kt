@@ -136,22 +136,89 @@ class AssistantComposerScopeTest {
         val action=actions.single()
         compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(coordinatorThreadId="successor"))}
         restoration.emulateSavedInstanceStateRestore()
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("restore pending")
+        assertEmpty()
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.runOnIdle {state=state.acceptSend(action)}
         assertEmpty()
         assertEquals(1,actions.size)
     }
 
-    @Test fun unknownReceiptKeepsPendingAndExplicitRejectionKeepsDraft() {
+    @Test fun unknownAndRejectedReceiptsStayBesideMessageAndDoNotLockNewDraft() {
         content();send("retain draft")
         val action=actions.single()
         compose.runOnIdle {state=state.acceptSend(action,"unknown")}
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("retain draft")
-        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
-        compose.runOnIdle {state=state.acceptSend(action,"rejected")}
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("retain draft")
+        assertEmpty()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("next draft")
         compose.onNodeWithTag(AssistantSend).assertIsEnabled()
+        compose.runOnIdle {state=state.acceptSend(action,"rejected")}
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("next draft")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
+    }
+
+    @Test fun conversationSwitchRetainsDraftAndLateReceiptCannotClearNewerDraft() {
+        state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="chat-a"))
+        content();send("first message")
+        val action=actions.single()
+        assertEmpty()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("new draft in a")
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(conversationId="chat-b"))}
+        assertEmpty()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("draft in b")
+        compose.runOnIdle {state=state.acceptSend(action)}
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("draft in b")
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(conversationId="chat-a"))}
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new draft in a")
+    }
+
+    @Test fun newConversationCannotBorrowOrConsumeThePreparationDraftAndAttachments() {
+        val app=androidx.test.core.app.ApplicationProvider.getApplicationContext<android.app.Application>()
+        val file=LocalAttachment("preparing-file","preparing.txt","text/plain")
+        AssistantAttachmentDraft(app,"main:pc:preparing").add(listOf(file))
+        state=AssistantUiState(AssistantSnapshot(enabled=false),computerId="pc")
+        content()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("original preparation draft")
+
+        compose.runOnIdle {state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="chat-new"))}
+        assertEmpty()
+        compose.onNodeWithTag("assistant-attachment:${file.id}").assertDoesNotExist()
+        compose.onNodeWithTag(AssistantDraft).performTextInput("new conversation draft")
+
+        compose.runOnIdle {state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="main:public-assistant"))}
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("original preparation draft")
+        compose.onNodeWithTag("assistant-attachment:${file.id}").assertExists()
+        compose.runOnIdle {state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="chat-new"))}
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("new conversation draft")
+        compose.onNodeWithTag("assistant-attachment:${file.id}").assertDoesNotExist()
+        assertTrue(actions.isEmpty())
+    }
+
+    @Test fun stopReplyWaitsForActualStoppedSnapshot() {
+        val running=AssistantOperation("reply", "Coordinator", null, AssistantOperationPhase.Running, false, "native", null, null, conversationId="chat-a")
+        state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="chat-a", activeCoordinatorOperationId="reply", operations=listOf(running)))
+        content()
+        compose.onNodeWithTag("assistant-stop-reply").performClick()
+        assertEquals("assistant/v2/conversation/interrupt",actions.single().method)
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(operations=listOf(running.copy(suspended=true))))}
+        compose.onNodeWithTag("assistant-stop-reply").assertIsDisplayed().assertIsNotEnabled()
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(operations=listOf(running.copy(phase=AssistantOperationPhase.Paused, suspended=true))))}
+        compose.onNodeWithTag("assistant-stop-reply").assertDoesNotExist()
+    }
+
+    @Test fun confirmedStopAllowsStoppingASuccessorWithoutAnIdleFrame() {
+        val running=AssistantOperation("reply-a", "Coordinator", null, AssistantOperationPhase.Running, false, "native-a", null, null, conversationId="chat-a")
+        state=initial.copy(snapshot=initial.snapshot!!.copy(conversationId="chat-a", activeCoordinatorOperationId=running.id, operations=listOf(running)))
+        content()
+        compose.onNodeWithTag("assistant-stop-reply").performClick()
+        assertEquals(assistantConversationInterrupt("chat-a","reply-a").params,actions.single().params)
+
+        val stopped=running.copy(phase=AssistantOperationPhase.Paused,suspended=true)
+        val successor=running.copy(id="reply-b",threadId="native-b")
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(fresh=false,activeCoordinatorOperationId=successor.id,operations=listOf(stopped,successor)))}
+        compose.onNodeWithTag("assistant-stop-reply").assertIsNotEnabled()
+        compose.runOnIdle {state=state.copy(snapshot=state.snapshot!!.copy(fresh=true))}
+        compose.onNodeWithTag("assistant-stop-reply").assertIsEnabled().performClick()
+        assertEquals(2,actions.size)
+        assertEquals(assistantConversationInterrupt("chat-a","reply-b").params,actions.last().params)
     }
 
     @Test fun legacyCoordinatorChangeHasIsolatedStateWithoutInventingPublicIdentity() {

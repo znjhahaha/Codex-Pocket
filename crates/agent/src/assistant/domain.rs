@@ -29,15 +29,12 @@ fn put(db: &Connection, owner: &str, kind: &str, id: &str, data: Value) -> Resul
 }
 
 pub(super) fn sync(db: &Connection, owner: &str, s: &State) -> Result<()> {
-    let conversation = format!("main:{owner}");
-    put(
-        db,
-        owner,
-        "conversation",
-        &conversation,
-        json!({"id":conversation,"kind":"main","title":"口袋助理"}),
-    )?;
+    let main = format!("main:{owner}");
+    for conversation in s.conversations.values() {
+        put(db,owner,"conversation",&conversation.id,serde_json::to_value(conversation)?)?;
+    }
     for m in &s.collaboration.conversation {
+        let conversation=s.origin("message",&m.id,&main);
         put(
             db,
             owner,
@@ -53,6 +50,7 @@ pub(super) fn sync(db: &Connection, owner: &str, s: &State) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in tasks {
         let task: Task = serde_json::from_str(&task)?;
+        let conversation=s.origin("task",&task.id,&main);
         let operations = s
             .operations
             .values()
@@ -101,6 +99,7 @@ pub(super) fn sync(db: &Connection, owner: &str, s: &State) -> Result<()> {
     // Historical records remain available after resolution.
     let mut open_attention = std::collections::BTreeSet::new();
     for op in s.operations.values() {
+        let conversation=s.origin("operation",&op.id,&main);
         put(
             db,
             owner,
@@ -233,7 +232,7 @@ fn memory_revision(db: &Connection, owner: &str, id: &str, value: Value) -> Resu
 
 impl<E: Executor> AssistantService<E> {
     pub fn domain_snapshot(&self, device: &str) -> Result<Value> {
-        let mut value = json!({"schema":2,"conversationId":format!("main:{}",self.assistant_id()),
+        let mut value = json!({"schema":2,"conversationId":self.selected_conversation_id(),"conversations":self.conversations(),
             "executionConsumer":"assistant_service","messages":[],"tasks":[],"attempts":[],"attention":[],
             "artifacts":[],"plans":[],"planRuns":[],"memories":[],"memoryRevisions":[]});
         let mut stmt=self.store.db.prepare("SELECT sequence,kind,data FROM assistant_v2_entities WHERE assistant_id=?1 AND kind<>'message' ORDER BY sequence")?;

@@ -361,7 +361,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height }) {
                 CompositionLocalProvider(LocalPocketClearGlass provides true) {
                 val syncLabel = when {
-                    s.automaticConnectionLabel()!=null -> s.automaticConnectionLabel()
+                    s.automaticConnectionLabel(locationKind == ExecutionTargetKind.ThisPhone)!=null ->
+                        s.automaticConnectionLabel(locationKind == ExecutionTargetKind.ThisPhone)
                     !s.online || read.failed -> null
                     read.refreshing -> stringResource(R.string.v04_transcript_refreshing)
                     s.busy && s.conversationLoadState != ConversationLoadState.Loading ->
@@ -410,7 +411,8 @@ internal fun ChatScreen(s: PocketState, repo: PocketRepository, onModels: () -> 
             }
             }
             QuestionDock(s, repo::respond, { repo.answerAsyncBatch(it) },
-                Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+                Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).padding(horizontal = 16.dp, vertical = 6.dp),
+                onClose = repo::closeAsyncQuestions, onRestore = repo::restoreAsyncQuestions, onDelete = repo::deleteAsyncQuestion)
             if (dockPlan != null) PlanConfirmation(dockPlan, PlanPresentation.unavailable(s, dockPlan),
                 onImplement = { repo.implementPlan(dockPlan) }, onModify = { repo.beginPlanFeedback(dockPlan) },
                 feedback = planFeedback?.text, onFeedbackChange = { repo.editPlanFeedback(dockPlan, it) },

@@ -2142,8 +2142,8 @@ fn handoff_recovery_checks_selected_roots_without_requiring_historical_grants() 
     f.service.state.operations.get_mut(&original.id).unwrap().authorized_directories.push(canonical_directory(&historical).unwrap());
     f.service.save().unwrap();
     f.service.resume_coordinator_handoff("recover-selected", &original.id, 4).unwrap();
-    assert_eq!(f.service.state.inbox.len(), 1);
-    assert_eq!(f.service.state.inbox[0].directories.len(), 1);
+    assert_eq!(f.service.state.coordinator.inbox.len(), 1);
+    assert_eq!(f.service.state.coordinator.inbox[0].directories.len(), 1);
 }
 
 #[test]
@@ -2165,7 +2165,7 @@ fn handoff_recovery_unknown_or_mapped_or_revoked_never_dispatches() {
         let before = serde_json::to_value(&f.service.state).unwrap();
         assert!(f.service.resume_coordinator_handoff("blocked-recovery", &original.id, 4).is_err(), "accepted {defect}");
         assert_eq!(serde_json::to_value(&f.service.state).unwrap(), before);
-        assert!(f.service.state.inbox.is_empty());
+        assert!(f.service.state.coordinator.inbox.is_empty());
         assert_eq!(f.service.executor.requests.len(), 1);
     }
 }
@@ -2181,7 +2181,7 @@ fn handoff_recovery_save_failure_preserves_original_fence_and_allows_same_intent
     f.service.store.db.execute_batch("DROP TRIGGER fail_recovery_save").unwrap();
     let mut f = reopen_fixture(f);
     f.service.resume_coordinator_handoff("recover-save", &original.id, 5).unwrap();
-    assert_eq!(f.service.state.inbox.len(), 1);
+    assert_eq!(f.service.state.coordinator.inbox.len(), 1);
 }
 
 #[test]
@@ -3326,6 +3326,8 @@ fn settings_and_explicit_memory_crud_survive_reopen_without_text_copies() {
         tone: "Warm".into(),
         model: Some("host-known-model".into()),
         coordinator_model: None,
+        effort: Some("high".into()),
+        coordinator_effort: Some("low".into()),
         timezone: "Asia/Shanghai".into(),
         notifications: NotificationSettings {
             completed: false,
@@ -3894,3 +3896,16 @@ mod rebuild_tests;
 
 #[path = "service_jobs_tests.rs"]
 mod jobs;
+#[path = "service_conversation_tests.rs"]
+mod conversations;
+
+#[test]
+fn legacy_main_conversation_has_persistent_metadata() {
+    let f = Fixture::new();
+    let view = f.service.domain_snapshot("phone").unwrap();
+    let conversations = view["conversations"].as_array().expect("conversation inventory");
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0]["id"], format!("main:{}", f.service.assistant_id()));
+    assert!(conversations[0]["createdAtMs"].is_i64());
+    assert!(conversations[0]["updatedAtMs"].is_i64());
+}

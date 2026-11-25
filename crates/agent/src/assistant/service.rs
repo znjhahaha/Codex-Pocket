@@ -25,6 +25,10 @@ pub use jobs::*;
 mod domain;
 #[path = "service_inputs.rs"]
 mod inputs;
+#[path = "service_conversations.rs"]
+mod conversations;
+pub use conversations::{Conversation,create_retained_conversation};
+use conversations::CoordinatorState;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationPhase {
@@ -221,12 +225,15 @@ struct State {
     #[serde(default)]
     collaboration: Collaboration,
     settings: Settings,
-    coordinator_thread: Option<String>,
+    #[serde(flatten)]
+    coordinator: CoordinatorState,
     #[serde(default)]
-    coordinator_attempt: Option<String>,
-    coordinator_watermark: u64,
+    conversations: BTreeMap<String, Conversation>,
+    #[serde(default)]
+    conversation_coordinators: BTreeMap<String, CoordinatorState>,
+    #[serde(default)]
+    conversation_origins: BTreeMap<String, String>,
     operations: BTreeMap<String, Operation>,
-    inbox: Vec<Inbox>,
     events: Vec<AssistantEvent>,
     journal: BTreeMap<String, JournalEntry>,
     schedules: BTreeMap<String, Schedule>,
@@ -307,6 +314,7 @@ pub struct AssistantService<E: Executor> {
     store: AssistantStore,
     state: State,
     generation: String,
+    current_conversation: String,
     /// Where this profile's private files live; job worktrees are created beneath it.
     state_dir: PathBuf,
     opened_at: Option<i64>,
@@ -354,6 +362,7 @@ impl<E: Executor> AssistantService<E> {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default();
+        state.migrate_conversations(&store.assistant_id);
         for op in state.operations.values_mut() {
             op.migrate_held_inputs(&state.journal)?;
         }
@@ -368,9 +377,11 @@ impl<E: Executor> AssistantService<E> {
                     }
                 }
             }
-            state.inbox.clear();
+            state.coordinator.inbox.clear();
             state.scheduled_commands.clear();
-            state.coordinator_watermark = state.events.last().map_or(0, |e| e.sequence);
+            state.coordinator.coordinator_watermark = state.events.last().map_or(0, |e| e.sequence);
+            let watermark=state.coordinator.coordinator_watermark;
+            for context in state.conversation_coordinators.values_mut() { context.inbox.clear();context.coordinator_watermark=watermark; }
         }
         // Reopening does not imply native death. Reconcile original operation IDs
         // first, including the crash window between Store claim and service save.
@@ -383,6 +394,8 @@ impl<E: Executor> AssistantService<E> {
             .filter(|t| t.active_run_id.is_some())
         {
             let id = task.active_run_id.clone().unwrap();
+            let origin=state.origin("task",&task.id,&format!("main:{}",store.assistant_id())).to_owned();
+            state.conversation_origins.entry(format!("operation:{id}")).or_insert(origin);
             if let Some(assignment) = &task.assignment {
                 state
                     .collaboration
@@ -426,6 +439,7 @@ impl<E: Executor> AssistantService<E> {
             }
             let service = Self {
                 executor,
+                current_conversation: format!("main:{}",store.assistant_id()),
                 store,
                 state,
                 generation: generation.into(),
@@ -438,6 +452,7 @@ impl<E: Executor> AssistantService<E> {
         }
         let service = Self {
             executor,
+            current_conversation: format!("main:{}",store.assistant_id()),
             store,
             state,
             generation: generation.into(),
@@ -464,11 +479,14 @@ impl<E: Executor> AssistantService<E> {
     pub fn settings(&self) -> &Settings {
         &self.state.settings
     }
+    /// A deferred Host starts later than its always-on scheduler. Preserve that
+    /// scheduler's online watermark so a due event is not mistaken for offline time.
+    pub(crate) fn scheduler_started_at(&mut self, at: i64) { self.opened_at = Some(at); }
     pub fn is_paused(&self) -> bool {
         self.state.paused || self.store.taken_over().unwrap_or(true)
     }
     pub fn coordinator_thread_id(&self) -> Option<&str> {
-        self.state.coordinator_thread.as_deref()
+        self.coordinator().coordinator_thread.as_deref()
     }
     pub fn tasks(&self) -> Result<Vec<Task>> {
         self.store.tasks()
@@ -582,9 +600,12 @@ impl<E: Executor> AssistantService<E> {
         if memory_mutation {self.state.memory_metadata=memory_state.memory_metadata;}
         if matches!(command, Command::TakeOver) {
             self.state.paused = true;
-            self.state.inbox.clear();
+            self.coordinator_mut().inbox.clear();
             self.cancel_deliveries(None, None);
-            self.state.coordinator_watermark = self.state.events.last().map_or(0, |e| e.sequence);
+            self.coordinator_mut().coordinator_watermark = self.state.events.last().map_or(0, |e| e.sequence);
+            let watermark=self.state.events.last().map_or(0,|e|e.sequence);
+            self.state.coordinator.inbox.clear();self.state.coordinator.coordinator_watermark=watermark;
+            for context in self.state.conversation_coordinators.values_mut() {context.inbox.clear();context.coordinator_watermark=watermark;}
             self.state.scheduled_commands.clear();
             // Pausing all previously queued/waiting work is intentional. Release
             // is a gate change only; it cannot silently dispatch old work.
@@ -594,7 +615,7 @@ impl<E: Executor> AssistantService<E> {
                     TaskStatus::Done | TaskStatus::Failed | TaskStatus::Paused
                 )
             }) {
-                self.store.apply(
+                self.apply_bound_command(
                     &format!("takeover:{id}:{}", task.id),
                     Command::PauseTask { task_id: task.id },
                 )?;
@@ -645,13 +666,17 @@ impl<E: Executor> AssistantService<E> {
     /// Explicit recovery of a product-accepted handoff proven not dispatched.
     /// It creates a new operation intent; the original operation and ID remain fenced.
     pub fn resume_coordinator_handoff(&mut self, id:&str, operation:&str, now:i64)->Result<()> {
+        let conversation=self.origin_conversation("operation",operation);
+        self.in_conversation(&conversation,|service|service.resume_handoff_in_conversation(id,operation,now))
+    }
+    fn resume_handoff_in_conversation(&mut self,id:&str,operation:&str,now:i64)->Result<()> {
         text(id,256)?;text(operation,256)?;clock(now)?;
         let hash=fingerprint(&("resume_coordinator_handoff",operation))?;
         if self.replay(id,&hash)?.is_some(){return Ok(());}
         self.coordinator_handoff_recovery_directories(operation)?;
         ensure!(!self.state.journal.contains_key(&format!("handoff-recovery:{operation}")), "Original handoff already has a recovery intent");
-        ensure!(!self.state.paused && !self.store.taken_over()? && self.state.inbox.is_empty()
-            && !self.state.operations.values().any(|op|op.phase.live()), "Resolve active or unknown work before recovery");
+        ensure!(!self.state.paused && !self.store.taken_over()? && self.coordinator().inbox.is_empty()
+            && !self.state.operations.values().any(|op|op.phase.live() && self.in_current_conversation("operation",&op.id)), "Resolve active or unknown work before recovery");
         let original=self.state.operations.get(operation).cloned().context("Original handoff unavailable")?;
         ensure!(original.role==Role::Coordinator && original.phase==OperationPhase::Paused
             && original.mapping.is_none() && original.question.is_none() && original.input_tool_call.is_none()
@@ -686,7 +711,7 @@ impl<E: Executor> AssistantService<E> {
                 message,directories,recovery_of:Some(operation.into())});
         }
         let saved=self.state.clone();
-        self.state.inbox.extend(handoffs);
+        self.coordinator_mut().inbox.extend(handoffs);
         self.record(id,hash,serde_json::Value::Null);
         self.record(&format!("handoff-recovery:{operation}"),fingerprint(&(id,operation))?,serde_json::json!({"commandId":id,"state":"queued"}));
         self.event(format!("resume-handoff:{id}"),Some(original.id),"recovery_queued",
@@ -698,8 +723,9 @@ impl<E: Executor> AssistantService<E> {
     /// The current product snapshot may offer recovery only for an untouched
     /// original handoff. Native non-dispatch proof is checked separately.
     pub fn coordinator_handoff_recovery_directories(&self, operation:&str)->Result<Vec<PathBuf>> {
-        ensure!(!self.state.paused && !self.store.taken_over()? && self.state.inbox.is_empty()
-            && !self.state.operations.values().any(|op|op.phase.live()), "Recovery is currently blocked");
+        let conversation=self.origin_conversation("operation",operation);
+        ensure!(!self.state.paused && !self.store.taken_over()? && self.conversation_inbox_empty(&conversation)
+            && !self.state.operations.values().any(|op|op.phase.live() && self.origin_conversation("operation",&op.id)==conversation), "Recovery is currently blocked");
         ensure!(!self.state.journal.contains_key(&format!("handoff-recovery:{operation}")), "Recovery intent already exists");
         let original=self.state.operations.get(operation).context("Original handoff unavailable")?;
         ensure!(original.role==Role::Coordinator && original.phase==OperationPhase::Paused && original.mapping.is_none()
@@ -742,6 +768,7 @@ impl<E: Executor> AssistantService<E> {
         clock(now)?;
         super::inputs::validate_inputs(&inputs)?;
         let hash = if inputs.is_empty() {fingerprint(&(message, &directories))?} else {fingerprint(&(message,&directories,&inputs))?};
+        let hash=if self.current_conversation==self.default_conversation_id() {hash} else {fingerprint(&(&self.current_conversation,hash))?};
         if self.replay(id, &hash)?.is_some() {
             return Ok(());
         }
@@ -750,7 +777,7 @@ impl<E: Executor> AssistantService<E> {
             "Assistant is paused"
         );
         ensure!(
-            directories.len() <= 32 && self.state.inbox.len() < 128,
+            directories.len() <= 32 && self.coordinator().inbox.len() < 128,
             "Assistant inbox or directory limit"
         );
         let directories = directories
@@ -759,7 +786,7 @@ impl<E: Executor> AssistantService<E> {
             .collect::<Result<Vec<_>>>()?;
         let display=super::inputs::message_label(message,&inputs);
         if !inputs.is_empty() {self.state.message_inputs.insert(format!("user:{id}"),inputs);}
-        self.state.inbox.push(Inbox {
+        self.coordinator_mut().inbox.push(Inbox {
             id: id.into(),
             message: message.into(),
             directories,
@@ -821,7 +848,9 @@ impl<E: Executor> AssistantService<E> {
         }
         // Unknown keeps its original lease, directory reservation and member.
         // It cannot claim an unrelated task or the entire main conversation.
-        self.advance_collaboration(now)?;
+        for conversation in self.state.conversations.keys().cloned().collect::<Vec<_>>() {
+            self.in_conversation(&conversation,|service|service.advance_collaboration(now))?;
+        }
         for _ in 0..MAX_CONCURRENT_TASKS {
             let eligible = self.eligible_tasks()?;
             let Some(lease) = self
@@ -847,6 +876,8 @@ impl<E: Executor> AssistantService<E> {
                 prompt: None,
                 user_message_ids: vec![],
             };
+            let origin=self.origin_conversation("task",&lease.task.id);
+            self.state.conversation_origins.insert(format!("operation:{}",op.id),origin);
             self.state.operations.insert(op.id.clone(), op.clone());
             if let Some(assignment) = &lease.task.assignment {
                 self.state
@@ -857,8 +888,8 @@ impl<E: Executor> AssistantService<E> {
             self.save()?;
             let prepared = (|| -> Result<_> {
                 Ok((
-                    self.execution_thread(&lease.task)?,
-                    self.task_prompt(&lease.task)?,
+                    self.in_conversation(&self.origin_conversation("task",&lease.task.id),|service|service.execution_thread(&lease.task))?,
+                    self.in_conversation(&self.origin_conversation("task",&lease.task.id), |service|service.task_prompt(&lease.task))?,
                 ))
             })();
             let (thread, prompt) = match prepared {
@@ -883,7 +914,10 @@ impl<E: Executor> AssistantService<E> {
             )?;
             self.dispatch(op.id, req, now)?;
         }
-        self.coordinate(now)
+        for conversation in self.state.conversations.keys().cloned().collect::<Vec<_>>() {
+            self.in_conversation(&conversation, |service| service.coordinate(now))?;
+        }
+        Ok(())
     }
 
     fn request(
@@ -972,37 +1006,37 @@ impl<E: Executor> AssistantService<E> {
     }
 
     fn coordinate(&mut self, now: i64) -> Result<()> {
+        if self.state.operations.values().any(|op|op.role==Role::Coordinator && op.suspended && op.phase.live()
+            && self.in_current_conversation("operation",&op.id) && !self.state.released_generations.contains(&op.expected_generation)) {return Ok(());}
         if self.state.operations.values().any(|o| {
-            o.role == Role::Coordinator && self.state.coordinator_attempt.as_deref().is_none_or(|id|id==o.id)
+            o.role == Role::Coordinator && self.in_current_conversation("operation",&o.id) && self.coordinator().coordinator_attempt.as_deref().is_none_or(|id|id==o.id)
                 && matches!(o.phase,OperationPhase::Running|OperationPhase::Waiting)
         }) {
             return Ok(());
         }
         // An unconfirmed coordinator may already have consumed its events. Only
         // a new explicit message can open an independent coordinator attempt.
-        if self.state.inbox.is_empty() && self.state.operations.values().any(|o|
-            o.role==Role::Coordinator && o.phase==OperationPhase::Unknown) {return Ok(());}
+        if self.coordinator().inbox.is_empty() && self.state.operations.values().any(|o|
+            o.role==Role::Coordinator && self.in_current_conversation("operation",&o.id) && o.phase==OperationPhase::Unknown) {return Ok(());}
         let wake: Vec<_> = self
             .state
             .events
             .iter()
-            .filter(|e| e.wake_coordinator && e.sequence > self.state.coordinator_watermark)
+            .filter(|e| e.wake_coordinator && self.in_current_conversation("event",&e.id) && e.sequence > self.coordinator().coordinator_watermark)
             .take(16)
             .cloned()
             .collect();
-        if wake.is_empty() && self.state.inbox.is_empty() {
+        if wake.is_empty() && self.coordinator().inbox.is_empty() {
             return Ok(());
         }
         // Jobs finishing close together are reported in one turn. A new message never waits.
-        if self.state.inbox.is_empty()
+        if self.coordinator().inbox.is_empty()
             && wake.iter().all(|e| e.kind == "job_settled" && now < e.at_ms + jobs::SETTLE_WINDOW_MS)
         {
             return Ok(());
         }
-        let independent=self.state.operations.values().any(|o|o.role==Role::Coordinator && o.phase==OperationPhase::Unknown);
-        let upgrade = !independent && self
-            .state
-            .coordinator_thread
+        let independent=self.state.operations.values().any(|o|o.role==Role::Coordinator && self.in_current_conversation("operation",&o.id) && o.phase==OperationPhase::Unknown);
+        let upgrade = !independent && self.coordinator().coordinator_thread
             .as_deref()
             .map(|thread| self.executor.needs_tool_upgrade(thread))
             .transpose()?
@@ -1010,14 +1044,12 @@ impl<E: Executor> AssistantService<E> {
         // Attachment bytes are not part of the clipped handoff preview. Bound
         // each native frame while leaving every remaining message queued.
         let mut input_bytes=0usize;let mut batch=0;
-        for entry in self.state.inbox.iter().take(8) {
+        for entry in self.coordinator().inbox.iter().take(8) {
             let size=serde_json::to_vec(&self.state.message_inputs.get(&format!("user:{}",entry.id)))?.len();
             if batch>0 && input_bytes+size>2*1024*1024 {break;}
             input_bytes+=size;batch+=1;
         }
-        let inbox: Vec<_> = self
-            .state
-            .inbox
+        let inbox: Vec<_> = self.coordinator_mut().inbox
             .drain(..batch)
             .collect();
         let mut roots: Vec<_> = inbox.iter().flat_map(|i| i.directories.clone()).collect();
@@ -1027,7 +1059,7 @@ impl<E: Executor> AssistantService<E> {
             .state
             .operations
             .values()
-            .filter(|op| op.role == Role::Coordinator && inbox.iter().all(|entry|entry.recovery_of.is_none()))
+            .filter(|op| op.role == Role::Coordinator && self.in_current_conversation("operation",&op.id) && inbox.iter().all(|entry|entry.recovery_of.is_none()))
         {
             for root in &previous.authorized_directories {
                 if !roots.contains(root) {
@@ -1065,7 +1097,7 @@ impl<E: Executor> AssistantService<E> {
                 intent.result["recoveryOperationId"]=serde_json::json!(id);
             }
         }
-        let mut coordinator_thread = self.state.coordinator_thread.clone();
+        let mut coordinator_thread = self.coordinator().coordinator_thread.clone();
         // A new explicit handoff may use a fresh read-only coordinator while an
         // older attempt is unresolved. Never resume/replay the unknown thread.
         if independent {
@@ -1103,9 +1135,10 @@ impl<E: Executor> AssistantService<E> {
                 .collect(),
         };
         if let Some(event) = wake.last() {
-            self.state.coordinator_watermark = event.sequence;
+            self.coordinator_mut().coordinator_watermark = event.sequence;
         }
-        self.state.coordinator_attempt=Some(id.clone());
+        self.coordinator_mut().coordinator_attempt=Some(id.clone());
+        self.bind_conversation("operation",&id);
         self.state.operations.insert(id.clone(), op.clone());
         self.save()?;
         let req = self.request(&op, coordinator_thread, prompt, None, false)?;
@@ -1113,7 +1146,11 @@ impl<E: Executor> AssistantService<E> {
     }
 
     /// Only trusted native Host observations may call this; it is not a phone RPC.
-    pub fn observe(
+    pub fn observe(&mut self,id:&str,status:ExecutionStatus,event_id:&str,now:i64)->Result<()> {
+        let conversation=self.origin_conversation("operation",id);
+        self.in_conversation(&conversation,|service|service.observe_in_conversation(id,status,event_id,now))
+    }
+    fn observe_in_conversation(
         &mut self,
         id: &str,
         status: ExecutionStatus,
@@ -1167,15 +1204,15 @@ impl<E: Executor> AssistantService<E> {
                     if m.thread_id == other_mapping.thread_id {
                         ensure!(
                             op.role == other.role
-                                && (op.role == Role::Coordinator
+                                && ((op.role == Role::Coordinator && self.origin_conversation("operation",&op.id)==self.origin_conversation("operation",&other.id))
                                     || self.same_member_operations(&op, other)),
                             "Native thread belongs to another task or coordinator"
                         );
                     }
                 }
             }
-            if op.role == Role::Coordinator && self.state.coordinator_attempt.as_deref().is_none_or(|current|current==id) {
-                if let Some(thread) = &self.state.coordinator_thread {
+            if op.role == Role::Coordinator && self.coordinator().coordinator_attempt.as_deref().is_none_or(|current|current==id) {
+                if let Some(thread) = &self.coordinator().coordinator_thread {
                     ensure!(
                         *thread == m.thread_id
                             || self.state.collaboration.coordinator_successors.get(id)
@@ -1319,7 +1356,7 @@ impl<E: Executor> AssistantService<E> {
                 input.native_terminal = Some(terminal.clone());
             }
         }
-        if op.role == Role::Coordinator && self.state.coordinator_attempt.as_deref().is_none_or(|current|current==id) {
+        if op.role == Role::Coordinator && self.coordinator().coordinator_attempt.as_deref().is_none_or(|current|current==id) {
             if let Some(m) = &op.mapping {
                 if let Some(previous) = self.state.collaboration.coordinator_successors.get(id) {
                     for member in self
@@ -1332,7 +1369,7 @@ impl<E: Executor> AssistantService<E> {
                         member.main_thread_id = m.thread_id.clone();
                     }
                 }
-                self.state.coordinator_thread = Some(m.thread_id.clone());
+                self.coordinator_mut().coordinator_thread = Some(m.thread_id.clone());
             }
         }
         let changed = prior.phase != op.phase
@@ -1571,7 +1608,12 @@ impl<E: Executor> AssistantService<E> {
         self.save()
     }
 
-    pub fn tool(
+    pub fn tool(&mut self,scope:NativeMapping,call_id:&str,call:ToolCall,now:i64)->Result<serde_json::Value> {
+        let id=self.state.operations.values().find(|op|op.mapping.as_ref()==Some(&scope)).context("Unowned tool scope")?.id.clone();
+        let conversation=self.origin_conversation("operation",&id);
+        self.in_conversation(&conversation,|service|service.tool_in_conversation(scope,call_id,call,now))
+    }
+    fn tool_in_conversation(
         &mut self,
         scope: NativeMapping,
         call_id: &str,
@@ -1686,7 +1728,7 @@ impl<E: Executor> AssistantService<E> {
                     "Task directory not authorized by this handoff"
                 );
                 // Immediate task time is stable across a crash/replayed tool call.
-                let receipt=self.store.apply(
+                let receipt=self.apply_bound_command(
                     &journal_id,
                     Command::CreateTask {
                         prompt,
@@ -1920,6 +1962,7 @@ impl<E: Executor> AssistantService<E> {
         };
         let result = receipt(&schedule)?;
         let previous = self.state.clone();
+        self.bind_conversation("schedule",&schedule.id);
         self.state
             .schedules
             .insert(schedule.id.clone(), schedule.clone());
@@ -2059,7 +2102,8 @@ impl<E: Executor> AssistantService<E> {
         if !paused {
             let commands = self.state.scheduled_commands.clone();
             for (id, command) in commands {
-                let receipt=self.store.apply(&id, command)?;
+                let conversation=self.state.schedule_runs.get(&id).map(|r|self.origin_conversation("schedule",&r.schedule_id)).unwrap_or_else(||self.default_conversation_id());
+                let receipt=self.in_conversation(&conversation,|service|service.apply_bound_command(&id,command))?;
                 if let (Some(run),CommandResult::Task(task))=(self.state.schedule_runs.get_mut(&id),receipt.result) {run.task_id=Some(task.id);run.status="queued".into();}
             }
             let pending=self.state.scheduled_commands.clone();
@@ -2106,10 +2150,13 @@ impl<E: Executor> AssistantService<E> {
         let sequence = self.state.events.last().map_or(1, |e| e.sequence + 1);
         let operation = operation_id
             .as_ref()
-            .and_then(|id| self.state.operations.get(id));
+            .and_then(|id| self.state.operations.get(id)).cloned();
         let assignment = operation_id
             .as_ref()
-            .and_then(|id| self.state.collaboration.operation_assignments.get(id));
+            .and_then(|id| self.state.collaboration.operation_assignments.get(id)).cloned();
+        let origin=operation_id.as_deref().map(|id|self.origin_conversation("operation",id)).unwrap_or_else(||self.current_conversation.clone());
+        self.state.conversation_origins.insert(format!("event:{id}"),origin);
+        self.touch_conversation(now);
         self.state.events.push(AssistantEvent {
             sequence,
             id,
@@ -2119,10 +2166,10 @@ impl<E: Executor> AssistantService<E> {
             notify,
             wake_coordinator: wake,
             at_ms: now,
-            task_id: operation.and_then(|op| op.task_id.clone()),
-            member_id: assignment.and_then(|a| a.member_id.clone()),
-            group_id: assignment.and_then(|a| a.group_id.clone()),
-            thread_id: operation.and_then(|op| op.mapping.as_ref().map(|m| m.thread_id.clone())),
+            task_id: operation.as_ref().and_then(|op| op.task_id.clone()),
+            member_id: assignment.as_ref().and_then(|a| a.member_id.clone()),
+            group_id: assignment.as_ref().and_then(|a| a.group_id.clone()),
+            thread_id: operation.as_ref().and_then(|op| op.mapping.as_ref().map(|m| m.thread_id.clone())),
         });
     }
     fn save(&self) -> Result<()> {

@@ -36,6 +36,7 @@ internal class ExecutionLocations(private val context: Context,
     val activeLocation = activated.asStateFlow()
     val directory = store.directoryChanges
     private val failure = MutableStateFlow<String?>(null)
+    private val diagnostics = ConnectionDiagnostics()
     val error = failure.asStateFlow()
     private val preparation = MutableStateFlow<String?>(null)
     val progress = preparation.asStateFlow()
@@ -198,7 +199,9 @@ internal class ExecutionLocations(private val context: Context,
             activate(target.id, dismissFailure = true)
             thisPhone.refreshAccount()
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (error: Exception) { failure.value = when ((error as? WireException)?.code) {
+        catch (error: Exception) {
+            diagnostics.record(0, "phone_activate", (error as? WireException)?.code ?: "unknown", error)
+            failure.value = when ((error as? WireException)?.code) {
             "local_runtime_missing" -> "这个安装包不包含手机本机运行环境。"
             else -> "此手机上的运行环境未能启动，请重试。已有本机会话与登录信息会保留。"
         } }

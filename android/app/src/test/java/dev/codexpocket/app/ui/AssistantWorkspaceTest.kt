@@ -21,7 +21,7 @@ import org.robolectric.annotation.GraphicsMode
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class AssistantWorkspaceTest {
     @get:Rule val compose=createAndroidComposeRule<MainActivity>()
-    @Test fun attachmentOnlySendRetainsFailureAndClearsOnlyAfterMatchingAcceptance() {
+    @Test fun attachmentOnlySendMovesFilesToOwnBubbleAndRetriesSameIdentity() {
         val context=compose.activity
         val file=LocalAttachment(java.util.UUID.randomUUID().toString(),"diagram.png","image/png")
         AssistantAttachmentDraft(context,"main:attachment-ui:a").add(listOf(file))
@@ -36,10 +36,17 @@ class AssistantWorkspaceTest {
         val first=actions.single()
         compose.runOnIdle {state=state.copy(sendReceipts=listOf(AssistantSendReceipt(first.commandId!!,"attachment-ui","r","assistant:a","rejected")))}
         compose.onNodeWithText("diagram.png").assertExists()
-        compose.onNodeWithTag("assistant-workspace-send").performClick()
+        compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-send-failure:${first.commandId}"))
+        compose.onNodeWithTag("assistant-send-failure:${first.commandId}").performClick()
+        compose.onNodeWithTag("assistant-send-retry:${first.commandId}").performClick()
         val accepted=actions.last()
+        assertNotEquals(first.commandId,accepted.commandId)
+        assertEquals(first.params,accepted.params)
+        assertEquals(first.composerBinding,accepted.composerBinding)
+        assertEquals(listOf(file),accepted.attachments)
         compose.runOnIdle {state=state.copy(sendReceipts=listOf(AssistantSendReceipt(accepted.commandId!!,"attachment-ui","r","assistant:a","accepted")))}
-        compose.onNodeWithText("diagram.png").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-attachment:${file.id}").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-send-failure:${first.commandId}").assertDoesNotExist()
     }
     @Test fun artifactFollowupCarriesAttachmentAndExactTaskAndVersion() {
         val task=AssistantTask("attachment-task","修改报告",AssistantTaskStatus.Done,null,false,null)

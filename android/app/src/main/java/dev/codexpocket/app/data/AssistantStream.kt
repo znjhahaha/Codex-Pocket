@@ -12,12 +12,13 @@ data class AssistantLiveJobStage(val status:String,val stage:String,val stageLab
 data class AssistantStreamFrame(val runtimeId:String,val epoch:String,val sequence:Long,val kind:String,
     val operationId:String? = null,val taskId:String? = null,val threadId:String? = null,val requestId:String? = null,
     val delta:String = "",val reset:Boolean = false,val status:String = "",val stage:String = "",val stageLabel:String = "",
-    val activeSubagents:Int = 0) {
+    val activeSubagents:Int = 0, val conversationId:String? = null) {
     companion object {
         /** Null for anything this client cannot place: a missing identity, a wrong type or an oversized identifier. */
         fun from(o:JsonObject):AssistantStreamFrame? {
             val f=StreamFields(o)
             val runtime=f.id("runtimeId",true);val epoch=f.id("epoch",true);val kind=f.word("kind",true);val sequence=f.integer("sequence",true)
+            val conversation = f.id("conversationId")
             f.id("generation")
             if(f.malformed || runtime==null || epoch==null || kind==null || sequence==null || sequence<1) return null
             val frame=when(kind) {
@@ -35,7 +36,7 @@ data class AssistantStreamFrame(val runtimeId:String,val epoch:String,val sequen
                 // A kind added later still occupies its place in the sequence.
                 else -> AssistantStreamFrame(runtime,epoch,sequence,kind)
             }
-            return frame.takeUnless {f.malformed}
+            return frame.copy(conversationId = conversation).takeUnless {f.malformed}
         }
     }
 }
@@ -65,13 +66,20 @@ fun AssistantUiState.reduceStream(frame:AssistantStreamFrame):AssistantStreamRed
     val known=if(contiguous) this else withoutStream()
     val base=known.copy(lastStreamEpoch=frame.epoch,lastStreamSequence=frame.sequence,streamRevision=known.streamRevision+1)
     val operation=frame.operationId
+    if (snapshot?.conversationId != null && frame.kind.startsWith("coordinator_")) {
+        if (frame.conversationId != null && frame.conversationId != snapshot.conversationId)
+            return AssistantStreamReduction(base, !contiguous)
+        if (frame.conversationId == null && snapshot.activeCoordinatorOperationId != operation &&
+            snapshot.operations.none { it.id == operation && it.conversationId == snapshot.conversationId })
+            return AssistantStreamReduction(base, true)
+    }
     return when {
         frame.kind=="coordinator_delta" && operation!=null -> AssistantStreamReduction(when {
             // Frames can trail a snapshot that already holds this turn's final message.
             snapshot.streamFinished(operation) -> if(base.streamingCoordinatorOpId==operation) base.withoutCoordinatorStream() else base
             else -> base.copy(streamingCoordinatorOpId=operation,streamCoordinatorEnd=0,streamingCoordinatorText=
                 ((if(base.streamingCoordinatorOpId==operation && !frame.reset) base.streamingCoordinatorText else "")+frame.delta).streamTail())
-        },!contiguous)
+        },!contiguous || (frame.conversationId != null && snapshot?.activeCoordinatorOperationId != operation))
         // The text stays until the snapshot read after this frame is stored; see streamReconciled.
         frame.kind=="coordinator_done" -> AssistantStreamReduction(
             if(operation!=null && base.streamingCoordinatorOpId==operation && base.streamCoordinatorEnd==0L) base.copy(streamCoordinatorEnd=base.streamRevision) else base,true)
@@ -119,7 +127,7 @@ fun AssistantUiState.streamReconciled(previousRuntimeId:String?,mark:Long?):Assi
 
 private fun AssistantUiState.withoutCoordinatorStream()=copy(streamingCoordinatorOpId=null,streamingCoordinatorText="",streamCoordinatorEnd=0)
 private fun AssistantSnapshot?.streamFinished(operation:String)=this?.operations?.any {
-    it.id==operation && it.phase in setOf(AssistantOperationPhase.Completed,AssistantOperationPhase.Failed)}==true
+    it.id==operation && it.phase in setOf(AssistantOperationPhase.Completed,AssistantOperationPhase.Failed,AssistantOperationPhase.Paused)}==true
 private fun String.streamTail()=if(length<=AssistantStream.MAX_TEXT) this else substring(length-AssistantStream.MAX_TEXT).let {if(it[0].isLowSurrogate()) it.substring(1) else it}
 private fun String.streamLabel()=if(length<=AssistantStream.MAX_LABEL) this else take(AssistantStream.MAX_LABEL).let {if(it.last().isHighSurrogate()) it.dropLast(1) else it}
 

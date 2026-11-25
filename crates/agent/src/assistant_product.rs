@@ -19,7 +19,18 @@ use tokio::sync::oneshot;
 mod command_receipts;
 mod artifacts;
 mod stream;
+mod conversations;
+pub(crate) mod retained;
 pub(crate) use command_receipts::read_completed_command;
+
+#[derive(Debug)]
+pub(crate) struct ModelSelectionUnavailable;
+impl std::fmt::Display for ModelSelectionUnavailable {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str("Selected assistant model or reasoning effort could not be verified; selection retained")
+    }
+}
+impl std::error::Error for ModelSelectionUnavailable {}
 
 /// Read retained role identity without starting the Actor, acquiring executor
 /// ownership, or touching its journal. Old/partial Coordinator starts are still
@@ -661,6 +672,7 @@ impl Actor {
                     Some(request) if !is_read(&request.method) => {
                         let response = result.take().unwrap().map(|receipt| {
                             let mut response = json!({"accepted":true,"commandId":request.id,"result":receipt});
+                            if let Some(conversation)=receipt.get("conversation") {response["conversation"]=conversation.clone();}
                             // Acceptance is durable before dispatch. A later refresh failure
                             // cannot turn that receipt into an ambiguous mutation result.
                             if let Ok(mut value) = worker.snapshot(None) {
@@ -669,7 +681,10 @@ impl Actor {
                                 value["fresh"] = json!(false);
                                 value["snapshotSource"] = json!("worker_cache");
                                 *out.lock().unwrap() = value.clone();
-                                response["snapshot"] = value;
+                                let mut selection=request.parameters.clone();
+                                if let Some(id)=receipt["conversation"]["id"].as_str() {selection["conversationId"]=json!(id);}
+                                let projected=worker.project_conversation(&mut value,&selection).is_ok();
+                                if projected {response["snapshot"] = value;}
                             }
                             response
                         });
@@ -690,9 +705,13 @@ impl Actor {
                             match value{Ok(mut v)=>{
                                 if request.method=="assistant/settings/read"{v=json!({"settings":v["settings"],"fresh":true,"updatedAtMs":v["updatedAtMs"],"snapshotSource":"worker_read"});}
                                 else {
-                                    if let Some(after)=request.parameters.get("after").and_then(Value::as_u64){v["events"]=json!(worker.service.events(after,256)?);}
-                                    if request.parameters.get("before").is_some() || request.parameters.get("limit").is_some() {
-                                        v["conversationPage"]=timeline_page(&worker.service,&worker.messages,request.parameters["before"].as_u64(),request.parameters["limit"].as_u64().unwrap_or(50) as usize)?;
+                                    worker.project_conversation(&mut v,&request.parameters)?;
+                                    if request.method=="assistant/v2/conversation/list" {return Ok(json!({"data":v["conversations"],"conversationId":worker.service.default_conversation_id()}));}
+                                    if let Some(after)=request.parameters.get("after").and_then(Value::as_u64){
+                                        v["events"]=json!(worker.service.events(after,256)?);
+                                        for event in v["events"].as_array_mut().into_iter().flatten() {
+                                            if let Some(id)=event["id"].as_str() {event["conversationId"]=json!(worker.service.origin_conversation("event",id));}
+                                        }
                                     }
                                     if let Some(task)=request.parameters["taskId"].as_str(){v["taskDetail"]=worker.service.task_context(task)?;}
                                 }
@@ -794,7 +813,7 @@ impl Actor {
 fn is_read(method: &str) -> bool {
     matches!(
         method,
-        "assistant/read" | "assistant/settings/read" | "assistant/snapshot" | "assistant/artifact/read"
+        "assistant/read" | "assistant/v2/read" | "assistant/v2/conversation/list" | "assistant/settings/read" | "assistant/snapshot" | "assistant/artifact/read"
     )
 }
 #[derive(Clone)]
@@ -838,6 +857,7 @@ fn messages_db(path: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
 CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,text TEXT NOT NULL,at_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS product_timeline(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,role TEXT NOT NULL,text TEXT NOT NULL,at_ms INTEGER NOT NULL,operation_id TEXT,source_sequence INTEGER);
+CREATE TABLE IF NOT EXISTS product_conversation_origins(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS product_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS product_projects(thread_id TEXT NOT NULL,root TEXT NOT NULL,writable INTEGER NOT NULL,PRIMARY KEY(thread_id,root));
 CREATE TABLE IF NOT EXISTS product_answers(generation TEXT NOT NULL,native_id TEXT NOT NULL,PRIMARY KEY(generation,native_id));
@@ -985,6 +1005,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             &generation,
             executor.clone(),
         )?;
+        let origins=messages.prepare("SELECT id,operation_id FROM product_timeline")?
+            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id,operation) in origins {service.import_message_origin(&id,operation.as_deref());}
         let legacy=messages.prepare("SELECT id,role,text,at_ms FROM product_timeline ORDER BY sequence")?
             .query_map([],|row|Ok(ConversationEntry{id:row.get(0)?,role:row.get(1)?,text:row.get(2)?,at_ms:row.get(3)?,member_id:None,task_id:None,group_id:None,source_thread_id:None}))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1028,6 +1051,17 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             stream: stream::Stream::new(frames),
             stream_clock: std::time::Instant::now(),
         };
+        if let Some(since)=retained::scheduler_started_at().filter(|since|*since<=(clock)()) { worker.service.scheduler_started_at(since); }
+        let profile_path=root.join("profile.json");
+        let source=if profile_path.try_exists()? { serde_json::from_slice::<Value>(&crate::storage::read_physical(&profile_path,16384)?)?["sourceRuntimeId"].as_str().unwrap_or("").to_owned() } else {String::new()};
+        let scope=format!("assistant:{profile}:{source}");
+        if let Some(pending)=retained::pending_settings(&root,&scope)?.filter(|_|worker.allowed()) {
+            ensure!(pending["configStoreId"]==profile,"Pending assistant settings belong to another profile");
+            let settings:Settings=serde_json::from_value(pending["settings"].clone())?;
+            worker.validate_selected_models(&settings)?;
+            worker.service.update_settings(&format!("pending:{}",text(&pending,"commandId")?),settings,(clock)())?;
+            retained::save_pending_settings(&root,&scope,None)?;
+        }
         worker.sync_timeline()?;
         worker.pause_unverified_tasks()?;
         Ok(worker)
@@ -1165,6 +1199,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             tx.execute("INSERT INTO product_meta(key,value) VALUES('event_cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[after])?;
             tx.commit()?;
         }
+        conversations::sync_origins(&self.service,&self.messages)?;
         Ok(())
     }
     fn authorize(
@@ -1350,6 +1385,9 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         Ok(())
     }
     fn apply(&mut self, r: &Request) -> Result<Value> {
+        if let Some(id)=r.parameters.get("conversationId") {
+            ensure!(id.as_str().is_some_and(|id|!id.trim().is_empty() && id.len()<=256),"Invalid conversation ID");
+        }
         if r.method=="assistant/artifact/read" {
             ensure!(r.parameters.as_object().is_some_and(|o|o.keys().all(|k|["artifactId","offset"].contains(&k.as_str()))) && r.parameters.get("offset").is_none_or(|v|v.as_u64().is_some()),"Invalid artifact read");
             return self.artifact_read(&r.parameters);
@@ -1358,7 +1396,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             ensure!(
                 r.parameters.as_object().is_some_and(|p| p
                     .keys()
-                    .all(|k| ["after", "before", "limit", "taskId"].contains(&k.as_str())))
+                    .all(|k| ["after", "before", "limit", "taskId", "conversationId"].contains(&k.as_str())))
                     && ["after", "before"]
                         .iter()
                         .all(|k| r.parameters.get(k).is_none_or(|v| v.as_u64().is_some()))
@@ -1374,11 +1412,12 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))),
                 "Invalid assistant read cursor"
             );
+            self.service.resolve_conversation(r.parameters["conversationId"].as_str())?;
             return Ok(Value::Null);
         }
         let restrictive = matches!(
             r.method.as_str(),
-            "assistant/pause" | "assistant/takeover" | "assistant/task/pause"
+            "assistant/pause" | "assistant/takeover" | "assistant/task/pause" | "assistant/v2/conversation/interrupt"
         );
         ensure!(
             self.allowed() || restrictive,
@@ -1393,7 +1432,15 @@ impl<R: RuntimeIo + Clone> Worker<R> {
         let p = &r.parameters;
         let at = (self.clock)();
         match r.method.as_str() {
-            "assistant/send" => {
+            "assistant/v2/conversation/create" => {
+                let conversation=self.service.create_conversation(&r.id,p["title"].as_str(),at)?;
+                return Ok(json!({"accepted":true,"commandId":r.id,"conversation":conversation}));
+            }
+            "assistant/v2/conversation/interrupt" => {
+                self.service.interrupt_conversation(&r.id,text(p,"conversationId")?,text(p,"operationId")?,at)?;
+            }
+            "assistant/send" | "assistant/v2/send" => {
+                let conversation=self.service.resolve_conversation(p["conversationId"].as_str())?;
                 let message = text(p, "message")?;
                 let mut inputs:Vec<crate::assistant::AssistantInput>=p.get("retainedAttachments").map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
                 crate::assistant::inputs::validate_inputs(&inputs)?;
@@ -1434,7 +1481,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     self.authorize(&source, None, text(p, "threadId")?, root, true)?;
                 }
                 if p["memberId"].is_string() || p["taskId"].is_string() {
-                    self.service.submit_targeted_with_inputs(
+                    self.service.in_conversation(&conversation,|service|service.submit_targeted_with_inputs(
                         &r.id,
                         submitted,
                         p["memberId"].as_str(),
@@ -1442,15 +1489,15 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                         false,
                         inputs,
                         at,
-                    )?;
+                    ))?;
                 } else {
-                    self.service.submit_with_inputs(
+                    self.service.in_conversation(&conversation,|service|service.submit_with_inputs(
                         &r.id,
                         message,
                         vec![r.directory.clone().unwrap_or_else(||self.workspace.clone())],
                         inputs,
                         at,
-                    )?;
+                    ))?;
                 }
                 let tx = self.messages.transaction()?;
                 tx.execute(
@@ -1458,6 +1505,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     params![r.id, message, at],
                 )?;
                 tx.execute("INSERT OR IGNORE INTO product_timeline(id,role,text,at_ms) VALUES(?1,'User',?2,?3)",params![format!("user:{}",r.id),message,at])?;
+                tx.execute("INSERT OR IGNORE INTO product_conversation_origins(id,conversation_id) VALUES(?1,?2)",params![format!("user:{}",r.id),conversation])?;
                 tx.commit()?;
             }
             "assistant/pause" => self.service.pause(&r.id, at)?,
@@ -1557,8 +1605,10 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                 )?;
             }
             "assistant/settings/update" => {
-                let settings: Settings = serde_json::from_value(p["settings"].clone())?;
+                let settings = self.service.settings().updated(p)?;
                 settings.validate()?;
+                if p.get("patch").is_some() { self.validate_selected_models(&settings)?; }
+                else { self.validate_selected_efforts(&settings)?; }
                 let _: chrono_tz::Tz = settings
                     .timezone
                     .parse()
@@ -1692,6 +1742,40 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             self.error = Some("timeline_unavailable");
         }
     }
+    fn validate_selected_models(&mut self, settings: &Settings) -> Result<()> {
+        self.validate_selected_efforts(settings)?;
+        let previous=self.service.settings();
+        let requested=[(&settings.model,&previous.model),(&settings.coordinator_model,&previous.coordinator_model)]
+            .into_iter().filter(|(new,old)|new!=old).filter_map(|(new,_)|new.clone()).collect::<BTreeSet<_>>();
+        if requested.is_empty() { return Ok(()); }
+        let mut missing=requested;
+        if let Ok(config)=self.probe.request(read_id(),"config/read",json!({"includeLayers":false})) {
+            if let Some(model)=config["config"]["model"].as_str() {missing.remove(model);}
+        }
+        let mut cursor=Value::Null;
+        let mut seen=BTreeSet::new();
+        for _ in 0..10 {
+            if missing.is_empty() {return Ok(());}
+            let page=self.probe.request(read_id(),"model/list",json!({"cursor":cursor,"limit":100})).map_err(|_|ModelSelectionUnavailable)?;
+            for model in page["data"].as_array().ok_or(ModelSelectionUnavailable)? {
+                if model["hidden"]==true {continue;}
+                if let Some(id)=model["model"].as_str() {missing.remove(id);}
+                if let Some(id)=model["id"].as_str() {missing.remove(id);}
+            }
+            cursor=page["nextCursor"].clone();
+            if cursor.is_null() || !seen.insert(cursor.to_string()) {break;}
+        }
+        ensure!(missing.is_empty(),ModelSelectionUnavailable);
+        Ok(())
+    }
+    fn validate_selected_efforts(&mut self, settings: &Settings) -> Result<()> {
+        for (model, effort) in settings.changed_effort_selections(self.service.settings()) {
+            crate::assistant::model_capabilities::verify_native_effort(model.as_deref(), &effort,
+                |method, params| self.probe.request(read_id(), method, params))
+                .map_err(|_| ModelSelectionUnavailable)?;
+        }
+        Ok(())
+    }
     fn observe_health(&mut self) {
         self.error = None;
         let health = self.probe.health();
@@ -1824,6 +1908,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
                     QuestionKind::Input => "input",
                 });
                 stream::OperationView {
+                    conversation_id: self.service.origin_conversation("operation",&o.id),
                     coordinator: o.role == Role::Coordinator,
                     task_id: self.service.operation_job(&o).or_else(|| o.task_id.clone()),
                     thread_id: o.mapping.as_ref().map(|m| m.thread_id.clone()),
@@ -1982,6 +2067,8 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             override_error.or(self.error),
         )?;
         let mut value = value;
+        conversations::annotate(&self.service,&mut value);
+        self.project_conversation(&mut value,&json!({}))?;
         artifacts::project(&self.messages,&mut value)?;
         self.service.record_artifact_versions(value["artifacts"].as_array().map(Vec::as_slice).unwrap_or(&[]))?;
         value["domain"]=self.service.domain_snapshot("local")?;
@@ -2014,26 +2101,7 @@ impl<R: RuntimeIo + Clone> Worker<R> {
             {"id":"coordinator","status":if !self.runtime_ready || self.account != AccountReadiness::Ready {"waiting"}else if self.uncertain() {"reconciling"}else if self.service.is_paused() {"paused"}else if self.error.is_some() {"blocked"}else{"ready"},"sessionCreated":self.service.coordinator_thread_id().is_some(),"recoveryAction":if self.uncertain() {json!("reconcile_retained_native_receipts")}else if self.service.is_paused() {json!("resume_assistant")}else if self.error.is_some() {json!("inspect_runtime_host_and_retry")}else{Value::Null}}
         ]);
         value["unsupportedOperation"] = json!(self.probe.tracking.lock().unwrap().unsupported);
-        if self.runtime_ready && self.account==AccountReadiness::Ready && !self.uncertain() {
-            for record in self.executor.operation_records()? {
-                if record.rejected && !record.thread_submitted && !record.turn_submitted && record.mapping.is_none()
-                    && self.service.coordinator_handoff_recovery_directories(&record.operation_id).is_ok() {
-                    if let Some(op)=value["operations"].as_array_mut().and_then(|ops|ops.iter_mut().find(|op|op["id"]==record.operation_id)) {
-                        op["handoffRecovery"]=json!({"action":"resume_original_handoff","operationId":record.operation_id,
-                            "messageIds":op["user_message_ids"],"generation":record.generation});
-                    }
-                }
-            }
-        }
         value["projectAuthorization"]=json!(self.projects.iter().map(|p|json!({"threadId":p.thread,"directory":p.root,"writable":p.writable,"verified":p.verified,"sourceRuntimeId":p.source_runtime,"sourceGeneration":p.source_generation,"permissionRevision":p.permission_revision})).collect::<Vec<_>>());
-        for p in self.executor.pending_requests()? {
-            if self.executor.rejection_recovery_available(&p)? {
-                if let Some(v) = value["pendingRequests"].as_array_mut().and_then(|items| items.iter_mut()
-                    .find(|v| v["operationId"] == p.operation_id && v["requestId"] == p.handle)) {
-                    v["recoveryAction"] = json!("reject_original_tool_answer");
-                }
-            }
-        }
         Ok(value)
     }
 }
@@ -2188,6 +2256,7 @@ fn attribute_messages<R: RuntimeIo>(
         let member_id = assignment
             .and_then(|a| a.member_id.as_deref())
             .or_else(|| entry.and_then(|e| e.member_id.as_deref()));
+        message["conversationId"]=json!(operation.map(|op|service.origin_conversation("operation",&op.id)).unwrap_or_else(||service.origin_conversation("message",message["id"].as_str().unwrap_or_default())));
         message["memberId"] = json!(member_id);
         message["authorName"] = json!(
             member_id
@@ -2208,26 +2277,22 @@ fn attribute_messages<R: RuntimeIo>(
     }
     Ok(())
 }
-fn timeline_page<R: RuntimeIo>(
-    service: &AssistantService<SharedHostExecutor<R>>,
-    db: &Connection,
-    before: Option<u64>,
-    limit: usize,
-) -> Result<Value> {
+fn timeline_page_for<R: RuntimeIo>(service:&AssistantService<SharedHostExecutor<R>>,db:&Connection,conversation:&str,before:Option<u64>,limit:usize)->Result<Value> {
     ensure!(
-        (1..=100).contains(&limit),
-        "Timeline page limit must be 1..100"
+        (1..=200).contains(&limit),
+        "Timeline page limit must be 1..200"
     );
     let before = before.unwrap_or(i64::MAX as u64).min(i64::MAX as u64) as i64;
-    let mut stmt=db.prepare("SELECT sequence,id,role,text,at_ms,operation_id,source_sequence FROM product_timeline WHERE sequence<?1 ORDER BY sequence DESC LIMIT ?2")?;
-    let mut chat=stmt.query_map(params![before,limit as i64],|r|Ok(json!({"sequence":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"atMs":r.get::<_,i64>(4)?,"operationId":r.get::<_,Option<String>>(5)?,"sourceEventSequence":r.get::<_,Option<u64>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    conversations::sync_origins(service,db)?;
+    let mut stmt=db.prepare("SELECT t.sequence,t.id,t.role,t.text,t.at_ms,t.operation_id,t.source_sequence FROM product_timeline t JOIN product_conversation_origins c ON c.id=t.id WHERE t.sequence<?1 AND c.conversation_id=?3 ORDER BY t.sequence DESC LIMIT ?2")?;
+    let mut chat=stmt.query_map(params![before,limit as i64,conversation],|r|Ok(json!({"sequence":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"atMs":r.get::<_,i64>(4)?,"operationId":r.get::<_,Option<String>>(5)?,"sourceEventSequence":r.get::<_,Option<u64>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     chat.reverse();
     attribute_messages(service, &mut chat)?;
     let cursor = chat.first().and_then(|v| v["sequence"].as_u64());
     let more = cursor.is_some_and(|cursor| {
         db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM product_timeline WHERE sequence<?1)",
-            [cursor],
+            "SELECT EXISTS(SELECT 1 FROM product_timeline t JOIN product_conversation_origins c ON c.id=t.id WHERE t.sequence<?1 AND c.conversation_id=?2)",
+            params![cursor,conversation],
             |r| r.get::<_, bool>(0),
         )
         .unwrap_or(false)

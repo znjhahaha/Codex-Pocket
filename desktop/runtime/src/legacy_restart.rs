@@ -10,6 +10,12 @@ use std::{collections::BTreeMap, io::Read};
 #[path = "restart_preservation.rs"]
 mod preservation;
 
+#[path = "restart_lock_owners.rs"]
+mod lock_owners;
+
+pub(super) fn notice_id(state: &Path, operation: &str) -> Option<String> { lock_owners::notice_id(state, operation) }
+pub(super) fn acknowledge_notice(state: &Path, operation: &str, notice: &str) -> Result<()> { lock_owners::acknowledge(state, operation, notice) }
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Intent {
@@ -168,6 +174,7 @@ fn attempts(state: &Path, operation: &str, reason: &str) -> u64 {
 }
 /// What an explicit restart is waiting for, for the management window to say in words.
 pub(super) fn wait_reason(state: &Path, operation: &str) -> Option<&'static str> {
+    if lock_owners::announced(state, operation) { return Some("restart_lock_owner_active"); }
     let f: Value = storage::read(&failure_path(state, operation)).ok()?;
     if f["operationId"] != operation { return None; }
     ["restart_cli_task_active", "restart_write_in_flight"].into_iter().find(|r| f["reason"] == *r).or(Some("restart_retrying"))
@@ -370,6 +377,7 @@ pub(super) fn failure_stage(msg: &str) -> Option<&'static str> {
         "restart_stop_failed",
         "restart_ledger_unverified",
         "restart_fence_unavailable",
+        "restart_lock_query_failed",
     ]
     .into_iter()
     .find(|s| *s == msg)
@@ -401,7 +409,24 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
         {
             return Ok(());
         }
-        let h = crate::native_update::authenticated_helper(root, state, &from)?;
+        verify_candidate(&bin, state, &s)?;
+        let (h, supervisor, agent, detached) = (|| -> Result<(Value, ProcessIdentity, ProcessIdentity, bool)> {
+            let h = crate::native_update::authenticated_helper(root, state, &from)?;
+            let sup: Value = storage::read(&storage::control(state).join("supervisor.json"))?;
+            let agent = ProcessIdentity::capture(pid(&h["helperRuntime"]["pid"])?)?;
+            let supervisor = ProcessIdentity::capture(pid(&sup["pid"])?)?;
+            ensure!(crate::connection::fresh(sup["updatedAt"].as_u64().unwrap_or(0),storage::now())
+                && sup["runtime"]["generation"] == from
+                && sup["runtime"]["processCreatedAt"] == supervisor.created_at
+                && supervisor.executable == launcher::verified_exe(&bin, "pocket-supervisor.exe")?
+                && agent.executable == launcher::verified_exe(&bin, "pocket-agent.exe")?, "restart_owner_changed");
+            let detached = sup["childPid"] != agent.pid;
+            Ok((h, supervisor, agent, detached))
+        })()?;
+        if detached {
+            ensure!(manual_restart,"restart_owner_changed");
+            if !lock_owners::ready(root,state,&bin,&s,&supervisor,&agent)? { return Ok(()); }
+        }
         if !(updates::explicit_cold_required(&h, storage::now()) || manual_restart
             && h["protocol"]==1 && h["acceptingWrites"]==true
             && h["handoffCapabilities"]["writeFence"]==true
@@ -409,18 +434,6 @@ pub(super) fn advance(root: &Path, state: &Path, operation: &str) -> Result<()> 
             // Writes in flight are what the fence and its drain are for; a quiet instant is not required to ask.
             return Ok(());
         }
-        verify_candidate(&bin, state, &s)?;
-        let sup: Value = storage::read(&storage::control(state).join("supervisor.json"))?;
-        let agent = ProcessIdentity::capture(pid(&h["helperRuntime"]["pid"])?)?;
-        let supervisor = ProcessIdentity::capture(pid(&sup["pid"])?)?;
-        ensure!(
-            sup["childPid"] == agent.pid
-                && sup["runtime"]["generation"] == from
-                && sup["runtime"]["processCreatedAt"] == supervisor.created_at
-                && supervisor.executable == launcher::verified_exe(&bin, "pocket-supervisor.exe")?
-                && agent.executable == launcher::verified_exe(&bin, "pocket-agent.exe")?,
-            "restart_owner_changed"
-        );
         let run = h["handoffCapabilities"]["generation"]
             .as_str()
             .filter(|v| upgrade::local::canonical_uuid(v))

@@ -272,6 +272,14 @@ pub async fn restart_update(context:State<'_,Context>,operation_id:String)->Resu
     }).await.map_err(join_error)?
 }
 #[tauri::command]
+pub async fn acknowledge_restart_notice(context:State<'_,Context>,operation_id:String,notice_id:String)->Result<(),OperationError>{
+    let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        let _guard=c.operation.try_lock().map_err(|_|OperationError::new("updates","operation_busy",true))?;
+        let current=current_context(&c);core_preflight(&current)?;
+        pocket_desktop_runtime::local_update::acknowledge_restart_notice(&c.state,&operation_id,&notice_id).map_err(|e|fail("updates",e))
+    }).await.map_err(join_error)?
+}
+#[tauri::command]
 pub async fn set_automatic_updates(context:State<'_,Context>,enabled:bool)->Result<(),OperationError>{
     let c=context.inner().clone();tauri::async_runtime::spawn_blocking(move||{
         core_preflight(&c)?;pocket_desktop_runtime::updates::set_automatic(&c.state,enabled).map_err(|e|fail("updates",e))

@@ -68,6 +68,8 @@ pub struct Router {
     startup: Option<crate::startup::StartupBarrier>,
     pub startup_admission: Option<pocket_core::admission::Registration>,
     settings: crate::settings::SettingsCache,
+    question_projection: crate::question_projection::QuestionProjection,
+    desktop_raw_opt_out: bool,
 }
 
 impl Default for Router {
@@ -96,6 +98,8 @@ impl Default for Router {
             startup: None,
             startup_admission: None,
             settings: Default::default(),
+            question_projection: Default::default(),
+            desktop_raw_opt_out: false,
         }
     }
 }
@@ -489,6 +493,15 @@ impl Router {
                     );
                 }
             }
+            if client == Client::Desktop && method == "initialize" && value["params"]["capabilities"]["experimentalApi"] == true {
+                if let Some(methods) = value["params"]["capabilities"]["optOutNotificationMethods"].as_array_mut() {
+                    // The desktop does not consume raw responses. Bridge needs
+                    // them to prove question answers; its opt-out is preserved
+                    // at delivery, and unrelated raw content stays internal.
+                    self.desktop_raw_opt_out = methods.iter().any(|m| m == "rawResponseItem/completed");
+                    methods.retain(|m| m != "rawResponseItem/completed");
+                }
+            }
             if client == Client::Desktop && method == "initialized" && self.initialize_received {
                 self.initialized = true;
             }
@@ -619,6 +632,7 @@ impl Router {
                 );
                 let token = format!("approval:{}", uuid::Uuid::new_v4());
                 let desktop_id = format!("server:{}", uuid::Uuid::new_v4());
+                self.question_projection.requested(&value, &desktop_id);
                 let questions = value["params"]["questions"]
                     .as_array()
                     .into_iter()
@@ -685,12 +699,15 @@ impl Router {
                         .remove(&resolved_key)
                         .expect("matched pending request");
                     value["params"]["requestId"] = json!(p.desktop_id);
-                    return vec![
+                    let projections = self.question_projection.resolved(&json!({"params":{"threadId":p.thread,"requestId":p.id}}));
+                    let mut routes = vec![
                         Route::Client(Client::Desktop, value),
                         Route::Broadcast(
                             json!({"method":"pocket/approvalResolved","params":{"requestId":p.remote_id,"threadId":p.thread}}),
                         ),
                     ];
+                    routes.extend(projections.into_iter().map(|v| Route::Client(Client::Desktop, v)));
+                    return routes;
                 }
                 if let Some(index) = self
                     .completed
@@ -698,6 +715,7 @@ impl Router {
                     .position(|p| p.native_id == resolved_key && thread == Some(p.thread.as_str()))
                 {
                     let p = self.completed.remove(index).expect("located completion");
+                    let projections = self.question_projection.resolved(&value);
                     let mut routes = Vec::new();
                     if let Some((client, response)) = p.winner {
                         // Resolution also covers native cancellation. This is
@@ -708,15 +726,20 @@ impl Router {
                         value["params"]["requestId"] = json!(p.desktop_id);
                         routes.push(Route::Client(Client::Desktop, value));
                     }
+                    routes.extend(projections.into_iter().map(|v| Route::Client(Client::Desktop, v)));
                     return routes;
                 }
                 // Duplicate/unknown resolution IDs cannot identify a desktop alias.
                 return vec![Route::Drop];
             }
-            return vec![
-                Route::Client(Client::Desktop, value.clone()),
-                Route::Broadcast(value),
-            ];
+            let projections = self.question_projection.observe(&value);
+            let raw = method == "rawResponseItem/completed";
+            let mut routes = Vec::new();
+            if !raw || !self.desktop_raw_opt_out { routes.push(Route::Client(Client::Desktop, value.clone())); }
+            if !raw || (!self.desktop_raw_opt_out && !projections.matched_raw) { routes.push(Route::Broadcast(value)); }
+            routes.extend(projections.native.into_iter().map(Route::Broadcast));
+            routes.extend(projections.desktop.into_iter().map(|v| Route::Client(Client::Desktop, v)));
+            return routes;
         }
         if let Some(id) = value.get("id").and_then(Value::as_str)
             && let Some(p) = self.pending.remove(id)

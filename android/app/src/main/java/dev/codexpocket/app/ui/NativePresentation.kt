@@ -41,7 +41,7 @@ internal fun conversationReadPresentation(state: ConversationLoadState, hasRows:
 /** Approvals and native execution are distinct from the phone's pending-command journal. */
 internal fun chatStatus(s: PocketState, chat: ChatEntity): String {
     if (!s.online || s.runtimes.none { it.id == chat.runtimeId && it.online }) return "offline"
-    if (s.approvals.any { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method) }) return "pending"
+    if (s.approvals.any { it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && approvalNeedsAction(s, it) }) return "pending"
     if (s.commands.any { it.chatKey == chat.key && it.method != "approvals/respond" && CommandPolicy.blocksNewSend(it.status) }) return "unknown"
     if (chat.key == s.selected?.key) {
         if (s.timeline.activeTurn != null) return "inProgress"

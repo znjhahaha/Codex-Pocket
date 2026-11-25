@@ -84,6 +84,32 @@ class QuestionDeliveryTest {
             ("toolOutputBlocks" to projected.raw.getValue("contentItems"))))
         assertEquals("Phone", NativeQuestionHistory.from(blocksOnly)!!.answers["public"])
     }
+
+    @Test fun completedOutputBlocksSupplyAnswersWhenContentItemsOnlyContainsANote() {
+        val native = item(content = buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", "Tool finished") }) })
+        val projected = native.copy(raw = JsonObject(native.raw + ("toolOutputBlocks" to item().raw.getValue("contentItems"))))
+        assertEquals("Phone", NativeQuestionHistory.from(projected)!!.answers["public"])
+        val cancelled = item(content = buildJsonArray { add(buildJsonObject { put("type", "inputText"); put("text", "{\"answers\":{}}") }) })
+        val conflicting = cancelled.copy(raw = JsonObject(cancelled.raw + ("toolOutputBlocks" to item().raw.getValue("contentItems"))))
+        assertTrue(NativeQuestionHistory.from(conflicting)!!.cancelled)
+    }
+
+    @Test fun localAnswersAreLabelledScopedAndNeverReplaceNativeAnswersOrCancellation() {
+        val pending = NativeQuestionHistory.from(item(content = JsonArray(emptyList()), secret = true))!!
+        val local = pending.withSubmitted(chat, listOf(receipt(true).awaitingConfirmation()))
+        assertEquals(mapOf("public" to "Phone"), local.answers)
+        assertTrue(local.locallySubmitted)
+        assertTrue(pending.withSubmitted(chat.copy(nativeId = "other"), listOf(receipt(true))).answers.isEmpty())
+        assertTrue(NativeQuestionHistory.from(item().copy(turnId = "other", raw = JsonObject(item().raw +
+            ("contentItems" to JsonArray(emptyList())))))!!.withSubmitted(chat, listOf(receipt())).answers.isEmpty())
+        val native = NativeQuestionHistory.from(item())!!
+        assertFalse(native.withSubmitted(chat, listOf(receipt())).locallySubmitted)
+        val cancelled = NativeQuestionHistory.from(item(content = buildJsonArray { add(buildJsonObject {
+            put("type", "inputText"); put("text", "{\"answers\":{}}")
+        }) }))!!.withSubmitted(chat, listOf(receipt()))
+        assertTrue(cancelled.cancelled)
+        assertTrue(cancelled.answers.isEmpty())
+    }
     @Test fun cancellationAndMalformedAnswerIdsDoNotInventAcceptedAnswers() {
         fun content(text: String) = buildJsonArray { add(buildJsonObject { put("type", "inputText"); put("text", text) }) }
         assertTrue(NativeQuestionHistory.from(item(content = content("{\"answers\":{}}")))!!.cancelled)

@@ -85,7 +85,8 @@ object ConversationPresentation {
         if (root.string("method") in setOf("item/started", "item/completed") && hookType(root.obj("params").obj("item").string("type"))) return true
         return root.string("type") in setOf("", "userMessage") && root.array("content").any { hookType(it.asObject().string("type")) }
     }
-    fun visible(item: TimelineItem): Boolean = !hookType(item.type) && !hasHookMetadata(item.raw) && (item.type in tools || item.type in messages)
+    fun visible(item: TimelineItem): Boolean = item.raw.string("pocketContextSource") != "runtime-environment" &&
+        !hookType(item.type) && !hasHookMetadata(item.raw) && (item.type in tools || item.type in messages)
     fun eventVisible(method: String) = !hookType(method) && method in setOf("turn/plan/updated", "turn/diff/updated", "error", "turn/error", "thread/error", "turn/failed")
 
     fun anchorKey(rows: List<TranscriptRow>, oldKey: String?): String? {

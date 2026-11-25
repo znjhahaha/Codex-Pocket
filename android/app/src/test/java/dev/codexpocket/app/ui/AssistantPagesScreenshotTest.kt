@@ -83,8 +83,8 @@ class AssistantPagesScreenshotTest {
         shot("memory-history") { compose.openAssistantPage("Memory"); compose.onNodeWithTag("assistant-memory-history").performClick() }
         shot("memory-edit") { compose.openAssistantPage("Memory"); scrollTo("assistant-memory-edit:m1"); compose.onNodeWithTag("assistant-memory-edit:m1").performClick() }
         shot("settings-top") { compose.openAssistantPage("Settings") }
-        shot("settings-models") { compose.openAssistantPage("Settings"); scrollTo("assistant-coordinator-model"); compose.onNodeWithTag("assistant-coordinator-model").performClick() }
-        shot("settings-off-catalogue", fx.pages("retired-model")) { compose.openAssistantPage("Settings"); scrollTo("assistant-coordinator-model-note") }
+        shot("settings-models") { compose.onNodeWithTag("assistant-model-open").performClick() }
+        shot("settings-off-catalogue", fx.pages("retired-model")) { compose.onNodeWithTag("assistant-model-open").performClick() }
         shot("settings-bottom") { compose.openAssistantPage("Settings"); scrollTo("assistant-global-pause") }
         shot("settings-disabled", AssistantUiState(AssistantSnapshot(enabled = false), computerId = "pc")) { compose.openAssistantPage("Settings") }
         shot("tasks-empty", fx.idle()) { compose.openAssistantPage("Tasks") }

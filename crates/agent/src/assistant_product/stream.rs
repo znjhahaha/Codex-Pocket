@@ -14,6 +14,7 @@ const DELTA_INTERVAL_MS: i64 = 50;
 pub(super) struct OperationView {
     pub id: String,
     pub coordinator: bool,
+    pub conversation_id: String,
     /// The job's id for a dispatched job, otherwise the task's own.
     pub task_id: Option<String>,
     pub thread_id: Option<String>,
@@ -178,6 +179,7 @@ impl Stream {
         self.attention = open;
 
         for frame in &mut frames {
+            if let Some(view)=frame["operationId"].as_str().and_then(find) {frame["conversationId"]=json!(view.conversation_id);}
             self.sequence += 1;
             frame["runtimeId"] = json!(runtime);
             frame["generation"] = json!(generation);
@@ -196,6 +198,7 @@ mod tests {
 
     fn job(status: &'static str) -> OperationView {
         OperationView {
+            conversation_id:"main:test".into(),
             id: "job-op".into(),
             coordinator: false,
             task_id: Some("job-1".into()),
@@ -266,6 +269,7 @@ mod tests {
         let (sender, _phone) = broadcast::channel(64);
         let mut stream = Stream::new(sender);
         let lead = |status: &'static str| OperationView {
+            conversation_id:"main:test".into(),
             id: "lead".into(),
             coordinator: true,
             task_id: None,

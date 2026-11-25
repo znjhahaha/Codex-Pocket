@@ -317,6 +317,10 @@ impl Broker {
             &r.capabilities,
             &custom,
         );
+        if crate::managed_runtime::packaged() {
+            permissions::phone_capabilities(&mut response, &r.settings.read(thread)["settings"],
+                &r.capabilities, std::env::var("POCKET_PHONE_SANDBOX").as_deref() == Ok("verified"));
+        }
         if read_failed {
             permissions::unavailable(&mut response, "error", "native_read_failed");
         }
@@ -462,6 +466,10 @@ impl Broker {
             &r.capabilities,
             &custom,
         );
+        if crate::managed_runtime::packaged() {
+            permissions::phone_capabilities(&mut response, &r.settings.read(thread)["settings"],
+                &r.capabilities, std::env::var("POCKET_PHONE_SANDBOX").as_deref() == Ok("verified"));
+        }
         if !r.settings.permissions_proven_since(thread, checkpoint)
             || response["currentPresetId"] != id
         {

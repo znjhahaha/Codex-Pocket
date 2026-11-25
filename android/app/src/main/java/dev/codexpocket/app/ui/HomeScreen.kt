@@ -116,18 +116,14 @@ private fun ColumnScope.HomeProjectSessions(
     val chats = remember(s.chats, s.computerId, runtimeFilter, project, search, archived) {
         homeFilteredChats(s.chats, s.computerId, runtimeFilter, project, search, archived)
     }
-    val statuses = remember(chats, s.online, s.runtimes, s.approvals, s.commands, s.pendingQuestions, s.advanced.asyncQuestions, s.selected?.key, s.timeline.activeTurn, s.timeline.status) {
+    val statuses = remember(chats, s.online, s.runtimes, s.approvals, s.submittingApprovalKeys, s.questionDeliveries, s.commands, s.pendingQuestions, s.advanced.asyncQuestions, s.selected?.key, s.timeline.activeTurn, s.timeline.status) {
         chats.associate { it.key.encoded to homeChatStatus(s, it) }
     }
     val groups = remember(chats, statuses, project, search, archived) {
         if (project == null && search.isBlank() && !archived) homeProjectGroups(chats)
         else homeChatGroups(chats, statuses, search, archived)
     }
-    val attentionCount = remember(s.approvals, s.pendingQuestions, s.advanced.asyncQuestions) {
-        val approvals = s.approvals.filter { !it.submitted && !ConversationPresentation.hookType(it.method) }.distinctBy { it.key }.size
-        val questions = s.pendingQuestions.values.sumOf { values -> values.filter { !it.flag("submitted") }.distinctBy { it.string("id") }.size }
-        approvals + if (s.pendingQuestions.isNotEmpty()) questions else s.advanced.asyncQuestions.filter { !it.flag("submitted") }.distinctBy { it.string("id") }.size
-    }
+    val attentionCount = questionAttentionCount(s)
     val runtimes = remember(s.runtimes) { s.runtimes.associateBy { it.id } }
     val canCreate = s.online && (s.supports(BrokerCapability.EnsureRuntime) || s.runtimes.any { (runtimeFilter == null || it.id == runtimeFilter) && s.supports("thread/start", it) })
     val listState = rememberLazyListState()
@@ -379,7 +375,7 @@ internal fun ChatHomeRow(
     val title = chat.title.ifBlank { stringResource(R.string.untitled_chat) }
     val actionsLabel = stringResource(R.string.chat_actions_named, title)
     val unreadLabel = stringResource(R.string.v02_unread)
-    val rowStatus = context.stateLabel(status.ifBlank { "idle" })
+    val rowStatus = if (status == "lastRunning") "上次运行中" else context.stateLabel(status.ifBlank { "idle" })
     val preview = remember(chat.preview) { homeSafePreview(chat.preview) }
     val configuration = LocalConfiguration.current
     val timestamp = remember(chat.updatedAt, configuration.locales.toLanguageTags()) {
@@ -415,7 +411,7 @@ internal fun ChatHomeRow(
                 if (relative.isNotBlank()) PText(relative, maxLines = 1, style = Pocket.type.labelSmall, color = c.inkMuted)
             }
             val line = when (status) {
-                "failed", "pending", "inProgress" -> rowStatus + if (preview.isNotBlank()) " · $preview" else ""
+                "failed", "pending", "inProgress", "lastRunning" -> rowStatus + if (preview.isNotBlank()) " · $preview" else ""
                 else -> preview
             }
             if (line.isNotBlank()) PText(line, Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -450,7 +446,7 @@ internal fun ChatHomeRow(
 @Composable
 private fun HomeRowStatus(status: String, unread: Boolean, pinned: Boolean) {
     val icon = when (status) {
-        "inProgress" -> PocketIcons.PlayCircle
+        "inProgress", "lastRunning" -> PocketIcons.PlayCircle
         "pending" -> PocketIcons.PendingActions
         "unknown" -> PocketIcons.Info
         "failed" -> PocketIcons.ErrorOutline
@@ -458,7 +454,7 @@ private fun HomeRowStatus(status: String, unread: Boolean, pinned: Boolean) {
         else -> if (pinned) PocketIcons.PushPin else null
     }
     // Leading marker only when there is something to say; idle/stopped rows carry no badge.
-    val shown = icon.takeIf { status in setOf("inProgress", "pending", "failed") || (pinned && status !in setOf("unknown", "offline")) }
+    val shown = icon.takeIf { status in setOf("inProgress", "lastRunning", "pending", "failed") || (pinned && status !in setOf("unknown", "offline")) }
     if (!unread && shown == null) return
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         if (unread) Box(Modifier.size(7.dp).background(Pocket.colors.accent, CircleShape).testTag("unread"))

@@ -31,6 +31,10 @@ internal class AssistantAttachmentDraft(private val context:android.content.Cont
         if(status in setOf("accepted","rejected")) {pendingId=null;sentText=null;preferences.edit().remove("attachment-pending:$key").remove("attachment-text:$key").remove("attachment-sent:$key").commit()}
     }
     fun newGoal() {files=emptyList();save();complete("rejected")}
+    /** The outbox transaction already retained these files and released the draft. */
+    fun releasedToOutbox() { files=emptyList();pendingId=null;sentText=null }
+    fun retainedFiles() = read("sent")
+    fun reload() {files=read("files");pendingId=preferences.getString("attachment-pending:$key",null);sentText=preferences.getString("attachment-text:$key",null)}
     fun adoptPreparingDraft(previous:String) {
         if(files.isNotEmpty() || pendingId!=null) return
         val old=AssistantAttachmentDraft(context,previous)

@@ -1,5 +1,66 @@
 use super::*;
 use std::sync::atomic::AtomicI64;
+#[path = "tests/conversations.rs"]
+mod conversations;
+#[path = "tests/effort.rs"]
+mod effort;
+
+#[tokio::test]
+async fn model_patch_keeps_other_role_null_resets_and_legacy_full_update_remains_supported() {
+    let mut f=Fixture::new(false).await;
+    let set=f.call("assistant/settings/update",json!({"patch":{"coordinator_model":"m"}}),"chief",false).await.unwrap();
+    assert_eq!(set["snapshot"]["settings"]["coordinator_model"],"m");
+    assert!(set["snapshot"]["settings"]["model"].is_null());
+    let preference=f.call("assistant/settings/update",json!({"patch":{"tone":"brief"}}),"tone",false).await.unwrap();
+    assert_eq!(preference["snapshot"]["settings"]["coordinator_model"],"m");
+    let reset=f.call("assistant/settings/update",json!({"patch":{"coordinator_model":null}}),"reset",false).await.unwrap();
+    assert!(reset["snapshot"]["settings"]["coordinator_model"].is_null());
+    assert!(f.call("assistant/settings/update",json!({"patch":{"model":"missing-model"}}),"invalid",false).await.is_err());
+    assert!(f.read().await["settings"]["model"].is_null());
+    let legacy=Settings {model:Some("retained-private-model".into()),..Settings::default()};
+    f.call("assistant/settings/update",json!({"settings":legacy}),"legacy",false).await.unwrap();
+    assert_eq!(f.io.count("turn/start"),0);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn pending_models_apply_once_before_first_dispatch_and_retained_read_never_calls_runtime() {
+    let root=tempfile::tempdir().unwrap();
+    retained::save_pending_settings(root.path(),"assistant:profile:",Some(json!({"configStoreId":"profile","commandId":"choose-model","settings":Settings {model:Some("m".into()),coordinator_model:Some("m".into()),..Settings::default()}}))).unwrap();
+    let io=Fake::default();
+    let actor=Actor::start_with_io(root.path().into(),"computer".into(),"profile".into(),io.clone(),None,Arc::new(||1_000_000)).await.unwrap();
+    let ready=actor.request("assistant/read",json!({}),"first-read".into(),None).await.unwrap();
+    assert_eq!(ready["settings"]["model"],"m");
+    assert_eq!(ready["settings"]["coordinator_model"],"m");
+    assert!(retained::pending_settings(root.path(),"assistant:profile:").unwrap().is_none());
+    assert_eq!(io.count("turn/start"),0);
+    actor.park_for_runtime_transition().await.unwrap();actor.stop_parked_worker().await.unwrap();
+    let reads=io.count("model/list");
+    let saved=retained::snapshot(root.path(),&json!({})).unwrap();
+    assert_eq!(saved["settings"]["model"],"m");
+    assert_eq!(io.count("model/list"),reads);
+    assert!(!retained::needs_wake(root.path(),1_000_000).unwrap());
+}
+
+#[test]
+fn deferred_host_preserves_online_scheduler_watermark() {
+    let root=tempfile::tempdir().unwrap();
+    let io=Fake::default();
+    let clock=Arc::new(AtomicI64::new(1_000_000));
+    let (frames,_)=tokio::sync::broadcast::channel(32);
+    let c=clock.clone();
+    let mut worker=Worker::open(root.path().into(),"computer".into(),"profile".into(),io.clone(),None,Arc::new(move||c.load(Ordering::SeqCst)),frames.clone()).unwrap();
+    worker.service.add_schedule("schedule",ScheduleSpec {kind:ScheduleKind::Once{at_ms:1_010_000},zone:ZoneRules::utc(),prompt:"scheduled work".into(),directory:worker.workspace.clone(),writes:false},1_000_000).unwrap();
+    drop(worker);
+    clock.store(1_010_500,Ordering::SeqCst);
+    let c=clock.clone();
+    let mut worker=Worker::open(root.path().into(),"computer".into(),"profile".into(),io,None,Arc::new(move||c.load(Ordering::SeqCst)),frames).unwrap();
+    worker.service.scheduler_started_at(1_000_000);
+    worker.service.tick(1_010_500).unwrap();
+    let runs=worker.service.schedule_runs().unwrap();
+    assert_eq!(runs.len(),1);
+    assert_ne!(runs[0].status,"skipped");
+}
 
 #[tokio::test]
 async fn assistant_lifecycle_parks_single_consumer_and_stop_ack_releases_locks_with_clones_alive() {
@@ -1280,6 +1341,8 @@ async fn dispatch_in_flight_actor_cache_reports_progress_without_ready_or_redisp
 
 #[derive(Default)]
 struct State {
+    models: Option<Value>,
+    configured_model: Option<String>,
     request_gate: Option<(String, Arc<RequestGate>)>,
     generation: Option<String>,
     account_reply: Option<Value>,
@@ -1470,8 +1533,9 @@ impl RuntimeIo for Fake {
         s.serial += 1;
         let n = s.serial;
         let result = match method {
+            "config/read" => json!({"config":{"model":s.configured_model}}),
             "model/list" => {
-                json!({"data":[{"id":"m","model":"m","hidden":false,"isDefault":true}],"nextCursor":null})
+                s.models.clone().unwrap_or_else(|| json!({"data":[{"id":"m","model":"m","hidden":false,"isDefault":true}],"nextCursor":null}))
             }
             "thread/start" | "thread/resume" => {
                 let thread = if method == "thread/start" {

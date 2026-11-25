@@ -144,6 +144,7 @@ internal fun modelFamilies(models: List<NativeModel>): List<ModelFamily> {
 @Composable
 private fun ModelRow(label: String, model: NativeModel, selected: Boolean, onClick: () -> Unit) {
     val c = Pocket.colors
+    val motion = PocketMotion.state<Float>().orSnap(rememberPocketMotion())
     // Codex lists models as plain lines with a trailing check; only a press tints the row.
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("model-row-${model.id}")
         .clip(RoundedCornerShape(14.dp))
@@ -158,8 +159,8 @@ private fun ModelRow(label: String, model: NativeModel, selected: Boolean, onCli
                 maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         if (model.images) PIcon(PocketIcons.Image, "支持图片", Modifier.size(15.dp), tint = c.inkMuted)
-        androidx.compose.animation.AnimatedVisibility(selected, enter = androidx.compose.animation.scaleIn(pocketPressSpring()) + androidx.compose.animation.fadeIn(),
-            exit = androidx.compose.animation.scaleOut() + androidx.compose.animation.fadeOut()) {
+        androidx.compose.animation.AnimatedVisibility(selected, enter = androidx.compose.animation.scaleIn(motion) + androidx.compose.animation.fadeIn(motion),
+            exit = androidx.compose.animation.scaleOut(motion) + androidx.compose.animation.fadeOut(motion)) {
             PIcon(PocketIcons.Check, null, Modifier.size(17.dp), tint = c.ink)
         }
     }
@@ -171,7 +172,7 @@ private fun ModelRow(label: String, model: NativeModel, selected: Boolean, onCli
 @Composable
 internal fun ModelSheet(s: PocketState, onSelect: (NativeModel, String?) -> Unit, onMode: (String?) -> Unit, onRetry: () -> Unit = {},
     onEffort: ((NativeModel, String?) -> Unit)? = null, onFast: ((Boolean) -> Unit)? = null) {
-    val ready = s.online && s.modelCatalogState == ModelCatalogState.Ready && s.models.isNotEmpty()
+    val ready = s.models.isNotEmpty()
     val model = remember(s.models, s.model, ready) {
         if (ready && s.model != null) modelMenuSelection(s.models, s.model, NativeModel::model, NativeModel::isDefault) else null
     }
@@ -283,7 +284,7 @@ private fun ModeRow(label: String, icon: androidx.compose.ui.graphics.vector.Ima
     }
 }
 
-private fun effortEnabled(s: PocketState) = s.paired && s.online && s.activeRuntime?.online == true && !s.busy && !s.sendBusy && !s.uncertainSend &&
+private fun effortEnabled(s: PocketState) = s.paired && !s.busy && !s.sendBusy && !s.uncertainSend &&
     s.selected?.conflict == false && s.selected?.archived == false
 
 @Composable
@@ -296,7 +297,7 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
         PText("选择模型", Modifier.weight(1f), style = Pocket.type.label, color = c.inkMuted)
         if (onFast != null) FastLightning(s, onFast)
     }
-    val ready = s.online && s.modelCatalogState == ModelCatalogState.Ready && s.models.isNotEmpty()
+    val ready = s.models.isNotEmpty()
     var query by rememberSaveable(s.selected?.key?.encoded) { mutableStateOf("") }
     var retries by remember { mutableIntStateOf(0) }
     if (!ready) {
@@ -329,25 +330,32 @@ private fun ModelsPage(s: PocketState, onSelect: (NativeModel, String?) -> Unit,
             PocketMenuItem("重新读取", PocketIcons.Refresh, { retries++; onRetry() }, enabled = s.online, glyph = { PocketRefreshGlyph(retries) })
         return
     }
-    run {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(PocketOval)
-            .background(c.fillStrong.copy(alpha = .8f)).padding(horizontal = 12.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PIcon(PocketIcons.Search, null, Modifier.size(16.dp), tint = c.inkMuted)
-            BasicTextField(query, { query = it }, Modifier.weight(1f).testTag("model-search").semantics { contentDescription = "搜索模型" },
-                singleLine = true, textStyle = Pocket.type.body.copy(color = c.ink), cursorBrush = SolidColor(c.accent),
-                decorationBox = { inner -> Box { if (query.isEmpty()) PText("搜索模型", style = Pocket.type.body, color = c.inkMuted); inner() } })
-        }
-    }
-    val matches = remember(s.models, query) { s.models.filter { it.matchesModelQuery(query) }.distinctBy { it.id to it.model } }
-    if (matches.isEmpty()) PText("没有匹配的模型", Modifier.padding(12.dp), style = Pocket.type.body, color = c.inkMuted)
     val listState = rememberLazyListState()
     LaunchedEffect(query) { listState.scrollToItem(0) }
-    // Stable keys and state preserve scroll across effort and mode updates; only a new query resets it.
-    if (matches.isNotEmpty()) LazyColumn(Modifier.fillMaxWidth().heightIn(max = minOf(240, matches.size * 64).dp)
-        .selectableGroup().testTag("model-list"), state = listState) {
+    ModelCatalogChoices(s.models, selected?.model, query, { query = it }, listState,
+        onSelect = { onSelect(it, it.selectionEffort(s.effort)) })
+}
+
+/** Shared by ordinary chat and the assistant's two roles. The owner retains search and scroll. */
+@Composable
+internal fun ModelCatalogChoices(models: List<NativeModel>, selected: String?, query: String, onQuery: (String) -> Unit,
+    listState: androidx.compose.foundation.lazy.LazyListState, onSelect: (NativeModel) -> Unit,
+    listModifier: Modifier = Modifier, leading: (@Composable () -> Unit)? = null) {
+    val c = Pocket.colors
+    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp).heightIn(min = 48.dp).clip(PocketOval)
+        .background(c.fillStrong.copy(alpha = .8f)).padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        PIcon(PocketIcons.Search, null, Modifier.size(16.dp), tint = c.inkMuted)
+        BasicTextField(query, onQuery, Modifier.weight(1f).testTag("model-search").semantics { contentDescription = "搜索模型" },
+            singleLine = true, textStyle = Pocket.type.body.copy(color = c.ink), cursorBrush = SolidColor(c.accent),
+            decorationBox = { inner -> Box { if (query.isEmpty()) PText("搜索模型", style = Pocket.type.body, color = c.inkMuted); inner() } })
+    }
+    val matches = remember(models, query) { models.filter { it.matchesModelQuery(query) }.distinctBy { it.id to it.model } }
+    if (matches.isEmpty() && query.isNotBlank()) PText("没有匹配的模型", Modifier.padding(12.dp), style = Pocket.type.body, color = c.inkMuted)
+    LazyColumn(listModifier.fillMaxWidth().heightIn(max = 240.dp).selectableGroup().testTag("model-list"), state = listState) {
+        if (leading != null) item("inherit") { leading() }
         items(matches, key = { "${it.id.length}:${it.id}${it.model}" }) { model ->
-            ModelRow(model.name.ifBlank { model.model }, model, selected == model) { onSelect(model, model.selectionEffort(s.effort)) }
+            ModelRow(model.name.ifBlank { model.model }, model, selected == model.model) { onSelect(model) }
         }
     }
 }

@@ -320,6 +320,13 @@ async fn request_worker(
             result = client.request(value["id"].clone(), value["method"].as_str().unwrap_or(""), value["params"].clone()) => {
                 match result {
                     Ok(value) => if let Some(error) = value.get("error") { Err(RpcFailure::Native(error.clone())) } else { Ok(value["result"].clone()) },
+                    Err(error) if error.is::<pocket_runtime_ipc::client::AdmissionRejected>() => {
+                        // The authenticated Host refused before reservation/native write.
+                        // Preserve that definite result so the broker records Rejected,
+                        // and keep the connection available for unrelated requests.
+                        Err(RpcFailure::Native(json!({"code":"reconciliation_required",
+                            "notDispatched":true,"message":error.to_string()})))
+                    },
                     Err(_) => { stop.send_replace(true); Err(RpcFailure::Timeout) }, // Outcome unknown; never resubmit.
                 }
             }
@@ -410,6 +417,83 @@ async fn attach_fixture(
         .unwrap(),
     );
     connect(descriptor, client, capabilities, events, None).await
+}
+
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "android")))]
+mod admission_tests {
+    use super::*;
+    use pocket_runtime_ipc::{PROTOCOL, read_frame, write_frame};
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn managed_admission_refusal_is_definite_and_keeps_the_request_worker_connected() {
+        for proven in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let process = NativeProcess::capture(std::process::id()).unwrap();
+            let descriptor = Descriptor {
+                protocol: PROTOCOL, runtime_id: "fixture".into(), generation: uuid::Uuid::new_v4().to_string(),
+                pid: process.pid, native_pid: process.pid, host_process: Some(process.clone()),
+                native_process: Some(process), port: listener.local_addr().unwrap().port(),
+                token: "a".repeat(64), config_home: home.path().into(), source: "cli".into(),
+            };
+            let host = tokio::spawn({
+                let descriptor = descriptor.clone();
+                async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = socket.into_split();
+                    let mut read = BufReader::new(read);
+                    let auth = read_frame(&mut read).await.unwrap().unwrap();
+                    assert_eq!(auth["generation"], descriptor.generation);
+                    let health = read_frame(&mut read).await.unwrap().unwrap();
+                    assert_eq!(health["method"], "host/status");
+                    write_frame(&mut write, &json!({"id":health["id"],"result":{
+                        "protocol":PROTOCOL,"runtimeId":descriptor.runtime_id,"generation":descriptor.generation,
+                        "pid":descriptor.pid,"nativePid":descriptor.native_pid,
+                        "hostProcess":descriptor.host_process,"nativeProcess":descriptor.native_process,
+                        "initialized":true,"capabilities":pocket_runtime_ipc::Capabilities::default(),
+                        "activeTurns":0,"pendingRequests":0,"reconciliationRequired":true}})).await.unwrap();
+                    let request = read_frame(&mut read).await.unwrap().unwrap();
+                    assert_eq!(request["method"], "host/request");
+                    assert_eq!(request["params"]["request"]["id"], "blocked-create");
+                    let mut error = json!({"code":"reconciliation_required"});
+                    if proven { error["notDispatched"] = json!(true); }
+                    write_frame(&mut write, &json!({"id":request["id"],"error":error})).await.unwrap();
+                    if proven {
+                        let request = read_frame(&mut read).await.unwrap().unwrap();
+                        assert_eq!(request["params"]["request"]["method"], "thread/list");
+                        write_frame(&mut write, &json!({"id":request["id"],"result":{
+                            "generation":descriptor.generation,"state":"completed","response":{
+                                "id":request["params"]["request"]["id"],"result":{"data":[]}}}})).await.unwrap();
+                    }
+                }
+            });
+            let client = HostClient::attach(&descriptor).await.unwrap();
+            let (tx, rx) = mpsc::channel(4);
+            let (events, _events) = mpsc::channel(4);
+            let (stop, stopped) = watch::channel(false);
+            let worker = tokio::spawn(request_worker(client, Arc::new(Mutex::new(rx)), events,
+                "fixture".into(), "connection".into(), stop.clone(), stopped));
+            let (reply, result) = tokio::sync::oneshot::channel();
+            tx.send(Outgoing::Request {value: json!({"id":"blocked-create","method":"thread/start","params":{"cwd":home.path()}}), reply}).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), result).await.unwrap().unwrap();
+            if proven {
+                let Err(RpcFailure::Native(error)) = result else { panic!("proven refusal lost dispatch certainty: {result:?}"); };
+                assert_eq!(error["code"], "reconciliation_required");
+                assert_eq!(error["notDispatched"], true);
+                assert!(!*stop.borrow());
+                let (reply, result) = tokio::sync::oneshot::channel();
+                tx.send(Outgoing::Request {value: json!({"id":"after-refusal","method":"thread/list","params":{}}), reply}).await.unwrap();
+                assert_eq!(tokio::time::timeout(Duration::from_secs(3), result).await.unwrap().unwrap().unwrap(), json!({"data":[]}));
+            } else {
+                assert!(matches!(result, Err(RpcFailure::Timeout)), "an old Host error proves no dispatch boundary");
+                assert!(*stop.borrow());
+            }
+            stop.send_replace(true);
+            worker.await.unwrap();
+            host.await.unwrap();
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

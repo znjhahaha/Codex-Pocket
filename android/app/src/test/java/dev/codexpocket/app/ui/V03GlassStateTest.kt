@@ -29,25 +29,24 @@ class V03GlassStateTest {
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") { block() } } }
         compose.waitForIdle()
     }
-    @Test fun failedAndOfflineCatalogNeverOfferCachedDefaultAsSuccess() {
+    @Test fun failedAndOfflineRefreshRetainsTheSavedModelCatalog() {
         var status by mutableStateOf(ModelCatalogState.Failed)
         var retries = 0
         var selections = 0
         val model = NativeModel("id", "codex", "Cached default", "", emptyList(), "", false, true)
         content { ModelSheet(PocketState(online = true, models = listOf(model), modelCatalogState = status),
             { _, _ -> selections++ }, {}, { retries++ }) }
-        compose.onNodeWithText("模型目录读取失败").assertExists()
-        compose.onNodeWithText("Cached default").assertDoesNotExist()
-        compose.onNodeWithText("重新读取").performClick()
-        assertEquals(1, retries); assertEquals(0, selections)
+        compose.onNodeWithText("Cached default").assertExists()
+        assertEquals(0, selections)
         compose.runOnIdle { status = ModelCatalogState.Offline }
-        compose.onNodeWithText("电脑离线，连接后可重新读取模型").assertExists()
-        compose.onNodeWithText("Cached default").assertDoesNotExist()
+        compose.onNodeWithText("Cached default").assertExists()
+        compose.onNodeWithText("Cached default").performClick()
+        assertEquals(1, selections)
         compose.runOnIdle { status = ModelCatalogState.Ready }
         // Ready opens directly on the model list.
         compose.onNodeWithText("Cached default").assertExists()
         compose.onNodeWithText("Cached default").performClick()
-        assertEquals(1, selections)
+        assertEquals(2, selections)
     }
     @Test fun everyNonReadyCatalogStateHasDistinctHonestText() {
         var status by mutableStateOf(ModelCatalogState.Idle)

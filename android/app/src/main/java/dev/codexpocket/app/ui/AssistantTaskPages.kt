@@ -18,44 +18,48 @@ import dev.codexpocket.app.data.*
 import dev.codexpocket.app.ui.kit.*
 import kotlinx.serialization.json.*
 
-/** Same bound-send receipt as the main composer; navigation cannot clear or
- * retarget a draft and an unknown result never enables a second send. */
+/** Task follow-ups share the durable per-message outbox, bound to the task's originating conversation. */
 @Composable internal fun AssistantTaskFollowup(task:AssistantTask,state:AssistantUiState,canAct:Boolean,act:(()->AssistantAction)->Unit,
     initialContext:String = "", artifact:AssistantArtifact? = null) {
     val snapshot=state.snapshot ?: return
-    val c=Pocket.colors
     val preferences=LocalContext.current.getSharedPreferences("assistant-drafts-v2",0)
-    val draftKey=JsonArray(listOf(state.computerId,snapshot.assistantId.orEmpty(),snapshot.runtimeId.orEmpty(),task.id,artifact?.version.orEmpty()).map(::JsonPrimitive)).toString()
-    var draft by rememberSaveable(draftKey) {mutableStateOf(preferences.getString(draftKey,"").orEmpty())}
+    val conversation = task.conversationId ?: snapshot.conversationId
+    val binding=snapshot.copy(conversationId=conversation).composerBinding(state.computerId)
+    val legacyKey=JsonArray(listOf(state.computerId,snapshot.assistantId.orEmpty(),snapshot.runtimeId.orEmpty(),task.id,artifact?.version.orEmpty()).map(::JsonPrimitive)).toString()
+    val draftKey=if(conversation==null || conversation.startsWith("main:")) legacyKey else "task:${binding.scopeKey}:${task.id}:${artifact?.version.orEmpty()}"
+    val draft=rememberSaveable(draftKey) {mutableStateOf(preferences.getString(draftKey,"").orEmpty())}
     val attachments=rememberAssistantAttachments(draftKey)
-    var submitted by rememberSaveable(draftKey) {mutableStateOf(attachments.pendingId)}
-    var sentText by rememberSaveable(draftKey) {mutableStateOf(attachments.sentText)}
-    LaunchedEffect(state.sendReceipts,submitted) {
-        val receipt=state.sendReceipts.firstOrNull {it.commandId==submitted && it.computerId==state.computerId && it.runtimeId==snapshot.runtimeId && it.conversationId==snapshot.composerBinding(state.computerId).conversationId}
-        if(receipt?.status=="accepted") {if(draft==sentText) {draft="";preferences.edit().putString(draftKey,"").apply()};submitted=null;sentText=null}
-        else if(receipt?.status=="rejected") {submitted=null;sentText=null}
-        receipt?.let {attachments.complete(it.status)}
-    }
+    val sentId=remember(draftKey) {mutableStateOf(attachments.pendingId)}
+    val sentText=remember(draftKey) {mutableStateOf<String?>(null)}
+    val project=remember(draftKey) {mutableStateOf<String?>(null)}
+    val target=remember(draftKey) {mutableStateOf<String?>(null)}
+    val composer=remember(draftKey,binding) {AssistantComposer(draftKey,binding,attachments,preferences,draft,sentId,sentText,project,target)}
+    LaunchedEffect(composer) {composer.adoptLegacy(snapshot.copy(conversationId=null).composerBinding(state.computerId))}
+    val outgoing=rememberAssistantOutbox(composer,state.sendReceipts).filter {it.params.string("taskId")==task.id}
     AssistantCard(Modifier.testTag("assistant-task-followup:${task.id}")) {
         PText(if(task.status in setOf(AssistantTaskStatus.Done,AssistantTaskStatus.Failed)) "基于成果继续" else "补充要求",style=Pocket.type.titleSmall)
-        PText("消息会绑定此任务。审批请在上方的原请求中处理。",style=Pocket.type.bodySmall,color=c.inkMuted)
-        PTextField(draft,{draft=it;preferences.edit().putString(draftKey,it).apply()},Modifier.testTag("assistant-task-draft:${task.id}"),placeholder="写下补充要求",minLines=2,maxLines=6)
-        AssistantAttachmentPicker(attachments,task.id,submitted==null)
-        if(submitted!=null) PText("已提交，等待电脑回执；草稿已保留。",style=Pocket.type.bodySmall,color=c.inkMuted)
-        PButton(if(submitted!=null) "确认送达中" else "发送到此任务",{
-            val id=java.util.UUID.randomUUID().toString()
+        outgoing.forEach {entry -> AssistantMessageRow(AssistantChatMessage("user:${entry.commandId}","User",entry.text,entry.atMs),
+            draftKey,false,entry,canAct) {act {requireNotNull(composer.outbox.retry(it.key))}} }
+        PTextField(composer.draft,composer::edit,Modifier.testTag("assistant-task-draft:${task.id}"),placeholder="写下补充要求",minLines=2,maxLines=6)
+        AssistantAttachmentPicker(attachments,task.id)
+        PButton("发送到此任务",{
             act {
-                val base=AssistantActions.send(snapshot.runtimeId.orEmpty(),listOf(initialContext,draft).filter(String::isNotBlank).joinToString("\n\n").ifBlank {"请结合附件继续这项任务。"},null,taskId=task.id)
-                val action=base.copy(commandId=id,composerBinding=snapshot.composerBinding(state.computerId),attachments=attachments.files.toList(),params=if(artifact==null) base.params else
-                    JsonObject(base.params+mapOf("artifactId" to JsonPrimitive(artifact.id),"artifactVersion" to JsonPrimitive(artifact.version))))
-                submitted=id;sentText=draft;attachments.sent(id,draft);action
+                val base=AssistantActions.send(snapshot.runtimeId.orEmpty(),listOf(initialContext,composer.draft).filter(String::isNotBlank).joinToString("\n\n").ifBlank {"请结合附件继续这项任务。"},null,taskId=task.id)
+                val action=base.copy(commandId=java.util.UUID.randomUUID().toString(),composerBinding=binding,attachments=attachments.files.toList(),
+                    params=JsonObject(base.params+buildJsonObject {
+                        conversation?.let {put("conversationId",it)}
+                        snapshot.scopeId?.let {put("scopeId",it)}
+                        artifact?.let {put("artifactId",it.id);put("artifactVersion",it.version)}
+                    }))
+                composer.sent(action);action
             }
-        },Modifier.fillMaxWidth().testTag("assistant-task-send:${task.id}"),enabled=canAct && snapshot.prepared && snapshot.paused!=true && !task.reconciliationRequired && submitted==null && !state.busy("assistant/send") && (draft.isNotBlank() || attachments.files.isNotEmpty()) && '\u0000' !in draft && (initialContext+draft).toByteArray().size<65000,
+        },Modifier.fillMaxWidth().testTag("assistant-task-send:${task.id}"),enabled=canAct && snapshot.prepared && snapshot.paused!=true && !task.reconciliationRequired &&
+            composer.sentId==null && (composer.draft.isNotBlank() || attachments.files.isNotEmpty()) && '\u0000' !in composer.draft && (initialContext+composer.draft).toByteArray().size<65000,
             haptic=PocketHaptic.Confirm)
     }
 }
 
-@Composable internal fun AssistantTasksPage(state:AssistantUiState,navigate:(String)->Unit) {
+@Composable internal fun AssistantTasksPage(state:AssistantUiState,navigate:(String)->Unit,canAct:Boolean,act:(()->AssistantAction)->Unit) {
     val snapshot=state.snapshot ?: return
     var query by rememberSaveable {mutableStateOf("")}
     var onlyPending by rememberSaveable {mutableStateOf(false)}
@@ -65,14 +69,15 @@ import kotlinx.serialization.json.*
         val tasks=snapshot.orderedTasks().filter {t->(query.isBlank() || t.prompt.contains(query,true)) &&
             (!onlyPending || snapshot.taskNeedsAttention(t) || snapshot.taskRecord(t.id)?.state=="needs_verification")}
         if(tasks.isEmpty()) item {AssistantPageNote(if(onlyPending) "没有待处理任务" else "交办后，任务会保留在这里。")}
-        items(tasks,key={it.id}) {task->AssistantTaskListCard(task,state,navigate)}
+        items(tasks,key={it.id}) {task->AssistantTaskListCard(task,state,navigate,canAct,act)}
     }
 }
 
 /** A task as a list shows it: where it stands, what was asked, what it is doing, and the way to its page. */
-@Composable internal fun AssistantTaskListCard(task:AssistantTask,state:AssistantUiState,navigate:(String)->Unit) {
+@Composable internal fun AssistantTaskListCard(task:AssistantTask,state:AssistantUiState,navigate:(String)->Unit,canAct:Boolean,act:(()->AssistantAction)->Unit) {
     val snapshot=state.snapshot ?: return
     val view=state.jobView(task)
+    var stop by rememberSaveable(task.id) { mutableStateOf(false) }
     AssistantCard(Modifier.pocketMorphSource("Task:${task.id}", 20.dp).testTag("assistant-task:${task.id}")) {
         Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
             AssistantJobGlyph(view)
@@ -82,7 +87,11 @@ import kotlinx.serialization.json.*
         PText(task.prompt,style=Pocket.type.titleSmall,maxLines=3,overflow=TextOverflow.Ellipsis)
         PText(snapshot.taskStage(task),style=Pocket.type.bodySmall,color=Pocket.colors.inkMuted,maxLines=2,overflow=TextOverflow.Ellipsis)
         AssistantCardAction("查看任务",{navigate("Task:${task.id}")},Modifier.testTag("assistant-task-open:${task.id}"))
+        if(task.status in setOf(AssistantTaskStatus.Running,AssistantTaskStatus.Queued,AssistantTaskStatus.WaitingUser) && snapshot.taskRecord(task.id)?.state!="stop_requested")
+            AssistantQuietButton("停止任务",{stop=true},Modifier.testTag("assistant-task-stop:${task.id}"),enabled=canAct)
     }
+    if(stop) PDialog("停止这项任务？",{stop=false},"确认停止",{act {AssistantActions.task(snapshot.runtimeId.orEmpty(),task.id,false)};stop=false},
+        text="会请求停止当前尝试，其他任务继续执行。收到执行器确认后显示已停止。",dismissLabel="继续执行",destructive=true)
 }
 
 @Composable internal fun AssistantResultsPage(state:AssistantUiState,navigate:(String)->Unit,open:(String,String)->Unit) {

@@ -2,6 +2,7 @@ import {diagnosticRuntimeStatus,type Snapshot} from './domain';
 import {Info,LoaderCircle,RefreshCw,ShieldCheck} from './PocketIcons';
 import {upgradeRecovery} from './upgradeRecovery';
 import {BackgroundFailureDetails} from './BackgroundFailureDetails';
+import {useRestartNoticeReceipt} from './useRestartNoticeReceipt';
 
 interface Props {
  snapshot:Snapshot;now:number;busy:boolean;
@@ -9,12 +10,13 @@ interface Props {
 }
 export function UpgradeRecoveryPanel({snapshot,now,busy,onAction,onRefresh,onDiagnostics}:Props) {
  const recovery=upgradeRecovery(snapshot,now),installation=snapshot.installation;
+ const noticeRef=useRestartNoticeReceipt(recovery.restartNotice,snapshot.updates);
  if(!recovery.visible)return null;
  const Icon=recovery.tone==='progress'?LoaderCircle:recovery.tone==='success'?ShieldCheck:Info;
  return <section className={`recovery-panel recovery-${recovery.tone}`} aria-label="更新与后台恢复">
   <div className="recovery-heading">
    <span className="recovery-symbol"><Icon size={23} className={recovery.tone==='progress'?'spin':undefined}/></span>
-   <div aria-live="polite" aria-atomic="true"><span className="eyebrow">更新与后台恢复</span><h2>{recovery.title}</h2><p>{recovery.description}</p></div>
+   <div aria-live="polite" aria-atomic="true"><span className="eyebrow">更新与后台恢复</span><h2>{recovery.title}</h2><p ref={noticeRef}>{recovery.description}</p></div>
   </div>
   {recovery.retry&&<div className="recovery-retry" aria-label="后台自动重试进度">
    <strong>自动重试 {recovery.retry.attempts} / {recovery.retry.maxAttempts}</strong>

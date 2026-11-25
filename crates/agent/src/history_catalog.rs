@@ -6,6 +6,13 @@ use std::{collections::BTreeSet, path::Path, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 const MAX_REPLY: usize = 12 * 1024 * 1024;
+#[path = "history_catalog/context.rs"]
+mod context;
+pub(crate) use context::LiveContexts;
+pub(crate) fn mark_internal_context(home: &Path, thread: &str, result: &mut Value) {
+    // Missing provenance preserves the original display; never infer from text alone.
+    let _ = context::mark(home, thread, result);
+}
 fn open(home: &Path, name: &str) -> Result<Connection> {
     let file = home.join(name);
     for candidate in [file.clone(),home.join(format!("{name}-wal")),home.join(format!("{name}-shm"))] {
@@ -122,7 +129,9 @@ pub fn read(home: &Path, thread: &str, cursor: Option<&str>, limit: usize) -> Re
     }
     let next=if ordinals.len()>limit {Some(token(json!({"scope":scope,"ordinal":ordinals[limit-1]})))}else{None};
     let state=if data.is_empty()&&cursor.is_none(){"empty"}else{"ready"};
-    Ok(json!({"thread":meta,"data":data,"nextCursor":next,"historyState":state,"readOnly":true,"readSource":"persisted"}))
+    let mut result = json!({"thread":meta,"data":data,"nextCursor":next,"historyState":state,"readOnly":true,"readSource":"persisted"});
+    mark_internal_context(home, thread, &mut result);
+    Ok(result)
 }
 
 #[path="history_catalog/legacy.rs"]

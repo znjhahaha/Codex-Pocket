@@ -22,6 +22,10 @@ pub struct Status {
     pub phase: String,
     pub pid: u32,
     pub child_pid: Option<u32>,
+    /// A live same-installation agent authenticated through this state's control
+    /// endpoint. It is not our child and grants no termination/handoff authority.
+    #[serde(default)]
+    pub external_agent: Option<maintenance::ProcessIdentity>,
     pub updated_at: u64,
     pub failures: u32,
     pub last_exit: Option<i32>,
@@ -49,6 +53,16 @@ pub struct Status {
     #[serde(default)]
     pub native_entry_ready: Option<bool>,
 }
+impl Status {
+    fn respawn_ready(
+        &self,
+        maintenance: &maintenance::Gate,
+        child_present: bool,
+        retry_due: bool,
+    ) -> bool {
+        self.external_agent.is_none() && maintenance.respawn_ready(child_present, retry_due)
+    }
+}
 /// Desired is phone ingress only; stopped may intentionally retain childPid.
 /// Only a fresh, authenticated helper response can confirm the remote gate.
 pub fn remote_phase(
@@ -72,6 +86,44 @@ pub fn remote_phase(
         (true, _) => "starting",
         (false, _) => "stopping",
     }
+}
+
+/// Only an authenticated control reply can introduce an external agent. A slow
+/// RPC may retain its previously verified identity, but every observation still
+/// checks liveness, current user, creation time and executable independently.
+fn existing_agent(
+    helper: Option<&serde_json::Value>,
+    previous: Option<&maintenance::ProcessIdentity>,
+    agent: &Path,
+    generation: Option<&str>,
+    now: u64,
+    capture: impl FnOnce(u32) -> Result<maintenance::ProcessIdentity>,
+) -> Option<maintenance::ProcessIdentity> {
+    let generation = generation.filter(|g| !g.is_empty())?;
+    let (pid, created) = if let Some(helper) = helper {
+        let runtime = &helper["helperRuntime"];
+        if helper["protocol"] != 1
+            || runtime["generation"].as_str() != Some(generation)
+            || !crate::connection::fresh(helper["updatedAt"].as_u64().unwrap_or(0), now)
+        {
+            return None;
+        }
+        let pid = runtime["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid != 0)?;
+        let claimed = &runtime["processIdentity"];
+        let created = claimed["createdAt"].as_u64().filter(|created| *created != 0)?;
+        if claimed["pid"].as_u64() != Some(u64::from(pid)) {
+            return None;
+        }
+        (pid, created)
+    } else {
+        // This value lives only in this supervisor; no on-disk PID is adopted.
+        let previous = previous.filter(|p| p.executable == agent)?;
+        (previous.pid, previous.created_at)
+    };
+    let observed = capture(pid).ok()?;
+    (observed.pid == pid && observed.created_at == created && observed.executable == agent)
+        .then_some(observed)
 }
 
 /// Read authenticated owner identity and remote gates without sampling native
@@ -343,6 +395,25 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
                 status.phase = "restarting".into();
             }
         }
+        // A previous supervisor may have exited while its agent kept serving.
+        // Observe it before attempting another spawn; never manufacture a Child
+        // or pass this PID into maintenance's parent/child ownership protocol.
+        let external_health = if child.is_none() { helper_status(state).ok() } else { None };
+        status.external_agent = if child.is_none() {
+            existing_agent(
+                external_health.as_ref(), status.external_agent.as_ref(), agent,
+                agent_generation.as_deref(), storage::now(), maintenance::ProcessIdentity::capture,
+            )
+        } else { None };
+        if let Some(external) = status.external_agent.as_ref() {
+            status.phase = remote_phase(enabled, external_health.as_ref(), external.pid, storage::now()).into();
+            status.failures = 0;
+            status.startup_failure = None;
+            status.helper_spawn_failure = None;
+            startup_attempt = None;
+            // No stale crash backoff after the observed agent subsequently exits.
+            retry = Instant::now();
+        }
         // Maintenance retains the live Child and both supervisor locks until
         // exact ownership and the flushed checkpoint prove its natural exit.
         maintenance.poll(
@@ -351,7 +422,9 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
             child.as_ref().map(Child::id),
         );
         if let Some(worker)=updates.as_ref(){
-            worker.permit(child.is_some() && !maintenance.blocks_respawn()
+            // A live external helper still permits update polling. The update
+            // coordinator must establish its own real process/lock ownership.
+            worker.permit((child.is_some() || status.external_agent.is_some()) && !maintenance.blocks_respawn()
                 && !startup_context_failed && upgrade::local::routes_may_reconcile(state));
         }
         // The released journal is already fsynced and the exact child is Gone.
@@ -360,7 +433,7 @@ pub fn run(state: &Path, agent: &Path, owner_directory: Option<PathBuf>) -> Resu
             return Ok(());
         }
         // Keep local control and broker alive even with phone ingress disabled.
-        if maintenance.respawn_ready(child.is_some(), Instant::now() >= retry) {
+        if status.respawn_ready(&maintenance, child.is_some(), Instant::now() >= retry) {
             match agent_startup_command(agent, state, handoff_environment.as_ref()) {
                 Ok(mut c) => {
                     startup_context_failed = false;
@@ -536,11 +609,151 @@ mod startup_tests;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn external_agent_fixture() -> (maintenance::ProcessIdentity, String, serde_json::Value) {
+        let identity = maintenance::ProcessIdentity {
+            pid: 160036,
+            created_at: 123456,
+            executable: std::env::temp_dir().join("pocket-fixture/bin/pocket-agent.exe"),
+        };
+        let generation = "a".repeat(64);
+        let health = json!({
+            "protocol": 1, "updatedAt": 100,
+            "remoteControlProtocol": 1, "remoteEnabled": true,
+            "helperRuntime": {
+                "pid": identity.pid, "generation": generation,
+                "processIdentity": {"pid": identity.pid, "createdAt": identity.created_at}
+            }
+        });
+        (identity, generation, health)
+    }
+
+    #[test]
+    fn external_agent_prevents_duplicate_spawn_without_claiming_a_child() {
+        let (identity, generation, mut health) = external_agent_fixture();
+        let gate = maintenance::Gate::default();
+        let mut status = Status::default();
+        // A restarted supervisor has no Child even though the old agent serves
+        // this state's authenticated control endpoint on every heartbeat.
+        for enabled in [true, true, false, false] {
+            health["remoteEnabled"] = json!(enabled);
+            status.external_agent = existing_agent(
+                Some(&health), None, &identity.executable, Some(&generation), 100,
+                |pid| { assert_eq!(pid, identity.pid); Ok(identity.clone()) },
+            );
+            assert!(!status.respawn_ready(&gate, false, true));
+            assert_eq!(remote_phase(enabled, Some(&health), identity.pid, 100),
+                if enabled { "running" } else { "stopped" });
+            let wire = serde_json::to_value(&status).unwrap();
+            assert!(wire["childPid"].is_null());
+            assert_eq!(wire["externalAgent"], json!(identity));
+        }
+    }
+
+    #[test]
+    fn external_agent_disappearance_restores_normal_respawn() {
+        let (identity, generation, health) = external_agent_fixture();
+        let gate = maintenance::Gate::default();
+        let mut status = Status::default();
+        status.external_agent = existing_agent(
+            Some(&health), None, &identity.executable, Some(&generation), 100,
+            |_| Ok(identity.clone()),
+        );
+        assert!(!status.respawn_ready(&gate, false, true));
+        // Even a fresh reply cannot retain an owner which has since exited.
+        status.external_agent = existing_agent(
+            Some(&health), None, &identity.executable, Some(&generation), 100,
+            |_| anyhow::bail!("Process is no longer running"),
+        );
+        assert!(status.external_agent.is_none());
+        assert!(status.respawn_ready(&gate, false, true));
+        assert!(!status.respawn_ready(&gate, false, false));
+        assert!(!status.respawn_ready(&gate, true, true));
+        status.external_agent = existing_agent(
+            None, None, &identity.executable, Some(&generation), 100,
+            |_| panic!("Missing authenticated health must not use a cached PID"),
+        );
+        assert!(status.respawn_ready(&gate, false, true));
+    }
+
+    #[test]
+    fn external_agent_health_timeout_does_not_respawn_a_verified_live_owner() {
+        let (identity, generation, health) = external_agent_fixture();
+        let gate = maintenance::Gate::default();
+        let previous = existing_agent(
+            Some(&health), None, &identity.executable, Some(&generation), 100,
+            |_| Ok(identity.clone()),
+        ).unwrap();
+        let mut status = Status::default();
+        status.external_agent = existing_agent(
+            None, Some(&previous), &identity.executable, Some(&generation), 120,
+            |_| Ok(identity.clone()),
+        );
+        assert!(!status.respawn_ready(&gate, false, true));
+        assert_eq!(remote_phase(true, None, identity.pid, 120), "starting");
+        // Process disappearance, rather than a slow RPC, releases this guard.
+        status.external_agent = existing_agent(
+            None, Some(&previous), &identity.executable, Some(&generation), 121,
+            |_| anyhow::bail!("Process is no longer running"),
+        );
+        assert!(status.respawn_ready(&gate, false, true));
+        assert!(existing_agent(
+            None, Some(&previous), &identity.executable, Some(&generation), 121,
+            |_| Ok(maintenance::ProcessIdentity { created_at: identity.created_at + 1, ..identity.clone() }),
+        ).is_none());
+    }
+
+    #[test]
+    fn external_agent_rejects_stale_foreign_and_reused_identities() {
+        let (identity, generation, health) = external_agent_fixture();
+        for (pointer, value) in [
+            ("/protocol", json!(2)),
+            ("/updatedAt", json!(89)),
+            ("/updatedAt", json!(103)),
+            ("/helperRuntime/generation", json!("b".repeat(64))),
+            ("/helperRuntime/pid", json!(0)),
+            ("/helperRuntime/pid", json!(u64::from(u32::MAX) + 1)),
+            ("/helperRuntime/processIdentity/pid", json!(160037)),
+            ("/helperRuntime/processIdentity/createdAt", json!(null)),
+            ("/helperRuntime/processIdentity/createdAt", json!(0)),
+            ("/helperRuntime/processIdentity/createdAt", json!(123457)),
+        ] {
+            let mut invalid = health.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(existing_agent(
+                Some(&invalid), None, &identity.executable, Some(&generation), 100,
+                |_| Ok(identity.clone()),
+            ).is_none(), "{pointer}: {invalid}");
+        }
+        for observed in [
+            maintenance::ProcessIdentity { pid: identity.pid + 1, ..identity.clone() },
+            maintenance::ProcessIdentity { created_at: identity.created_at + 1, ..identity.clone() },
+            maintenance::ProcessIdentity {
+                executable: identity.executable.with_file_name("foreign-agent.exe"),
+                ..identity.clone()
+            },
+        ] {
+            assert!(existing_agent(
+                Some(&health), None, &identity.executable, Some(&generation), 100,
+                |_| Ok(observed),
+            ).is_none());
+        }
+        assert!(existing_agent(
+            Some(&health), None, &identity.executable, Some(&generation), 100,
+            |_| anyhow::bail!("Process does not belong to current user"),
+        ).is_none());
+        assert!(existing_agent(
+            Some(&health), None, &identity.executable, None, 100,
+            |_| Ok(identity.clone()),
+        ).is_none());
+    }
+
     #[test]
     fn legacy_supervisor_status_has_no_maintenance_claim() {
         let status:Status=serde_json::from_value(json!({"phase":"running","pid":1,"childPid":2,"updatedAt":100,"failures":0,"lastExit":null})).unwrap();
         assert!(status.maintenance.is_none());
         assert!(status.maintenance_error.is_none());
+        assert!(status.external_agent.is_none());
         let heartbeat = serde_json::to_value(Status {
             maintenance_error: Some(maintenance::Failure::IdentityUnavailable),
             ..status

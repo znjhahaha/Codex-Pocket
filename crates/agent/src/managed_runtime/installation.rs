@@ -28,15 +28,6 @@ pub fn layout_names(executable: Option<&Path>) -> (&'static str, &'static str) {
 pub fn packaged() -> bool {
     current_layout().0 == PACKAGED_HOST_FILENAME
 }
-/// Codex cannot create its own command sandbox inside an Android application, whose own
-/// sandbox is the boundary there. Its sessions therefore run without Codex's sandbox and
-/// ask before every command that is not known to be safe.
-pub fn apply_packaged_policy(method: &str, params: &mut serde_json::Value, packaged: bool) {
-    if packaged && matches!(method, "thread/start" | "thread/resume" | "thread/fork") {
-        params["approvalPolicy"] = serde_json::json!("untrusted");
-        params["sandbox"] = serde_json::json!("danger-full-access");
-    }
-}
 /// File names of the installation this process was started from.
 pub fn current_layout() -> (&'static str, &'static str) {
     static NAMES: std::sync::OnceLock<(&str, &str)> = std::sync::OnceLock::new();
@@ -261,19 +252,4 @@ mod layout_tests {
         assert_eq!(layout_names(None), standard);
     }
 
-    #[test]
-    fn packaged_sessions_ask_before_commands_and_other_installations_are_untouched() {
-        for method in ["thread/start", "thread/resume", "thread/fork"] {
-            let mut params = serde_json::json!({"cwd":"/data/data/app/files/project"});
-            apply_packaged_policy(method, &mut params, true);
-            assert_eq!(params["approvalPolicy"], "untrusted", "{method}");
-            assert_eq!(params["sandbox"], "danger-full-access", "{method}");
-            let mut elsewhere = serde_json::json!({"cwd":"/home/me/project"});
-            apply_packaged_policy(method, &mut elsewhere, false);
-            assert_eq!(elsewhere, serde_json::json!({"cwd":"/home/me/project"}), "{method}");
-        }
-        let mut turn = serde_json::json!({"threadId":"t"});
-        apply_packaged_policy("turn/start", &mut turn, true);
-        assert_eq!(turn, serde_json::json!({"threadId":"t"}));
-    }
 }

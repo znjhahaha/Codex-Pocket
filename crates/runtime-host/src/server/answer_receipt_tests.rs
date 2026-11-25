@@ -9,6 +9,7 @@ enum Mode {
     LoseAnswerReply,
     Legacy,
     ColdSchema2,
+    ColdUnknown,
 }
 
 struct Fixture {
@@ -40,13 +41,13 @@ impl Fixture {
             config_home: root.path().into(),
             source: "cli".into(),
         };
-        if matches!(mode,Mode::ColdSchema2) {
+        if matches!(mode,Mode::ColdSchema2 | Mode::ColdUnknown) {
             let old=uuid::Uuid::new_v4().to_string();
             let mut seed=Store::open(&root.path().join("recovery.json"),&descriptor.runtime_id,&old).unwrap();
             for request_id in [json!(0),json!("0"),json!(-1),json!(u64::MAX),json!("s:0")] {
                 let id=key(&request_id).unwrap();
                 seed.state.reserve(id.clone(),&json!({"id":request_id,"result":"private-answer-sentinel"}),true).unwrap();
-                seed.state.complete(&id,json!({"id":request_id,"result":{"written":true}}),true);
+                if matches!(mode,Mode::ColdSchema2) {seed.state.complete(&id,json!({"id":request_id,"result":{"written":true}}),true);}
             }
             seed.save().unwrap();
         }
@@ -56,7 +57,7 @@ impl Fixture {
             &descriptor.generation,
         )
         .unwrap();
-        if matches!(mode,Mode::ColdSchema2) {store.begin_generation(&descriptor.generation).unwrap();}
+        if matches!(mode,Mode::ColdSchema2 | Mode::ColdUnknown) {store.begin_generation(&descriptor.generation).unwrap();}
         let (incoming, receiver) = mpsc::channel(32);
         let (routed, mut route) = mpsc::channel(32);
         let target = incoming.clone();
@@ -162,6 +163,66 @@ impl Fixture {
 fn pending(id: Value) -> Value {
     json!({"id":id,"method":"item/tool/call","params":{
         "threadId":"thread","turnId":"turn","callId":"call","tool":"assistant_create_task","arguments":{}}})
+}
+
+#[tokio::test]
+async fn answer_reused_id_answers_current_pending_and_retains_old_completed_or_unknown_evidence() {
+    for mode in [Mode::ColdSchema2, Mode::ColdUnknown] {
+        let mut f = Fixture::new(mode).await;
+        let mut client = f.client().await;
+        let snapshot = client.recovery().await.unwrap();
+        let old = client.answer_evidence(0, snapshot["evidenceDigest"].as_str().unwrap()).await.unwrap();
+        let old_generation = old.records[0].generation.clone();
+        // A current-generation receipt query never substitutes an old answer.
+        assert_eq!(client.answer_receipt(json!(0)).await.unwrap().state, "missing");
+        let stale = f.raw("host/respond", json!({"generation":old_generation,
+            "requestId":0,"response":{"result":{"decision":"accept"}}})).await;
+        assert_eq!(stale["error"]["code"], "generation_mismatch");
+        let absent = f.raw("host/respond", json!({"generation":f.descriptor.generation,
+            "requestId":0,"response":{"result":{"decision":"accept"}}})).await;
+        assert_eq!(absent["error"]["code"], "stale_request");
+        for id in [json!(0), json!("0")] {
+            f.emit(pending(id.clone())).await;
+            let response = json!({"result":{"decision":"accept"}});
+            let receipt = client.respond(id.clone(), response.clone()).await.unwrap();
+            assert_eq!(receipt.state, "completed");
+            assert_eq!(receipt.generation, f.descriptor.generation);
+            assert_eq!(read_frame(&mut f.native).await.unwrap().unwrap(), json!({"id":id,"result":{"decision":"accept"}}));
+            assert_eq!(client.respond(id.clone(), response).await.unwrap().state, "completed");
+            assert_eq!(client.answer_receipt(id).await.unwrap().state, "completed");
+        }
+        let snapshot = client.recovery().await.unwrap();
+        let page = client.answer_evidence(0, snapshot["evidenceDigest"].as_str().unwrap()).await.unwrap();
+        assert_eq!(page.total, 7);
+        for prior in &old.records {
+            assert!(page.records.iter().any(|r| r.generation == prior.generation
+                && r.request_id == prior.request_id && r.completed == prior.completed));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(30), read_frame(&mut f.native)).await.is_err(),
+            "duplicate receipts and historical queries never replay an answer");
+        let retained = tempfile::tempdir().unwrap();
+        let path = retained.path().join("recovery.json");
+        std::fs::copy(f._root.path().join("recovery.json"), &path).unwrap();
+        f.stop().await;
+        let next = uuid::Uuid::new_v4().to_string();
+        let mut cold = Store::open(&path, "answer-fixture", &next).unwrap();
+        cold.begin_generation(&next).unwrap();
+        let page = cold.state.answer_evidence(&next, 0, &cold.state.evidence_digest().unwrap()).unwrap();
+        assert_eq!(page.total, 7, "both generations survive a cold load");
+        cold.observe_native(pending(json!(0))).unwrap();
+        let (mut writer, native) = tokio::io::duplex(1024);
+        drop(native);
+        let (reply, mut replies) = mpsc::channel(2);
+        assert!(answer(&mut writer, &mut cold, json!(0), json!({"result":{}}), &reply, Some(json!("outer"))).await.is_err());
+        assert!(replies.try_recv().is_err());
+        let restored = Store::open(&path, "answer-fixture", &next).unwrap();
+        assert_eq!(restored.state.current_answer_receipt("n:0").state, "unknown");
+        let page = restored.state.answer_evidence(&next, 0, &restored.state.evidence_digest().unwrap()).unwrap();
+        assert_eq!(page.total, 8, "a third generation retains both earlier ID-zero receipts on write failure");
+        assert_eq!(page.records.iter().filter(|r| r.request_id == json!(0)).count(), 3);
+        answer(&mut writer, &mut cold, json!(0), json!({"result":{}}), &reply, Some(json!("duplicate"))).await.unwrap();
+        assert_eq!(replies.recv().await.unwrap().value["result"]["state"], "unknown");
+    }
 }
 
 #[tokio::test]

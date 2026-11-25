@@ -21,9 +21,9 @@ fn identity(value: &Value) -> Option<&str> {
         .as_str()
         .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
 }
-fn object(value: &Value) -> Option<Value> {
+fn object_with_limit(value: &Value, limit: usize) -> Option<Value> {
     if let Some(text) = value.as_str() {
-        if text.len() > 128 * 1024 {
+        if text.len() > limit {
             return None;
         }
         serde_json::from_str(text).ok()
@@ -32,7 +32,7 @@ fn object(value: &Value) -> Option<Value> {
     }
 }
 fn arguments(value: &Value) -> Option<Value> {
-    let value = object(value)?;
+    let value = object_with_limit(value, 128 * 1024)?;
     let questions = value["questions"].as_array()?;
     if questions.is_empty() || questions.len() > 16 {
         return None;
@@ -83,8 +83,9 @@ fn arguments(value: &Value) -> Option<Value> {
     Some(json!({"questions":clean}))
 }
 fn answers(value: &Value, args: &Value) -> Option<Value> {
-    let value = object(value)?;
+    let value = object_with_limit(value, 16 * 1024 * 1024)?;
     let source = value["answers"].as_object()?;
+    if source.is_empty() { return Some(json!({"answers":{}})); }
     let questions = args["questions"].as_array()?;
     if source.len() != questions.len() {
         return None;
@@ -93,11 +94,10 @@ fn answers(value: &Value, args: &Value) -> Option<Value> {
     for question in questions {
         let id = question["id"].as_str()?;
         let answer = source.get(id)?["answers"].as_array()?;
-        if answer.is_empty()
-            || answer.len() > 32
+        if answer.len() > 32
             || answer
                 .iter()
-                .any(|text| text.as_str().is_none_or(|text| text.len() > 8192))
+                .any(|text| text.as_str().is_none_or(|text| text.len() > 65536))
         {
             return None;
         }
@@ -254,7 +254,7 @@ fn restore_missing_answer(item: &mut Value, call: &Call) {
     // replaced by supplemental history. Other output blocks stay in place.
     if ["contentItems", "toolOutputBlocks"].iter().any(|key| {
         item[*key].as_array().into_iter().flatten().any(|part| {
-            object(&part["text"]).is_some_and(|value| value.get("answers").is_some())
+            object_with_limit(&part["text"], 16 * 1024 * 1024).is_some_and(|value| value.get("answers").is_some())
         })
     }) {
         return;
@@ -295,15 +295,19 @@ fn sanitize(item: &mut Value, proven: Option<&Call>) {
     {
         return;
     }
-    let answer = item["contentItems"]
-        .as_array()
-        .and_then(|parts| parts.iter().find_map(|part| answers(&part["text"], &args)))
-        .unwrap_or_else(|| json!({"answers":{}}));
+    let answer = ["contentItems", "toolOutputBlocks"].iter().find_map(|key| {
+        let results: Vec<_> = item[*key].as_array().into_iter().flatten()
+            .filter_map(|part| answers(&part["text"], &args)).collect();
+        (results.len() == 1).then(|| results[0].clone())
+    });
     for key in ["content", "result", "output", "toolOutputBlocks"] {
         item.as_object_mut().unwrap().remove(key);
     }
     item["arguments"] = args;
-    item["contentItems"] = json!([{"type":"inputText","text":answer.to_string()}]);
+    item["contentItems"] = match answer {
+        Some(answer) => json!([{"type":"inputText","text":answer.to_string()}]),
+        None => json!([]),
+    };
 }
 /// Redaction applies to every native history response, including resume and fork.
 /// It does not require or establish a rollout proof and never restores missing items.
@@ -564,6 +568,36 @@ mod tests {
             sanitize_history(&mut item);
             assert!(!item.to_string().contains("SECRET-SENTINEL"));
         }
+    }
+    #[test]
+    fn redacting_missing_secret_output_does_not_invent_native_cancellation() {
+        let mut item=json!({"id":"call","type":"dynamicToolCall","tool":"request_user_input","status":"completed",
+            "arguments":{"questions":[{"id":"secret","question":"Code?","isSecret":true}]},"contentItems":[]});
+        sanitize_history(&mut item);
+        assert!(item["contentItems"].as_array().unwrap().is_empty(),"No result is still unknown, not an empty answer result");
+    }
+    #[test]
+    fn native_cancellation_and_full_sized_answers_survive_rollout_reconstruction() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("rollout.jsonl");
+        for output in [json!({"answers":{}}),json!({"answers":{"q":{"answers":["a".repeat(65536)]}}})] {
+            let mut data=records(false);data[3]["payload"]["output"]=json!(output.to_string());write(&path,&data);
+            let projected=view(&path);
+            let items=projected["thread"]["turns"][0]["items"].as_array().unwrap();
+            assert_eq!(items.len(),1);
+            let actual:Value=serde_json::from_str(items[0]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual,output);
+        }
+    }
+    #[test]
+    fn large_canonical_answer_is_not_shadowed_by_a_rollout_answer() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("rollout.jsonl");write(&path,&records(false));
+        let output=json!({"answers":{"q":{"answers":["a".repeat(65536),"b".repeat(65536),"c".repeat(65536)]}}});
+        let item=json!({"id":"fc-id","callId":"call-id","type":"dynamicToolCall","tool":"request_user_input",
+            "status":"completed","success":true,"arguments":{"questions":[{"id":"q","question":"Choose","isSecret":false}]},
+            "contentItems":[{"type":"inputText","text":output.to_string()}]});
+        let mut native=json!({"thread":{"id":"thread","turns":[{"id":"turn","items":[item.clone()]}]}});
+        project(&mut native,Some(&path),"thread","thread/read","",&BTreeSet::new(),&mut BTreeMap::new());
+        assert!(native["thread"]["turns"][0]["items"][0]==item,"Canonical answer must remain the only result");
     }
     #[test]
     fn secret_answers_are_redacted_in_supplement_and_canonical_items() {

@@ -57,8 +57,7 @@ class QuestionDockModelTest {
         val pending = questionDockEntries(s).single()
         assertEquals(listOf(question("a", 1).string("id")), pending.batch!!.questions.map { it.id })
         assertFalse(pending.submitted)
-        val done = questionDockEntries(s.copy(advanced = s.advanced.copy(asyncQuestions = listOf(question("a", 0, true), question("a", 1, true))))).single()
-        assertTrue(done.submitted)
+        assertTrue(questionDockEntries(s.copy(advanced = s.advanced.copy(asyncQuestions = listOf(question("a", 0, true), question("a", 1, true))))).isEmpty())
     }
 
     @Test fun connectionFreshnessAndInFlightProduceExplicitStatuses() {
@@ -79,8 +78,9 @@ class QuestionDockModelTest {
         val s = state().copy(approvals = listOf(first, second), commands = listOf(command))
         assertFalse(s.uncertainSend)
         assertEquals(1, s.unresolvedCommands.size)
-        assertEquals(QuestionPhase.AwaitingConfirmation, questionAvailability(s, questionDockEntries(s)[0]))
-        assertEquals(QuestionPhase.Waiting, questionAvailability(s, questionDockEntries(s)[1]))
+        assertEquals(second.key, questionDockEntries(s).single().key)
+        assertEquals(QuestionPhase.Waiting, questionAvailability(s, questionDockEntries(s).single()))
+        assertEquals("unknown", s.commands.single().status)
         assertTrue(s.copy(commands = listOf(command.copy(method = "turn/start"))).uncertainSend)
     }
 
@@ -90,9 +90,23 @@ class QuestionDockModelTest {
         val receipt = QuestionReceipt.capture("command", chat.key, a, buildJsonObject {})
         val command = CommandEntity("command", "pc", chat.key, "approvals/respond", "unknown", 1, a.key)
         val s = state().copy(commands = listOf(command))
-        assertEquals(a.key, questionDockEntries(s, listOf(receipt)).single().key)
+        assertTrue(questionDockEntries(s, listOf(receipt)).isEmpty())
         assertTrue(questionDockEntries(s.copy(selected = chat.copy(runtimeId = "other")), listOf(receipt)).isEmpty())
         assertTrue(questionDockEntries(s.copy(selected = chat.copy(key = chat.key.copy(nativeId = "other"))), listOf(receipt)).isEmpty())
+    }
+
+    @Test fun submittingAndGuardedApprovalsLeaveOnlyActionableRequestsInTheDock() {
+        val a = approval("a")
+        val b = approval("b", method = "item/commandExecution/requestApproval")
+        val c = approval("c")
+        val s = state().copy(approvals = listOf(a, b, c), submittingApprovalKeys = setOf(a.key),
+            commands = listOf(CommandEntity("b-command", "pc", chat.key, "approvals/respond", "unknown", 1, b.key)))
+        assertEquals(listOf(c.key), questionDockEntries(s).map { it.key })
+        assertEquals(1, questionAttentionCount(s))
+        // A definite send refusal makes the same request actionable again.
+        val rejected = s.copy(submittingApprovalKeys = emptySet(), commands = s.commands.map { it.copy(status = "rejected") })
+        assertEquals(listOf(a.key, b.key, c.key), questionDockEntries(rejected).map { it.key })
+        assertEquals(3, questionAttentionCount(rejected))
     }
 
     @Test fun cachedAsyncQuestionsCannotSubmitUntilConversationIsFresh() {

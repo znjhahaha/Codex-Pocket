@@ -113,7 +113,10 @@ internal class ExecutionLocationStore(private val blob: LocationBlob, private va
     @Synchronized fun add(target: ExecutionTarget) { val old = record(); commit(old.copy(catalog = old.catalog.put(target))) }
     @Synchronized fun register(target: ExecutionTarget, pair: PairedComputer, connector: JsonObject? = null) {
         val old = record()
-        val catalog = old.catalog.put(target).bind(target.id, pair.computerId)
+        // Re-pairing may supply an unbound draft of a saved location. Validate the
+        // authenticated endpoint in the same update instead of clearing its identity.
+        require(target.endpointId == null || target.endpointId == pair.computerId)
+        val catalog = old.catalog.put(target.copy(endpointId = pair.computerId))
         commit(Record(catalog, old.pairs + (target.id to pair),
             if (connector == null) old.connectors else old.connectors + (target.id to connector)))
     }

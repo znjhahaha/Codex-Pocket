@@ -163,6 +163,30 @@ pub fn response(
     }
     result
 }
+/// The same native permission transport, with choices constrained by a real device probe.
+pub fn phone_capabilities(result: &mut Value, settings: &Value, caps: &Capabilities, sandbox: bool) {
+    let thread = result["threadId"].as_str().unwrap_or("").to_owned();
+    let known = result["revision"].is_string();
+    let app = crate::permission_policy::preset(&thread, "app-request").unwrap();
+    let enabled = known && caps.supports("thread/settings/update", &app);
+    if let Some(presets) = result["presets"].as_array_mut() {
+        if !sandbox {
+            for preset in presets.iter_mut().filter(|p| p["id"] != "full") {
+                preset["enabled"] = json!(false);
+                preset["reasonCode"] = json!("sandbox_unavailable");
+                preset["reason"] = json!("此设备未通过工作区文件隔离验证；可明确选择按命令审批，或改用电脑运行");
+            }
+        }
+        presets.insert(0, json!({"id":"app-request","label":"按命令请求批准",
+            "description":"保留原生命令审批；共享应用内文件，不提供项目间隔离","enabled":enabled}));
+    }
+    if settings["approvalPolicy"] == "untrusted" && settings["sandboxPolicy"]["type"] == "dangerFullAccess" {
+        result["currentPresetId"] = json!("app-request");
+        result["currentLabel"] = json!("按命令请求批准");
+    }
+    result["sandboxVerified"] = json!(sandbox);
+}
+
 pub fn unavailable(result: &mut Value, status: &str, reason: &str) {
     result["status"] = json!(status);
     result["revision"] = Value::Null;
@@ -238,6 +262,20 @@ pub fn thread_metadata(t: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn phone_without_verified_sandbox_keeps_approval_choice_and_disables_isolation() {
+        let mut caps = Capabilities::default();
+        caps.0.insert("thread/settings/update".into(), ["threadId", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "$autoReview"].into_iter().map(str::to_owned).collect());
+        let settings = crate::permission_policy::preset("t", "app-request").unwrap();
+        let mut result = response("r", "t", "g", &settings, &caps, &BTreeMap::new());
+        phone_capabilities(&mut result, &settings, &caps, false);
+        assert_eq!(result["status"], "ready");
+        assert_eq!(result["currentPresetId"], "app-request");
+        for p in result["presets"].as_array().unwrap() {
+            assert_eq!(p["enabled"], p["id"] == "app-request" || p["id"] == "full");
+        }
+        assert_eq!(settings["approvalPolicy"], "untrusted");
+    }
     #[test]
     fn v052_known_custom_is_ready_and_partial_state_has_no_writable_revision() {
         let mut caps = Capabilities::default();

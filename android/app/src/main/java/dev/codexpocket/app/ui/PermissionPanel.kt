@@ -43,7 +43,7 @@ internal fun PermissionPanel(state: PermissionState, online: Boolean, running: B
     val writable = online && !busy && state.status == "ready" && state.revision != null && state.error == null
     val c = Pocket.colors
     val notice = when {
-        !online -> "离线 · 连接电脑后可选择权限"
+        !online -> "离线 · 连接运行端后可选择权限"
         busy -> null
         state.error != null -> state.error.take(300)
         state.status == "initializing" -> "正在读取原生能力，请稍候"
@@ -62,7 +62,7 @@ internal fun PermissionPanel(state: PermissionState, online: Boolean, running: B
                 Column(Modifier.weight(1f)) {
                     PText("会话权限", style = Pocket.type.labelSmall, color = c.inkMuted,
                         modifier = Modifier.semantics { heading() })
-                    PText(if (updating) "等待电脑确认" else state.label, style = Pocket.type.bodySmall,
+                    PText(if (updating) "等待运行端确认" else state.label, style = Pocket.type.bodySmall,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 Box(Modifier.size(48.dp).testTag("permission-refresh")
@@ -75,7 +75,7 @@ internal fun PermissionPanel(state: PermissionState, online: Boolean, running: B
             if (notice != null && notice != state.label) PText(notice, Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                 .testTag("permission-status").semantics { liveRegion = LiveRegionMode.Polite },
                 style = Pocket.type.caption, color = if (state.error != null) c.danger else c.inkMuted)
-            if (online && busy) PText(if (updating) "正在更新会话权限 · 等待电脑确认" else "正在读取会话权限",
+            if (online && busy) PText(if (updating) "正在更新会话权限 · 等待运行端确认" else "正在读取会话权限",
                 Modifier.padding(horizontal = 10.dp, vertical = 4.dp).testTag(if (updating) "permission-updating" else "permission-loading"),
                 style = Pocket.type.caption, color = c.inkMuted)
             Column(Modifier.fillMaxWidth().selectableGroup()) {

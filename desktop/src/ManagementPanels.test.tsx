@@ -13,6 +13,35 @@ describe('native management evidence',()=>{
   expect(html).toContain('重启并更新');
   expect(html).not.toContain('已安排重启更新');
  });
+ it.each(['waiting_cold_start','restarting_legacy','switching','cold_starting'])('shows the coordinator interruption ahead of %s and keeps retry enabled',phase=>{
+  const html=renderToStaticMarkup(<UpdatesPanel status={{automatic:false,restartRequested:true,operationId:'b85e78a5-4874-4217-9b56-cf77315a6f36',phase,version:'1.2.3',downloadedBytes:1,totalBytes:1,waitReason:'runtime_activity_unverified',coordinator:{phase:'waiting_login',reason:'restart_owner_changed'}}} busy={false} onCheck={()=>{}} onAutomatic={()=>{}}/>);
+  expect(html).toContain('<h3>后台更新尚未完成</h3>');
+  expect(html).toContain('Pocket 后台进程发生变化');
+  expect(html).toContain('点击“重启并更新”重试');
+  expect(html).toContain('class="button primary"><');
+  expect(html).not.toContain('disabled=""');
+  expect(html).not.toContain('已安排重启更新');
+  expect(html).not.toContain('Pocket 会在当前 Windows 会话中核对任务');
+ });
+ it('does not leave a finished coordinator looking active while cold start remains pending',()=>{
+  const html=renderToStaticMarkup(<UpdatesPanel status={{automatic:false,restartRequested:true,operationId:'b85e78a5-4874-4217-9b56-cf77315a6f36',phase:'waiting_cold_start',downloadedBytes:1,totalBytes:1,coordinator:{phase:'finished',reason:'restart_owner_changed'}}} busy={false} onCheck={()=>{}} onAutomatic={()=>{}}/>);
+  expect(html).toContain('<h3>后台更新尚未完成</h3>');
+  expect(html).toContain('Pocket 后台进程发生变化');
+  expect(html).toContain('class="button primary"><');
+ });
+ it('announces ending the old Pocket lock owner instead of an idle task wait',()=>{
+  const html=renderToStaticMarkup(<UpdatesPanel status={{automatic:false,restartRequested:true,operationId:'b85e78a5-4874-4217-9b56-cf77315a6f36',phase:'waiting_idle',downloadedBytes:1,totalBytes:1,waitReason:'runtime_activity_unverified',coordinator:{phase:'waiting',reason:'restart_lock_owner_active'}}} busy={false} onCheck={()=>{}} onAutomatic={()=>{}}/>);
+  expect(html).toContain('检测到旧 Pocket 后台占用');
+  expect(html).toContain('正在结束旧后台并继续更新');
+  expect(html).not.toContain('等待任务空闲');
+  expect(html).not.toContain('等待核对旧后台');
+  expect(html).toContain('class="button primary" disabled=""');
+ });
+ it('keeps completed updates completed when the coordinator has finished',()=>{
+  const html=renderToStaticMarkup(<UpdatesPanel status={{automatic:false,phase:'succeeded',downloadedBytes:1,totalBytes:1,coordinator:{phase:'finished'}}} busy={false} onCheck={()=>{}} onAutomatic={()=>{}}/>);
+  expect(html).toContain('<h3>更新已完成</h3>');
+  expect(html).not.toContain('后台更新尚未完成');
+ });
  it('uses human preparation guidance without leaking the internal error code',()=>{
   const message=assistantPreparationMessage({error:'assistant_runtime_start_failed'});
   expect(message).toContain('重新准备');expect(message).not.toContain('assistant_');

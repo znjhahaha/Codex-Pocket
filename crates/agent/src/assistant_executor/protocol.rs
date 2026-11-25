@@ -36,7 +36,7 @@ pub(super) fn turn_params(
     } else {
         json!({"type":"readOnly","networkAccess":false})
     };
-    json!({"threadId":thread,"model":model,"cwd":directory,"input":crate::assistant::inputs::native_input(&req.prompt,&req.inputs),"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":sandbox,"runtimeWorkspaceRoots":[directory],"clientUserMessageId":req.operation_id})
+    json!({"threadId":thread,"model":model,"effort":req.settings.effort,"cwd":directory,"input":crate::assistant::inputs::native_input(&req.prompt,&req.inputs),"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":sandbox,"runtimeWorkspaceRoots":[directory],"clientUserMessageId":req.operation_id})
 }
 /// The coordinator only routes; whatever the request says, it never gets a writable sandbox.
 pub(super) fn sandbox_writes(req: &StartRequest) -> bool {

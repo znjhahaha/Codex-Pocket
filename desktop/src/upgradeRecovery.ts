@@ -1,4 +1,4 @@
-import {freshHeartbeat,type InstalledComponent,type Snapshot} from './domain';
+import {freshHeartbeat,type InstalledComponent,type Snapshot,type UpdateState,type RestartNotice} from './domain';
 
 export type RecoveryKind='current'|'staged_dashboard'|'installing'|'inconsistent'|'ui_outdated'|'unknown'|'old_backend'|'backend_missing'|'starting'|'paused'|'handoff'|'waiting_restart'|'failed'|'rolled_back'|'succeeded'|'bridge'|'retry_waiting'|'retry_starting'|'retry_exhausted'|'retry_blocked'|'recovered';
 export interface RecoveryModel {
@@ -12,6 +12,7 @@ export interface RecoveryModel {
  actionLabel?:string;
  bridge?:'pending'|'unverified';
  upgradeHistorical?:boolean;
+ restartNotice?:RestartNotice;
  retry?:{attempts:number;maxAttempts:number;remainingSeconds?:number;verifying?:boolean};
 }
 const progress:Record<string,string>={
@@ -37,6 +38,23 @@ const installerWaits:Record<string,string>={
 const validGeneration=(generation?:string)=>typeof generation==='string'&&/^[a-f0-9]{64}$/.test(generation);
 const restartInstruction='请运行新版 Pocket 安装包。安装器会在当前会话中核对任务并重启 Pocket 后台。';
 
+export function installerCoordinatorNotice(status?:UpdateState):{stopped:boolean;description:string;restartNotice?:RestartNotice}|undefined {
+ if(!status||!['staged','waiting_idle',...installerPhases].includes(status.phase))return;
+ const coordinator=status.coordinator;
+ if(coordinator&&['waiting_login','finished','failed'].includes(coordinator.phase)){
+  const reasons:Record<string,string>={
+   restart_owner_changed:'检测到 Pocket 后台进程发生变化，本次重启已停止。',
+   independent_dispatch_failed:'更新进程未能启动，后台更新尚未完成。',
+  };
+  const reason=coordinator.reason||'';
+  return {stopped:true,description:Object.hasOwn(reasons,reason)?reasons[reason]:'更新进程已停止，后台更新尚未完成。'};
+ }
+ if(coordinator?.phase==='waiting'&&coordinator.reason==='restart_lock_owner_active'){
+  return {stopped:false,description:'检测到旧 Pocket 后台占用，正在结束旧后台并继续更新。Codex 和正在运行的 Runtime Host 不受影响。',
+   ...(status.operationId&&coordinator.noticeId?{restartNotice:{operationId:status.operationId,noticeId:coordinator.noticeId}}:{})};
+ }
+}
+
 /** Installed files, live process identity and a handoff journal are distinct evidence. */
 export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  const installation=s.installation,upgrade=installation?.upgrade,target=installation?.installedGeneration;
@@ -50,9 +68,11 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
  const unknown=(description='尚未取得可靠的安装或后台运行证据。请刷新状态，或在诊断中检查读取结果。')=>model('unknown','后台状态尚未核验',description);
  if(installation?.consistent===false)return model('inconsistent','安装状态需要检查','当前界面与安装或状态目录不一致。请关闭 Pocket 界面，从 Windows 开始菜单打开新版 Codex Pocket，再查看诊断。');
  if(!installation||!validGeneration(target))return unknown('安装目标尚未核验，暂时无法判断新版是否已生效。请从 Windows 开始菜单打开 Codex Pocket，再刷新状态。');
- if(upgrade&&Object.hasOwn(progress,upgrade.phase))return model('handoff',progress[upgrade.phase],'交接仍在进行中，请等待状态核验。此时可以刷新进度或检查诊断。',{tone:'progress'});
  const ui=installation.ui;
  const dashboard=ui?.state==='staged_dashboard'&&ui.runningVerified===true&&validGeneration(ui.generation)&&!!s.updates&&ui.generation===s.updates.generation;
+ const notice=dashboard?installerCoordinatorNotice(s.updates):undefined;
+ if(notice?.stopped)return model('staged_dashboard','后台更新尚未完成',`${notice.description}请在“更新与修复”中查看详情并重试。`,{blockMutations:false});
+ if(upgrade&&Object.hasOwn(progress,upgrade.phase))return model('handoff',progress[upgrade.phase],'交接仍在进行中，请等待状态核验。此时可以刷新进度或检查诊断。',{tone:'progress'});
  // This window is the new version's own, opened by its installer. While that installer is at work
  // the window says so; it is never told to go and open itself.
  if(dashboard&&s.updates){
@@ -60,7 +80,7 @@ export function upgradeRecovery(s:Snapshot,now:number):RecoveryModel {
   if(installerPhases.includes(s.updates.phase)||queued&&working){
    const reason=s.updates.coordinator?.reason||'';
    return model('installing',queued?'正在准备更新 Pocket 后台':s.updates.phase==='cold_starting'?'正在核验新版后台':'正在重启 Pocket 后台',
-    Object.hasOwn(installerWaits,reason)?installerWaits[reason]:'安装包已核验。Pocket 只重启自己的后台，完成后本窗口自动刷新；Codex 和正在运行的任务不受影响，无需其他操作。',{tone:'progress'});
+    notice?.description||(Object.hasOwn(installerWaits,reason)?installerWaits[reason]:'安装包已核验。Pocket 只重启自己的后台，完成后本窗口自动刷新；Codex 和正在运行的任务不受影响，无需其他操作。'),{tone:'progress',restartNotice:notice?.restartNotice});
   }
  }
  if(dashboard&&s.updates&&(['staged','waiting_idle'].includes(s.updates.phase)||s.updates.phase==='failed'&&s.updates.failure==='legacy_restart_unverified')){

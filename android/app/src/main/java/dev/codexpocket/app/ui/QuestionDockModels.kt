@@ -13,7 +13,33 @@ internal data class QuestionDockEntry(
     val submitted get() = approval?.submitted ?: batch?.questions?.all { it.source.flag("submitted") } ?: false
 }
 
-internal fun questionDockEntries(s: PocketState, receipts: List<QuestionReceipt> = emptyList()): List<QuestionDockEntry> {
+/** A request needs attention only while another user decision can be made. */
+internal fun approvalNeedsAction(s: PocketState, approval: PendingApproval, receipts: List<QuestionReceipt> = s.questionDeliveries): Boolean {
+    if (approval.submitted || approval.key in s.submittingApprovalKeys || ConversationPresentation.hookType(approval.method)) return false
+    if (s.commands.any { it.method == "approvals/respond" && it.draftText == approval.key && CommandPolicy.blocksNewSend(it.status) }) return false
+    val chat = s.runtimes.firstOrNull { it.id == approval.runtimeId }?.let { ThreadKey(s.computerId, it.configStoreId, approval.threadId) }
+        ?: s.selected?.takeIf { it.runtimeId == approval.runtimeId && it.key.nativeId == approval.threadId }?.key
+    return receipts.none { receipt ->
+        val same = receipt.requestKey == approval.key || chat != null && receipt.matchesNative(chat, approval)
+        same && (receipt.phase.terminal || s.commands.any { it.id == receipt.commandId && CommandPolicy.blocksNewSend(it.status) })
+    }
+}
+
+internal fun questionAttentionCount(s: PocketState): Int {
+    val approvals = s.approvals.filter { approvalNeedsAction(s, it) }.distinctBy { it.key }.size
+    val pending = if (s.pendingQuestions.isNotEmpty()) s.pendingQuestions.values.toList() else listOf(s.advanced.asyncQuestions)
+    return approvals + pending.sumOf { batch -> batch.filter { !it.flag("submitted") }.distinctBy { it.string("id") }.size }
+}
+
+internal fun questionDockEntries(s: PocketState, receipts: List<QuestionReceipt> = s.questionDeliveries): List<QuestionDockEntry> =
+    questionDockRequests(s, receipts).mapNotNull { entry ->
+        if (entry.approval != null) entry.takeIf { approvalNeedsAction(s, entry.approval, receipts) }
+        else entry.batch?.questions?.filter { !it.source.flag("submitted") }?.takeIf { it.isNotEmpty() }
+            ?.let { entry.copy(batch = entry.batch.copy(questions = it)) }
+    }
+
+/** Includes in-flight requests only for draft lifetime; these never count as action items. */
+internal fun questionDockRequests(s: PocketState, receipts: List<QuestionReceipt> = s.questionDeliveries): List<QuestionDockEntry> {
     val chat = s.selected ?: return emptyList()
     val approvals = s.approvals.filter {
         it.runtimeId == chat.runtimeId && it.threadId.isNotBlank() && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method)
@@ -31,18 +57,8 @@ internal fun questionDockEntries(s: PocketState, receipts: List<QuestionReceipt>
         // Native question metadata enriches presentation; pending identity/submission flags remain authoritative.
         JsonObject(native.orEmpty() + source)
     }
-    val asynchronous = QuestionBatches.async(chat.key.encoded, enriched).map { full ->
-        // A prior single-question reply may have acknowledged only part of a native batch.
-        // Offer its remaining questions without ever resending the guarded ones.
-        val remaining = full.questions.filter { !it.source.flag("submitted") }
-        val batch = if (remaining.isEmpty()) full else full.copy(questions = remaining)
-        QuestionDockEntry(batch.id, batch)
-    }
-    val retained = receipts.filter { receipt -> receipt.chat == chat.key && receipt.runtimeId == chat.runtimeId &&
-        !receipt.phase.terminal && approvals.none { it.key == receipt.requestKey } &&
-        s.commands.any { it.id == receipt.commandId && CommandPolicy.blocksNewSend(it.status) } }
-        .map { QuestionDockEntry(it.requestKey, receipt = it) }
-    return approvals + asynchronous + retained
+    val asynchronous = QuestionBatches.async(chat.key.encoded, enriched).map { QuestionDockEntry(it.id, it) }
+    return approvals + asynchronous
 }
 
 internal fun questionAvailability(s: PocketState, entry: QuestionDockEntry): QuestionPhase {

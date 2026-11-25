@@ -175,13 +175,14 @@ class AssistantStageTest {
         assertEquals("login", actions.single().params.string("taskId"))
         assertEquals("看一下 进度", actions.single().params.string("message"))
         assertEquals(PocketHaptic.Confirm, haptics.last())
-        // Locked until its own receipt: no second send, and the address cannot be changed under it.
+        // The persisted message owns its target; the empty composer is immediately available for another goal.
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
-        compose.onNodeWithTag("assistant-target-chip").assertIsNotEnabled()
+        compose.onNodeWithTag("assistant-target-chip").assertDoesNotExist()
         compose.runOnIdle { state = state.acceptSend(actions.single(), "rejected") }
-        compose.onNodeWithTag("assistant-target-chip").assertIsDisplayed().assertIsEnabled()
-        compose.onNodeWithTag(AssistantDraft).assertTextContains("看一下 进度")
-        compose.onNodeWithTag(AssistantSend).assertIsEnabled().performClick()
+        emptyDraft()
+        val originalId = actions.single().commandId
+        compose.scrollAssistantChatTo("assistant-send-failure:$originalId").performClick()
+        compose.onNodeWithTag("assistant-send-retry:$originalId").performClick()
         assertEquals("login", actions.last().params.string("taskId"))
         assertNotEquals(actions[0].commandId, actions[1].commandId)
         compose.runOnIdle { state = state.acceptSend(actions.last()) }

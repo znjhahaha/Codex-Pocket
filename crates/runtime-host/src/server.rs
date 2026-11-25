@@ -156,7 +156,7 @@ async fn actor_loop(
                             if value["params"]["generation"]!=descriptor.generation {deliver(&reply,fail(id,"generation_mismatch"));continue;}
                             let request_id=&value["params"]["requestId"];
                             let Some(key)=key(request_id) else {deliver(&reply,fail(id,"invalid_request"));continue;};
-                            let receipt=store.state.receipt(&key,true);
+                            let receipt=store.state.current_answer_receipt(&key);
                             deliver(&reply,json!({"id":id,"result":{"namespace":"answer","requestId":request_id,
                                 "generation":receipt.generation,"state":receipt.state,"response":receipt.response}}));
                         },
@@ -224,9 +224,9 @@ async fn submit(
         deliver(reply, fail(id, "unsupported"));
         return Ok(());
     }
-    // Cold recovery never authorizes a fresh write to resolve an unknown run.
-    // These existing native reads can supply evidence without model inference.
-    if store.state.reconciliation_required
+    // Scope proof is required while recovery can still overlap live effects.
+    // Ended lifetimes release that fence without resolving or replaying receipts.
+    if store.requires_scope_admission()
         && !read_only(&value)
         && store.state.receipt(&command_key, false).state == "missing"
         && !store.admits_independent(&value)
@@ -303,20 +303,15 @@ async fn answer(
         .as_object_mut()
         .unwrap()
         .insert("id".into(), request_id.clone());
-    if store
-        .state
-        .answers
-        .get(&request_key)
-        .is_some_and(|r| r.generation != store.state.generation)
-        || !store.state.answers.contains_key(&request_key)
-            && store.state.pending.get(&request_key).is_none_or(|r| {
+    if store.state.current_answer_receipt(&request_key).state == "missing"
+        && store.state.pending.get(&request_key).is_none_or(|r| {
                 r.generation != store.state.generation || r.request.get("method").is_none()
             })
     {
         deliver(reply, fail(id, "stale_request"));
         return Ok(());
     }
-    match store.state.reserve(request_key.clone(), &native, true) {
+    match store.state.reserve_answer(request_key.clone(), &native) {
         Err(error) => deliver(
             reply,
             fail(
@@ -361,6 +356,27 @@ async fn answer(
 }
 
 pub async fn run(config: HostConfig) -> Result<()> {
+    let mut stage = "validate";
+    let result = run_staged(&config, &mut stage).await;
+    if let Err(error) = &result {
+        // Only fixed stages, OS codes and our own creation identity. Native
+        // output, descriptors, arguments and error messages can contain secrets.
+        // Diagnostics never release ownership or establish process termination.
+        if !matches!(stage, "validate" | "state_access") {
+            let diagnostic = json!({"schema":1,
+                "hostProcess":pocket_core::native_process::NativeProcess::capture(std::process::id()).ok(),
+                "stage":stage,
+                "osCode":error.chain().find_map(|e|e.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error))});
+            let _ = pocket_agent::storage::atomic_write(
+                &config.state.join("host-startup-failure.json"),
+                &serde_json::to_vec(&diagnostic).expect("fixed diagnostic fields"),
+            );
+        }
+    }
+    result
+}
+
+async fn run_staged(config: &HostConfig, stage: &mut &'static str) -> Result<()> {
     ensure!(
         config.state.is_absolute() && config.descriptor.is_absolute(),
         "Absolute host state paths required"
@@ -373,8 +389,10 @@ pub async fn run(config: HostConfig) -> Result<()> {
         config.config_home.is_absolute() && config.config_home.is_dir(),
         "Existing config home required"
     );
+    *stage = "state_access";
     pocket_agent::storage::private_directory(&config.state)
         .context("Protect host state directory")?;
+    *stage = "host_lock";
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -395,12 +413,14 @@ pub async fn run(config: HostConfig) -> Result<()> {
             Sha256::digest(crate::client::normalized_home(&config.config_home)?.as_bytes())
         )[..24]
     );
+    *stage = "predecessor_descriptor";
     let previous=if config.descriptor.try_exists()? {
         let bytes = pocket_agent::storage::read_physical(&config.descriptor, 16384)
             .context("Read earlier host descriptor")?;
         let _ = bytes;
         let previous =
             pocket_runtime_ipc::load_descriptor(&config.descriptor, &config.config_home)?;
+        *stage = "predecessor_lifetime";
         for (pid, process) in [
             (previous.pid, &previous.host_process),
             (previous.native_pid, &previous.native_process),
@@ -414,19 +434,24 @@ pub async fn run(config: HostConfig) -> Result<()> {
         }
         Some(previous)
     } else {None};
-    verify_reservation(&config).await?;
+    *stage = "startup_reservation";
+    verify_reservation(config).await?;
+    *stage = "descriptor_directory";
     let parent = config
         .descriptor
         .parent()
         .context("Descriptor parent missing")?;
     pocket_agent::storage::private_directory(parent).context("Protect descriptor directory")?;
+    *stage = "recovery_open";
     let mut store = Store::open(
         &config.state.join("recovery.json"),
         &runtime_id,
         &generation,
     )
     .context("Open host recovery")?;
+    *stage = "recovery_predecessor";
     if let Some(previous)=&previous {store.release_predecessor(previous)?;}
+    *stage = "listen";
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mut launch = tokio::process::Command::new(&config.binary);
     launch
@@ -438,6 +463,7 @@ pub async fn run(config: HostConfig) -> Result<()> {
         .kill_on_drop(false);
     #[cfg(windows)]
     launch.creation_flags(0x08000000);
+    *stage = "native_spawn";
     let mut child = launch.spawn().context("Spawn native process")?;
     let native_pid = child.id().context("Native PID unavailable")?;
     let descriptor = Descriptor {
@@ -454,11 +480,14 @@ pub async fn run(config: HostConfig) -> Result<()> {
         source: "cli".into(),
     };
     // Publish ownership before initialization: a startup failure cannot authorize a duplicate native.
+    *stage = "descriptor_publish";
     pocket_agent::storage::atomic_write(&config.descriptor, &serde_json::to_vec(&descriptor)?)
         .context("Publish host ownership")?;
+    *stage = "generation_persist";
     store
         .begin_generation(&descriptor.generation)
         .context("Persist host generation")?;
+    *stage = "native_initialize";
     let mut writer = child.stdin.take().context("Native stdin unavailable")?;
     let mut reader = BufReader::new(child.stdout.take().context("Native stdout unavailable")?);
     write_frame(&mut writer,&json!({"id":"pocket-host-initialize","method":"initialize","params":{"clientInfo":{"name":"codex_pocket_assistant","title":"Pocket Assistant","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}})).await?;
@@ -488,8 +517,10 @@ pub async fn run(config: HostConfig) -> Result<()> {
     .await??;
     if config.native_args == ["app-server", "--listen", "stdio://"] {
         // Same native initialize contract as agent::native::cli. No second initialize.
+        *stage = "native_identity";
         codex_initialize_identity(&config.config_home, &initialized)?;
     }
+    *stage = "native_initialized";
     write_frame(&mut writer, &json!({"method":"initialized"})).await?;
     let token = Arc::new(descriptor.token.clone());
     let mut clients = tokio::task::JoinSet::new();
@@ -507,6 +538,7 @@ pub async fn run(config: HostConfig) -> Result<()> {
         }
     });
     // Actor loop is defined below.
+    *stage = "host_loop";
     let idle_exit = actor_loop(
         listener,
         token,
@@ -525,6 +557,7 @@ pub async fn run(config: HostConfig) -> Result<()> {
     // Only an explicitly verified idle shutdown closes stdin intentionally.
     // Unexpected native exit is reported; no native or unrelated process is killed.
     if idle_exit {
+        *stage = "shutdown";
         writer.shutdown().await?;
         drop(writer);
         let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;

@@ -1,6 +1,7 @@
 export type Theme = 'system'|'light'|'dark';
 export interface RuntimeReadiness {authoritative:boolean;ready:boolean;updatedAt:number;installed?:boolean;cliInstalled?:boolean;desktopInstalled?:boolean;historyReadable?:boolean;localDesktop?:{observedAt:number;version:string}|null;nativeObservation?:{desktop?:{state:string;version?:string|null};cli?:{state:string}};runtimes:{id?:string;role:string;online:boolean;initialized?:boolean|null;schemaReady:boolean;inventoryReady:boolean;ready:boolean}[]}
-export interface UpdateState {restartRequested?:boolean;automatic:boolean;phase:string;operationId?:string;updatedAt?:number;version?:string;generation?:string;downloadedBytes:number;totalBytes:number;failure?:string;waitReason?:string;manager?:{phase:string;version?:string;reason?:string};coordinator?:{phase:string;reason?:string}|null}
+export interface RestartNotice {operationId:string;noticeId:string}
+export interface UpdateState {restartRequested?:boolean;automatic:boolean;phase:string;operationId?:string;updatedAt?:number;version?:string;generation?:string;downloadedBytes:number;totalBytes:number;failure?:string;waitReason?:string;manager?:{phase:string;version?:string;reason?:string};coordinator?:{phase:string;reason?:string;noticeId?:string}|null}
 export interface Device {id:string;name:string;createdAt?:number;lastSeenAt?:number;revoked?:boolean}
 export interface ProcessInfo {name:string;role?:string;pid?:number;state:string;version?:string;bridgeVersion?:string;helperVersion?:string;bridgeUpdatePending?:boolean}
 export interface OperationError {code:string;stage:string;message:string;retryable:boolean;operationId:string;exitCode?:number;osCode?:number;actions?:string[]}

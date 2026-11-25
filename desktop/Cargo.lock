@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-desktop"
-version = "0.7.1-rc.20261124.50"
+version = "0.7.1-rc.20261125.54"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-desktop-runtime"
-version = "0.7.1-rc.20261124.50"
+version = "0.7.1-rc.20261125.54"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2749,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-runtime-ipc"
-version = "0.7.1-rc.20261124.50"
+version = "0.7.1-rc.20261125.54"
 dependencies = [
  "anyhow",
  "pocket-core",

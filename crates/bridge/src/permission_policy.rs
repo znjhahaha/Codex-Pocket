@@ -52,6 +52,7 @@ pub fn preset(thread: &str, id: &str) -> Option<Value> {
             json!({"type":"workspaceWrite","networkAccess":false}),
         ),
         "full" => ("never", "user", json!({"type":"dangerFullAccess"})),
+        "app-request" => ("untrusted", "user", json!({"type":"dangerFullAccess"})),
         _ => return None,
     };
     Some(
@@ -65,7 +66,7 @@ pub fn valid_update(p: &Value) -> bool {
     else {
         return false;
     };
-    if ["request", "auto", "full"]
+    if ["request", "auto", "full", "app-request"]
         .iter()
         .any(|id| preset(thread, id).as_ref() == Some(p))
     {

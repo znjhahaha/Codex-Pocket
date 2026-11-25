@@ -20,6 +20,8 @@ fn assistant_attachment_native_start_and_steer_preserve_images_text_and_at_most_
 use serde_json::json;
 #[path = "tests/terminal_generation.rs"]
 mod terminal_generation;
+#[path = "tests/effort.rs"]
+mod effort;
 #[derive(Clone)]
 struct Fake {
     generation: String,

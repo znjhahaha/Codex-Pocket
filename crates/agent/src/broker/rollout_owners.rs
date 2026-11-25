@@ -35,8 +35,81 @@ pub(super) fn holders(path: &Path) -> Result<Vec<NativeProcess>> {
     }
     anyhow::bail!("Rollout ownership is changing")
 }
-#[cfg(not(windows))]
+#[cfg(any(target_os="linux", target_os="android"))]
+pub(super) fn holders(path: &Path) -> Result<Vec<NativeProcess>> {
+    use std::os::unix::fs::MetadataExt;
+    // The open handle pins the selected inode even if a writer renames its path.
+    // Android /data/data and /data/user/0 may name the same rollout under PRoot.
+    let file=std::fs::File::open(path)?;
+    let selected=file.metadata()?;
+    ensure!(selected.is_file(), "Rollout unavailable; release is unconfirmed");
+    let root=Path::new("/proc");
+    // PRoot can emulate uid 0: compare kernel process-directory ownership with
+    // our own, rather than assuming getuid is the APK's actual Linux uid.
+    let uid=std::fs::metadata(root.join(std::process::id().to_string()))?.uid();
+    let owners=proc_holders(root,
+        |process|Ok(std::fs::metadata(process)?.uid()==uid),
+        NativeProcess::capture,
+        |fd|{let m=std::fs::metadata(fd)?;Ok(m.dev()==selected.dev() && m.ino()==selected.ino())})?;
+    let current=std::fs::metadata(path)?;
+    ensure!(current.dev()==selected.dev() && current.ino()==selected.ino(),"Rollout identity changed");
+    Ok(owners)
+}
+#[cfg(not(any(windows, target_os="linux", target_os="android")))]
 pub(super) fn holders(_: &Path) -> Result<Vec<NativeProcess>> { anyhow::bail!("Native ownership inspection unavailable") }
+
+#[cfg(any(test, target_os="linux", target_os="android"))]
+pub(super) fn proc_holders(
+    root: &Path,
+    same_user: impl Fn(&Path)->std::io::Result<bool>,
+    capture: impl Fn(u32)->std::io::Result<NativeProcess>,
+    matches_file: impl Fn(&Path)->std::io::Result<bool>,
+) -> Result<Vec<NativeProcess>> {
+    use std::io::ErrorKind::NotFound;
+    let gone=|path:&Path|matches!(std::fs::metadata(path),Err(e) if e.kind()==NotFound);
+    let mut owners=Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry=entry?;
+        let Some(pid)=entry.file_name().to_str().and_then(|s|s.parse::<u32>().ok()).filter(|p|*p!=0) else {continue};
+        let process=entry.path();
+        match same_user(&process) {
+            Ok(false)=>continue,
+            Err(e) if e.kind()==NotFound=>continue,
+            Err(e)=>return Err(e.into()),
+            Ok(true)=>{},
+        }
+        let before=match capture(pid) {
+            Ok(p)=>p,
+            Err(e) if e.kind()==NotFound && gone(&process)=>continue,
+            Err(e)=>return Err(e.into()),
+        };
+        ensure!(before.pid==pid && before.created_at!=0,"Invalid rollout holder identity");
+        let descriptors=match std::fs::read_dir(process.join("fd")) {
+            Ok(fds)=>fds,
+            Err(e) if e.kind()==NotFound && gone(&process)=>continue,
+            Err(e)=>return Err(e.into()),
+        };
+        let mut holds=false;
+        for fd in descriptors {
+            match matches_file(&fd?.path()) {
+                Ok(true)=>{holds=true;break},
+                Ok(false)=>{},
+                // A descriptor may close between directory enumeration and stat.
+                Err(e) if e.kind()==NotFound=>{},
+                Err(e)=>return Err(e.into()),
+            }
+        }
+        if holds {
+            match capture(pid) {
+                Ok(after)=>ensure!(after==before,"Rollout holder process changed"),
+                Err(e) if e.kind()==NotFound && gone(&process)=>continue,
+                Err(e)=>return Err(e.into()),
+            }
+            owners.push(before);
+        }
+    }
+    Ok(owners)
+}
 
 #[cfg(all(test,windows))]
 mod tests {

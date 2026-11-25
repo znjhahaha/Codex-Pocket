@@ -35,6 +35,9 @@ internal fun QuestionDock(
     onRespond: (PendingApproval, JsonObject) -> Unit,
     onAsyncAnswers: (List<Pair<JsonObject, String>>) -> Unit,
     modifier: Modifier = Modifier,
+    onClose: (ThreadKey, Set<String>) -> Unit = { _, _ -> },
+    onRestore: (ThreadKey, Set<String>) -> Unit = { _, _ -> },
+    onDelete: (ThreadKey, String) -> Unit = { _, _ -> },
 ) {
     val memory = remember(s.computerId) { QuestionDockMemory() }
     val context = LocalContext.current
@@ -44,11 +47,15 @@ internal fun QuestionDock(
     var collapsed by remember(memory) { mutableStateOf(false) }
     val receipts = (answerStore.all().associateBy { it.commandId } + s.questionDeliveries.associateBy { it.commandId })
         .values.filter { it.chat.computerId == s.computerId }
-    val entries = questionDockEntries(s, receipts)
+    val pending = questionDockEntries(s, receipts)
+    val (closed, entries) = pending.partition { entry ->
+        entry.asynchronous && entry.batch!!.questions.all { it.id in s.closedQuestions }
+    }
+    val requests = questionDockRequests(s, receipts)
     val scope = s.selected?.key?.encoded.orEmpty()
-    memory.reconcile(scope, entries, s.online && s.approvalsFresh && s.conversationLoadState == ConversationLoadState.Ready)
+    memory.reconcile(scope, requests, s.online && s.approvalsFresh && s.conversationLoadState == ConversationLoadState.Ready)
     // Synchronize every batch even while collapsed or while a different batch is selected.
-    entries.forEach { entry -> entry.batch?.let { batch ->
+    requests.forEach { entry -> entry.batch?.let { batch ->
         val session = memory.session(batch)
         entry.receipt?.let { session.restoreSubmitted(it, entry.approval) }
         val submitting = if (entry.approval != null) entry.key in s.submittingApprovalKeys
@@ -58,48 +65,62 @@ internal fun QuestionDock(
             QuestionPhase.Confirmed, QuestionPhase.AnsweredElsewhere, QuestionPhase.Cancelled), submitting,
             pendingConfirmed = availability == QuestionPhase.Waiting)
     } }
-    if (entries.isEmpty()) return
-    val index = entries.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 } ?: 0
-    val entry = entries[index]
-    LaunchedEffect(scope, entry.key) { selectedKey = entry.key }
-    val availability = questionAvailability(s, entry)
-    val session = entry.batch?.let(memory::session)
-    val phase = session?.presentationPhase(availability) ?: availability
-    PSurface(modifier.fillMaxWidth().testTag("question-dock"), shape = RoundedCornerShape(20.dp),
-        color = Pocket.colors.surface, border = BorderStroke(1.dp, Pocket.colors.line)) {
-        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                PIcon(if (entry.batch != null) PocketIcons.ChatBubbleOutline else PocketIcons.ShieldCheck, null,
-                    Modifier.padding(end = 8.dp).size(18.dp), tint = Pocket.colors.accent)
-                Column(Modifier.weight(1f)) {
-                    PText("待处理 · ${entries.size}", Modifier.testTag("question-batch-count"), style = Pocket.type.label)
-                    PText("${index + 1}/${entries.size} · " + if (entry.asynchronous) "异步问题" else if (entry.batch != null) "需要回答" else "权限审批",
-                        style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+    if (pending.isEmpty()) return
+    val chatKey = s.selected?.key ?: return
+    Column(modifier.fillMaxWidth()) {
+        if (closed.isNotEmpty()) {
+            val ids = closed.flatMap { it.batch!!.questions.map { q -> q.id } }.toSet()
+            PTextAction("待回答 · ${ids.size}", {
+                selectedKey = closed.first().key
+                collapsed = false
+                onRestore(chatKey, ids)
+            }, Modifier.align(Alignment.End).testTag("question-restore"), leading = PocketIcons.ChatBubbleOutline)
+        }
+        if (entries.isEmpty()) return@Column
+        val index = entries.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 } ?: 0
+        val entry = entries[index]
+        LaunchedEffect(scope, entry.key) { selectedKey = entry.key }
+        val availability = questionAvailability(s, entry)
+        val session = entry.batch?.let(memory::session)
+        val phase = session?.presentationPhase(availability) ?: availability
+        PSurface(Modifier.fillMaxWidth().testTag("question-dock"), shape = RoundedCornerShape(20.dp),
+            color = Pocket.colors.surface, border = BorderStroke(1.dp, Pocket.colors.line)) {
+            Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    PIcon(if (entry.batch != null) PocketIcons.ChatBubbleOutline else PocketIcons.ShieldCheck, null,
+                        Modifier.padding(end = 8.dp).size(18.dp), tint = Pocket.colors.accent)
+                    Column(Modifier.weight(1f)) {
+                        PText("待处理 · ${entries.size}", Modifier.testTag("question-batch-count"), style = Pocket.type.label)
+                        PText("${index + 1}/${entries.size} · " + if (entry.asynchronous) "异步问题" else if (entry.batch != null) "需要回答" else "权限审批",
+                            style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                    }
+                    if (entries.size > 1) {
+                        ActionIcon(PocketIcons.ChevronLeft, "上一批", index > 0) { selectedKey = entries[index - 1].key }
+                        ActionIcon(PocketIcons.ChevronRight, "下一批", index < entries.lastIndex) { selectedKey = entries[index + 1].key }
+                    }
+                    if (entry.asynchronous) {
+                        PIconButton(PocketIcons.Close, "关闭问题卡片", {
+                            onClose(chatKey, entry.batch!!.questions.map { it.id }.toSet())
+                        }, Modifier.testTag("question-close"))
+                    } else ActionIcon(if (collapsed) PocketIcons.ExpandMore else PocketIcons.ExpandLess,
+                        if (collapsed) "展开问题" else "收起问题") { collapsed = !collapsed }
                 }
-                if (entries.size > 1) {
-                    ActionIcon(PocketIcons.ChevronLeft, "上一批", index > 0) { selectedKey = entries[index - 1].key }
-                    ActionIcon(PocketIcons.ChevronRight, "下一批", index < entries.lastIndex) { selectedKey = entries[index + 1].key }
-                }
-                ActionIcon(if (collapsed) PocketIcons.ExpandMore else PocketIcons.ExpandLess,
-                    if (collapsed) "展开问题" else "收起问题") { collapsed = !collapsed }
-            }
-            if (collapsed) {
-                QuestionStatus(phase, !s.busy && !s.sendBusy)
-            } else if (entry.batch != null && session != null) {
-                QuestionCard(entry.batch, session, phase, onSubmit = { answers ->
-                    entry.approval?.let { approval ->
-                        QuestionBatches.blockingResponse(entry.batch, answers)?.let { onRespond(approval, it) }
-                    } ?: QuestionBatches.asyncAnswers(entry.batch, answers)?.let(onAsyncAnswers)
-                }, enabled = !s.busy && !s.sendBusy, revealState = memory.reveal(entry.batch))
-            } else if (entry.receipt != null && entry.approval == null) {
-                QuestionStatus(phase)
-                PText("回答已保留 · 核对状态不会再次发送", style = Pocket.type.bodySmall)
-            } else {
-                // Command/file approval decisions keep their own native allow/decline/cancel interface.
-                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                    QuestionStatus(phase, !s.busy)
-                    entry.approval?.let { ApprovalCard(it, availability == QuestionPhase.Waiting && !s.busy &&
-                        !s.sendBusy && it.key !in s.submittingApprovalKeys, onRespond) }
+                if (collapsed && !entry.asynchronous) {
+                    QuestionStatus(phase, !s.busy && !s.sendBusy)
+                } else if (entry.batch != null && session != null) {
+                    QuestionCard(entry.batch, session, phase, onSubmit = { answers ->
+                        entry.approval?.let { approval ->
+                            QuestionBatches.blockingResponse(entry.batch, answers)?.let { onRespond(approval, it) }
+                        } ?: QuestionBatches.asyncAnswers(entry.batch, answers)?.let(onAsyncAnswers)
+                    }, enabled = !s.busy && !s.sendBusy, revealState = memory.reveal(entry.batch),
+                        onDelete = if (entry.asynchronous) ({ id -> onDelete(chatKey, id) }) else null)
+                } else {
+                    // Command/file approval decisions keep their own native allow/decline/cancel interface.
+                    Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                        QuestionStatus(phase, !s.busy)
+                        entry.approval?.let { ApprovalCard(it, availability == QuestionPhase.Waiting && !s.busy &&
+                            !s.sendBusy && it.key !in s.submittingApprovalKeys, onRespond) }
+                    }
                 }
             }
         }
@@ -116,6 +137,7 @@ internal fun QuestionCard(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     revealState: QuestionRevealState? = null,
+    onDelete: ((String) -> Unit)? = null,
 ) {
     var revision by remember(session) { mutableIntStateOf(0) }
     // The session is plain memory so it can be tested without Compose or a persistence runtime.
@@ -133,6 +155,10 @@ internal fun QuestionCard(
                         Modifier.weight(1f), style = Pocket.type.labelSmall, color = Pocket.colors.inkMuted)
                     PText(if (question == null) "0/0" else "${session.page + 1}/${batch.questions.size}", Modifier.testTag("question-page"),
                         style = Pocket.type.label)
+                    if (batch.asynchronous && question != null && onDelete != null) {
+                        PIconButton(PocketIcons.DeleteOutline, "从待回答中删除", { onDelete(question.id) },
+                            Modifier.testTag("question-delete:${question.id}"))
+                    }
                 }
                 QuestionStatus(phase, enabled)
                 if (question != null) {

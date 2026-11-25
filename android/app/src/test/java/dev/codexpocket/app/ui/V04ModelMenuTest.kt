@@ -68,19 +68,19 @@ class V04ModelMenuTest {
         compose.onNodeWithTag("model-search").assertDoesNotExist()
     }
 
-    @Test fun modelFirstMenuShowsNativeEffortSliderAndDisablesOfflineEffortChanges() {
+    @Test fun savedModelEffortCanBeEditedWhileRuntimeIsOffline() {
         val model = NativeModel("a", "astra", "6 Astra", "", listOf("low", "medium", "high", "xhigh"), "medium", false, true)
         var chosen: String? = null
         compose.activity.runOnUiThread { compose.activity.setContent { PocketTheme("light") {
-            ModelSheet(modelState(model, runtimeOnline = false).copy(effort = "high"),
+            ModelSheet(modelState(model, runtimeOnline = false).copy(effort = "high", online = false, modelCatalogState = ModelCatalogState.Offline),
                 { _, _ -> }, {}, onEffort = { _, effort -> chosen = effort })
         } } }
         compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertTextEquals("high")
         compose.onNodeWithText("6 Astra").assertExists()
-        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo(2f, 0f..3f, 2)).assertIsNotEnabled()
-        compose.onNodeWithTag("effort-track").assert(SemanticsMatcher.keyNotDefined(SemanticsActions.SetProgress))
+        compose.onNodeWithTag("effort-track").assertRangeInfoEquals(ProgressBarRangeInfo(2f, 0f..3f, 2)).assertIsEnabled()
+        compose.onNodeWithTag("effort-track").performSemanticsAction(SemanticsActions.SetProgress) { it(0f) }
         compose.onNodeWithTag("composer-effort").assertDoesNotExist()
-        compose.runOnIdle { assertNull(chosen) }
+        compose.runOnIdle { assertEquals("low", chosen) }
         compose.onNodeWithTag("model-picker-open").assertExists()
         compose.onNodeWithTag("effort-title", useUnmergedTree = true).assertExists()
     }

@@ -64,15 +64,23 @@ class AssistantScreenTest {
         assertTrue(bitmap.width > 0 && bitmap.height > 0)
     }
 
-    @Test fun disabledEntryRetainsComposerAndOffersPreparationWithoutRuntimeSelection() {
+    @Test fun legacyPreparationRetainsDraftAndOnlyBlocksSendingWhilePending() {
         val actions = mutableListOf<AssistantAction>()
-        content({AssistantUiState(AssistantSnapshot(enabled=false))},actions)
+        var state by mutableStateOf(AssistantUiState(AssistantSnapshot(enabled=false)))
+        content({state},actions)
+        assertTrue("Opening an unprepared assistant must not prepare it", actions.isEmpty())
         compose.onNodeWithTag(AssistantDraft).performTextInput("保留草稿")
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         compose.onNodeWithTag("assistant-prepare").performClick()
         assertEquals("assistant/prepare",actions.single().method)
         assertTrue(actions.single().params.isEmpty())
+        compose.runOnIdle { state = state.copy(pendingActions=setOf("assistant/prepare")) }
         compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留草稿")
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(pendingActions=emptySet()) }
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留草稿")
+        assertEquals("No send is dispatched by preparation or its completion", 1, actions.size)
         compose.onNodeWithText("服务已就绪").assertDoesNotExist()
         screenshot("disabled-prepare")
     }
@@ -96,7 +104,7 @@ class AssistantScreenTest {
         screenshot("chat-result")
     }
 
-    @Test fun sendsOnlyChosenAuthorizedThreadAndRetainsDraftUntilAcknowledged() {
+    @Test fun sendsOnlyChosenAuthorizedThreadAndReleasesPersistedDraft() {
         val actions = mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot()))
         content({state},actions)
@@ -106,7 +114,7 @@ class AssistantScreenTest {
         assertEquals("真实消息",actions.last().params.string("message"))
         assertEquals("authorized-thread",actions.last().params.string("threadId"))
         assertFalse(actions.last().params.containsKey("path"))
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("真实消息")
+        compose.onNodeWithTag(AssistantDraft).assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
         compose.runOnIdle { state = state.copy(pendingActions=setOf("assistant/send")) }
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(pendingActions=emptySet()).acceptSend(actions.last()) }
@@ -162,13 +170,11 @@ class AssistantScreenTest {
         content({AssistantUiState(snapshot())},actions)
         compose.openAssistantPage("Settings")
         scroll("assistant-personality").performTextReplacement("耐心核对")
-        scroll("assistant-model").performClick()
-        compose.onNodeWithTag("assistant-model:model:actual-model").performClick()
         scroll("assistant-timezone").performTextReplacement("Asia/Shanghai")
         scroll("assistant-notify-failed").performClick()
         scroll("assistant-save-settings").performClick()
-        val settings = actions.last().params.obj("settings")
-        assertEquals("actual-model",settings.string("model"))
+        val settings = actions.last().params.obj("patch")
+        assertFalse(settings.containsKey("model"))
         assertEquals("耐心核对",settings.string("personality"))
         assertEquals("Asia/Shanghai",settings.string("timezone"))
         assertFalse(settings.obj("notifications").flag("failed"))
@@ -236,11 +242,10 @@ class AssistantScreenTest {
         val directory=listOf(models.single().copy(model="default",name="电脑的 default 模型"))
         val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(snapshot())},actions,modelDirectory=directory)
-        compose.openAssistantPage("Settings")
-        scroll("assistant-model").performClick()
-        compose.onNodeWithTag("assistant-model:model:default").performClick()
-        scroll("assistant-save-settings").performClick()
-        assertEquals(JsonPrimitive("default"),actions.last().params.obj("settings")["model"])
+        compose.onNodeWithTag("assistant-model-open").performClick()
+        compose.onNodeWithText("工作").performClick()
+        compose.onNodeWithTag("model-row-native-1").performClick()
+        assertEquals(JsonPrimitive("default"),actions.last().params.obj("patch")["model"])
     }
 
     @Test fun taskControlsRespectReconciliationAndPausedQuestionCannotApprove() {
@@ -284,13 +289,11 @@ class AssistantScreenTest {
         var state by mutableStateOf(AssistantUiState(AssistantSnapshot(enabled=false)))
         content({state},actions,modelDirectory=emptyList())
         compose.openAssistantPage("Settings")
-        scroll("assistant-model").performClick()
-        compose.onNodeWithTag("assistant-model:host-default").performClick()
         scroll("assistant-enable").performClick()
         assertEquals("assistant/enable",actions.last().method)
         compose.runOnIdle {state=AssistantUiState(snapshot().copy(settings=AssistantSettings("认真协助","简洁",null,"UTC")))}
         scroll("assistant-save-settings").performClick()
-        assertEquals(JsonNull,actions.last().params.obj("settings")["model"])
+        assertFalse(actions.last().params.obj("patch").containsKey("model"))
     }
 
     @Test fun offlineErrorWhileMemoryDeleteConfirmationIsOpenBlocksMutation() {
@@ -358,68 +361,41 @@ class AssistantScreenTest {
     }
 
     private fun withCoordinator(model: String?) = snapshot().let { it.copy(settings = it.settings!!.copy(coordinatorModel = model)) }
-    private fun chooseCoordinator(option: String) {
-        scroll("assistant-coordinator-model").performClick()
-        compose.onNodeWithTag("assistant-coordinator-model:$option").performScrollTo().performClick()
-    }
-
-    @Test fun choosingACoordinatorModelSendsItAndLeavesTheTaskModelAlone() {
-        val actions = mutableListOf<AssistantAction>()
+    @Test fun choosingACoordinatorModelOnlyPatchesThatRole() {
+        val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(withCoordinator(null))},actions)
-        compose.openAssistantPage("Settings")
-        scroll("assistant-coordinator-model").assert(hasText("跟随默认"))
-        chooseCoordinator("model:actual-model")
-        scroll("assistant-coordinator-model").assert(hasText("电脑传入模型"))
-        scroll("assistant-save-settings").performClick()
-        val settings = actions.single().params.obj("settings")
-        assertEquals("actual-model",settings.string("coordinator_model"))
-        assertEquals("actual-model",settings.string("model"))
-        assertEquals("认真协助",settings.string("personality"))
+        compose.onNodeWithTag("assistant-model-open").performClick()
+        compose.onNodeWithTag("assistant-model-choose").performClick()
+        compose.onNodeWithTag("model-row-native-1").performClick()
+        val patch=actions.last().params.obj("patch")
+        assertEquals("actual-model",patch.string("coordinator_model"))
+        assertFalse(patch.containsKey("model"))
     }
-
-    @Test fun followingTheDefaultSendsNoCoordinatorModel() {
-        val actions = mutableListOf<AssistantAction>()
+    @Test fun followingTheWorkModelUsesExplicitNull() {
+        val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(withCoordinator("actual-model"))},actions)
-        compose.openAssistantPage("Settings")
-        scroll("assistant-coordinator-model").assert(hasText("电脑传入模型"))
-        chooseCoordinator("follow-default")
-        scroll("assistant-coordinator-model").assert(hasText("跟随默认"))
-        scroll("assistant-save-settings").performClick()
-        val settings = actions.single().params.obj("settings")
-        // The settings object leaves the field out, which the computer reads as none.
-        assertFalse(settings.containsKey("coordinator_model"))
-        assertEquals("actual-model",settings.string("model"))
+        compose.onNodeWithTag("assistant-model-open").performClick()
+        compose.onNodeWithTag("assistant-model-choose").performClick()
+        compose.onNodeWithTag("assistant-model-inherit").performClick()
+        assertEquals(JsonNull,actions.last().params.obj("patch")["coordinator_model"])
     }
-
-    @Test fun savingAnotherFieldPreservesTheStoredCoordinatorModel() {
-        val actions = mutableListOf<AssistantAction>()
-        content({AssistantUiState(withCoordinator("actual-model").let { it.copy(settings = it.settings!!.copy(model = null)) })},actions)
+    @Test fun staleSettingsDraftCannotReplaceEitherModel() {
+        val actions=mutableListOf<AssistantAction>()
+        var current by mutableStateOf(AssistantUiState(withCoordinator("actual-model")))
+        content({current},actions)
         compose.openAssistantPage("Settings")
         scroll("assistant-tone").performTextReplacement("耐心")
-        scroll("assistant-notify-completed").performClick()
+        compose.runOnIdle {current=current.copy(snapshot=withCoordinator("new-chief"))}
         scroll("assistant-save-settings").performClick()
-        val settings = actions.single().params.obj("settings")
-        assertEquals("actual-model",settings.string("coordinator_model"))
-        assertEquals(JsonNull,settings["model"])
-        assertEquals("耐心",settings.string("tone"))
-        assertFalse(settings.obj("notifications").flag("completed"))
+        val patch=actions.last().params.obj("patch")
+        assertFalse(patch.containsKey("model"));assertFalse(patch.containsKey("coordinator_model"))
+        assertEquals("耐心",patch.string("tone"))
     }
-
-    @Test fun offCatalogueCoordinatorModelIsShownAndSurvivesAnUnrelatedSave() {
-        val actions = mutableListOf<AssistantAction>()
+    @Test fun offCatalogueModelRemainsVisibleInComposerAndPicker() {
+        val actions=mutableListOf<AssistantAction>()
         content({AssistantUiState(withCoordinator("retired-model"))},actions)
-        compose.openAssistantPage("Settings")
-        scroll("assistant-coordinator-model").assert(hasText("retired-model（不在列表中）"))
-        scroll("assistant-personality").performTextReplacement("耐心核对")
-        compose.onNodeWithTag("assistant-settings-issue").assertDoesNotExist()
-        scroll("assistant-save-settings").assertIsEnabled().performClick()
-        val settings = actions.single().params.obj("settings")
-        assertEquals("retired-model",settings.string("coordinator_model"))
-        assertEquals("耐心核对",settings.string("personality"))
-        // It is offered only as what is stored: the list holds the default and the catalogue.
-        scroll("assistant-coordinator-model").performClick()
-        compose.onNodeWithTag("assistant-coordinator-model:follow-default").assertExists()
-        compose.onNodeWithTag("assistant-coordinator-model:model:actual-model").assertExists()
-        compose.onNodeWithTag("assistant-coordinator-model:model:retired-model").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-model-open").performClick()
+        compose.onNodeWithTag("model-row-retired-model").assertExists()
+        compose.onNodeWithTag("assistant-model-inherit").assertExists()
     }
 }

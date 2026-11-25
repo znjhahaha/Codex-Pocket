@@ -43,6 +43,8 @@ mod history_takeover;
 mod desktop_control;
 mod history_settings;
 #[cfg(test)]
+mod context_tests;
+#[cfg(test)]
 mod history_settings_tests;
 #[path = "broker_usage.rs"]
 mod usage_backend;
@@ -1158,7 +1160,7 @@ impl Broker {
             turn.to_owned(),
         );
         tokio::task::spawn_blocking(move || {
-            histories
+            let mut projected = histories
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Media metadata unavailable"))?
                 .project(
@@ -1173,7 +1175,10 @@ impl Broker {
                     &store,
                     &extra_roots,
                     request_cursor.as_deref(),
-                )
+                )?;
+            let context_thread = if thread.is_empty() { projected["thread"]["id"].as_str().unwrap_or("").to_owned() } else { thread.clone() };
+            crate::history_catalog::mark_internal_context(&home, &context_thread, &mut projected);
+            Ok(projected)
         })
         .await
         .map_err(|_| classify(anyhow::anyhow!("Media worker unavailable"), Code::Unknown))?
@@ -2265,6 +2270,11 @@ impl Broker {
                 "assistant.jobs.v1",
                 "assistant.stream.v1",
                 "assistant/read",
+                "assistant/v2/read",
+                "assistant/v2/send",
+                "assistant/v2/conversation/create",
+                "assistant/v2/conversation/list",
+                "assistant/v2/conversation/interrupt",
                 "assistant/project/read",
                 "push/status",
                 "push/register",
@@ -2982,6 +2992,7 @@ impl Broker {
         Ok(())
     }
     pub async fn receive_events(self: Arc<Self>, mut rx: mpsc::Receiver<NativeEvent>) {
+        let mut contexts = crate::history_catalog::LiveContexts::default();
         while let Some(event) = rx.recv().await {
             let event = match event {
                 NativeEvent::Message {
@@ -2999,7 +3010,18 @@ impl Broker {
                     {
                         continue;
                     }
-                    let projected = self.media.project(&value, &runtime_id, &connection_id, "");
+                    let mut projected = self.media.project(&value, &runtime_id, &connection_id, "");
+                    if contexts.project(&runtime_id, &connection_id, &mut projected) {
+                        let home = self.state.lock().await.runtimes.get(&runtime_id)
+                            .filter(|r| r.connection_id == connection_id).map(|r| r.config_home.clone());
+                        if let Some(home) = home {
+                            let thread = projected["params"]["threadId"].as_str().unwrap_or("").to_owned();
+                            projected = tokio::task::spawn_blocking(move || {
+                                crate::history_catalog::mark_internal_context(&home, &thread, &mut projected);
+                                projected
+                            }).await.expect("context projection worker panicked");
+                        }
+                    }
                     NativeEvent::Message {
                         runtime_id,
                         connection_id,
@@ -3344,7 +3366,12 @@ impl Broker {
             "threads/control/read" => return self.desktop_control(&p).await,
             "usage/read" | "usage/sources" | "usage/dashboard/read" | "usage/requests/read" => return self.usage_request(device, method, &p).await,
             "usage/v2/sources" | "usage/v2/read" | "usage/v2/requests/read" => return self.usage_v2_request(device, method, &p).await,
-            "assistant/read" => return self.assistant_read(&p).await,
+            "assistant/read" | "assistant/v2/read" => return self.assistant_read(&p).await,
+            "assistant/v2/conversation/list" => {
+                anyhow::ensure!(p.as_object().is_some_and(|o|o.is_empty()),"Invalid conversation list");
+                let value=self.assistant_read(&p).await?;
+                return Ok(json!({"data":value["conversations"],"conversationId":value["conversationId"]}));
+            }
             "assistant/project/read" => return self.assistant_project_read(device, &p).await,
             "routes/list" => return Ok(crate::config::routes::snapshot(&self.config,&self.state_dir)),
             "session/preferences/read" => {
@@ -4285,8 +4312,12 @@ impl Broker {
             attachments::translate(&mut params, device, &s.attachments)?;
             if method == "thread/start" {
                 crate::native_history_compat::prepare_creation(&mut params, &r.capabilities);
+                // experimentalApi at initialize is necessary but insufficient:
+                // Codex also requires this per-thread raw-response opt-in.
+                if r.capabilities.supports(method, &json!({"experimentalRawEvents":true})) {
+                    params["experimentalRawEvents"] = json!(true);
+                }
             }
-            crate::managed_runtime::apply_packaged_policy(method, &mut params, crate::managed_runtime::packaged());
             if method == "thread/resume"
                 && r.capabilities.supports("thread/resume", &json!({"threadId":"probe","excludeTurns":true}))
             {
@@ -5608,6 +5639,35 @@ mod tests {
             assert_eq!(finish(task).await.unwrap()["thread"]["id"], "history");
         }
     }
+    #[tokio::test]
+    async fn managed_admission_refusal_is_rejected_in_durable_command_ledger() {
+        let (dir, broker) = fixture().await;
+        let mut native = peer(&broker, "managed", "cli").await;
+        let params = json!({"commandId":"blocked-create","runtimeId":"managed","method":"thread/start","params":{"cwd":dir.path()}});
+        let task = tokio::spawn({
+            let broker = broker.clone();
+            let params = params.clone();
+            async move { broker.request("phone", "codex/request", params).await }
+        });
+        loaded(&mut native, &[]).await;
+        let request = native.recv().await;
+        assert_eq!(request["method"], "thread/start");
+        assert_eq!(request["params"]["cwd"], json!(dir.path()));
+        native.send(json!({"id":request["id"],"error":{
+            "code":"reconciliation_required","notDispatched":true,
+            "message":"Runtime scope requires reconciliation before dispatch"}})).await;
+        let response = crate::session::reply(json!(1), finish(task).await);
+        assert_eq!(response["error"]["code"], "rejected");
+        let status = broker.request("phone", "commands/status", json!({"commandId":"blocked-create"})).await.unwrap();
+        assert_eq!(status["status"], "rejected");
+        let disk: Value = serde_json::from_slice(&std::fs::read(dir.path().join("commands.json")).unwrap()).unwrap();
+        let command = disk["entries"].as_array().unwrap().iter()
+            .find(|entry| entry["key"]["command_id"] == "blocked-create").unwrap();
+        assert!(command["status"].get("Rejected").is_some(), "{command}");
+        assert_eq!(crate::session::reply(json!(2), broker.request("phone", "codex/request", params).await)["error"]["code"], "rejected");
+        assert!(broker.state.lock().await.runtimes["managed"].rpc.online());
+    }
+
     #[tokio::test]
     async fn dispatched_disconnect_is_unknown_and_native_rejection_is_redacted() {
         for disconnect in [true, false] {

@@ -26,6 +26,8 @@ internal fun AssistantUiState.busy(method: String, id: String? = null) =
 /** One short phrase for the readiness dot; the same wording wherever the assistant's state is named. */
 internal fun assistantStatus(state: AssistantUiState): String = when {
     state.loading -> "正在读取状态"; state.error != null -> "暂时无法确认状态"; state.snapshot?.enabled==null -> "状态尚未读取"
+    state.snapshot.preparationStatus == "idle" -> "发送时启动"
+    state.snapshot.preparationStatus in setOf("starting","preparing") || state.busy("assistant/prepare") -> "正在启动助理"
     state.snapshot.dispatchInFlight -> "正在处理"
     state.snapshot.enabled==false -> "尚未启用"; state.busy("assistant/prepare") || state.snapshot.ready==false -> "正在准备助理"; state.snapshot.paused==true -> "助理已暂停"
     state.snapshot.operations.any {it.phase==AssistantOperationPhase.Waiting && !it.suspended} -> "等待你确认"

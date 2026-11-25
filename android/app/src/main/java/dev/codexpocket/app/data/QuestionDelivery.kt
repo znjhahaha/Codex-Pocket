@@ -33,6 +33,11 @@ class QuestionReceipt private constructor(
         return batch.questions.filter { !it.secret && inputs[it.id] == signature(it) && it.accepts(answers[it.id]) }
             .associate { it.id to answers.getValue(it.id) }
     }
+    fun historyAnswers(chat: ThreadKey, turn: String, item: String, batch: QuestionBatch): Map<String, String> {
+        if (this.chat != chat || turnId.isBlank() || itemId.isBlank() || turnId != turn || itemId != item || !batch.valid) return emptyMap()
+        return batch.questions.filter { !it.secret && inputs[it.id] == signature(it) && it.accepts(answers[it.id]) }
+            .associate { it.id to answers.getValue(it.id) }
+    }
     fun withDelivery(value: JsonObject): QuestionReceipt? {
         val next = QuestionDeliveryPhase.parse(value.string("phase")) ?: return null
         if (value.string("commandId") != commandId || value.string("runtimeId") != runtimeId ||
@@ -81,11 +86,25 @@ class QuestionReceipt private constructor(
 }
 
 /** Read-only rendering of native arguments and completed results, including authenticated broker projections. */
-class NativeQuestionHistory private constructor(val batch: QuestionBatch, val answers: Map<String, String>, val cancelled: Boolean) {
+class NativeQuestionHistory private constructor(val batch: QuestionBatch, val answers: Map<String, String>, val cancelled: Boolean,
+    private val turnId: String, private val itemId: String, private val nativeOutcome: Boolean,
+    val locallySubmitted: Boolean = false) {
     val text get() = batch.questions.joinToString("\n\n") { q ->
         listOfNotNull(q.prompt, answers[q.id]?.let { "回答：$it" }).joinToString("\n")
     } + if (cancelled) "\n问题已取消" else ""
     override fun toString() = "NativeQuestionHistory"
+    /** Display-only fallback; its provenance stays visible and it cannot change a native outcome. */
+    fun withSubmitted(chat: ThreadKey, receipts: List<QuestionReceipt>): NativeQuestionHistory {
+        if (nativeOutcome) return this
+        val receipt = receipts.filter { it.chat == chat && it.turnId == turnId && it.itemId == itemId }
+            .maxByOrNull { it.createdAt } ?: return this
+        if (receipt.phase == QuestionDeliveryPhase.Cancelled) return NativeQuestionHistory(batch, emptyMap(), true, turnId, itemId, true)
+        if (receipt.phase == QuestionDeliveryPhase.AnsweredElsewhere) return this
+        val submitted = receipt.historyAnswers(chat, turnId, itemId, batch)
+        if (submitted.isEmpty()) return this
+        return NativeQuestionHistory(batch, submitted, false, turnId, itemId, false,
+            locallySubmitted = receipt.phase != QuestionDeliveryPhase.Confirmed)
+    }
     companion object {
         fun isRequest(item: TimelineItem) = item.type == "dynamicToolCall" &&
             item.raw.string("tool").substringAfterLast('.') == "request_user_input"
@@ -93,8 +112,7 @@ class NativeQuestionHistory private constructor(val batch: QuestionBatch, val an
             runCatching { pocketJson.parseToJsonElement(item.raw.string("arguments")) as? JsonObject }.getOrNull() ?: buildJsonObject {}
         private fun result(item: TimelineItem, ids: Set<String>): JsonObject? {
             if (item.raw.string("status") != "completed" || item.raw["success"] == JsonPrimitive(false)) return null
-            val content = item.raw.array("contentItems").takeIf { it.isNotEmpty() } ?: item.raw.array("toolOutputBlocks")
-            val results = content.mapNotNull { part ->
+            fun read(content: JsonArray) = content.mapNotNull { part ->
                 val block = part as? JsonObject ?: return@mapNotNull null
                 if (block.string("type") !in setOf("inputText", "text")) return@mapNotNull null
                 // Match the native frame bound; individual answers retain their smaller byte limit below.
@@ -103,6 +121,10 @@ class NativeQuestionHistory private constructor(val batch: QuestionBatch, val an
                 }?.content ?: return@mapNotNull null
                 runCatching { pocketJson.parseToJsonElement(text).jsonObject["answers"] as? JsonObject }.getOrNull()
             }
+            // An unrelated content note must not shadow the actual tool result.
+            // A native answer/cancellation/malformed envelope still takes precedence.
+            val results = read(item.raw.array("contentItems")).takeIf { it.isNotEmpty() }
+                ?: read(item.raw.array("toolOutputBlocks"))
             val answers = results.singleOrNull() ?: return null
             if (answers.isEmpty()) return answers
             if (answers.keys != ids || answers.values.any { value ->
@@ -119,7 +141,12 @@ class NativeQuestionHistory private constructor(val batch: QuestionBatch, val an
                 val values = result?.get(q.id)?.asObject()?.array("answers") ?: return@mapNotNull null
                 q.id to if (q.secret) "敏感回答已隐藏" else values.joinToString("\n") { it.jsonPrimitive.content }
             }.toMap()
-            return NativeQuestionHistory(batch, answers, result?.isEmpty() == true)
+            val envelope = listOf("contentItems", "toolOutputBlocks").any { field -> item.raw.array(field).any { part ->
+                runCatching { pocketJson.parseToJsonElement(part.asObject().string("text")).jsonObject.containsKey("answers") }.getOrDefault(false)
+            } }
+            val cancelled = result?.isEmpty() == true || item.status == "cancelled"
+            val nativeOutcome = envelope || item.raw["success"] == JsonPrimitive(false) || item.status in setOf("failed", "cancelled", "declined")
+            return NativeQuestionHistory(batch, answers, cancelled, item.turnId, item.itemId, nativeOutcome)
         }
         /** Cached history may retain public answers, but never native secret result content. */
         fun cacheSafe(item: TimelineItem): TimelineItem {

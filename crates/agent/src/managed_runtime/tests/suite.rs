@@ -639,6 +639,60 @@ async fn manifest_tampering_and_uncertain_reservation_fail_closed() {
     assert!(error.contains("uncertain"), "{error}");
     assert!(!state.join("descriptor.json").exists());
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn interrupted_replacement_recovers_only_after_original_and_attempt_lifetimes_end() {
+    use pocket_core::native_process::NativeProcess;
+    let f = Fixture::new();
+    let original = f.controller.ensure(&f.profile).await.unwrap();
+    let descriptor_path = f.state().join("descriptor.json");
+    let descriptor = pocket_runtime_ipc::load_descriptor(&descriptor_path, f.profile.config_home()).unwrap();
+    let startup = f.state().join("startup.json");
+    let mut owner = read_json(&startup);
+    let live = NativeProcess::capture(std::process::id()).unwrap();
+    let ended_attempt = NativeProcess { created_at: live.created_at ^ 1, ..live.clone() };
+    assert!(ended_attempt.terminated());
+    owner["phase"] = json!("spawned");
+    owner["descriptorGeneration"] = Value::Null;
+    owner["hostProcess"] = json!(ended_attempt);
+    owner["reservation"] = json!(uuid::Uuid::new_v4().to_string());
+    crate::storage::atomic_write(&startup, &serde_json::to_vec(&owner).unwrap()).unwrap();
+    let paths = [startup.clone(), descriptor_path.clone(), f.state().join("recovery.json")];
+    let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert!(f.controller.ensure(&f.profile).await.is_err(), "live predecessor must not be replaced or adopted as this attempt");
+    for (path, bytes) in paths.iter().zip(before) { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    original.shutdown_idle().await.unwrap();
+    ended(&descriptor).await;
+    let journal = f.state().join("recovery.json");
+    let mut recovery = read_json(&journal);
+    recovery["commands"]["s:historical-unknown"] = json!({"generation":descriptor.generation,"completed":false});
+    recovery["reconciliation_required"] = json!(true);
+    crate::storage::atomic_write(&journal, &serde_json::to_vec(&recovery).unwrap()).unwrap();
+    let historical = recovery["commands"]["s:historical-unknown"].clone();
+    owner["hostProcess"] = json!(live);
+    crate::storage::atomic_write(&startup, &serde_json::to_vec(&owner).unwrap()).unwrap();
+    let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert!(f.controller.ensure(&f.profile).await.is_err(), "a live attempted Host still owns the reservation");
+    for (path, bytes) in paths.iter().zip(before) { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    owner["hostProcess"] = json!(ended_attempt);
+    crate::storage::atomic_write(&startup, &serde_json::to_vec(&owner).unwrap()).unwrap();
+    let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let error = f.controller.attach_existing(&f.profile).await.err().unwrap();
+    assert_eq!(error.downcast_ref::<crate::managed_runtime::discovery::RestoreFailure>(),
+        Some(&crate::managed_runtime::discovery::RestoreFailure::ProfileMigrationFenced), "{error:#}");
+    for (path, bytes) in paths.iter().zip(before) { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    let next = f.controller.ensure(&f.profile).await.unwrap();
+    assert_ne!(next.generation(), descriptor.generation);
+    assert_eq!(read_json(&journal)["commands"]["s:historical-unknown"], historical);
+    let receipt = next.receipt(json!("historical-unknown")).await.unwrap();
+    assert_eq!(receipt.state, "unknown");
+    assert_eq!(receipt.generation, descriptor.generation);
+    assert!(next.request(json!("historical-unknown"), "fixture/info", json!({})).await.is_err());
+    let current = pocket_runtime_ipc::load_descriptor(&descriptor_path, f.profile.config_home()).unwrap();
+    assert_ne!(current.host_process, Some(ended_attempt));
+    next.shutdown_idle().await.unwrap();
+    ended(&current).await;
+}
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn fenced_attach_existing_preserves_spawned_ownership_and_live_generation() {
     let f=Fixture::new();

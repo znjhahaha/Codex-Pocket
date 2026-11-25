@@ -1,5 +1,5 @@
-//! Scope evidence for independent work. A retained unknown receipt never grants
-//! authority, and an old record without scope cannot prove a write independent.
+//! Scope evidence for work alongside unresolved live effects. Ended process
+//! lifetimes release resources; their retained receipts never authorize replay.
 use crate::recovery::{CommandRecord, RunRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +42,29 @@ fn pending_effect(record: &CommandRecord) -> bool {
 }
 
 impl Store {
+    pub(crate) fn requires_scope_admission(&self) -> bool {
+        if !self.state.reconciliation_required {
+            return false;
+        }
+        // With no verified predecessor, an unexplained recovery flag still fences.
+        // Once its lifetimes ended, historical uncertainty must not impose new
+        // sandbox/parameter prerequisites on ordinary, broker-authorized requests.
+        self.ended_generations.is_empty()
+            || self.state.commands.values().chain(self.state.answers.values()).any(|c| {
+                !self.resources_ended(&c.generation) && pending_effect(c)
+            })
+            || self.state.runs.values().any(|r| {
+                !self.resources_ended(&r.generation)
+                    && (r.state == "unknown"
+                        || (r.generation != self.state.generation && r.state != "completed"))
+            })
+            || self.state.pending.values().any(|p| {
+                p.generation != self.state.generation && !self.resources_ended(&p.generation)
+            })
+        // Current active turns and current questions remain real activity for
+        // shutdown/drain; they are not uncertain effects recovered from an exit.
+    }
+
     pub(crate) fn scope_before_answer(&mut self, request: &str, response: &Value) {
         let Some(pending) = self.state.pending.get(request) else {
             return;
@@ -109,10 +132,14 @@ impl Store {
                 "ephemeral",
                 "allowProviderModelFallback",
                 "dynamicTools",
+                "experimentalRawEvents",
+                "historyMode",
+                "excludeTurns",
             ],
             "turn/start" => &[
                 "threadId",
                 "model",
+                "effort",
                 "cwd",
                 "input",
                 "approvalPolicy",

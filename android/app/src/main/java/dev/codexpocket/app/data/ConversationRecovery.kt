@@ -48,19 +48,41 @@ data class ConversationRecovery(val phase: String, val reason: String? = null, v
 }
 
 /** Conversation chrome owns the small connection indicator; it never blocks the transcript. */
-fun PocketState.automaticConnectionLabel(): String? {
+fun PocketState.automaticConnectionLabel(local: Boolean = false): String? {
     val chat=selected ?: return null
     if (chat.archived || chat.isSubagent) return null
-    if (!online) return if (connectionPhase in setOf("offline","authorization_required")) "离线" else "连接中"
+    if (!online) return if (local) {
+        if (connectionPhase in setOf("offline", "authorization_required")) "本机运行时未启动" else "正在启动本机 Codex"
+    } else if (connectionPhase in setOf("offline","authorization_required")) "离线" else "连接中"
     val recovery=conversationRecovery[chat.key]
     if (uncertainSend || recovery?.uncertain==true) return "确认结果中"
     if (ownershipVerifiedFor(chat) && !chat.conflict) return null
     if (recovery?.phase=="waiting_idle") return "等待本轮结束"
+    if (local) return when {
+        recovery?.phase == "waiting_release" -> "等待本机会话释放"
+        recovery?.pending == true -> "正在恢复会话"
+        recovery?.phase in setOf("blocked", "disconnected") || chat.conflict -> "会话待恢复"
+        conversationLoadState == ConversationLoadState.Failed -> "会话读取失败"
+        conversationLoadState == ConversationLoadState.Ready -> null
+        else -> "正在读取会话"
+    }
     if (chat.runtimeId.startsWith("history:") && !chat.conflict && recovery?.pending != true &&
         conversationLoadState == ConversationLoadState.Ready && conversationReadSource == "persisted") return "历史会话"
+    // Reading and sending have separate readiness. Once native history/events
+    // are visible, a control-ownership probe is not a transport connection.
+    if (!chat.conflict && activeRuntime?.online == true && conversationLoadState == ConversationLoadState.Ready &&
+        conversationReadSource == "native" && recovery?.pending != true) return null
     if (chat.conflict || chat.runtimeId.startsWith("history:") || activeRuntime?.online!=true ||
         supports(BrokerCapability.AccessRead)&&!accessAllowsSending(chat)) return "连接中"
     return null
+}
+
+/** Recovery must not depend on whether the connection label is shown. */
+fun PocketState.needsConversationControlRefresh(): Boolean {
+    val chat=selected ?: return false
+    return online && !chat.archived && !chat.isSubagent && (uncertainSend || chat.conflict ||
+        chat.runtimeId.startsWith("history:") || activeRuntime?.online != true ||
+        supports(BrokerCapability.AccessRead) && !ownershipVerifiedFor(chat) || conversationRecovery[chat.key]?.pending == true)
 }
 
 internal fun automaticConnectionFailure(failure: Exception): Boolean =

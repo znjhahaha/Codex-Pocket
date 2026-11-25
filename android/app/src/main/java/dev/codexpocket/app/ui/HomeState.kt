@@ -83,7 +83,7 @@ internal fun homeChatStatus(s: PocketState, chat: ChatEntity): String {
     val questions = s.pendingQuestions[chat.key.encoded]
         ?: if (s.selected?.key == chat.key) s.advanced.asyncQuestions else emptyList()
     if (questions.any { !it.flag("submitted") } || s.approvals.any {
-            !it.submitted && it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && !ConversationPresentation.hookType(it.method)
+            it.runtimeId == chat.runtimeId && it.threadId == chat.key.nativeId && approvalNeedsAction(s, it)
         }) return "pending"
     if (s.commands.any { it.chatKey == chat.key && it.method != "approvals/respond" && CommandPolicy.blocksNewSend(it.status) }) return "unknown"
     val online = s.online && s.runtimes.any { it.id == chat.runtimeId && it.online }
@@ -97,7 +97,11 @@ internal fun homeChatStatus(s: PocketState, chat: ChatEntity): String {
         "completed", "interrupted", "unknown", "idle", "notloaded" -> nativeStatus.lowercase(Locale.ROOT)
         else -> "idle"
     }
-    return if (online || normalized in setOf("failed", "pending", "unknown")) normalized else "offline"
+    return when {
+        online || normalized in setOf("failed", "pending", "unknown") -> normalized
+        normalized == "inProgress" -> "lastRunning"
+        else -> "offline"
+    }
 }
 
 internal fun homeUpdatedAtMillis(value: Long): Long = when {

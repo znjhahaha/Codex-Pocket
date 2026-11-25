@@ -14,6 +14,9 @@ mod project_read;
 
 #[path = "broker_assistant/command_receipts.rs"]
 mod command_receipts;
+#[path = "broker_assistant/models.rs"]
+mod models;
+use models::assistant_scope;
 
 #[cfg(test)]
 #[path = "broker_assistant/visibility_tests.rs"]
@@ -525,7 +528,8 @@ impl Broker {
         }
     }
     pub async fn restore_assistant(&self) -> Result<()> {
-        self.restore_assistant_using(crate::managed_runtime::discovery::restore_saved_profile,async |profile|self.ensure_assistant(profile).await).await
+        crate::assistant_product::retained::begin_scheduler();
+        self.restore_assistant_using(crate::managed_runtime::discovery::restore_saved_profile,async |profile|self.assistant_runtime(profile,true).await).await
     }
     async fn restore_assistant_using(&self,resolve:impl FnOnce(&Path,&Path)->Result<SelectedProfile>,ensure:impl AsyncFnOnce(Profile)->Result<Actor>)->Result<()> {
         let _write=self.writes.lock().await;
@@ -539,6 +543,7 @@ impl Broker {
             let Some(profile)=profile else {
                 return Ok(());
             };
+            if !self.fenced_assistant_bootstrap() && !crate::assistant_product::retained::needs_attachment(&self.state_dir.join("assistant"))? { return Ok(()); }
             ensure(profile).await.map(|_| ()).map_err(runtime_restore_error)
         }
         .await;
@@ -588,6 +593,19 @@ impl Broker {
         }
     }
 
+    /// Only durable queued work or a schedule approaching its due time needs a Host.
+    /// Reads and an empty installation never enter Controller::ensure.
+    pub async fn assistant_wake_loop(self: Arc<Self>) {
+        if crate::managed_runtime::packaged() { return; }
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if self.assistant.try_lock().ok().is_none_or(|a|a.as_ref().is_some_and(Actor::is_alive)) { continue; }
+            if crate::assistant_product::retained::needs_wake(&self.state_dir.join("assistant"), chrono::Utc::now().timestamp_millis()).unwrap_or(false) {
+                if self.prepare_assistant().await.is_err() { tokio::time::sleep(Duration::from_secs(30)).await; }
+            }
+        }
+    }
+
     /// Current-user diagnostics reveal readiness, never chat/account contents.
     pub async fn assistant_status(&self) -> Value {
         let snapshot = self.assistant_read(&json!({})).await;
@@ -608,6 +626,12 @@ impl Broker {
         discover: impl FnOnce() -> Result<SelectedProfile>,
     ) -> Result<Profile> {
         self.check_write_fence()?;
+        if self.state_dir.join("assistant/pending-profile.json").try_exists()? {
+            let mut profile=self.assistant_read_profile()?.context("Selected assistant profile missing")?;
+            let selected=crate::managed_runtime::discovery::restore_saved_profile(&profile.config_home,&profile.native_binary)?;
+            profile.native_binary=selected.native_binary().into();
+            return Ok(profile);
+        }
         if let Some(saved)=self.saved_assistant_profile(crate::managed_runtime::discovery::restore_saved_profile)? {
             return Ok(saved);
         }
@@ -644,10 +668,18 @@ impl Broker {
         ensure: impl AsyncFnOnce(Profile) -> Result<Actor>,
     ) -> Result<()> {
         self.check_write_fence()?;
+        let actor = self.assistant.try_lock().ok().and_then(|a|a.as_ref().filter(|a|a.is_alive()).cloned());
+        if let Some(actor)=actor.filter(|_|!self.state_dir.join("assistant/pending-profile.json").exists()) {
+            return self.apply_pending_assistant_settings(&actor).await;
+        }
         *self.assistant_error.lock().await = Some("assistant_preparing");
         let result = async {
             let profile = self.preparation_profile(discover)?;
-            ensure(profile).await.map(|_| ()).map_err(runtime_restore_error)
+            let actor=ensure(profile).await.map_err(runtime_restore_error)?;
+            self.apply_pending_assistant_settings(&actor).await?;
+            let pending=self.state_dir.join("assistant/pending-profile.json");
+            if pending.try_exists()? {std::fs::remove_file(pending)?;}
+            Ok(())
         }
         .await;
         let error = result.as_ref().err().map(|error| {
@@ -685,6 +717,9 @@ impl Broker {
     }
 
     async fn ensure_assistant(&self, profile: Profile) -> Result<Actor> {
+        self.assistant_runtime(profile,false).await
+    }
+    async fn assistant_runtime(&self, profile: Profile, attach_only: bool) -> Result<Actor> {
         let executable = std::env::current_exe()?;
         let bin = executable.parent().context("Missing installation")?;
         let generation = crate::installation::current()["generation"]
@@ -694,16 +729,20 @@ impl Broker {
         let installation = Installation::new(bin, generation)?;
         let registry = if self.fenced_assistant_bootstrap(){Registry::existing(self.state_dir.join("managed-runtimes"))?}else{Registry::new(self.state_dir.join("managed-runtimes"))?};
         let controller = Controller::new(installation, registry.clone());
-        self.ensure_assistant_with(profile, &controller, &registry)
+        self.assistant_with_mode(profile, &controller, &registry,attach_only)
             .await
     }
 
+    #[cfg(test)]
     async fn ensure_assistant_with(
         &self,
         profile: Profile,
         controller: &Controller,
         registry: &Registry,
     ) -> Result<Actor> {
+        self.assistant_with_mode(profile,controller,registry,false).await
+    }
+    async fn assistant_with_mode(&self, profile: Profile, controller: &Controller, registry: &Registry, attach_only: bool) -> Result<Actor> {
         let readonly=self.fenced_assistant_bootstrap();
         if readonly {
             let saved=self.saved_assistant_profile(validate_fenced_saved_profile)?;
@@ -727,7 +766,9 @@ impl Broker {
                 Err(error)=>{actor.resume_after_runtime_check().await?;return Err(error);}
             };
             if runtime.generation()==old {
-                actor.resume_after_runtime_check().await?;return Ok(actor);
+                actor.resume_after_runtime_check().await?;
+                storage::atomic_write(&self.state_dir.join("assistant/profile.json"),&serde_json::to_vec(&profile)?)?;
+                return Ok(actor);
             }
             // Acknowledgement follows Worker drop, including the Service and
             // Executor owner locks. Cloned Actor handles cannot keep it alive.
@@ -736,7 +777,7 @@ impl Broker {
             Arc::new(runtime)
         } else {
             *current=None;
-            Arc::new(if readonly {controller.attach_existing(&selected).await?}else{controller.ensure(&selected).await?})
+            Arc::new(if readonly || attach_only {controller.attach_existing(&selected).await?}else{controller.ensure(&selected).await?})
         };
         let cursor = self
             .handoff
@@ -802,13 +843,15 @@ impl Broker {
     pub(super) async fn assistant_read(&self, p: &Value) -> Result<Value> {
         if p.as_object().is_none_or(|o| {
             o.keys()
-                .any(|k| !["after", "before", "limit", "taskId"].contains(&k.as_str()))
+                .any(|k| !["after", "before", "limit", "taskId", "models", "conversationId"].contains(&k.as_str()))
         }) || ["after", "before"]
             .iter()
             .any(|k| p.get(k).is_some_and(|v| v.as_u64().is_none()))
             || p.get("limit")
                 .is_some_and(|v| v.as_u64().is_none_or(|n| !(1..=100).contains(&n)))
             || p.get("taskId").is_some_and(|v| !valid_scope_id(v))
+            || p.get("models").is_some_and(|v| !v.is_boolean())
+            || p.get("conversationId").is_some_and(|v| !valid_assistant_id(v))
         {
             return Err(classify(
                 anyhow::anyhow!("Invalid assistant read"),
@@ -818,21 +861,39 @@ impl Broker {
         // ensure holds this lock while launching. Reads must still expose the
         // preparing state, without queueing behind native startup/handshake.
         let actor = self.assistant.try_lock().ok().and_then(|a| a.clone());
+        let idle = actor.is_none();
+        let selection_pending=self.state_dir.join("assistant/pending-profile.json").try_exists()?;
+        let mut read = p.clone();
+        read.as_object_mut().unwrap().remove("models");
         let mut result = if let Some(actor) = actor {
             actor
                 .request(
                     "assistant/read",
-                    p.clone(),
+                    read.clone(),
                     format!("read:{}", uuid::Uuid::new_v4()),
                     None,
                 )
                 .await
-                .unwrap_or_else(|_| actor.snapshot())
+                .or_else(|error| {
+                    if p.get("conversationId").is_some() {crate::assistant_product::retained::snapshot(&self.state_dir.join("assistant"),p).map_err(|_|error)} else {Ok(actor.snapshot())}
+                })?
         } else {
-            json!({"enabled":false,"ready":false,"runtimeId":null,"tasks":[],"operations":[],"events":[],"memories":[],"schedules":[],"messages":[]})
+            crate::assistant_product::retained::snapshot(&self.state_dir.join("assistant"),p)?
         };
+        let profile = match self.assistant_read_profile() {
+            Ok(profile)=>profile,
+            Err(_) => { *self.assistant_error.lock().await=Some("assistant_restore_failed"); None }
+        };
+        let scope = assistant_scope(profile.as_ref())?;
+        result["scopeId"] = json!(scope);
+        result["selectedRuntimeId"] = json!(profile.as_ref().map(|p|p.source_runtime_id.as_str()).filter(|id|!id.is_empty()));
+        if let Some(saved)=crate::assistant_product::retained::pending_settings(&self.state_dir.join("assistant"), &scope)? {
+            result["settings"] = saved["settings"].clone();
+        }
+        if p["models"] == true { result["models"] = self.assistant_models(profile.as_ref()).await?; }
         let mut error = *self.assistant_error.lock().await;
-        if error.is_none() && result["runtimeId"].as_str().is_some() {
+        if crate::managed_runtime::packaged() { error=Some(ASSISTANT_UNAVAILABLE_ON_DEVICE); }
+        if !idle && !selection_pending && error.is_none() && result["runtimeId"].as_str().is_some() {
             error = if result.get("accountReady").is_some() {
                 match result["error"].as_str() { Some("assistant_needs_login")=>Some("assistant_needs_login"), Some("assistant_account_unavailable")=>Some("assistant_account_unavailable"), _=>None }
             } else { self.assistant_account_status(&result).await };
@@ -848,14 +909,15 @@ impl Broker {
             }
             result["recoveryAction"] = json!(preparation_hint(error));
         }
+        if selection_pending {result["ready"]=json!(false);result["acceptingMessages"]=json!(false);}
         let status = match error {
-            Some("assistant_preparing") => "preparing",
+            Some("assistant_preparing") => "starting",
             Some("assistant_missing_cli") => "missing_cli",
             Some("assistant_missing_config") => "missing_config",
             Some("assistant_needs_login") => "needs_login",
             Some(_) => "recoverable_error",
+            None if idle || selection_pending => "idle",
             None if result["ready"] == true || result["dispatchInFlight"] == true => "ready",
-            None if result["runtimeId"].is_null() => "preparing",
             None => "recoverable_error",
         };
         // The worker snapshot's ready/fresh remain authoritative. This describes
@@ -864,7 +926,7 @@ impl Broker {
         result["preparationStatus"] = json!(status);
         if !result["startupStages"].is_array() {
             result["startupStages"] = json!([
-                {"id":"runtime","status":if status=="preparing" {"preparing"}else{"blocked"},"recoveryAction":error.map(preparation_hint)},
+                {"id":"runtime","status":if status=="starting" {"preparing"}else if status=="idle" {"idle"}else{"blocked"},"recoveryAction":error.map(preparation_hint)},
                 {"id":"account","status":"waiting","recoveryAction":null},
                 {"id":"capabilities","status":"waiting","recoveryAction":null},
                 {"id":"coordinator","status":"waiting","sessionCreated":false,"recoveryAction":null}
@@ -900,16 +962,18 @@ impl Broker {
     }
     pub(super) fn validate_assistant(method: &str, p: &Value) -> Result<()> {
         let fields: &[&str] = match method {
-            "assistant/prepare" => &[],
+            "assistant/prepare" => &["scopeId"],
             "assistant/enable" | "assistant/pause" => &[],
             "assistant/resume" => &["operationId"],
-            "assistant/send" => &["message", "threadId", "sourceRuntimeId", "sourceConfigStoreId", "memberId", "taskId", "artifactId", "artifactVersion", "attachments"],
+            "assistant/send" | "assistant/v2/send" => &["conversationId", "message", "threadId", "sourceRuntimeId", "sourceConfigStoreId", "memberId", "taskId", "artifactId", "artifactVersion", "attachments", "scopeId"],
+            "assistant/v2/conversation/create" => &["title"],
+            "assistant/v2/conversation/interrupt" => &["conversationId","operationId"],
             "assistant/task/pause" | "assistant/task/resume" => &["taskId"],
             "assistant/v2/task/retry" => &["taskId"],
             "assistant/v2/task/merge" | "assistant/v2/task/discard_worktree" => &["taskId"],
             "assistant/v2/task/seen" => &["taskId","throughSequence"],
             "assistant/task/memory" => &["taskId", "enabled"],
-            "assistant/settings/update" => &["settings"],
+            "assistant/settings/update" => &["settings", "patch"],
             "assistant/memory/add" => &["text", "scope"],
             "assistant/memory/update" => &["text", "memoryId"],
             "assistant/memory/delete" | "assistant/memory/undo" => &["memoryId"],
@@ -940,7 +1004,7 @@ impl Broker {
                 && p["runtimeId"]
                     .as_str()
                     .is_none_or(|s| s.is_empty() || s.len() > 256))
-            || (method == "assistant/send"
+            || (matches!(method,"assistant/send"|"assistant/v2/send")
                 && ["memberId", "taskId"].iter().any(|key| {
                     p.get(key).is_some_and(|v| {
                         if *key == "memberId" {
@@ -953,14 +1017,18 @@ impl Broker {
             // Merging or dropping a branch names exactly one job; nothing is inferred.
             || (matches!(method, "assistant/v2/task/merge" | "assistant/v2/task/discard_worktree")
                 && !p.get("taskId").is_some_and(valid_scope_id))
-            || p.to_string().len() > if method=="assistant/send" {2*1024*1024} else {131072}
+            || p.to_string().len() > if matches!(method,"assistant/send"|"assistant/v2/send") {2*1024*1024} else {131072}
         {
             return Err(classify(
                 anyhow::anyhow!("Invalid assistant action"),
                 Code::InvalidParams,
             ));
         }
+        if let Some(conversation)=p.get("conversationId") {anyhow::ensure!(valid_assistant_id(conversation),"Invalid conversation ID");}
+        if method=="assistant/v2/conversation/create" {anyhow::ensure!(p.get("title").is_none_or(|v|v.as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=512 && !s.contains('\0'))),"Invalid conversation title");}
+        if method=="assistant/v2/conversation/interrupt" {anyhow::ensure!(p.get("conversationId").is_some_and(valid_assistant_id) && p.get("operationId").is_some_and(valid_scope_id),"Exact coordinator scope required");}
         if let Some(inputs)=p.get("attachments") {crate::assistant::inputs::validate_uploaded(inputs)?;}
+        if let Some(scope)=p.get("scopeId") { anyhow::ensure!(valid_assistant_id(scope), "Invalid assistant scope"); }
         Ok(())
     }
     pub(super) async fn assistant_write(
@@ -974,10 +1042,37 @@ impl Broker {
             return Err(classify(anyhow::anyhow!("The assistant is not available on this device"), Code::RuntimeUnavailable));
         }
         if method == "assistant/prepare" {
-            self.prepare_assistant_inner().await?;
+            if let Some(scope)=p["scopeId"].as_str() {
+                anyhow::ensure!(scope == assistant_scope(self.assistant_read_profile()?.as_ref())?, "Assistant scope changed; keep the draft and select its original profile");
+            }
+            self.prepare_assistant_inner().await.map_err(|e|classify(e,Code::RuntimeUnavailable))?;
             return self.assistant_read(&json!({})).await;
         }
         let runtime_id = field(p, "runtimeId")?;
+        if method == "assistant/settings/update" && (self.state_dir.join("assistant/pending-profile.json").try_exists()? || self.assistant.lock().await.as_ref().is_none_or(|a|!a.is_alive())) {
+            let profile = self.assistant_read_profile()?;
+            let scope = assistant_scope(profile.as_ref())?;
+            anyhow::ensure!(runtime_id == scope, "Assistant settings scope changed");
+            let snapshot = self.assistant_read(&json!({})).await?;
+            let current: crate::assistant::Settings = serde_json::from_value(snapshot["settings"].clone())?;
+            let settings = current.updated(p)?;
+            let selections = settings.changed_effort_selections(&current);
+            if !selections.is_empty() {
+                let catalog = self.assistant_models(profile.as_ref()).await?;
+                for (model, effort) in selections {
+                    crate::assistant::model_capabilities::verify_catalog_effort(
+                        catalog.as_array().context("Assistant model catalog unavailable")?, model.as_deref(), &effort,
+                    ).map_err(|error| classify(error, Code::Rejected))?;
+                }
+            }
+            let _: chrono_tz::Tz = settings.timezone.parse().context("Unknown timezone")?;
+            let root = self.state_dir.join("assistant");
+            storage::private_directory(&root)?;
+            let profile=profile.context("Select a configured assistant runtime first")?;
+            storage::atomic_write(&root.join("pending-profile.json"), &serde_json::to_vec(&profile)?)?;
+            crate::assistant_product::retained::save_pending_settings(&root,&scope,Some(json!({"scopeId":scope,"configStoreId":storage::config_store(&profile.config_home)?,"commandId":field(p,"commandId")?,"settings":settings})))?;
+            return Ok(json!({"accepted":true,"commandId":field(p,"commandId")?,"snapshot":self.assistant_read(&json!({})).await?}));
+        }
         if method == "assistant/enable" {
             let (home, native) = {
                 let state = self.state.lock().await;
@@ -1012,16 +1107,28 @@ impl Broker {
                     "Pause and finish the current assistant before changing profiles"
                 );
             }
-            let actor = self
-                .ensure_assistant(Profile {
+            let profile = Profile {
                     schema: 1,
                     config_home: home,
                     native_binary: binary,
                     source_runtime_id: runtime_id.into(),
-                })
-                .await
-                .map_err(|e| classify(e, Code::RuntimeUnavailable))?;
-            return Ok(actor.snapshot());
+                };
+            storage::private_directory(&self.state_dir.join("assistant"))?;
+            storage::atomic_write(&self.state_dir.join("assistant/pending-profile.json"),&serde_json::to_vec(&profile)?)?;
+            return self.assistant_read(&json!({})).await;
+        }
+        if method=="assistant/v2/conversation/create" {
+            let current=self.assistant.lock().await;
+            if current.as_ref().is_none_or(|actor|!actor.is_alive()) {
+                self.check_write_fence()?;
+                anyhow::ensure!(self.device_exists(device).await,"Device revoked");
+                let profile=self.assistant_read_profile()?.context("Select a configured assistant runtime first")?;
+                let scope=assistant_scope(Some(&profile))?;
+                let retained_runtime=crate::assistant_product::coordinator_identity(&self.state_dir.join("assistant"))?.runtime_id;
+                anyhow::ensure!(runtime_id==scope || runtime_id==profile.source_runtime_id || retained_runtime.as_deref()==Some(runtime_id),"Wrong assistant profile");
+                return crate::assistant_product::retained::create_conversation(&self.state_dir.join("assistant"),&self.config.computer_id,
+                    &storage::config_store(&profile.config_home)?,device,p);
+            }
         }
         let actor = self
             .assistant
@@ -1037,11 +1144,16 @@ impl Broker {
             &self.state_dir.join("assistant/profile.json"),
             16384,
         )?)?;
-        if runtime_id != chosen && runtime_id != profile.source_runtime_id {
+        if runtime_id != chosen && runtime_id != profile.source_runtime_id && runtime_id != assistant_scope(Some(&profile))? {
             return Err(classify(
                 anyhow::anyhow!("Wrong assistant profile"),
                 Code::InvalidParams,
             ));
+        }
+        if let Some(scope)=p["scopeId"].as_str() {
+            if scope != assistant_scope(Some(&profile))? {
+                return Err(classify(anyhow::anyhow!("Assistant scope changed before dispatch; draft retained"),Code::InvalidParams));
+            }
         }
         // Parent integration point: target-send/group validation belongs here,
         // before project proof and actor dispatch; prepare has no target scope.
@@ -1071,7 +1183,7 @@ impl Broker {
             return Err(classify(anyhow::anyhow!("Device revoked"), Code::Revoked));
         }
         let mut parameters=p.clone();
-        if method=="assistant/send" {
+        if matches!(method,"assistant/send"|"assistant/v2/send") {
             if let Some(inputs)=p.get("attachments") {
                 let state=self.state.lock().await;
                 parameters["retainedAttachments"]=serde_json::to_value(crate::assistant::inputs::retain_uploaded(inputs,device,&state.attachments,
@@ -1081,7 +1193,7 @@ impl Broker {
         actor
             .request_from_device(method, parameters, field(p, "commandId")?.into(), directory, device.into())
             .await
-            .map_err(|e| classify(e, Code::Unknown))
+            .map_err(|e| {let code=if e.downcast_ref::<crate::assistant_product::ModelSelectionUnavailable>().is_some() {Code::Rejected}else{Code::Unknown};classify(e,code)})
     }
 }
 
@@ -1160,6 +1272,7 @@ fn runtime_restore_error(error:anyhow::Error)->anyhow::Error {
 }
 fn assistant_preparation_error(error:&anyhow::Error,saved:bool)->&'static str {
     use crate::managed_runtime::discovery::Unavailable;
+    if error.downcast_ref::<crate::assistant_product::ModelSelectionUnavailable>().is_some() {return "assistant_model_unavailable";}
     if let Some(failure)=error.downcast_ref::<RestoreFailure>() {
         return match failure {
             RestoreFailure::ProfileRead=>"assistant_saved_profile_read_failed",
@@ -1229,7 +1342,57 @@ fn manual_write_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conversation_wire_contract_validates_explicit_interrupt_and_optional_send_scope() {
+        use serde_json::json;
+        use super::Broker;
+        for method in ["assistant/send","assistant/v2/send"] {
+            assert!(Broker::validate_assistant(method,&json!({"runtimeId":"r","commandId":"c","message":"hello","conversationId":"main:owner"})).is_ok());
+            assert!(Broker::validate_assistant(method,&json!({"runtimeId":"r","commandId":"c","message":"hello","conversationId":42})).is_err());
+        }
+        assert!(Broker::validate_assistant("assistant/v2/conversation/create",&json!({"runtimeId":"r","commandId":"c","title":"新对话"})).is_ok());
+        assert!(Broker::validate_assistant("assistant/v2/conversation/create",&json!({"runtimeId":"r","commandId":"c","title":" "})).is_err());
+        assert!(Broker::validate_assistant("assistant/v2/conversation/interrupt",&json!({"runtimeId":"r","commandId":"c","conversationId":"chat:id","operationId":"operation-id"})).is_ok());
+        for missing in ["conversationId","operationId"] {
+            let mut p=json!({"runtimeId":"r","commandId":"c","conversationId":"chat:id","operationId":"operation-id"});
+            p.as_object_mut().unwrap().remove(missing);
+            assert!(Broker::validate_assistant("assistant/v2/conversation/interrupt",&p).is_err());
+        }
+    }
     use super::*;
+    #[tokio::test]
+    async fn idle_read_never_prepares_or_creates_an_assistant() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::create("wss://example.org/pocket".into()).unwrap();
+        let (broker, _) = Broker::open(config, dir.path().into()).unwrap();
+        let read = broker.assistant_read(&json!({})).await.unwrap();
+        assert_eq!(read["preparationStatus"], "idle");
+        assert!(!dir.path().join("assistant/profile.json").exists());
+        assert!(broker.assistant.lock().await.is_none());
+    }
+    #[tokio::test]
+    async fn model_panel_reads_only_saved_home_and_settings_are_saved_without_ensure() {
+        let dir=tempfile::tempdir().unwrap();
+        let home=dir.path().join("home");std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("config.toml"),"model = 'tenant-private'\napi_key = 'private-secret'\n").unwrap();
+        std::fs::write(home.join("models_cache.json"),r#"{"models":[{"slug":"cached-model","display_name":"Cached"}]}"#).unwrap();
+        let (broker,_)=Broker::open(Config::create("wss://example.org/pocket".into()).unwrap(),dir.path().into()).unwrap();
+        let root=dir.path().join("assistant");storage::private_directory(&root).unwrap();
+        let profile=Profile {schema:1,config_home:home.clone(),native_binary:std::env::current_exe().unwrap(),source_runtime_id:"source".into()};
+        storage::atomic_write(&root.join("profile.json"),&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let read=broker.assistant_read(&json!({"models":true})).await.unwrap();
+        assert_eq!(read["preparationStatus"],"idle");
+        assert_eq!(read["models"].as_array().unwrap().len(),2);
+        assert!(!read.to_string().contains("private-secret"));
+        let scope=assistant_scope(Some(&profile)).unwrap();
+        broker.assistant_write("phone","assistant/settings/update",&json!({"runtimeId":scope,"commandId":"choose","patch":{"coordinator_model":"cached-model"}})).await.unwrap();
+        let saved=broker.assistant_read(&json!({"before":100,"limit":10})).await.unwrap();
+        assert_eq!(saved["settings"]["coordinator_model"],"cached-model");
+        assert!(broker.assistant.lock().await.is_none());
+        assert!(broker.state.lock().await.runtimes.is_empty());
+        assert!(!root.join("executor.db").exists());
+        assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(),"model = 'tenant-private'\napi_key = 'private-secret'\n");
+    }
     #[test]
     fn packaged_device_runs_ordinary_sessions_on_the_hosted_runtime_and_withholds_the_assistant() {
         use crate::native::NativeRole;
@@ -1252,6 +1415,7 @@ mod tests {
     }
     #[test]
     fn silent_prepare_accepts_no_selected_runtime_and_rejects_phone_paths() {
+        assert!(Broker::validate_assistant("assistant/prepare",&json!({"commandId":"prepare","scopeId":"assistant:store:runtime"})).is_ok());
         assert!(
             Broker::validate_assistant("assistant/prepare", &json!({"commandId":"prepare"}))
                 .is_ok()
@@ -1447,7 +1611,7 @@ mod tests {
         .await
         .expect("preparation status must be readable during a slow host launch")
         .unwrap();
-        assert_eq!(value["preparation"]["status"], "preparing");
+        assert_eq!(value["preparation"]["status"], "starting");
         assert_eq!(value["ready"], false);
     }
     #[test]

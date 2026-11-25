@@ -739,12 +739,13 @@ impl<R: RuntimeIo> HostExecutor<R> {
         }
         // None deliberately inherits the native profile's model/provider. The
         // public directory may omit custom provider models and is not a default.
-        let model = req
-            .settings
-            .model
-            .as_deref()
-            .map(|m| self.select_model(Some(m)))
-            .transpose()?;
+        let model = if let Some(effort) = req.settings.effort.as_deref() {
+            Some(crate::assistant::model_capabilities::verify_native_effort(
+                req.settings.model.as_deref(), effort, |method, params| self.query(method, params),
+            )?)
+        } else {
+            req.settings.model.as_deref().map(|m| self.select_model(Some(m))).transpose()?
+        };
         let thread_rpc_id = rpc_id(&req.operation_id, "thread");
         let turn_rpc_id = rpc_id(&req.operation_id, "turn");
         let tool_revision = req.thread_id.as_ref().map_or(TOOL_REVISION, |thread| {

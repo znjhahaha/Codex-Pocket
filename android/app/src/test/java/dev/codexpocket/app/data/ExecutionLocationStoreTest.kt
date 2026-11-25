@@ -71,6 +71,22 @@ class ExecutionLocationStoreTest {
         assertEquals("computer", store.pairing("computer").load()!!.computerId)
     }
 
+    @Test fun reconnectingLocalPhoneBindsIdentityBeforeUpdatingSavedLocation() {
+        val blob = Blob(); val store = ExecutionLocationStore(blob, Legacy(pair("computer")))
+        val phone = ExecutionTarget("phone", ExecutionTargetKind.ThisPhone, "此手机")
+        store.register(phone, pair("local"))
+        store.select("computer")
+        val renewed = pair("local").let { PairedComputer(it.config, "renewed-device", "renewed-secret", it.computerId, it.computerName) }
+        store.register(phone, renewed)
+        store.select("phone")
+        val restored = ExecutionLocationStore(blob, Legacy(null))
+        assertEquals("local", restored.directory().selected!!.endpointId)
+        assertEquals("renewed-device", restored.pairing("phone").load()!!.deviceId)
+        assertEquals(2, restored.directory().targets.size)
+        assertThrows(IllegalArgumentException::class.java) { restored.register(phone, pair("different")) }
+        assertEquals("local", restored.pairing("phone").load()!!.computerId)
+    }
+
     @Test fun anUnpairedPhoneHasOneLocationWithoutWritingAndSavesItOnlyOncePaired() {
         val blob = Blob().apply { fail = true }
         val store = ExecutionLocationStore(blob, Legacy(null))

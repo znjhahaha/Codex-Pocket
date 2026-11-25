@@ -134,7 +134,7 @@ class AssistantChatNavigationTest {
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
     }
 
-    @Test fun repeatedSendStaysBlockedUntilTheMatchingDraftIsAcknowledged() {
+    @Test fun emptyComposerCannotDuplicateTheRetainedMessage() {
         val actions = mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot))
         content({ state }, actions)
@@ -142,7 +142,7 @@ class AssistantChatNavigationTest {
         compose.onNodeWithTag(AssistantSend).performClick()
         assertEquals("assistant/send", actions.single().method)
 
-        // The local latch covers the interval before the repository publishes pendingActions.
+        // Releasing the draft leaves no content to send again until the reader types a new message.
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput { click() }
         assertEquals(1, actions.size)
         compose.runOnIdle { state = state.copy(pendingActions = setOf("assistant/send")) }
@@ -151,7 +151,7 @@ class AssistantChatNavigationTest {
         compose.runOnIdle { state = state.copy(pendingActions = emptySet()) }
         compose.openAssistantPage("Settings")
         compose.returnToAssistantChat()
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("只发送一次")
+        compose.onNodeWithTag(AssistantDraft).assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
         compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput { click() }
         assertEquals(1, actions.size)
 
@@ -184,52 +184,48 @@ class AssistantChatNavigationTest {
         compose.onNodeWithTag(AssistantDraft).performTextInput("上一条消息")
         compose.onNodeWithTag(AssistantSend).performClick()
         compose.onNodeWithTag(AssistantDraft).assertIsEnabled().performTextReplacement("还未发送的新草稿")
-        // Editing must not bypass the local latch before pendingActions reaches the UI.
-        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput { click() }
-        assertEquals(1, actions.size)
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         compose.runOnIdle { state = state.copy(pendingActions = setOf("assistant/send")) }
-        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput { click() }
-        assertEquals(1, actions.size)
-        compose.runOnIdle { state = state.copy(pendingActions = emptySet()) }
-        compose.onNodeWithTag(AssistantSend).assertIsNotEnabled().performTouchInput { click() }
-        assertEquals(1, actions.size)
+        compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         compose.runOnIdle { state = state.copy(pendingActions = emptySet()).acceptSend(actions.single()) }
         compose.onNodeWithTag(AssistantDraft).assertTextEquals("还未发送的新草稿")
         compose.onNodeWithTag(AssistantSend).assertIsEnabled().performClick()
         assertEquals(listOf("上一条消息", "还未发送的新草稿"), actions.map { it.params.string("message") })
     }
 
-    @Test fun foreignOrOldReceiptsCannotConsumeThePendingComposerAndRejectionKeepsText() {
+    @Test fun foreignOrOldReceiptsDoNotSettleOriginalAndRetryKeepsIdentity() {
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot,computerId="pc"))
         content({state},actions)
         compose.onNodeWithTag(AssistantDraft).performTextInput("保留原稿")
         compose.onNodeWithTag(AssistantSend).performClick()
-        val receipt=state.acceptSend(actions.single()).sendReceipts.single()
+        val original=actions.single()
+        val receipt=state.acceptSend(original).sendReceipts.single()
         for(other in listOf(receipt.copy(commandId="old"),receipt.copy(computerId="other"),receipt.copy(runtimeId="other"),receipt.copy(conversationId="other"))) {
             compose.runOnIdle {state=state.copy(sendReceipts=listOf(other))}
-            compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留原稿")
-            compose.onNodeWithTag(AssistantSend).assertIsNotEnabled()
+            compose.onNodeWithTag(AssistantDraft).assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+            compose.onNodeWithTag("assistant-send-failure:${original.commandId}").assertDoesNotExist()
         }
-        compose.runOnIdle {state=state.acceptSend(actions.single(),"rejected")}
-        compose.onNodeWithTag(AssistantDraft).assertTextEquals("保留原稿")
-        compose.onNodeWithTag(AssistantSend).assertIsEnabled().performClick()
+        compose.runOnIdle {state=state.acceptSend(original,"rejected")}
+        compose.onNodeWithTag("assistant-chat-list").performScrollToNode(hasTestTag("assistant-send-failure:${original.commandId}"))
+        compose.onNodeWithTag("assistant-send-failure:${original.commandId}").performClick()
+        compose.onNodeWithTag("assistant-send-retry:${original.commandId}").performClick()
         assertEquals(2,actions.size)
-        assertNotEquals(actions[0].commandId,actions[1].commandId)
+        assertNotEquals(original.commandId,actions.last().commandId)
+        assertEquals(original.params,actions.last().params)
+        assertEquals(original.composerBinding,actions.last().composerBinding)
+        assertTrue(actions.last().retry)
     }
 
-    /** The sent draft is recognised by its text, which is what survives a restart: typing the same text again is still that draft. */
-    @Test fun editingAwayKeepsTheNewTextAndEditingBackIsTheSentDraftAgain() {
+    @Test fun retypingTheSameTextIsANewDraftAndLateReceiptCannotClearIt() {
         val actions=mutableListOf<AssistantAction>()
         var state by mutableStateOf(AssistantUiState(snapshot))
         content({state},actions)
         compose.onNodeWithTag(AssistantDraft).performTextInput("相同内容")
         compose.onNodeWithTag(AssistantSend).performClick()
-        compose.onNodeWithTag(AssistantDraft).performTextReplacement("新内容")
-        compose.onNodeWithTag(AssistantDraft).performTextReplacement("相同内容")
+        compose.onNodeWithTag(AssistantDraft).performTextInput("相同内容")
         compose.runOnIdle {state=state.acceptSend(actions.single())}
-        compose.onNodeWithTag(AssistantDraft).assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText,AnnotatedString("")))
-        compose.onNodeWithTag(AssistantDraft).performTextInput("新内容")
+        compose.onNodeWithTag(AssistantDraft).assertTextEquals("相同内容")
         compose.onNodeWithTag(AssistantSend).assertIsEnabled()
         assertEquals(1,actions.size)
     }
@@ -274,7 +270,7 @@ class AssistantChatNavigationTest {
         content({ AssistantUiState(snapshot) }, actions, opens)
         compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-task:task").assertIsDisplayed()
-        compose.onNodeWithTag("assistant-task-stop:task").assertDoesNotExist()
+        compose.onNodeWithTag("assistant-task-stop:task").assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithText("真实任务详情").assertDoesNotExist()
         compose.onNodeWithTag("assistant-task-open:task").assertHasClickAction().performClick()
         compose.onNodeWithText("真实任务详情").assertIsDisplayed()
@@ -290,6 +286,16 @@ class AssistantChatNavigationTest {
         assertEquals(listOf("r" to "native-task"), opens)
         assertTrue(actions.isEmpty())
         page.performScrollToNode(hasTestTag("assistant-task-stop:task"))
+        compose.onNodeWithTag("assistant-task-stop:task").performClick()
+        assertTrue(actions.isEmpty())
+        compose.onNodeWithText("确认停止").performClick()
+        assertEquals("assistant/task/pause", actions.single().method)
+        assertEquals("task", actions.single().params.string("taskId"))
+    }
+    @Test fun taskListStopsOnlyTheChosenTaskAfterConfirmation() {
+        val actions = mutableListOf<AssistantAction>()
+        content({ AssistantUiState(snapshot.copy(tasks = snapshot.tasks + snapshot.tasks.single().copy(id = "other", prompt = "另一项任务"))) }, actions)
+        compose.openAssistantPage("Tasks")
         compose.onNodeWithTag("assistant-task-stop:task").performClick()
         assertTrue(actions.isEmpty())
         compose.onNodeWithText("确认停止").performClick()

@@ -26,7 +26,7 @@ internal enum class LocalProviderModelProblem(val message: String) {
 }
 
 internal sealed interface LocalProviderModelResult {
-    data class Models(val ids: List<String>) : LocalProviderModelResult
+    data class Models(val ids: List<String>, val capabilities: Map<String, LocalProviderModel> = emptyMap()) : LocalProviderModelResult
     data class Failed(val problem: LocalProviderModelProblem) : LocalProviderModelResult
 }
 
@@ -90,7 +90,12 @@ internal class LocalProviderModelDiscovery(private val providers: LocalProviderS
                 id?.takeIf { it.isNotEmpty() && LocalProviderRules.model(it) == it }
             }.distinct()
             return if (entries.isNotEmpty() && ids.isEmpty()) LocalProviderModelResult.Failed(LocalProviderModelProblem.Response)
-                else LocalProviderModelResult.Models(ids)
+                else LocalProviderModelResult.Models(ids, entries.mapNotNull { entry ->
+                    val o = entry as? JsonObject ?: return@mapNotNull null
+                    val id = o.string(field).takeIf { it in ids } ?: return@mapNotNull null
+                    val declared = LocalProviderModel.declared(id, o)
+                    if (declared.efforts == null && declared.images == null) null else id to declared
+                }.toMap())
         }
     }
 }

@@ -1,6 +1,104 @@
 use pocket_bridge::router::{Client, Route, Router};
 use serde_json::{Value, json};
 
+#[test]
+fn native_three_answer_result_updates_the_desktops_existing_question_card() {
+    let mut router = Router::default();
+    let questions = json!([
+        {"id":"one","header":"First","question":"First choice?","options":[]},
+        {"id":"two","header":"Second","question":"Second choice?","options":[]},
+        {"id":"three","header":"Third","question":"Third choice?","options":[]}
+    ]);
+    let issued = router.from_runtime(json!({"id":81,"method":"item/tool/requestUserInput",
+        "params":{"threadId":"thread","turnId":"turn","itemId":"native-call","questions":questions}}));
+    let answer = json!({"answers":{"one":{"answers":["A"]},"two":{"answers":["B"]},"three":{"answers":["C"]}}});
+    router.from_client(phone(), json!({"id":remote_id(&issued),"result":answer}));
+    let closed = router.from_runtime(json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":81}}));
+    assert!(!closed.iter().any(|r|matches!(r, Route::Client(Client::Desktop,v) if v["params"]["item"]["type"]=="userInputResponse")),
+        "Request closure is not evidence of the answers");
+    let native = json!({"method":"rawResponseItem/completed","params":{"threadId":"thread","turnId":"turn",
+        "item":{"type":"function_call_output","call_id":"native-call","output":answer.to_string()}}});
+    let routes = router.from_runtime(native.clone());
+    let projected = routes.iter().find_map(|r| match r {
+        Route::Client(Client::Desktop,v) if v["params"]["item"]["type"]=="userInputResponse" => Some(v), _ => None
+    }).expect("A proven native result must repair the desktop answer card");
+    let item = &projected["params"]["item"];
+    assert_eq!(item["id"], format!("user-input-response-{}", desktop_id(&issued).as_str().unwrap()));
+    assert_eq!(item["requestId"], desktop_id(&issued));
+    assert_eq!(item["turnId"], "turn");
+    assert_eq!(item["answers"], json!({"one":["A"],"two":["B"],"three":["C"]}));
+    assert_eq!(item["completed"], true);
+    assert!(routes.iter().any(|r|matches!(r, Route::Client(Client::Desktop,v) if v==&native)), "Keep subscribed desktop native evidence unchanged");
+    assert!(routes.iter().any(|r|matches!(r, Route::Broadcast(v) if v["params"]["item"]["id"]=="native-call"
+        && v["params"]["item"]["pocketNativeQuestionResult"]==true)), "Expose native question results in Pocket's history shape");
+    assert!(!router.from_runtime(native).iter().any(|r| matches!(r,Route::Client(Client::Desktop,v) if v["params"]["item"]["type"]=="userInputResponse")));
+}
+
+#[test]
+fn desktop_projection_waits_for_native_resolution_and_uses_native_cancellation() {
+    for cancel in [false, true] {
+        let mut r = Router::default();
+        let issued=r.from_runtime(json!({"id":"req","method":"item/tool/requestUserInput","params":{
+            "threadId":"thread","turnId":"turn","itemId":"call","questions":[{"id":"q","question":"Choose"}]}}));
+        r.from_client(phone(),json!({"id":remote_id(&issued),"result":{"answers":{"q":{"answers":["Phone choice"]}}}}));
+        let answer=if cancel {json!({"answers":{}})} else {json!({"answers":{"q":{"answers":["Native choice"]}}})};
+        let result=json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{
+            "id":"call","type":"dynamicToolCall","tool":"functions.request_user_input","status":"completed","success":true,
+            "contentItems":[{"type":"inputText","text":answer.to_string()}]}}});
+        let before=r.from_runtime(result);
+        assert!(!before.iter().any(is_question_projection));
+        let closed=r.from_runtime(json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":"req"}}));
+        let projected=closed.iter().find_map(|route|match route {
+            Route::Client(Client::Desktop,v) if is_question_projection(route)=>Some(v),_=>None
+        }).unwrap();
+        assert_eq!(projected["params"]["item"]["answers"],if cancel {json!({})} else {json!({"q":["Native choice"]})});
+        assert!(matches!(&closed[closed.len()-2],Route::Client(Client::Desktop,v) if v["method"]=="serverRequest/resolved"));
+    }
+}
+fn is_question_projection(route:&Route)->bool {
+    matches!(route,Route::Client(Client::Desktop,v) if v["method"]=="item/completed" && v["params"]["item"]["type"]=="userInputResponse")
+}
+#[test]
+fn desktop_projection_rejects_foreign_and_partial_results_and_redacts_secrets() {
+    let mut r=Router::default();
+    r.from_runtime(json!({"id":9,"method":"item/tool/requestUserInput","params":{
+        "threadId":"thread","turnId":"turn","itemId":"call","questions":[{"id":"q","question":"Code?","isSecret":true}]}}));
+    r.from_runtime(json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":9}}));
+    let native=json!({"method":"rawResponseItem/completed","params":{"threadId":"thread","turnId":"turn",
+        "item":{"type":"function_call_output","call_id":"call","output":"{\"answers\":{\"q\":{\"answers\":[\"SECRET-SENTINEL\"]}}}"}}});
+    for mode in 0..4 {
+        let mut wrong=native.clone();
+        match mode {0=>wrong["params"]["threadId"]=json!("foreign"),1=>wrong["params"]["turnId"]=json!("foreign"),
+            2=>wrong["params"]["item"]["call_id"]=json!("foreign"),_=>wrong["params"]["item"]["output"]=json!("{\"answers\":{\"other\":{\"answers\":[\"x\"]}}}")}
+        assert!(!r.from_runtime(wrong).iter().any(is_question_projection));
+    }
+    let routes=r.from_runtime(native);
+    let projected=routes.iter().find_map(|route|match route {Route::Client(Client::Desktop,v) if is_question_projection(route)=>Some(v),_=>None}).unwrap();
+    assert_eq!(projected["params"]["item"]["answers"]["q"],json!(["敏感回答已隐藏"]));
+    assert!(!projected.to_string().contains("SECRET-SENTINEL"));
+}
+
+#[test]
+fn desktop_raw_opt_out_is_preserved_while_bridge_receives_question_evidence() {
+    let mut r=Router::default();
+    let routes=r.from_client(Client::Desktop,json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"Codex"},
+        "capabilities":{"experimentalApi":true,"optOutNotificationMethods":["rawResponseItem/completed","turn/diff/updated"]}}}));
+    let Route::Runtime(init)=&routes[0] else {panic!()};
+    assert_eq!(init["params"]["capabilities"]["optOutNotificationMethods"],json!(["turn/diff/updated"]));
+    r.from_runtime(json!({"id":9,"method":"item/tool/requestUserInput","params":{"threadId":"thread","turnId":"turn","itemId":"call",
+        "questions":[{"id":"q","question":"Code?","isSecret":true}]}}));
+    let raw=json!({"method":"rawResponseItem/completed","params":{"threadId":"thread","turnId":"turn","item":{
+        "type":"function_call_output","call_id":"call","output":"{\"answers\":{\"q\":{\"answers\":[\"SECRET-SENTINEL\"]}}}"}}});
+    let events=r.from_runtime(raw.clone());
+    assert!(!events.iter().any(|e|matches!(e,Route::Client(_,v)|Route::Broadcast(v) if v["method"]=="rawResponseItem/completed")));
+    let result=events.iter().find_map(|e|match e {Route::Broadcast(v) if v["method"]=="item/completed"=>Some(v),_=>None}).unwrap();
+    assert_eq!(result["params"]["item"]["id"],"call");
+    assert_eq!(result["params"]["item"]["arguments"]["questions"][0]["isSecret"],true);
+    assert!(!result.to_string().contains("SECRET-SENTINEL"));
+    let mut unrelated=raw;unrelated["params"]["item"]["call_id"]=json!("unrelated");
+    assert!(!r.from_runtime(unrelated).iter().any(|e|matches!(e,Route::Client(_,_)|Route::Broadcast(_))));
+}
+
 fn phone() -> Client {
     Client::Remote("test-phone".into())
 }

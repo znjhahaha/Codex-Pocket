@@ -336,8 +336,12 @@ async fn execute(args: Args) -> Result<()> {
             // Restore saved authority before activation above. Only an active
             // successor may do first-install discovery; preparation is setup,
             // never an implicit assistant message or replacement model turn.
-            let preparing=broker.clone();
-            tasks.spawn(async move { preparing.prepare_assistant_at_startup().await; });
+            if pocket_agent::managed_runtime::packaged() {
+                let preparing=broker.clone();
+                tasks.spawn(async move { preparing.prepare_assistant_at_startup().await; });
+            } else {
+                tasks.spawn(broker.clone().assistant_wake_loop());
+            }
             let controller=routes::Controller::open(state.clone(),c.clone(),broker.connection.clone());
             let _control=startup.step(Phase::ControlBind,local::Server::start_with_routes(&state,broker.clone(),controller.clone()).await)?;
             let _=startup.clear_own();drop(startup);

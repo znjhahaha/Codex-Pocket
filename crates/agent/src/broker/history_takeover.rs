@@ -143,6 +143,10 @@ impl Broker {
             .is_some_and(Migration::blocks_write)
     }
     async fn external_release_unconfirmed(&self, home: &std::path::Path, thread: &str) -> bool {
+        self.external_release_with(home, thread, rollout_owners::holders).await
+    }
+    async fn external_release_with(&self, home: &std::path::Path, thread: &str,
+        inspect: impl FnOnce(&std::path::Path)->Result<Vec<NativeProcess>> + Send + 'static) -> bool {
         // Inspect holders of this exact rollout, not every Codex process on the
         // computer. A stale descriptor or reused PID is never release evidence.
         let mut known = self.state.lock().await.runtimes.values()
@@ -155,7 +159,7 @@ impl Broker {
         let thread = thread.to_owned();
         tokio::task::spawn_blocking(move || {
             let path = crate::history_catalog::rollout_path(&home,&thread)?;
-            let owners = rollout_owners::holders(&path)?;
+            let owners = inspect(&path)?;
             Ok::<bool,anyhow::Error>(unregistered_identities(&known,&owners,|p|NativeProcess::capture(p.pid).ok()))
         }).await.ok().and_then(Result::ok).unwrap_or(true)
     }
@@ -247,6 +251,33 @@ fn unregistered_identities(known: &[NativeProcess], observed: &[NativeProcess],
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn external_release_linux_proc_recognizes_own_holder_and_keeps_unknown_identity_blocked() {
+        let (dir,b)=super::super::tests::fixture().await;
+        let sessions=dir.path().join("sessions");std::fs::create_dir(&sessions).unwrap();
+        let path=sessions.join("history.jsonl");std::fs::write(&path,b"selected rollout").unwrap();
+        let db=rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,source TEXT,title TEXT,preview TEXT,cwd TEXT,updated_at INTEGER,archived INTEGER,rollout_path TEXT);").unwrap();
+        db.execute("INSERT INTO threads VALUES('t','cli','saved','','',1,0,?1)",[path.to_str().unwrap()]).unwrap();
+        let process=NativeProcess::capture(std::process::id()).unwrap();
+        let proc_root=dir.path().join("proc");
+        let fd=proc_root.join(process.pid.to_string()).join("fd");
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::write(fd.join("4"),b"selected rollout").unwrap();
+        std::fs::write(fd.join("5"),b"unrelated rollout").unwrap();
+        for fault in ["none","denied","missing_identity","reused"] {
+            let proc_root=proc_root.clone();let process=process.clone();
+            let blocked=b.external_release_with(dir.path(),"t",move |selected| {
+                let selected=std::fs::read(selected)?;
+                rollout_owners::proc_holders(&proc_root, |_|Ok(true), |pid| {
+                    if fault=="denied" {return Err(std::io::ErrorKind::PermissionDenied.into())}
+                    if fault=="missing_identity" {return Err(std::io::ErrorKind::NotFound.into())}
+                    Ok(NativeProcess {pid,created_at:process.created_at ^ u64::from(fault=="reused")})
+                }, |path|Ok(std::fs::read(path)?==selected))
+            }).await;
+            assert_eq!(blocked,fault!="none","{fault}");
+        }
+    }
     #[cfg(windows)]
     #[tokio::test]
     async fn unstarted_migration_adopts_the_verified_owner_without_resuming_again() {

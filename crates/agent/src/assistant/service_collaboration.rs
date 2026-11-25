@@ -334,6 +334,11 @@ impl<E: Executor> AssistantService<E> {
         let mut changed=false;
         for entry in entries {
             if !self.state.collaboration.conversation.iter().any(|old|old.id==entry.id) {
+                self.bind_conversation("message",&entry.id);
+                let origin=self.origin_conversation("message",&entry.id);
+                if let Some(conversation)=self.state.conversations.get_mut(&origin) {
+                    conversation.updated_at_ms=conversation.updated_at_ms.max(entry.at_ms);
+                }
                 self.state.collaboration.conversation.push(entry);changed=true;
             }
         }
@@ -643,7 +648,7 @@ impl<E: Executor> AssistantService<E> {
             (1..=100).contains(&limit),
             "Conversation limit must be 1..100"
         );
-        let entries = &self.state.collaboration.conversation;
+        let entries = self.state.collaboration.conversation.iter().filter(|e|self.in_current_conversation("message",&e.id)).collect::<Vec<_>>();
         let end = before.unwrap_or(entries.len()).min(entries.len());
         let start = end.saturating_sub(limit);
         let mut page = Vec::new();
@@ -666,6 +671,7 @@ impl<E: Executor> AssistantService<E> {
         Ok(json!({"messages":page,"nextBefore":if first>0 {Some(first)}else{None}}))
     }
     fn conversation_text(&self, id: &str, offset: usize) -> Result<Value> {
+        ensure!(self.in_current_conversation("message",id),"Conversation entry belongs to another conversation");
         let entry = self
             .conversation_entry(id)
             .context("Conversation entry not found")?;
@@ -698,10 +704,15 @@ impl<E: Executor> AssistantService<E> {
             .iter()
             .any(|e| e.id == entry.id)
         {
+            self.bind_conversation("message",&entry.id);
+            self.touch_conversation(entry.at_ms);
             self.state.collaboration.conversation.push(entry);
         }
     }
     fn authorized_member(&self, id: &str) -> Result<Member> {
+        self.authorized_member_for(id,&self.current_conversation)
+    }
+    fn authorized_member_for(&self,id:&str,conversation:&str)->Result<Member> {
         let member = self
             .state
             .collaboration
@@ -710,7 +721,7 @@ impl<E: Executor> AssistantService<E> {
             .context("Member not found")?;
         ensure!(
             member.active
-                && self.state.coordinator_thread.as_deref() == Some(&member.main_thread_id),
+                && self.conversation_thread_id(conversation) == Some(&member.main_thread_id),
             "Member belongs to another or inactive conversation"
         );
         ensure!(
@@ -747,7 +758,7 @@ impl<E: Executor> AssistantService<E> {
                 text(&duty, 4096)?;
                 let directory = self.authorize_task_directory(op, &directory)?;
                 ensure!(
-                    self.members().iter().filter(|m| m.active).count() < 10,
+                    self.members().iter().filter(|m| m.active && self.coordinator().coordinator_thread.as_ref()==Some(&m.main_thread_id)).count() < 10,
                     "Member limit is 10 per conversation"
                 );
                 ensure!(
@@ -755,6 +766,7 @@ impl<E: Executor> AssistantService<E> {
                         .members()
                         .iter()
                         .any(|m| m.active
+                            && self.coordinator().coordinator_thread.as_ref()==Some(&m.main_thread_id)
                             && m.name.trim().to_lowercase() == name.trim().to_lowercase()),
                     "Member name already exists"
                 );
@@ -763,9 +775,7 @@ impl<E: Executor> AssistantService<E> {
                     id: id.clone(),
                     name: name.trim().into(),
                     duty,
-                    main_thread_id: self
-                        .state
-                        .coordinator_thread
+                    main_thread_id: self.coordinator().coordinator_thread
                         .clone()
                         .context("Main conversation unavailable")?,
                     directory,
@@ -776,7 +786,7 @@ impl<E: Executor> AssistantService<E> {
                 self.state.collaboration.members.insert(id, member.clone());
                 Ok(serde_json::to_value(member)?)
             }
-            CollaborationTool::ListMembers => Ok(json!(self.members())),
+            CollaborationTool::ListMembers => Ok(json!(self.members().into_iter().filter(|m|self.coordinator().coordinator_thread.as_ref()==Some(&m.main_thread_id)).collect::<Vec<_>>())),
             CollaborationTool::RetireMember { member_id } => {
                 self.authorized_member(&member_id)?;
                 ensure!(
@@ -895,7 +905,7 @@ impl<E: Executor> AssistantService<E> {
                     continue_from_task: None,
                     lineage_root: None,
                 };
-                let receipt = self.store.apply(
+                let receipt = self.apply_bound_command(
                     journal,
                     Command::CreateAssignedTask {
                         prompt,
@@ -987,10 +997,12 @@ impl<E: Executor> AssistantService<E> {
         let receipt_id = format!("delivery:{id}");
         super::super::inputs::validate_inputs(&inputs)?;
         let hash = if inputs.is_empty() {fingerprint(&(message, member_id, task_id, reassign))?} else {fingerprint(&(message,member_id,task_id,reassign,&inputs))?};
+        let hash=if self.current_conversation==self.default_conversation_id() {hash} else {fingerprint(&(&self.current_conversation,hash))?};
         if self.replay(&receipt_id, &hash)?.is_some() {
             return Ok(());
         }
         ensure!(!self.is_paused(), "Assistant is paused");
+        if let Some(task)=task_id {ensure!(self.in_current_conversation("task",task),"Task belongs to another conversation");}
         let task = task_id.map(|id| self.store.task(id)).transpose()?;
         if let Some(task) = &task {
             self.ensure_job_workspace(task)?;
@@ -1078,6 +1090,7 @@ impl<E: Executor> AssistantService<E> {
             .last_delivery_sequence
             .checked_add(1)
             .context("Delivery sequence exhausted")?;
+        self.bind_conversation("delivery",id);
         let delivery = Delivery {
             id: id.into(),
             sequence,
@@ -1157,6 +1170,7 @@ impl<E: Executor> AssistantService<E> {
         }
         let deliveries = self.deliveries();
         for delivery in deliveries.into_iter().filter(|d| d.status == "queued") {
+            if !self.in_current_conversation("delivery",&delivery.id) {continue;}
             let tasks = self.store.tasks()?;
             if self.earlier_delivery_pending(&delivery, &tasks, false)? {
                 continue;
@@ -1208,7 +1222,7 @@ impl<E: Executor> AssistantService<E> {
                     task.directory == member.directory,
                     "Reassignment directory changed"
                 );
-                self.store.apply(
+                self.apply_bound_command(
                     &command_id,
                     Command::ReassignTask {
                         task_id: task_id.into(),
@@ -1324,7 +1338,8 @@ impl<E: Executor> AssistantService<E> {
                 },
                 ..Default::default()
             };
-            let receipt = self.store.apply(
+            let conversation=self.origin_conversation("delivery",&delivery.id);
+            let receipt = self.in_conversation(&conversation, |service|service.apply_bound_command(
                 &format!("delivery-task:{}", delivery.id),
                 Command::CreateAssignedTask {
                     prompt,
@@ -1332,7 +1347,7 @@ impl<E: Executor> AssistantService<E> {
                     writes: delivery.writes,
                     assignment,
                 },
-            )?;
+            ))?;
             let CommandResult::Task(task) = receipt.result else {
                 unreachable!()
             };
@@ -1368,6 +1383,7 @@ impl<E: Executor> AssistantService<E> {
             .into_iter()
             .filter(|g| g.sealed && g.requires_summary && !g.summary_enqueued)
         {
+            if !self.in_current_conversation("operation",&group.origin_operation) {continue;}
             let members: Vec<_> = tasks
                 .iter()
                 .filter(|t| {
@@ -1385,6 +1401,8 @@ impl<E: Executor> AssistantService<E> {
                     true,
                     now,
                 );
+                let origin=self.origin_conversation("operation",&group.origin_operation);
+                self.state.conversation_origins.insert(format!("event:group-ready:{}",group.id),origin);
                 if let Some(event) = self
                     .state
                     .events
@@ -1423,7 +1441,7 @@ impl<E: Executor> AssistantService<E> {
             if task.assignment.as_ref().is_some_and(|a| {
                 a.member_id
                     .as_ref()
-                    .is_some_and(|id| self.authorized_member(id).is_err())
+                    .is_some_and(|id| self.authorized_member_for(id,&self.origin_conversation("task",&task.id)).is_err())
                     || a.group_id.as_ref().is_some_and(|id| {
                         !self
                             .state
@@ -1559,6 +1577,7 @@ impl<E: Executor> AssistantService<E> {
             .collaboration
             .conversation
             .iter()
+            .filter(|e|self.in_current_conversation("message",&e.id))
             .rev()
             .take(3)
             .map(|entry| {

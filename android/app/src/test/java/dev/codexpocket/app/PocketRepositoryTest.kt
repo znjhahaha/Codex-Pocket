@@ -1554,6 +1554,27 @@ class PocketRepositoryTest {
         assertTrue(repo.state.value.online)
     }
 
+    @Test fun restartedRuntimeEpochKeepsInFlightCreateOnAuthenticatedConnection() = runBlocking<Unit> {
+        await { it.online }
+        val link = server.links.last()
+        val refreshed = CompletableDeferred<Unit>()
+        server.intercept = { method, params, _ ->
+            if (method == "sync" && server.cursor().string("epoch") == "restarted") refreshed.complete(Unit)
+            if (method == "codex/request" && params.string("method") == "thread/start") {
+                server.moveEpoch("restarted", 0)
+                server.emit("thread/started", buildJsonObject { put("thread", server.thread("new")) })
+                withTimeout(5_000) { refreshed.await() }
+                assertFalse("A runtime restart must not cut off an accepted creation reply", link.closed)
+            }
+            null
+        }
+        repo.create(repo.state.value.runtimes.first(), "D:/fixture").join()
+        assertFalse(link.closed)
+        assertNull(repo.state.value.actionStatus["create"]?.error)
+        assertEquals("new", repo.state.value.selected?.key?.nativeId)
+        assertEquals("restarted", db.dao().cursors("computer").single { it.runtimeId == "runtime" }.epoch)
+    }
+
     @Test fun delayedRejectionSnapshotKeepsNewPendingApprovalBeforeAnyFurtherEvent() = runBlocking<Unit> {
         val original = server.approval()
         server.pending += original; server.emitRaw(original)
@@ -1869,6 +1890,15 @@ class PocketRepositoryTest {
     }
 
     private fun providerModel(id: String) = NativeModel(id, id, id, "", emptyList(), "", false, false)
+
+    @Test fun phoneConfiguredModelsLoadWithoutLiveConversationRuntime() = runBlocking<Unit> {
+        val custom = providerModel("only-enabled")
+        providerCatalog = ModelCatalogRequest({ true }, saved = listOf(custom)) { listOf(custom) }
+        update { it.copy(runtimes = it.runtimes.map { runtime -> runtime.copy(online = false) }, models = emptyList()) }
+        repo.refreshModels().join()
+        assertEquals(listOf(custom), repo.state.value.models)
+        assertEquals(ModelCatalogState.Ready, repo.state.value.modelCatalogState)
+    }
 
     @Test fun phoneProviderCatalogReplacesOfficialModelsWithoutChangingConversationOwner() = runBlocking<Unit> {
         val custom = providerModel("ccs-aggit/gpt-6.1-sol")

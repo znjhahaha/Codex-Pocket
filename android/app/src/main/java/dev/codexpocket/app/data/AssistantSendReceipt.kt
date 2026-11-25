@@ -4,7 +4,7 @@ import kotlinx.serialization.json.*
 
 /** Local Room evidence for one composer attempt; never inferred from a model message. */
 data class AssistantSendReceipt(val commandId: String, val computerId: String, val runtimeId: String,
-    val conversationId: String?, val status: String) {
+    val conversationId: String?, val status: String, val submittedAtMs: Long = 0) {
     val key get() = key(computerId,runtimeId,conversationId,commandId)
     companion object {
         fun key(computer: String, runtime: String, conversation: String?, command: String) =
@@ -16,7 +16,7 @@ data class AssistantSendReceipt(val commandId: String, val computerId: String, v
             if(command.method!="assistant/send" || command.status !in setOf("accepted","rejected")) return null
             val draft=runCatching {pocketJson.parseToJsonElement(command.draftText).jsonObject}.getOrNull() ?: return null
             if(draft.number("pocketAssistantDraft")!=1L || draft.string("runtimeId").isBlank()) return null
-            return AssistantSendReceipt(command.id,command.computerId,draft.string("runtimeId"),draft.string("conversationId").ifBlank {null},command.status)
+            return AssistantSendReceipt(command.id,command.computerId,draft.string("runtimeId"),draft.string("conversationId").ifBlank {null},command.status,command.createdAt)
         }
     }
 }

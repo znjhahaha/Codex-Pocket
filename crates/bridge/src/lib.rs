@@ -2,6 +2,7 @@
 pub mod capabilities;
 pub mod discovery;
 pub mod router;
+mod question_projection;
 pub mod settings;
 pub mod permission_policy;
 mod startup;

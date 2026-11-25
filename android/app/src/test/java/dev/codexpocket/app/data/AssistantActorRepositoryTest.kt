@@ -111,14 +111,50 @@ class AssistantActorRepositoryTest {
         assertTrue(repo.state.value.assistant.sendReceipts.isEmpty())
     }
 
-    @Test fun unpreparedAssistantIsPreparedOnceWithoutARunningRuntimeSelection()=runBlocking<Unit> {
-        transport.snapshot=buildJsonObject {put("enabled",false);put("ready",false)}
-        transport.preparation=actorSnapshot()
+    private fun idleSnapshot()=buildJsonObject {put("enabled",false);put("ready",false);put("runtimeId","scope");put("scopeId","scope");put("preparationStatus","idle");put("models",buildJsonArray {})}
+    private fun startedSnapshot()=JsonObject(actorSnapshot()+mapOf("scopeId" to JsonPrimitive("scope"),"models" to buildJsonArray {}))
+    @Test fun viewingIdleAssistantHistoryAndModelsNeverPrepares()=runBlocking<Unit> {
+        transport.snapshot=idleSnapshot();transport.preparation=startedSnapshot()
         repo.loadAssistant().join()
-        assertEquals(listOf("assistant/read","assistant/prepare","codex/request"),transport.calls.map {it.first})
-        assertTrue(transport.calls.single {it.first=="assistant/prepare"}.second.isEmpty())
-        assertEquals(true,repo.state.value.assistant.snapshot?.ready)
-        assertNull(repo.state.value.assistant.error)
+        repo.loadAssistant(AssistantActions.read(0,before=10).params,automaticPrepare=true).join()
+        repo.loadAssistant(buildJsonObject {put("models",true)}).join()
+        assertTrue(transport.calls.all {it.first=="assistant/read"})
+        assertFalse(repo.state.value.assistant.snapshot!!.prepared)
+    }
+    @Test fun concurrentFirstSendsEnsureOnceAndSendBothIndependentMessages()=runBlocking<Unit> {
+        transport.snapshot=idleSnapshot();transport.preparation=startedSnapshot()
+        transport.prepareStarted=CompletableDeferred();transport.prepareRelease=CompletableDeferred()
+        repo.loadAssistant().join()
+        val first=boundSend("first")
+        val sending=repo.assistantAction(first)
+        withTimeout(5000) {transport.prepareStarted!!.await()}
+        val second=repo.assistantAction(boundSend("second"))
+        transport.prepareRelease!!.complete(Unit)
+        withTimeout(5000) {joinAll(sending,second)}
+        assertEquals(1,transport.calls.count {it.first=="assistant/prepare"})
+        assertEquals(2,transport.calls.count {it.first=="assistant/send"})
+        assertTrue(transport.calls.filter {it.first=="assistant/send"}.all {it.second.string("runtimeId")=="managed"})
+        assertEquals("accepted",db.dao().assistantSendReceipts().first().single {it.id=="first"}.status)
+    }
+    @Test fun startupFailureRetainsTheOriginalDraftWithoutSending()=runBlocking<Unit> {
+        transport.snapshot=idleSnapshot();repo.loadAssistant().join()
+        repo.assistantAction(boundSend("failed-start")).join()
+        assertTrue(transport.calls.none {it.first=="assistant/send"})
+        val receipt=db.dao().assistantSendReceipts().first().single {it.id=="failed-start"}
+        assertEquals("rejected",receipt.status)
+        assertTrue(receipt.draftText.contains("original scope draft"))
+    }
+    @Test fun changingScopeWhileStartingCancelsSendAndKeepsDraft()=runBlocking<Unit> {
+        transport.snapshot=idleSnapshot();transport.preparation=startedSnapshot()
+        transport.prepareStarted=CompletableDeferred();transport.prepareRelease=CompletableDeferred()
+        repo.loadAssistant().join()
+        val sending=repo.assistantAction(boundSend("changed-scope"))
+        withTimeout(5000) {transport.prepareStarted!!.await()}
+        state().update {it.copy(assistant=it.assistant.copy(snapshot=it.assistant.snapshot!!.copy(scopeId="other")))}
+        transport.prepareRelease!!.complete(Unit)
+        withTimeout(5000) {sending.join()}
+        assertTrue(transport.calls.none {it.first=="assistant/send"})
+        assertEquals("rejected",db.dao().assistantSendReceipts().first().single {it.id=="changed-scope"}.status)
     }
 
     @Test fun staleUnpreparedReadCannotPrepareAReplacementConnection()=runBlocking<Unit> {
@@ -152,8 +188,8 @@ class AssistantActorRepositoryTest {
         assertEquals(listOf("older")+newer.map {it.id},repo.state.value.assistant.messages.map {it.id})
         assertEquals(1L,repo.state.value.assistant.nextBefore)
         assertTrue(repo.state.value.assistant.historyPaged)
-        assertTrue(repo.state.value.assistant.snapshot!!.prepared)
-        assertTrue(transport.calls.single {it.first=="assistant/prepare"}.second.isEmpty())
+        assertFalse(repo.state.value.assistant.snapshot!!.prepared)
+        assertTrue(transport.calls.none {it.first=="assistant/prepare"})
     }
 
     @Test fun olderConversationPageMergesWithoutDroppingNewerMessagesOrAuthorship()=runBlocking<Unit> {
@@ -248,7 +284,7 @@ class AssistantActorRepositoryTest {
         repo.loadAssistant().join()
         repo.assistantAction(AssistantActions.send("managed","send once",null).copy(commandId="direct-once")).join()
         val receipt=withTimeout(5000) {repo.state.first {it.assistant.sendReceipts.any {r->r.commandId=="direct-once"}}}.assistant.sendReceipts.single()
-        assertEquals(AssistantSendReceipt("direct-once","pc","managed","assistant:assistant","accepted"),receipt)
+        assertEquals(AssistantSendReceipt("direct-once","pc","managed","assistant:assistant","accepted"),receipt.copy(submittedAtMs=0))
         assertEquals(1,transport.calls.count {it.first=="assistant/send"})
     }
 
@@ -339,6 +375,72 @@ class AssistantActorRepositoryTest {
 
     private fun boundSend(id:String="scope-once")=AssistantActions.send("managed","original scope draft",null).copy(commandId=id,
         composerBinding=repo.state.value.assistant.snapshot!!.composerBinding("pc"))
+
+    @Test fun secondIndependentMessageQueuesWithoutBeingRejectedByFirstPendingSend()=runBlocking<Unit> {
+        repo.loadAssistant().join()
+        transport.sendStarted=CompletableDeferred();transport.sendRelease=CompletableDeferred()
+        val first=repo.assistantAction(boundSend("first-independent"))
+        withTimeout(5000) {transport.sendStarted!!.await()}
+        val second=repo.assistantAction(boundSend("second-independent"))
+        delay(100)
+        assertFalse(second.isCompleted)
+        transport.sendRelease!!.complete(Unit)
+        withTimeout(5000) {joinAll(first,second)}
+        assertEquals(2,transport.calls.count {it.first=="assistant/send"})
+        assertEquals(setOf("first-independent","second-independent"),db.dao().assistantSendReceipts().first().filter {it.status=="accepted"}.map {it.id}.toSet())
+    }
+
+    @Test fun terminalRejectionCannotBeReopenedWithSameCommandIdentity()=runBlocking<Unit> {
+        repo.loadAssistant().join()
+        val original=boundSend("retry-original")
+        transport.sendReply=buildJsonObject {put("accepted",false);put("status","rejected");put("commandId","retry-original")}
+        repo.assistantAction(original).join()
+        transport.sendReply=null
+        repo.assistantAction(original.copy(retry=true)).join()
+        assertEquals(1,transport.calls.count {it.first=="assistant/send"})
+        assertEquals("rejected",db.dao().command("retry-original")!!.status)
+        repo.assistantAction(original.copy(commandId="retry-next",retry=true)).join()
+        assertEquals("accepted",db.dao().command("retry-next")!!.status)
+        assertEquals(2,transport.calls.count {it.first=="assistant/send"})
+    }
+
+    @Test fun anExistingCommandFromAnotherComputerCannotConfirmThisMessage()=runBlocking<Unit> {
+        repo.loadAssistant().join()
+        val action=boundSend("foreign-command")
+        db.dao().putCommand(CommandEntity("foreign-command","another-pc",null,"assistant/send","accepted",1,"foreign draft"))
+        repo.assistantAction(action).join()
+        assertTrue(transport.calls.none {it.first=="assistant/send"})
+        assertEquals("another-pc",db.dao().command("foreign-command")!!.computerId)
+        assertTrue(repo.state.value.assistant.sendReceipts.none {it.commandId=="foreign-command"})
+    }
+
+    @Test fun selectingConversationCannotRedirectAnAdmittedSendOrMixReadMessages()=runBlocking<Unit> {
+        transport.snapshot=JsonObject(actorSnapshot()+mapOf("conversationId" to JsonPrimitive("chat-a")))
+        repo.loadAssistant().join()
+        transport.sendStarted=CompletableDeferred();transport.sendRelease=CompletableDeferred()
+        val original=boundSend("chat-a-send").let {it.copy(params=JsonObject(it.params+("conversationId" to JsonPrimitive("chat-a"))))}
+        val sending=repo.assistantAction(original)
+        withTimeout(5000) {transport.sendStarted!!.await()}
+        transport.snapshot=JsonObject(actorSnapshot()+mapOf("conversationId" to JsonPrimitive("chat-b"),"messages" to JsonArray(emptyList())))
+        repo.assistantAction(assistantConversationSelect("chat-b")).join()
+        assertTrue(repo.state.value.assistant.messages.isEmpty())
+        transport.sendRelease!!.complete(Unit)
+        withTimeout(5000) {sending.join()}
+        assertEquals("chat-a",transport.calls.single {it.first=="assistant/send"}.second.string("conversationId"))
+        assertEquals("chat-b",repo.state.value.assistant.snapshot!!.conversationId)
+        assertTrue(repo.state.value.assistant.messages.isEmpty())
+        assertEquals("chat-a",AssistantSendReceipt.from(db.dao().command("chat-a-send")!!)!!.conversationId)
+    }
+
+    @Test fun createConversationBeforeNativeStartupSelectsBlankChatWithoutPreparing()=runBlocking<Unit> {
+        transport.snapshot=JsonObject(idleSnapshot()+mapOf("runtimeId" to JsonNull))
+        repo.loadAssistant().join()
+        repo.assistantAction(assistantConversationCreate()).join()
+        assertEquals("chat-created",repo.state.value.assistant.selectedConversationId)
+        assertTrue(repo.state.value.assistant.messages.isEmpty())
+        assertEquals("scope",transport.calls.single {it.first=="assistant/v2/conversation/create"}.second.string("runtimeId"))
+        assertTrue(transport.calls.none {it.first in setOf("assistant/prepare","assistant/send","codex/request")})
+    }
 
     @Test fun uiBindingCannotBeReplacedByALaterRuntimeBeforeRepositoryInvocation()=runBlocking<Unit> {
         repo.loadAssistant().join()
@@ -484,6 +586,8 @@ class AssistantActorRepositoryTest {
         override val notifications=emptyFlow<JsonObject>()
         var snapshot=actorSnapshot()
         var preparation: JsonObject? = null
+        var prepareStarted:CompletableDeferred<Unit>?=null
+        var prepareRelease:CompletableDeferred<Unit>?=null
         var olderPage: JsonElement? = null
         var readStarted:CompletableDeferred<Unit>?=null
         var readRelease:CompletableDeferred<Unit>?=null
@@ -502,6 +606,11 @@ class AssistantActorRepositoryTest {
         override suspend fun request(method:String,params:JsonObject,commandId:String?,timeoutMillis:Long):JsonElement {
             calls+=method to params
             return when(method) {
+                "assistant/v2/conversation/create" -> {
+                    val conversation=buildJsonObject {put("id","chat-created");put("title","新对话");put("createdAtMs",1);put("updatedAtMs",1)}
+                    snapshot=JsonObject(snapshot+mapOf("conversationId" to JsonPrimitive("chat-created"),"conversations" to buildJsonArray {add(conversation)},"messages" to buildJsonArray {}))
+                    buildJsonObject {put("accepted",true);put("commandId",commandId);put("conversation",conversation)}
+                }
                 "attachment/upload"->{if(uploadFailure) throw WireException("upload_failed","fixture upload failed");buildJsonObject {put("attachmentId",java.util.UUID.randomUUID().toString())}}
                 "assistant/send" -> {
                     sendStarted?.complete(Unit);sendRelease?.await()
@@ -518,6 +627,7 @@ class AssistantActorRepositoryTest {
                     if(params.containsKey("before") && olderPage!=null) JsonObject(snapshot+mapOf("conversationPage" to olderPage!!)) else snapshot
                 }
                 "assistant/prepare"-> {
+                    prepareStarted?.complete(Unit);prepareRelease?.await()
                     assertFalse(params.containsKey("runtimeId"))
                     preparation?.also {snapshot=it} ?: throw WireException("unsupported", "Preparation unavailable")
                 }

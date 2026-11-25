@@ -345,6 +345,12 @@ impl HostClient {
                 self.transport = Some(transport);
                 Ok(value)
             }
+            Ok(Err(error)) if error.is::<AdmissionRejected>() => {
+                // A complete authenticated refusal finished the exchange before
+                // native dispatch; the socket remains aligned and reusable.
+                self.transport = Some(transport);
+                Err(error)
+            }
             Ok(Err(error)) => Err(error),
             Err(_) => {
                 bail!("Host deadline exceeded; native operation may still be running")
@@ -564,6 +570,8 @@ mod tests {
             let result = client.exchange("outer", &json!({"id":"outer","method":method}), Some(&json!("native"))).await;
             assert_eq!(result.is_ok(), success);
             assert_eq!(result.as_ref().err().is_some_and(|e|e.downcast_ref::<AdmissionRejected>().is_some()), rejected);
+            assert_eq!(client.transport.is_some(), rejected || success,
+                "a proven refusal completes this exchange without corrupting the connection");
             reader.await.unwrap();
         }
     }

@@ -21,6 +21,7 @@ import dev.codexpocket.app.data.LocalProviderModelLoader
 import dev.codexpocket.app.data.LocalProviderModelResult
 import dev.codexpocket.app.data.LocalProviderModelProblem
 import dev.codexpocket.app.data.LocalProjects
+import dev.codexpocket.app.data.PhoneLinuxProgress
 import dev.codexpocket.app.ui.kit.*
 
 /** Running Codex on this phone: start it, choose the model service it uses, stop it. */
@@ -30,7 +31,8 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
     access: LocalAccess = LocalAccess(), applying: Boolean = false, onUseProvider: (String?) -> Unit = {},
     onSaveProvider: (LocalProviderDraft) -> Boolean = { false }, onRemoveProvider: (String) -> Unit = {}, onSignOut: () -> Unit = {},
     projects: LocalProjects = LocalProjects(), onImport: (Uri) -> Unit = {}, onExport: (String, Uri) -> Unit = { _, _ -> },
-    onFetchModels: LocalProviderModelLoader = { LocalProviderModelResult.Failed(LocalProviderModelProblem.Network) }) {
+    onFetchModels: LocalProviderModelLoader = { LocalProviderModelResult.Failed(LocalProviderModelProblem.Network) },
+    environment: PhoneLinuxProgress? = null) {
     val context = LocalContext.current
     var exporting by remember { mutableStateOf<String?>(null) }
     val pickArchive = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) onImport(uri) }
@@ -40,13 +42,16 @@ internal fun ThisPhoneSheet(added: Boolean, account: LocalAccount, progress: Str
     }
     PSheet("此手机", onDismiss, subtitle = "Codex 直接在手机上运行，不需要电脑", maxHeightFraction = .9f) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            PText("项目、命令和登录信息都留在本应用的私有目录内，其它应用和你的相册、文件不可访问。Codex 自带的命令沙箱在手机上不可用，所以每条不在安全名单内的命令都会先问你。",
+            PText("在应用私有目录中使用 Bash、Git、Python 和 Node。工具遵循会话中选择的权限；支持的隔离模式会在启动时验证，可在对话的权限菜单中查看。",
                 style = Pocket.type.bodySmall, color = Pocket.colors.inkMuted)
             if (!added) {
-                progress?.let { PocketProgressStatus(it) }
-                PButton("在此手机上运行", onStart, Modifier.fillMaxWidth().testTag("this-phone-start"), enabled = progress == null)
+                if (environment?.failed == true) PText(environment.message, style = Pocket.type.bodySmall, color = Pocket.colors.danger)
+                else (environment?.let { it.message + (it.fraction?.let { value -> " ${(value * 100).toInt()}%" } ?: "") } ?: progress)?.let { PocketProgressStatus(it) }
+                PButton("在此手机上运行", onStart, Modifier.fillMaxWidth().testTag("this-phone-start"), enabled = progress == null && environment?.failed != false)
                 return@Column
             }
+            if (environment?.failed == true) PText(environment.message, style = Pocket.type.bodySmall, color = Pocket.colors.danger)
+            else environment?.let { PocketProgressStatus(it.message) }
             ThisPhoneProviders(access, applying, onUseProvider, onSaveProvider, onRemoveProvider, onFetchModels) {
                 when (account) {
                     LocalAccount.Unknown, LocalAccount.Checking -> PocketProgressStatus("正在读取登录状态", Modifier.testTag("this-phone-checking"))

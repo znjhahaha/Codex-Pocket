@@ -6,16 +6,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.*
 
 /** A model service the person brings their own key for, kept the way CC Switch keeps one: a name, an address, a key and a model. */
-internal class LocalProvider(val id: String, val name: String, val baseUrl: String, val apiKey: String, val model: String) {
+internal class LocalProvider(val id: String, val name: String, val baseUrl: String, val apiKey: String, val model: String,
+    val enabledModels: List<LocalProviderModel> = LocalProviderModel.initial(model),
+    val configuration: Any = Any()) {
     /** Enough of the key to tell two apart, never enough to use. */
     val keyHint: String get() = if (apiKey.length < 12) "••••" else apiKey.take(3) + "…" + apiKey.takeLast(4)
-    val summary get() = LocalProviderSummary(id, name, baseUrl, model, keyHint)
+    val summary get() = LocalProviderSummary(id, name, baseUrl, model, keyHint, enabledModels)
     // Not a data class: the key must never reach a log line through toString.
     override fun toString() = "LocalProvider($id)"
 }
 
 /** What a screen may show of a provider. */
-internal data class LocalProviderSummary(val id: String, val name: String, val baseUrl: String, val model: String, val keyHint: String)
+internal data class LocalProviderSummary(val id: String, val name: String, val baseUrl: String, val model: String, val keyHint: String,
+    val enabledModels: List<LocalProviderModel> = LocalProviderModel.initial(model))
 
 /** The saved services and which one Codex on this phone uses; none in use means OpenAI's own sign-in. */
 internal data class LocalAccess(val providers: List<LocalProviderSummary> = emptyList(), val activeId: String? = null) {
@@ -23,7 +26,8 @@ internal data class LocalAccess(val providers: List<LocalProviderSummary> = empt
 }
 
 /** What the person typed. A blank key on an existing provider keeps the saved one. */
-internal class LocalProviderDraft(val id: String?, val name: String, val baseUrl: String, val apiKey: String, val model: String)
+internal class LocalProviderDraft(val id: String?, val name: String, val baseUrl: String, val apiKey: String, val model: String,
+    val enabledModels: List<LocalProviderModel>? = null)
 
 internal object LocalProviderRules {
     const val LIMIT = 32
@@ -65,7 +69,8 @@ internal class LocalProviderStore(private val blob: LocationBlob) {
                 val o = entry as? JsonObject ?: return@mapNotNull null
                 fun text(key: String) = (o[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
                 LocalProvider(text("id") ?: return@mapNotNull null, text("name") ?: return@mapNotNull null,
-                    text("baseUrl") ?: return@mapNotNull null, text("apiKey") ?: return@mapNotNull null, text("model").orEmpty())
+                    text("baseUrl") ?: return@mapNotNull null, text("apiKey") ?: return@mapNotNull null, text("model").orEmpty(),
+                    LocalProviderModel.configured(o, text("model").orEmpty()))
             }.take(LocalProviderRules.LIMIT)
             activeId = (record["active"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { id -> providers.any { it.id == id } }
         }
@@ -74,9 +79,10 @@ internal class LocalProviderStore(private val blob: LocationBlob) {
     private fun publish() { changes.value = LocalAccess(providers.map { it.summary }, activeId) }
     private fun commit(next: List<LocalProvider>, active: String?) {
         blob.write(buildJsonObject {
-            put("version", 1); put("active", active?.let(::JsonPrimitive) ?: JsonNull)
+            put("version", 2); put("active", active?.let(::JsonPrimitive) ?: JsonNull)
             putJsonArray("providers") { next.forEach { p -> addJsonObject {
                 put("id", p.id); put("name", p.name); put("baseUrl", p.baseUrl); put("apiKey", p.apiKey); put("model", p.model)
+                put("enabledModels", JsonArray(p.enabledModels.map { it.json() }))
             } } }
         }.toString())
         providers = next; activeId = active; publish()
@@ -93,9 +99,24 @@ internal class LocalProviderStore(private val blob: LocationBlob) {
         val model = LocalProviderRules.model(draft.model) ?: return null
         val key = if (existing != null && draft.apiKey.isBlank()) existing.apiKey else LocalProviderRules.apiKey(draft.apiKey) ?: return null
         if (existing == null && providers.size >= LocalProviderRules.LIMIT) return null
-        val saved = LocalProvider(existing?.id ?: UUID.randomUUID().toString(), name, baseUrl, key, model)
+        val configured = draft.enabledModels ?: existing?.enabledModels?.takeIf { model == existing.model } ?: LocalProviderModel.initial(model)
+        if (configured.size > 200 || configured.any { it.id.isBlank() || LocalProviderRules.model(it.id) != it.id ||
+                it.efforts?.any { effort -> effort !in LocalProviderModel.EFFORTS } == true ||
+                (it.defaultEffort != null && it.defaultEffort !in it.efforts.orEmpty()) }) return null
+        val enabled = (configured + LocalProviderModel.initial(model)).distinctBy { it.id }
+        if (enabled.size > 200) return null
+        val saved = LocalProvider(existing?.id ?: UUID.randomUUID().toString(), name, baseUrl, key, model, enabled)
         commit(if (existing == null) providers + saved else providers.map { if (it.id == saved.id) saved else it }, saved.id)
         return saved.id
+    }
+    /** A late discovery response may only enrich the same saved service; it never enables models. */
+    @Synchronized fun refreshCapabilities(captured: LocalProvider, declared: Map<String, LocalProviderModel>): LocalProvider? {
+        if (active() !== captured) return null
+        val models = captured.enabledModels.map { it.refreshed(declared[it.id]) }
+        if (models == captured.enabledModels) return captured
+        val next = LocalProvider(captured.id, captured.name, captured.baseUrl, captured.apiKey, captured.model, models, captured.configuration)
+        commit(providers.map { if (it === captured) next else it }, activeId)
+        return next
     }
     /** Null goes back to OpenAI's own sign-in; the saved services stay. */
     @Synchronized fun use(id: String?): Boolean {

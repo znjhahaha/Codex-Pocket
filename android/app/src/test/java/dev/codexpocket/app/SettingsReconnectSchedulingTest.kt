@@ -41,7 +41,7 @@ class SettingsReconnectSchedulingTest {
             override fun save(pair: PairedComputer) = Unit
             override fun forget() = Unit
         }
-        repo = PocketRepository(app, { server.connection() }, storage, db, emptyFlow())
+        repo = PocketRepository(app, { server.connection() }, storage, db, emptyFlow(), backgroundRetentionMillis = 200)
         awaitState { it.initialized }
     }
 
@@ -145,8 +145,7 @@ class SettingsReconnectSchedulingTest {
         val original = server.links.single()
         val epoch = repo.state.value.mediaConnectionEpoch
         repo.setForeground(false)
-        // Match the physical-phone repro: a four-second HOME visit, not a same-tick toggle.
-        delay(4_000)
+        delay(50)
         repo.setForeground(true)
         awaitState { it.online }
         assertFalse("A brief app switch must not close a healthy authenticated link", original.closed)
@@ -188,11 +187,106 @@ class SettingsReconnectSchedulingTest {
         } finally { gate.release.complete(Unit); withTimeout(5_000) { selection.join() } }
     }
 
+    @Test fun selectingHistoryDoesNotWaitForSlowCatalogOrAccess() = runBlocking<Unit> {
+        connect()
+        val access = Gate().also { server.gates["thread/access/read"] = it }
+        val catalog = Gate().also { server.gates["model/list"] = it }
+        val selection = repo.select(chat)
+        try {
+            withTimeout(5_000) { access.entered.await(); catalog.entered.await() }
+            awaitState { it.conversationLoadState == ConversationLoadState.Ready }
+            assertTrue("The visible conversation must finish opening while optional metadata is pending", eventually { selection.isCompleted })
+            assertNull(repo.state.value.automaticConnectionLabel())
+            assertFalse(repo.state.value.accessAllowsSending())
+        } finally { access.release.complete(Unit); catalog.release.complete(Unit) }
+    }
+
+    @Test fun reenteringKeepsPermissionAndModelLabelsWhileRevalidating() = runBlocking<Unit> {
+        selectReady()
+        val permission = Gate().also { server.gates["thread/permissions/read"] = it }
+        val catalog = Gate().also { server.gates["model/list"] = it }
+        repo.select(chat, forceRefresh = true)
+        try {
+            withTimeout(5_000) { permission.entered.await(); catalog.entered.await() }
+            assertEquals("Ask", repo.state.value.permissions.label)
+            assertEquals("saved", repo.state.value.permissions.status)
+            assertNull("Cached permissions are presentation only", repo.state.value.permissions.revision)
+            assertTrue(repo.state.value.permissions.presets.none { it.enabled })
+            assertEquals(listOf("catalog-model"), repo.state.value.models.map { it.model })
+            permission.release.complete(Unit)
+            awaitState { it.permissions.status == "ready" }
+        } finally { permission.release.complete(Unit); catalog.release.complete(Unit) }
+    }
+
+    @Test fun unchangedRuntimeNotificationsDoNotInvalidateAccessOrRestartPermissions() = runBlocking<Unit> {
+        selectReady()
+        val before = server.count("thread/permissions/read")
+        val gate = Gate().also { server.gates["thread/permissions/read"] = it }
+        val refresh = repo.refreshPermissions()
+        try {
+            withTimeout(5_000) { gate.entered.await() }
+            repeat(4) { server.links.single().runtimeNotification() }
+            delay(200)
+            assertEquals(before + 1, server.count("thread/permissions/read"))
+            assertTrue("Identical inventory must not discard verified ownership", key in repo.state.value.accessFresh)
+            gate.release.complete(Unit)
+            withTimeout(5_000) { refresh.join() }
+            assertEquals("ready", repo.state.value.permissions.status)
+        } finally { gate.release.complete(Unit) }
+    }
+
+    @Test fun initializingPermissionsRetryInPlaceWithoutOpeningThePanel() = runBlocking<Unit> {
+        server.permissionStatus = "initializing"
+        connect()
+        repo.select(chat).join()
+        awaitState { it.permissions.status == "initializing" }
+        val observer = repo.observeConversation(key)
+        try {
+            server.permissionStatus = "ready"
+            awaitState { it.permissions.status == "ready" }
+        } finally { observer.cancelAndJoin() }
+    }
+
+    @Test fun missingDirectoryStatusKeepsObservedRunningMarker() = runBlocking<Unit> {
+        selectReady()
+        db.dao().putChat(chat.copy(status = "active"))
+        awaitState { it.chats.any { row -> row.key == key && row.status == "active" } }
+        repo.refresh().join()
+        assertEquals("active", db.dao().chat(key)?.status)
+    }
+
+    @Test fun liveStatusWinsOverDirectoryResponseThatStartedEarlier() = runBlocking<Unit> {
+        selectReady()
+        server.directoryStatus = "completed"
+        val gate = Gate().also { server.gates["threads/list"] = it }
+        val refresh = repo.refresh()
+        try {
+            withTimeout(5_000) { gate.entered.await() }
+            server.links.single().statusNotification("active")
+            awaitState { it.chats.any { row -> row.key == key && row.status == "active" } }
+            gate.release.complete(Unit)
+            withTimeout(5_000) { refresh.join() }
+            assertEquals("active", db.dao().chat(key)?.status)
+        } finally { gate.release.complete(Unit) }
+    }
+
+    @Test fun changedOwnerInventoryStillRevokesOldAccessUntilRevalidated() = runBlocking<Unit> {
+        selectReady()
+        val gate = Gate().also { server.gates["thread/access/read"] = it }
+        try {
+            server.runtimeOnline = false
+            server.links.single().runtimeNotification()
+            withTimeout(5_000) { gate.entered.await() }
+            assertFalse(key in repo.state.value.accessFresh)
+            assertFalse(repo.state.value.accessAllowsSending())
+        } finally { gate.release.complete(Unit) }
+    }
+
     @Test fun remainingInBackgroundStillClosesLinkWithoutWatch() = runBlocking<Unit> {
         selectReady()
         val original = server.links.single()
         repo.setForeground(false)
-        withTimeout(15_000) { repo.state.first { !it.online } }
+        withTimeout(5_000) { repo.state.first { !it.online } }
         assertTrue("Warm return must not turn into an unbounded background connection", original.closed)
         assertFalse(repo.state.value.settingsFresh)
         assertFalse(repo.state.value.approvalsFresh)
@@ -211,10 +305,13 @@ class SettingsReconnectSchedulingTest {
         val gates = ConcurrentHashMap<String, Gate>()
         @Volatile var connectGate: Gate? = null
         @Volatile var failCatalog = false
+        @Volatile var permissionStatus = "ready"
+        @Volatile var directoryStatus: String? = null
+        @Volatile var runtimeOnline = true
         fun count(method: String) = calls.count { it == method }
         fun connection() = Link().also { links += it }
         private fun runtimes() = buildJsonArray { add(buildJsonObject {
-            put("id", chat.runtimeId); put("source", "desktop"); put("configStoreId", key.configStoreId); put("online", true)
+            put("id", chat.runtimeId); put("source", "desktop"); put("configStoreId", key.configStoreId); put("online", runtimeOnline)
             put("loadedThreadIds", buildJsonArray { add(key.nativeId) })
             put("capabilities", buildJsonArray { add("thread/read"); add("model/list") })
         }) }
@@ -224,6 +321,18 @@ class SettingsReconnectSchedulingTest {
             override val state = MutableStateFlow(LinkState.OFFLINE)
             private val notes = Channel<JsonObject>(Channel.UNLIMITED)
             override val notifications = notes.receiveAsFlow()
+            suspend fun runtimeNotification() { notes.send(buildJsonObject {
+                put("method", "runtimes/changed"); put("params", buildJsonObject { put("data", runtimes()) })
+            }) }
+            suspend fun statusNotification(status: String) { notes.send(buildJsonObject {
+                put("method", "codex/event"); put("params", buildJsonObject {
+                    put("runtimeId", chat.runtimeId)
+                    put("cursor", buildJsonObject { put("epoch", "fixture"); put("sequence", 1) })
+                    put("event", buildJsonObject { put("method", "thread/status/changed"); put("params", buildJsonObject {
+                        put("threadId", key.nativeId); put("status", buildJsonObject { put("type", status) })
+                    }) })
+                })
+            }) }
             override suspend fun connect(config: ConnectionConfig) {
                 connectGate?.waitHere()
                 state.value = LinkState.ONLINE
@@ -244,6 +353,7 @@ class SettingsReconnectSchedulingTest {
                         put("data", buildJsonArray { if (!params.flag("archived")) add(buildJsonObject {
                             put("id", key.nativeId); put("runtimeId", chat.runtimeId); put("source", "desktop")
                             put("configStoreId", key.configStoreId); put("name", "Selected")
+                            directoryStatus?.let { put("status", it) }
                         }) }); put("nextCursor", JsonNull)
                     }
                     "sync" -> buildJsonObject {
@@ -259,7 +369,7 @@ class SettingsReconnectSchedulingTest {
                         put("known", true); put("settings", buildJsonObject { put("model", "native-model"); put("effort", "high") })
                     })
                     "thread/permissions/read" -> JsonObject(identity() + buildJsonObject {
-                        put("status", "ready"); put("revision", "fixture-revision"); put("currentPresetId", "ask")
+                        put("status", permissionStatus); put("revision", "fixture-revision"); put("currentPresetId", "ask")
                         put("presets", buildJsonArray { add(buildJsonObject { put("id", "ask"); put("label", "Ask"); put("enabled", true) }) })
                     })
                     "thread/context/read" -> JsonObject(identity() + ("status" to JsonPrimitive("empty")))

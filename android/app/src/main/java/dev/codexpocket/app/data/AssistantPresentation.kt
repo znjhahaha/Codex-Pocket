@@ -4,7 +4,7 @@ import kotlinx.serialization.json.*
 import java.time.*
 
 data class AssistantAction(val method: String, val params: JsonObject, val commandId: String? = null,
-    val composerBinding: AssistantComposerBinding? = null,val attachments:List<LocalAttachment> = emptyList())
+    val composerBinding: AssistantComposerBinding? = null,val attachments:List<LocalAttachment> = emptyList(), val retry: Boolean = false)
 data class AssistantStartupStage(val id: String, val status: String, val recoveryAction: String? = null) {
     val label get() = when(id) { "runtime"->"电脑服务"; "account"->"登录与提供商"; "capabilities"->"执行能力"; "coordinator"->"助理协调"; else->"准备状态" }
     val statusLabel get() = when(status) {"ready"->"已就绪";"paused"->"已暂停";"reconciling"->"核对中";"blocked"->"需处理";"preparing"->"准备中";else->"等待前一步"}
@@ -31,12 +31,12 @@ enum class AssistantOperationPhase { Unknown, Running, Waiting, Paused, Complete
 enum class AssistantQuestionKind { Input, Approval, Unknown }
 data class AssistantNotifications(val completed: Boolean = true, val failed: Boolean = true, val waitingUser: Boolean = true)
 data class AssistantSettings(val personality: String = "", val tone: String = "", val model: String? = null, val timezone: String = "Asia/Shanghai", val notifications: AssistantNotifications = AssistantNotifications(),
-    val coordinatorModel: String? = null)
-data class AssistantTask(val id: String, val prompt: String, val status: AssistantTaskStatus, val activeRunId: String?, val reconciliationRequired: Boolean, val detail: String?, val assignment: AssistantAssignment? = null)
+    val coordinatorModel: String? = null, val effort: String? = null, val coordinatorEffort: String? = null)
+data class AssistantTask(val id: String, val prompt: String, val status: AssistantTaskStatus, val activeRunId: String?, val reconciliationRequired: Boolean, val detail: String?, val assignment: AssistantAssignment? = null, val conversationId: String? = null)
 data class AssistantQuestion(val requestId: String, val kind: AssistantQuestionKind, val text: String)
 data class AssistantOperation(val id: String, val role: String, val taskId: String?, val phase: AssistantOperationPhase, val suspended: Boolean, val threadId: String?, val question: AssistantQuestion?, val result: String?, val heldInputs:List<AssistantHeldInput> = emptyList(),
-    val handoffRecovery: AssistantHandoffRecovery? = null)
-data class AssistantEvent(val sequence: Long, val id: String, val operationId: String?, val kind: String, val detail: String, val atMs: Long?, val taskId: String? = null, val memberId: String? = null, val groupId: String? = null, val threadId: String? = null, val memberAttributionProvided: Boolean = memberId != null)
+    val handoffRecovery: AssistantHandoffRecovery? = null, val conversationId: String? = null)
+data class AssistantEvent(val sequence: Long, val id: String, val operationId: String?, val kind: String, val detail: String, val atMs: Long?, val taskId: String? = null, val memberId: String? = null, val groupId: String? = null, val threadId: String? = null, val memberAttributionProvided: Boolean = memberId != null, val conversationId: String? = null)
 data class AssistantMemory(val id: String, val text: String, val source:String? = null, val scope:String = "personal", val automatic:Boolean = false, val updatedAtMs:Long? = null, val revisions:List<Long> = emptyList())
 data class AssistantSchedule(val id: String, val prompt: String, val kind: JsonObject, val timezone: String, val nextMs: Long?, val missed: Boolean, val error: String?, val paused:Boolean = false, val missedPolicy:String = "skip", val writes:Boolean = false)
 data class AssistantAssignment(val taskId: String, val memberId: String? = null, val groupId: String? = null,
@@ -49,7 +49,7 @@ data class AssistantAssignment(val taskId: String, val memberId: String? = null,
 data class AssistantMember(val id: String, val name: String, val duty: String, val mainThreadId: String?, val directory: String,
     val threadId: String?, val active: Boolean)
 data class AssistantGroup(val id: String, val title: String, val taskIds: List<String>, val requiresSummary: Boolean, val sealed: Boolean, val status: String)
-data class AssistantDelivery(val id: String, val message: String, val memberId: String?, val taskId: String?, val status: String, val deliveredTaskId: String?, val atMs: Long? = null) {
+data class AssistantDelivery(val id: String, val message: String, val memberId: String?, val taskId: String?, val status: String, val deliveredTaskId: String?, val atMs: Long? = null, val conversationId: String? = null) {
     val label get() = when(status) {"queued" -> "待送达"; "sent" -> "已送达"; "sending" -> "正在送达"; "paused" -> "暂停送达"; else -> "待确认送达"}
 }
 data class AssistantQuestionHistory(val id: String, val operationId: String?, val requestId: String?, val atMs: Long?, val item: TimelineItem)
@@ -77,20 +77,23 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
     val artifacts:List<AssistantArtifact> = emptyList(), val scheduleRuns:List<AssistantScheduleRun> = emptyList(),
     val memoryUsage:Map<String,List<String>> = emptyMap(), val memoryDisabledTasks:List<String> = emptyList(),
     val protocolVersion:Int = 1,val acceptingMessages:Boolean? = null,val domain:AssistantDomain? = null,
-    val jobs:List<AssistantJob> = emptyList()) {
+    val jobs:List<AssistantJob> = emptyList(), val scopeId: String? = null, val selectedRuntimeId: String? = null,
+    val conversationId: String? = null, val activeCoordinatorOperationId: String? = null) {
     val prepReady get() = preparationStatus in setOf(null,"ready") && errorCode.isNullOrBlank()
     val prepared get() = if(protocolVersion>=2) enabled==true && ready==true && acceptingMessages==true else enabled==true && ready==true && prepReady && recoveries.isEmpty() && (startupStages.isEmpty() ||
         listOf("runtime","account","capabilities","coordinator").all {id -> startupStages.firstOrNull {it.id==id}?.status in setOf("ready","paused")})
     val preparationIssue: String? get() = when {
+        preparationStatus == "idle" && errorCode.isNullOrBlank() -> null
         protocolVersion>=2 && prepared -> null
         dispatchInFlight && errorCode.isNullOrBlank() -> null
         recoveries.isNotEmpty() -> "请先结束待恢复的原操作，再继续与助理对话"
         errorCode=="assistant_missing_cli" || preparationStatus=="missing_cli" -> "电脑端尚未找到 Codex CLI，请安装或定位 CLI 后重试"
         errorCode=="assistant_missing_config" || preparationStatus in setOf("config","missing_config") -> "电脑端 Codex 配置尚未就绪，请修复配置后重试"
         errorCode=="assistant_needs_login" || preparationStatus=="needs_login" -> "请在电脑端登录 Codex 后重试"
+        errorCode=="assistant_model_unavailable" -> "所选模型暂未确认可用，已保留选择；请更换模型或选择跟随默认后重试"
         errorCode=="assistant_restore_failed" -> "助理恢复未完成，请重试准备"
         errorCode=="assistant_unavailable_on_device" -> "助理暂不支持在此手机上运行，请切换到电脑或 SSH 主机后使用"
-        errorCode=="assistant_preparing" || preparationStatus=="preparing" -> "助理正在准备，草稿会保留"
+        errorCode=="assistant_preparing" || preparationStatus in setOf("preparing","starting") -> "助理正在准备，草稿会保留"
         !errorCode.isNullOrBlank() || preparationStatus=="recoverable_error" -> "助理准备遇到问题，请检查电脑端后重试"
         !prepReady -> "助理准备状态尚未确认，请重试"
         ready==false -> "助理正在准备，可保留草稿并重试"
@@ -117,6 +120,8 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
     }
     companion object {
         fun from(o: JsonObject): AssistantSnapshot = AssistantSnapshot(
+            scopeId=o.assistantText("scopeId"), conversationId=o.assistantText("conversationId"), activeCoordinatorOperationId=o.assistantText("activeCoordinatorOperationId"),
+            selectedRuntimeId=o.assistantText("selectedRuntimeId"),
             protocolVersion=(o.assistantLong("protocolVersion") ?: 1).toInt(),
             acceptingMessages=o.assistantBoolean("acceptingMessages"),
             domain=(o["domain"] as? JsonObject)?.let(AssistantDomain::from),
@@ -138,31 +143,31 @@ data class AssistantSnapshot(val enabled: Boolean? = null, val runtimeId: String
                 g.assistantStrings("task_ids"), g.assistantBoolean("requires_summary") == true, g.assistantBoolean("sealed") == true, g.assistantText("status").orEmpty())}},
             assignments = o.assistantObjects("assignments").mapNotNull {a -> a.assistantText("task_id")?.let {AssistantAssignment.from(a, it)}},
             deliveries = o.assistantObjects("deliveries").mapNotNull {d -> d.assistantText("id")?.let {id -> AssistantDelivery(id, d.assistantText("message").orEmpty(),
-                d.assistantText("member_id"), d.assistantText("task_id"), d.assistantText("status").orEmpty(), d.assistantText("delivered_task_id"),d.assistantLong("at_ms"))}},
+                d.assistantText("member_id"), d.assistantText("task_id"), d.assistantText("status").orEmpty(), d.assistantText("delivered_task_id"),d.assistantLong("at_ms"), d.assistantText("conversationId"))}},
             errorCode = o.assistantText("error"), ready = o.assistantBoolean("ready"), preparationStatus = o.assistantText("preparationStatus") ?: (o["preparation"] as? JsonObject)?.assistantText("status"),
             fresh = o.assistantBoolean("fresh"), dispatchInFlight = o.assistantBoolean("dispatchInFlight") == true, assistantId = o.assistantText("assistantId"),
             enabled = o.assistantBoolean("enabled"), runtimeId = o.assistantText("runtimeId"), coordinatorThreadId = o.assistantText("coordinatorThreadId"), paused = o.assistantBoolean("paused"),
             settings = (o["settings"] as? JsonObject)?.let { s ->
                 val n = s["notifications"] as? JsonObject
                 if (s.assistantText("personality") == null || s.assistantText("tone") == null || s.assistantText("timezone") == null || n == null || listOf("completed", "failed", "waiting_user").any { n.assistantBoolean(it) == null }) null
-                else AssistantSettings(s.assistantText("personality")!!, s.assistantText("tone")!!, s.assistantText("model"), s.assistantText("timezone")!!, AssistantNotifications(n.flag("completed"), n.flag("failed"), n.flag("waiting_user")), s.assistantText("coordinator_model"))
+                else AssistantSettings(s.assistantText("personality")!!, s.assistantText("tone")!!, s.assistantText("model"), s.assistantText("timezone")!!, AssistantNotifications(n.flag("completed"), n.flag("failed"), n.flag("waiting_user")), s.assistantText("coordinator_model"), s.assistantText("effort"), s.assistantText("coordinator_effort"))
             },
             tasks = o.assistantObjects("tasks").mapNotNull { t -> t.assistantText("id")?.let { id ->
                 AssistantTask(id, t.assistantText("prompt").orEmpty(), when (t.assistantText("status")) {
                     "queued" -> AssistantTaskStatus.Queued; "running" -> AssistantTaskStatus.Running; "waiting_user" -> AssistantTaskStatus.WaitingUser
                     "paused" -> AssistantTaskStatus.Paused; "done" -> AssistantTaskStatus.Done; "failed" -> AssistantTaskStatus.Failed; else -> AssistantTaskStatus.Unknown
-                }, t.assistantText("active_run_id"), t.assistantBoolean("reconciliation_required") ?: true, t.assistantText("detail"), (t["assignment"] as? JsonObject)?.let {AssistantAssignment.from(it, id)})
+                }, t.assistantText("active_run_id"), t.assistantBoolean("reconciliation_required") ?: true, t.assistantText("detail"), (t["assignment"] as? JsonObject)?.let {AssistantAssignment.from(it, id)}, t.assistantText("conversationId"))
             } },
             operations = o.assistantObjects("operations").mapNotNull { op -> op.assistantText("id")?.let { id ->
                 AssistantOperation(id, op.assistantText("role").orEmpty(), op.assistantText("task_id"), AssistantOperationPhase.entries.firstOrNull { it.name == op.assistantText("phase") } ?: AssistantOperationPhase.Unknown,
                     op.assistantBoolean("suspended") ?: true, (op["mapping"] as? JsonObject)?.assistantText("thread_id"),
                     (op["question"] as? JsonObject)?.let { q -> q.assistantText("request_id")?.let { request ->
                         AssistantQuestion(request, AssistantQuestionKind.entries.firstOrNull { it.name == q.assistantText("kind") } ?: AssistantQuestionKind.Unknown, q.assistantText("text").orEmpty())
-                    } }, op.assistantText("result"),op.assistantHeldInputs(),AssistantHandoffRecovery.from(op))
+                    } }, op.assistantText("result"),op.assistantHeldInputs(),AssistantHandoffRecovery.from(op), op.assistantText("conversationId"))
             } },
             events = o.assistantObjects("events").mapNotNull { e -> e.assistantText("id")?.let { id ->
                 val sequence = e.assistantLong("sequence")?.takeIf { it >= 0 } ?: return@mapNotNull null
-                AssistantEvent(sequence,id,e.assistantText("operation_id"),e.assistantText("kind").orEmpty(),e.assistantText("detail").orEmpty(),e.assistantLong("at_ms"), e.assistantText("task_id"), e.assistantText("member_id"), e.assistantText("group_id"), e.assistantText("thread_id"), e.containsKey("member_id"))
+                AssistantEvent(sequence,id,e.assistantText("operation_id"),e.assistantText("kind").orEmpty(),e.assistantText("detail").orEmpty(),e.assistantLong("at_ms"), e.assistantText("task_id"), e.assistantText("member_id"), e.assistantText("group_id"), e.assistantText("thread_id"), e.containsKey("member_id"), e.assistantText("conversationId"))
             } },
             memories = o.assistantObjects("memories").mapNotNull { m -> m.assistantText("id")?.let { (o["memoryMetadata"] as? JsonObject)?.get(it).let {raw -> val meta=raw as? JsonObject; AssistantMemory(it,m.assistantText("text").orEmpty(),meta?.assistantText("source"),meta?.assistantText("scope") ?: "personal",meta?.assistantBoolean("automatic")==true,meta?.assistantLong("updated_at_ms"),(meta?.get("revisions") as? JsonArray)?.mapNotNull {(it as? JsonPrimitive)?.longOrNull}.orEmpty())} } },
             schedules = o.assistantObjects("schedules").mapNotNull { schedule -> schedule.assistantText("id")?.let { id ->
@@ -180,7 +185,8 @@ data class AssistantUiState(val snapshot: AssistantSnapshot? = null, val message
     val streamingCoordinatorOpId: String? = null, val streamingCoordinatorText: String = "",
     val liveJobStages: Map<String, AssistantLiveJobStage> = emptyMap(), val lastStreamEpoch: String? = null, val lastStreamSequence: Long = 0,
     /** Stream bookkeeping, not for display: a local frame counter and the revisions at which held entries ended. */
-    val streamRevision: Long = 0, val streamCoordinatorEnd: Long = 0, val streamJobEnds: Map<String, Long> = emptyMap())
+    val streamRevision: Long = 0, val streamCoordinatorEnd: Long = 0, val streamJobEnds: Map<String, Long> = emptyMap(),
+    val selectedConversationId: String? = null, val conversations: List<AssistantConversation> = emptyList())
 data class AssistantScheduleDraft(val prompt: String = "", val kind: String = "Once", val date: String = "", val time: String = "09:00", val weekday: Int = 0, val intervalMinutes: String = "60", val timezone: String = "Asia/Shanghai", val writes: Boolean = false)
 object AssistantActions {
     private fun payload(method: String, runtime: String, fields: JsonObjectBuilder.() -> Unit = {}): AssistantAction {
@@ -240,6 +246,28 @@ object AssistantActions {
         return payload("assistant/settings/update",runtime) {put("settings",buildJsonObject {
             put("personality",settings.personality);put("tone",settings.tone);put("model",settings.model?.let(::JsonPrimitive) ?: JsonNull);put("timezone",settings.timezone)
             settings.coordinatorModel?.let {put("coordinator_model",it)}
+            put("notifications",buildJsonObject {put("completed",settings.notifications.completed);put("failed",settings.notifications.failed);put("waiting_user",settings.notifications.waitingUser)})
+        })}
+    }
+    fun model(runtime: String, coordinator: Boolean, model: String?): AssistantAction {
+        model?.let { bounded(it,256,"模型标识无效") }
+        return payload("assistant/settings/update",runtime) { put("patch",buildJsonObject {
+            put(if(coordinator) "coordinator_model" else "model", model?.let(::JsonPrimitive) ?: JsonNull)
+        }) }
+    }
+    fun effort(runtime: String, coordinator: Boolean, effort: String?): AssistantAction {
+        effort?.let { bounded(it, 64, "思考强度无效") }
+        return payload("assistant/settings/update", runtime) { put("patch", buildJsonObject {
+            put(if (coordinator) "coordinator_effort" else "effort", effort?.let(::JsonPrimitive) ?: JsonNull)
+        }) }
+    }
+    /** A settings page owns preferences only. Its stale draft cannot overwrite model selection. */
+    fun preferences(runtime: String, settings: AssistantSettings): AssistantAction {
+        bounded(settings.personality,8192,"人格描述不能为空，最多 8KiB")
+        bounded(settings.tone,2048,"语气不能为空，最多 2KiB")
+        require(runCatching {ZoneId.of(settings.timezone)}.isSuccess) {"时区名称无效"}
+        return payload("assistant/settings/update",runtime) {put("patch",buildJsonObject {
+            put("personality",settings.personality); put("tone",settings.tone); put("timezone",settings.timezone)
             put("notifications",buildJsonObject {put("completed",settings.notifications.completed);put("failed",settings.notifications.failed);put("waiting_user",settings.notifications.waitingUser)})
         })}
     }

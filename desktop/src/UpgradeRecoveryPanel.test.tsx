@@ -53,6 +53,18 @@ describe('home recovery presentation',()=>{
   expect(html).toContain('检查详情');
   expect(html).not.toContain('检查并更新后台');expect(html).not.toContain('恢复后台</button>');
  });
+ it('replaces the installer spinner with the coordinator interruption and retry guidance',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:'c'.repeat(64),runningVerified:true};
+  s.updates={automatic:false,phase:'waiting_cold_start',generation:'c'.repeat(64),downloadedBytes:1,totalBytes:1,coordinator:{phase:'waiting_login',reason:'restart_owner_changed'}};
+  const html=render(s);
+  expect(html).toContain('recovery-attention');
+  expect(html).toContain('Pocket 后台进程发生变化');
+  expect(html).toContain('重试');
+  expect(html).not.toContain('class="spin"');
+  expect(html).not.toContain('正在重启 Pocket 后台');
+  expect(html).toContain('检查详情');
+ });
  it('sends an old UI to the Start menu',()=>{
   const s=snapshot();s.installation!.ui={state:'restart_required',generation:'b'.repeat(64),runningVerified:true};
   const html=render(s);expect(html).toContain('从 Windows 开始菜单打开新版 Codex Pocket');

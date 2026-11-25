@@ -61,11 +61,12 @@ internal fun ExecutionLocationsRoot(locations: ExecutionLocations) {
             val projects by locations.thisPhone.projects.collectAsStateWithLifecycle()
             val access by locations.thisPhone.access.collectAsStateWithLifecycle()
             val applying by locations.thisPhone.applying.collectAsStateWithLifecycle()
+            val environment by locations.thisPhone.preparation.collectAsStateWithLifecycle()
             LaunchedEffect(added) { if (added) { locations.thisPhone.refreshAccount(); locations.thisPhone.refreshProjects() } }
             ThisPhoneSheet(added, account, progress, { thisPhone = false }, locations::connectThisPhone,
                 locations.thisPhone::signInWithChatGpt, locations.thisPhone::refreshAccount,
                 onStop = { locations.stopThisPhone(); thisPhone = false },
-                access = access, applying = applying, onUseProvider = locations.thisPhone::useProvider,
+                access = access, applying = applying, environment = environment, onUseProvider = locations.thisPhone::useProvider,
                 onSaveProvider = locations.thisPhone::saveProvider, onRemoveProvider = locations.thisPhone::removeProvider,
                 onFetchModels = locations.thisPhone::discoverProviderModels,
                 onSignOut = locations.thisPhone::signOut,

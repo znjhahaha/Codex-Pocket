@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import dev.codexpocket.app.data.*
 import dev.codexpocket.app.ui.questionDockEntries
+import dev.codexpocket.app.ui.questionAttentionCount
 import dev.codexpocket.wire.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -47,7 +48,7 @@ class AsyncQuestionReconciliationTest {
     }
     @Before fun prepare() = runBlocking<Unit> {
         app = ApplicationProvider.getApplicationContext()
-        app.getSharedPreferences("settings", 0).edit().remove("questions:${key.encoded}").commit()
+        clearQuestionPreferences()
         db = Room.inMemoryDatabaseBuilder(app, PocketDatabase::class.java).build()
         link = QuestionLink()
         val pair = PairedComputer(ConnectionConfig("wss://fixture.invalid", "fixture", "fixture", "00".repeat(32)),
@@ -69,7 +70,20 @@ class AsyncQuestionReconciliationTest {
     @After fun close() = runBlocking<Unit> {
         (field("scope").get(repo) as CoroutineScope).coroutineContext[Job]!!.cancelAndJoin()
         db.close()
-        app.getSharedPreferences("settings", 0).edit().remove("questions:${key.encoded}").commit()
+        clearQuestionPreferences()
+    }
+    private fun clearQuestionPreferences() {
+        val prefs = app.getSharedPreferences("settings", 0)
+        val edit = prefs.edit()
+        prefs.all.keys.filter { it.startsWith("questions:") || it.startsWith("closedQuestions:") || it.startsWith("deletedQuestions:") }
+            .forEach(edit::remove)
+        edit.commit()
+    }
+    private suspend fun restartRepository() {
+        val storage = field("pairStore").get(repo) as PairingStorage
+        (field("scope").get(repo) as CoroutineScope).coroutineContext[Job]!!.cancelAndJoin()
+        repo = PocketRepository(app, { link }, storage, db, emptyFlow())
+        withTimeout(5_000) { repo.state.first { it.initialized } }
     }
     private fun field(name: String) = PocketRepository::class.java.getDeclaredField(name).apply { isAccessible = true }
     @Suppress("UNCHECKED_CAST")
@@ -94,6 +108,93 @@ class AsyncQuestionReconciliationTest {
         assertEquals(1, repo.state.value.timeline.items.size)
         assertEquals(listOf(questionId), repo.state.value.advanced.asyncQuestions.map { it.string("id") })
         assertEquals(listOf(questionId), repo.state.value.pendingQuestions[key.encoded].orEmpty().map { it.string("id") })
+        assertTrue(link.writes.isEmpty())
+    }
+
+    @Test fun closingSurvivesRestartWithoutAnsweringOrLosingPendingCount() = runBlocking<Unit> {
+        openCachedQuestion()
+        repo.editDraft("Unsent composer draft")
+        repo.closeAsyncQuestions(key, setOf(questionId))
+        assertEquals(setOf(questionId), repo.state.value.closedQuestions)
+        assertEquals(1, questionAttentionCount(repo.state.value))
+        assertEquals(1, AsyncQuestions.pending(repo.state.value.timeline).size)
+        restartRepository()
+        repo.select(chat).join()
+        assertEquals(setOf(questionId), repo.state.value.closedQuestions)
+        assertEquals("Unsent composer draft", repo.state.value.draft?.text)
+        repo.restoreAsyncQuestions(key, setOf(questionId))
+        assertTrue(repo.state.value.closedQuestions.isEmpty())
+        assertEquals(1, questionAttentionCount(repo.state.value))
+        assertTrue(link.writes.isEmpty())
+    }
+
+    @Test fun deletionSurvivesReloadAndRestartButKeepsHistoryAndNewQuestions() = runBlocking<Unit> {
+        openCachedQuestion()
+        repo.editDraft("Keep this draft")
+        repo.closeAsyncQuestions(key, setOf(questionId))
+        repo.deleteAsyncQuestion(key, questionId)
+        assertNoPending()
+        assertEquals(0, questionAttentionCount(repo.state.value))
+        assertEquals(1, AsyncQuestions.pending(repo.state.value.timeline).size)
+        assertEquals("Keep this draft", repo.state.value.draft?.text)
+        repo.reloadConversation().join()
+        assertNoPending()
+        restartRepository()
+        assertTrue(repo.state.value.pendingQuestions[key.encoded].isNullOrEmpty())
+        repo.select(chat).join()
+        assertNoPending()
+        assertEquals(1, AsyncQuestions.pending(repo.state.value.timeline).size)
+        // The same native item ID in a different conversation is a different local choice.
+        val other = chat.copy(key = key.copy(nativeId = "other-thread"))
+        db.dao().putChat(other)
+        db.dao().putItems(listOf(ItemEntity.from(other.key, TimelineItem.from("execution-turn", question), 0)))
+        repo.select(other).join()
+        assertTrue(repo.state.value.closedQuestions.isEmpty())
+        assertEquals(listOf(questionId), repo.state.value.advanced.asyncQuestions.map { it.string("id") })
+        assertTrue(link.writes.isEmpty())
+    }
+
+    @Test fun deletingOneQuestionKeepsSiblingAndApprovalAndDoesNotAcceptAnOldCallback() = runBlocking<Unit> {
+        link.items = listOf(JsonObject(question + ("questions" to buildJsonArray {
+            add(buildJsonObject { put("title", "What next?") }); add(buildJsonObject { put("title", "Which folder?") })
+        })))
+        repo.select(chat).join()
+        val old = repo.state.value.advanced.asyncQuestions.first()
+        val approval = PendingApproval(chat.runtimeId, JsonPrimitive("permission"), "item/commandExecution/requestApproval",
+            buildJsonObject { put("threadId", key.nativeId) })
+        update { it.copy(approvals = listOf(approval), approvalsFresh = true) }
+        repo.deleteAsyncQuestion(key, questionId)
+        assertEquals(1, repo.state.value.advanced.asyncQuestions.size)
+        assertEquals(2, questionAttentionCount(repo.state.value))
+        assertEquals(listOf(approval), repo.state.value.approvals)
+        repo.answerAsyncBatch(listOf(old to "stale callback")).join()
+        assertTrue(link.writes.isEmpty())
+    }
+
+    @Test fun ordinaryConversationDoesNotResolveAnUnansweredQuestion() = runBlocking<Unit> {
+        link.items = listOf(question,
+            buildJsonObject { put("id", "ordinary"); put("type", "userMessage"); put("text", "Use adb") },
+            buildJsonObject { put("id", "continued"); put("type", "agentMessage"); put("text", "Continuing with adb") })
+        repo.select(chat).join()
+        assertEquals(listOf(questionId), repo.state.value.advanced.asyncQuestions.map { it.string("id") })
+        assertTrue(link.writes.isEmpty())
+    }
+
+    @Test fun attentionDeletionTargetsItsConversationAndDoesNotHideNewQuestions() = runBlocking<Unit> {
+        openCachedQuestion()
+        val other = chat.copy(key = key.copy(nativeId = "other-thread"))
+        db.dao().putChat(other)
+        repo.select(other).join()
+        assertEquals(2, questionAttentionCount(repo.state.value))
+        repo.deleteAsyncQuestion(key, questionId)
+        assertTrue(repo.state.value.pendingQuestions[key.encoded].isNullOrEmpty())
+        assertEquals(listOf(questionId), repo.state.value.advanced.asyncQuestions.map { it.string("id") })
+        assertEquals(1, questionAttentionCount(repo.state.value))
+        link.items = listOf(question, JsonObject(question + ("id" to JsonPrimitive("new-call"))))
+        repo.select(chat, forceRefresh = true).join()
+        assertEquals(listOf("[\"request_user_input_async\",\"new-call\",0]"),
+            repo.state.value.advanced.asyncQuestions.map { it.string("id") })
+        assertEquals(2, AsyncQuestions.pending(repo.state.value.timeline).size)
         assertTrue(link.writes.isEmpty())
     }
 

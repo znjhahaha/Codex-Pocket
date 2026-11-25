@@ -246,7 +246,7 @@ impl<E: Executor> AssistantService<E> {
     }
     /// The coordinator's routing table: bounded, with no results or transcripts in it.
     pub(super) fn active_jobs_summary(&self) -> Result<String> {
-        let jobs = self.recent_jobs(usize::MAX, 5)?;
+        let jobs = self.recent_jobs(usize::MAX, 5)?.into_iter().filter(|job|job["taskId"].as_str().is_some_and(|id|self.in_current_conversation("task",id))).collect::<Vec<_>>();
         let mut kept: Vec<Value> = vec![];
         for (index, job) in jobs.iter().enumerate() {
             let entry = json!({
@@ -332,7 +332,7 @@ impl<E: Executor> AssistantService<E> {
             None
         };
         // The task, not this call, owns execution: the coordinator is free as soon as it is saved.
-        let receipt = self.store.apply(
+        let receipt = self.apply_bound_command(
             journal,
             Command::CreateTask {
                 prompt,

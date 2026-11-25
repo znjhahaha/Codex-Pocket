@@ -86,6 +86,16 @@ class HomeStateTest {
         assertEquals(0L, homeUpdatedAtMillis(-1))
     }
 
+    @Test fun runningMarkerSurvivesReconnectWithoutClaimingFreshExecution() {
+        val row = chat("running").copy(status = "active")
+        val offline = PocketState(computerId = "pc", chats = listOf(row))
+        assertEquals("lastRunning", homeChatStatus(offline, row))
+        assertEquals("lastRunning", homeChatStatus(offline.copy(online = true), row))
+        val runtime = RuntimeInfo("desktop", "desktop", "1", "store", true, setOf("running"), emptySet())
+        assertEquals("inProgress", homeChatStatus(offline.copy(online = true, runtimes = listOf(runtime)), row))
+        assertEquals("offline", homeChatStatus(offline, row.copy(status = "completed")))
+    }
+
     @Test fun projectChipsKeepRecentOrderAndRetainSelectionAcrossPartialRefreshes() {
         val old = chat("old", cwd = "D:/Old", updated = 1)
         val recent = chat("recent", cwd = "D:/Recent", updated = 20)

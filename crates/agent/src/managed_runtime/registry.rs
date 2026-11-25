@@ -213,12 +213,26 @@ async fn ensure_mode(installation:&Installation,registry:&Registry,profile:&Sele
         let mut owner = previous.context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
         let descriptor =
             pocket_runtime_ipc::load_descriptor(&descriptor_path, profile.config_home()).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
-        owner.matches(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+        let interrupted = owner.phase == "spawned"
+            && owner.descriptor_generation.is_none()
+            && owner.host_process != descriptor.host_process;
+        if interrupted {
+            // The replacement exited before publishing its own descriptor. Its
+            // reservation and the predecessor are separate lifetime owners;
+            // neither missing IPC nor an old descriptor releases either owner.
+            require_ended(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+            ensure!(owner.host_process.as_ref().is_some_and(|p| p.pid != 0
+                && p.created_at != 0 && p.terminated()),
+                super::discovery::RestoreFailure::OwnershipUnconfirmed);
+            ensure!(allow_start, super::discovery::RestoreFailure::ProfileMigrationFenced);
+        } else {
+            owner.matches(&descriptor).context(super::discovery::RestoreFailure::OwnershipUnconfirmed)?;
+        }
         let migrating=matches!(std::fs::symlink_metadata(&owner.native_binary),Err(e) if e.kind()==std::io::ErrorKind::NotFound);
         // Package files can disappear while their native process remains alive.
         // Authenticate the original Host first; selecting the new package only
         // changes a future launch and must not strand a live execution owner.
-        if let Ok(mut client) = HostClient::attach(&descriptor).await {
+        if !interrupted && let Ok(mut client) = HostClient::attach(&descriptor).await {
             if owner.phase == "spawned" {
                 owner.phase = "ready".into();
                 owner.descriptor_generation = Some(descriptor.generation.clone());

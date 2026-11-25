@@ -20,6 +20,51 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")
 class QuestionCardUiTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
+    @Test fun pendingAsyncQuestionOffersCloseAndDelete() {
+        val chat = ChatEntity(ThreadKey("pc", "store", "chat"), "runtime", "desktop", "Chat", "", "", 1, "idle", false)
+        val question = Json.parseToJsonElement("""{"id":"q","questionItemId":"q","title":"Still waiting?"}""").jsonObject
+        val state = PocketState(computerId = "pc", selected = chat,
+            advanced = AdvancedConversationState(asyncQuestions = listOf(question)))
+        content { QuestionDock(state, { _, _ -> fail("No approval") }, { fail("No answer") }) }
+        compose.onNodeWithContentDescription("关闭问题卡片").assertExists()
+        compose.onNodeWithContentDescription("从待回答中删除").assertExists()
+    }
+
+    @Test fun closeRestoresDraftAndDeletingCurrentQuestionKeepsSibling() {
+        val chat = ChatEntity(ThreadKey("pc", "store", "chat"), "runtime", "desktop", "Chat", "", "", 1, "idle", false)
+        val item = TimelineItem.from("turn", Json.parseToJsonElement("""{"id":"call","type":"agentMessage","delivery":"async","questions":[
+            {"title":"First?","options":["Yes","No"]},{"title":"Second?","options":["Yes","No"]}]}""").jsonObject)
+        val timeline = NativeTimeline(items = mapOf(item.key to item))
+        val questions = AsyncQuestions.pending(timeline)
+        var state by mutableStateOf(PocketState(computerId = "pc", selected = chat, online = true, timeline = timeline,
+            conversationLoadState = ConversationLoadState.Ready,
+            runtimes = listOf(RuntimeInfo("runtime", "desktop", "", "store", true, emptySet(), setOf("turn/start"))),
+            advanced = AdvancedConversationState(asyncQuestions = questions)))
+        content { QuestionDock(state, { _, _ -> fail("No approval") }, { fail("No answer") },
+            onClose = { _, ids -> state = state.copy(closedQuestions = state.closedQuestions + ids) },
+            onRestore = { _, ids -> state = state.copy(closedQuestions = state.closedQuestions - ids) },
+            onDelete = { _, id -> state = state.copy(advanced = state.advanced.copy(
+                asyncQuestions = state.advanced.asyncQuestions.filterNot { it.string("id") == id })) }) }
+        val first = questions.first().string("id")
+        compose.onNodeWithTag("question-option:$first:0").performClick()
+        compose.onNodeWithTag("question-close").performClick()
+        compose.onNodeWithTag("question-dock").assertDoesNotExist()
+        compose.onNodeWithTag("question-restore").assertExists()
+        assertEquals(2, questionAttentionCount(state))
+        compose.onNodeWithTag("question-restore").performClick()
+        compose.onNodeWithTag("question-option:$first:0").assertIsSelected()
+        compose.onNodeWithTag("question-next").performClick()
+        compose.onNodeWithContentDescription("从待回答中删除").performClick()
+        compose.onNodeWithTag("question-page").assertTextEquals("1/1")
+        compose.onNodeWithTag("question-option:$first:0").assertIsSelected()
+        assertEquals(1, questionAttentionCount(state))
+        compose.onNodeWithContentDescription("从待回答中删除").performClick()
+        compose.onNodeWithTag("question-dock").assertDoesNotExist()
+        compose.onNodeWithTag("question-restore").assertDoesNotExist()
+        assertEquals(0, questionAttentionCount(state))
+        assertEquals(2, AsyncQuestions.pending(state.timeline).size)
+    }
+
     private fun batch() = QuestionBatches.blocking("rpc", Json.parseToJsonElement("""{"questions":[
         {"id":"one","header":"Client","question":"Which client?","options":[{"label":"Phone (Recommended)","description":"Phone details"},{"label":"Desktop"}],"isOther":true},
         {"id":"two","question":"Which region?","options":[{"label":"Local"},{"label":"Remote"}]},
@@ -172,6 +217,29 @@ class QuestionCardUiTest {
         compose.onNodeWithTag("question-submit").assertIsNotEnabled()
         assertEquals(questions.map { it.string("id") }, emissions.single().map { it.first.string("id") })
         assertEquals(listOf("Yes", "Yes", "Yes"), emissions.single().map { it.second })
+    }
+
+    @Test fun submittedDockDisappearsAndDefiniteFailureRestoresTheOriginalAnswer() {
+        val approval = PendingApproval("runtime", JsonPrimitive("request"), "item/tool/requestUserInput",
+            Json.parseToJsonElement("""{"threadId":"chat","turnId":"turn","itemId":"item","questions":[{"id":"q","question":"Choose","options":[{"label":"Phone"},{"label":"Desktop"}]}]}""").jsonObject)
+        val chat = ChatEntity(ThreadKey("pc", "store", "chat"), "runtime", "desktop", "Chat", "", "", 1, "idle", false)
+        var state by mutableStateOf(PocketState(computerId = "pc", online = true, selected = chat, approvalsFresh = true,
+            runtimes = listOf(RuntimeInfo("runtime", "desktop", "", "store", true, emptySet(), setOf("turn/start"))),
+            approvals = listOf(approval), conversationLoadState = ConversationLoadState.Ready))
+        var sends = 0
+        content { QuestionDock(state, { _, _ ->
+            sends++
+            state = state.copy(approvals = listOf(approval.copy(submitted = true)), submittingApprovalKeys = setOf(approval.key))
+        }, { fail("Not async") }) }
+        compose.onNodeWithTag("question-option:q:0").performClick()
+        compose.onNodeWithContentDescription("关闭问题卡片").assertDoesNotExist()
+        compose.onNodeWithContentDescription("从待回答中删除").assertDoesNotExist()
+        compose.onNodeWithTag("question-submit").performClick()
+        compose.onNodeWithTag("question-dock").assertDoesNotExist()
+        compose.runOnIdle { state = state.copy(approvals = listOf(approval), submittingApprovalKeys = emptySet()) }
+        compose.onNodeWithTag("question-option:q:0").assertIsSelected()
+        compose.onNodeWithTag("question-submit").assertIsEnabled()
+        assertEquals(1, sends)
     }
 
     @Test fun asyncSecretBatchShowsDesktopNoticeWithoutInputsOrSubmit() {

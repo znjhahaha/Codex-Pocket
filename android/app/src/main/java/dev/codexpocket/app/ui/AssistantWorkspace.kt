@@ -73,6 +73,7 @@ internal fun assistantPageTitle(page: String) = when {
         // How deep each page sits, kept for a page that has just been left so the stage knows which way it goes.
         val depths = remember(owner) { HashMap<String, Int>() }
         depths[page] = if (page == "Main") 0 else stack.size.coerceAtLeast(1)
+        val mainVisible = page == "Main"
         val previous = stack.lastOrNull() ?: "Main".takeIf { page != "Main" }
         // A command whose outcome is unsettled is named for as long as it is, whatever a later refresh reports.
         val issue = error ?: state.readError ?: state.unconfirmedFeedback?.takeUnless { snapshot?.protocolVersion == 2 } ?: state.error?.takeUnless {
@@ -87,13 +88,13 @@ internal fun assistantPageTitle(page: String) = when {
             // On the first page there is nothing here to go back to: whoever opened the assistant previews the way out.
             PStage(page, depth = { depths[it] ?: 1 }, back = previous, onBack = ::back, source = { it.takeIf { name -> ':' in name } }) { page ->
                 holder.SaveableStateProvider("$owner:$page") {
-                    if (page == "Main") AssistantStage(state, workspaces, canAct, connected, ::act, ::navigate, onOpenThread, ::back, onProjectSelected, notice)
+                    if (page == "Main") AssistantStage(state, workspaces, canAct, connected, ::act, ::navigate, onOpenThread, ::back, onProjectSelected, notice, models, mainVisible)
                     else AssistantSubpage(assistantPageTitle(page), ::back, notice) {
                         when {
-                            page == "Tasks" -> AssistantTasksPage(state, ::navigate)
+                            page == "Tasks" -> AssistantTasksPage(state, ::navigate, canAct, ::act)
                             page == "Artifacts" -> AssistantResultsPage(state, ::navigate, onOpenThread)
                             page == "Plans" -> AssistantSchedules(state, workspaces, canAct, nowMs, onProjectSelected, ::navigate, ::act)
-                            page == "Settings" -> AssistantSettingsPage(state, models, runtimes, canAct, ::act)
+                            page == "Settings" -> AssistantSettingsPage(state, models, runtimes, canAct, ::act, connected)
                             page == "Memory" -> AssistantMemoryPage(state, canAct, ::act)
                             page.startsWith("Task:") -> AssistantWorkDetail(page.substringAfter(':'), state, canAct, ::act, ::navigate, onOpenThread)
                             page.startsWith("ScheduleFrom:") -> {
@@ -234,8 +235,8 @@ private fun AssistantReadiness(state: AssistantUiState, connected: Boolean) {
 @Composable
 private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWorkspaceChoice>, canAct: Boolean, connected: Boolean,
     act: (() -> AssistantAction) -> Unit, navigate: (String) -> Unit, open: (String, String) -> Unit, onBack: () -> Unit,
-    onProjectSelected: (AssistantWorkspaceChoice?) -> Unit, notice: @Composable () -> Unit) {
-    val snapshot = state.snapshot ?: AssistantSnapshot()
+    onProjectSelected: (AssistantWorkspaceChoice?) -> Unit, notice: @Composable () -> Unit, models: List<NativeModel>, modelPanelVisible: Boolean) {
+    val snapshot = state.snapshot?.selectedConversation() ?: AssistantSnapshot()
     val c = Pocket.colors
     val motion = rememberPocketMotion()
     val composer = rememberAssistantComposer(state)
@@ -247,9 +248,16 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
     var menu by remember { mutableStateOf(false) }
     var attentionOpen by rememberSaveable { mutableStateOf(false) }
     var tools by rememberSaveable { mutableStateOf(false) }
+    var history by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf<AssistantJobConfirm?>(null) }
 
-    val timeline = remember(state.messages, snapshot) { assistantTimeline(state) }
+    val outgoing = rememberAssistantOutbox(composer, state.sendReceipts)
+    LaunchedEffect(composer, state.messages) { composer.outbox.observe(composer.binding, state.messages.filter { it.role == "User" }.map { it.id }.toSet()) }
+    val shownMessages = state.messages.map { message -> outgoing.firstOrNull { it.matchesMessage(message.id) }
+        ?.let { message.copy(id = "user:${it.messageId}") } ?: message }.distinctBy { it.id }
+    val localMessages = outgoing.filter { entry -> !entry.observed && shownMessages.none { entry.matchesMessage(it.id) } }
+        .map { AssistantChatMessage("user:${it.messageId}", "User", it.text, it.atMs) }
+    val timeline = remember(shownMessages, snapshot, localMessages) { assistantTimeline(state.copy(snapshot = snapshot, messages = shownMessages + localMessages)) }
     val rows = remember(timeline, snapshot) { assistantStageRows(timeline, snapshot) }
     val recoveries = snapshot.recoveries.distinct()
     val handoffs = snapshot.operations.filter { it.handoffRecovery != null }.distinctBy { it.id }
@@ -260,7 +268,7 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
     val arrivals = remember(composer.key) { AssistantArrivals() }
     arrivals.update(rows.map { it.key } + listOfNotNull(streamOp?.let { "stream" }, "working".takeIf { working }))
 
-    val list = rememberLazyListState()
+    val list = rememberSaveable(composer.key, saver = androidx.compose.foundation.lazy.LazyListState.Saver) { androidx.compose.foundation.lazy.LazyListState() }
     val scope = rememberCoroutineScope()
     val tail = "${state.messages.lastOrNull()?.id}|${rows.lastOrNull()?.key}|${streamOp ?: if (working) "working" else ""}"
     var previousTail by rememberSaveable(composer.key) { mutableStateOf<String?>(null) }
@@ -296,6 +304,8 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
         PFrame(header = {
             Column(Modifier.assistantChromeVeil(true)) {
                 AssistantTopBar("口袋助理", onBack, status = { AssistantReadiness(state, connected) }) {
+                    PIconButton(PocketIcons.Add, "新对话", { act { assistantConversationCreate() } }, Modifier.testTag("assistant-new-conversation"),
+                        enabled = connected && !(snapshot.runtimeId ?: snapshot.scopeId).isNullOrBlank() && !state.busy("assistant/v2/conversation/create"))
                     PGlassIconButton(AssistantIcons.Schedule, "计划", { navigate("Plans") }, Modifier.testTag("assistant-schedules"),
                         glyph = { PPulseGlyph(MotionGlyphs.Clock, snapshot.schedules.size, Modifier.size(20.dp)) })
                     PGlassIconButton(PocketIcons.MoreHoriz, "更多", { menu = true }, Modifier.testTag("assistant-title-menu").pocketAnchor(anchor))
@@ -304,10 +314,10 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
                 AssistantAttentionCapsule(attention, { attentionOpen = true })
             }
         }, dock = {
-            AssistantInputDock(composer, state, workspaces, canAct, connected, act, { tools = !tools }, tools, Modifier.assistantChromeVeil(false))
+            AssistantInputDock(composer, state.copy(snapshot = snapshot), workspaces, canAct, connected, act, { tools = !tools }, tools, Modifier.assistantChromeVeil(false), models, modelPanelVisible)
         }) { padding ->
             AssistantConversation(state, snapshot, rows, recoveries, handoffs, streamOp, working, composer.key, arrivals, list, padding, canAct, connected,
-                act, navigate, open) { confirm = it }
+                act, navigate, open, outgoing, { entry -> act { requireNotNull(composer.outbox.retry(entry.key)) } }) { confirm = it }
             Box(Modifier.fillMaxSize().padding(padding).testTag("assistant-chat-viewport"))
             if (moreBelow) Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 4.dp), contentAlignment = Alignment.BottomCenter) {
                 Box(Modifier.heightIn(min = PocketSpace.touch).testTag("assistant-new-progress")
@@ -323,6 +333,7 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
             }
         }
         if (menu) PMenu("更多", { menu = false }, anchor, widthDp = 216f) {
+            PRow("历史对话", { menu = false; history = true; act { assistantConversationList() } }, Modifier.testTag("assistant-menu:History"), AssistantIcons.Schedule)
             PRow("全部任务", { menu = false; navigate("Tasks") }, Modifier.testTag("assistant-menu:Tasks"), AssistantIcons.Tasks)
             PRow("成果", { menu = false; navigate("Artifacts") }, Modifier.testTag("assistant-menu:Artifacts"), PocketIcons.Inventory2)
             PRow("记忆", { menu = false; navigate("Memory") }, Modifier.testTag("assistant-menu:Memory"), AssistantIcons.Memory)
@@ -330,6 +341,15 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
             PDivider(Modifier.padding(vertical = 4.dp, horizontal = 10.dp))
             PRow("刷新", { menu = false; act { AssistantActions.read(snapshot.after) } }, Modifier.testTag("assistant-menu:Refresh"), PocketIcons.Refresh,
                 enabled = !state.busy("assistant/read"))
+        }
+        if (history) PSheet("历史对话", { history = false }) {
+            LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("assistant-history")) {
+                item { PRow("新对话", { history = false; act { assistantConversationCreate() } }, Modifier.testTag("assistant-history-new"), PocketIcons.Add) }
+                items(state.conversations, key = { it.id }) { conversation ->
+                    PRow(conversation.title, { history = false; act { assistantConversationSelect(conversation.id) } },
+                        Modifier.testTag("assistant-conversation:${conversation.id}"), selected = snapshot.conversationId == conversation.id)
+                }
+            }
         }
         if (attentionOpen) AssistantAttentionSheet(attention, state, canAct, act, navigate, open, { confirm = it }, links) { attentionOpen = false }
         if (tools) AssistantToolsSheet(composer, workspaces, canAct, onProjectSelected) { tools = false }
@@ -341,10 +361,10 @@ private fun AssistantStage(state: AssistantUiState, workspaces: List<AssistantWo
 private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSnapshot, rows: List<AssistantTimeline>, recoveries: List<AssistantRecoveryRequest>,
     handoffs: List<AssistantOperation>, streamOp: String?, working: Boolean, scope: String, arrivals: AssistantArrivals,
     list: androidx.compose.foundation.lazy.LazyListState, padding: PaddingValues, canAct: Boolean, connected: Boolean, act: (() -> AssistantAction) -> Unit,
-    navigate: (String) -> Unit, open: (String, String) -> Unit, confirm: (AssistantJobConfirm) -> Unit) {
+    navigate: (String) -> Unit, open: (String, String) -> Unit, outgoing: List<AssistantOutgoingMessage>, retry: (AssistantOutgoingMessage) -> Unit,
+    confirm: (AssistantJobConfirm) -> Unit) {
     val c = Pocket.colors
     val runtime = snapshot.runtimeId.orEmpty()
-    val unknown = snapshot.domain?.attention.orEmpty().filter { it.state == "open" && it.kind == "verification" }
     LazyColumn(Modifier.fillMaxSize().testTag("assistant-chat-list"), state = list, verticalArrangement = Arrangement.spacedBy(14.dp),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = padding.calculateTopPadding() + 8.dp, bottom = padding.calculateBottomPadding() + 10.dp)) {
         if (state.nextBefore != null) item("older") {
@@ -366,7 +386,8 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
                 when (row) {
                     is AssistantTimeline.Message -> {
                         val before = (rows.getOrNull(index - 1) as? AssistantTimeline.Message)?.message
-                        AssistantMessageRow(row.message, scope, before?.role != row.message.role || before?.authorName != row.message.authorName)
+                        val entry = outgoing.firstOrNull { it.matchesMessage(row.message.id) }
+                        AssistantMessageRow(row.message, scope, before?.role != row.message.role || before?.authorName != row.message.authorName, entry, connected, retry)
                     }
                     is AssistantTimeline.Task -> AssistantJobInlineCard(row.task, state, canAct, act, navigate, open, confirm)
                     is AssistantTimeline.Group -> AssistantGroupInlineCard(row.group, row.tasks, state, canAct, act, navigate, open, confirm)
@@ -391,7 +412,7 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
         items(recoveries, key = { "recovery:${it.operationId}:${it.requestId}" }) { request -> AssistantCard { AssistantRecoveryCard(request, runtime, state, canAct, act) } }
         items(handoffs, key = { "handoff:${it.id}" }) { op -> AssistantCard { AssistantHandoffRecoveryCard(op, runtime, state, canAct, act) } }
         // What the assistant's own state asks for sits after the conversation, next to the composer, not above a long history.
-        if (!snapshot.prepared && !snapshot.dispatchInFlight) item("prepare") {
+        if (!snapshot.prepared && !snapshot.dispatchInFlight && snapshot.preparationStatus != "idle") item("prepare") {
             AssistantCard(Modifier.testTag("assistant-prepare-card")) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     AssistantAvatar(size = 28.dp)
@@ -401,16 +422,6 @@ private fun AssistantConversation(state: AssistantUiState, snapshot: AssistantSn
                 if (snapshot.startupStages.isNotEmpty()) AssistantStartupStatus(snapshot)
                 PButton("准备助理", { act { AssistantActions.prepare() } }, Modifier.fillMaxWidth().testTag("assistant-prepare"),
                     enabled = connected && "assistant/prepare" !in state.pendingActions)
-            }
-        }
-        if (unknown.isNotEmpty()) item("unknown") {
-            AssistantCard(Modifier.testTag("assistant-unknown-notice")) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PIcon(PocketIcons.Info, null, Modifier.size(18.dp), c.warning)
-                    PText("${unknown.size} 次执行待核对", style = Pocket.type.titleSmall)
-                }
-                PText("保留原执行与回执，你可以继续交办其他目标。", style = Pocket.type.bodySmall, color = c.inkMuted)
-                AssistantCardAction("查看待核对任务", { navigate("Tasks") }, Modifier.testTag("assistant-unknown-open"))
             }
         }
         if (streamOp != null) item("stream") {
@@ -437,12 +448,24 @@ private fun AssistantAuthor(name: String, sweep: Boolean = false) {
 }
 
 @Composable
-private fun AssistantMessageRow(message: AssistantChatMessage, scope: String, showAuthor: Boolean) {
+internal fun AssistantMessageRow(message: AssistantChatMessage, scope: String, showAuthor: Boolean,
+    outgoing: AssistantOutgoingMessage? = null, connected: Boolean = true, retry: (AssistantOutgoingMessage) -> Unit = {}) {
     val c = Pocket.colors
     if (message.role == "User") Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         if (showAuthor) PText("你", Modifier.padding(end = 6.dp), style = Pocket.type.labelSmall, color = c.inkFaint)
-        PSurface(Modifier.padding(start = 44.dp).testTag("assistant-message:${message.id}"), PocketRadii.card, c.fillStrong) {
+        var failure by remember(message.id) { mutableStateOf(false) }
+        Row(Modifier.padding(start = 36.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (outgoing?.status == "rejected") PTextAction("!", { failure = !failure }, Modifier.testTag("assistant-send-failure:${outgoing.commandId}"), tint = c.danger)
+        PSurface(Modifier.weight(1f, fill = false).testTag("assistant-message:${message.id}"), PocketRadii.card, c.fillStrong) {
             SelectionContainer { ReferenceText(message.text, emptyList(), Modifier.padding(horizontal = 14.dp, vertical = 10.dp), color = c.ink) }
+        }
+        }
+        outgoing?.attachments?.forEach { PText(it.name, Modifier.padding(end = 8.dp), style = Pocket.type.caption, color = c.inkMuted) }
+        if (outgoing != null && outgoing.status !in setOf("accepted", "rejected"))
+            PText("等待确认", Modifier.padding(end = 8.dp).testTag("assistant-send-waiting:${outgoing.commandId}"), style = Pocket.type.caption, color = c.inkFaint)
+        if (failure && outgoing?.status == "rejected") Row(Modifier.padding(start = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+            PText(if (!outgoing.retryAllowed) "原发送失败，旧版本未保存完整发送目标；请复制内容重新交办" else outgoing.reason ?: "这条消息未发送成功", Modifier.weight(1f), style = Pocket.type.caption, color = c.danger)
+            if (outgoing.canRetry) PTextAction("重试", { failure = false; retry(outgoing) }, Modifier.testTag("assistant-send-retry:${outgoing.commandId}"), enabled = connected)
         }
     } else Column(Modifier.fillMaxWidth().testTag("assistant-message:${message.id}"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         if (showAuthor) AssistantAuthor(message.authorName?.takeIf(String::isNotBlank) ?: "助理")

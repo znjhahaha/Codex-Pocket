@@ -9,7 +9,8 @@ data class AssistantComposerBinding(val computerId: String, val runtimeId: Strin
     fun draft(text: String) = AssistantSendReceipt.draft(runtimeId,conversationId,text)
 }
 
-fun AssistantSnapshot.composerBinding(computerId: String) = AssistantComposerBinding(computerId,runtimeId.orEmpty(),
+fun AssistantSnapshot.composerBinding(computerId: String) = AssistantComposerBinding(computerId,scopeId ?: runtimeId.orEmpty(),
+    conversationId ?: if(scopeId != null) null else
     assistantId?.takeIf(String::isNotBlank)?.let { "assistant:$it" } ?: coordinatorThreadId)
 
 /** A successful transport response alone does not establish product acceptance. */

@@ -13,7 +13,7 @@ mod installation;
 #[path = "managed_runtime/registry.rs"]
 mod registry;
 pub use crate::native::host::Cursor;
-pub use installation::{Installation, apply_packaged_policy, current_layout, packaged};
+pub use installation::{Installation, current_layout, packaged};
 pub use registry::Registry;
 
 /// Local authority from an explicitly selected runtime or first-install discovery.

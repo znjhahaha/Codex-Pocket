@@ -94,6 +94,13 @@ impl Receipts {
         if value["method"]=="item/completed" {
             self.item(store, value["params"]["threadId"].as_str().unwrap_or(""), value["params"]["turnId"].as_str().unwrap_or(""), &value["params"]["item"], &mut changed);
         }
+        if value["method"]=="rawResponseItem/completed" {
+            let p=&value["params"];let item=&p["item"];
+            if item["type"]=="function_call_output" && let Some(result)=native_answer(&item["output"]) {
+                self.result(store,p["threadId"].as_str().unwrap_or(""),p["turnId"].as_str().unwrap_or(""),
+                    &[item["call_id"].as_str().unwrap_or("")],&result,&mut changed);
+            }
+        }
         if let Some(thread)=value.get("thread") {
             let id=thread["id"].as_str().unwrap_or("");
             for turn in thread["turns"].as_array().into_iter().flatten() {
@@ -107,27 +114,34 @@ impl Receipts {
     fn item(&mut self, store:&str, thread:&str, turn:&str, item:&Value, changes:&mut Vec<(CommandKey,Phase)>) {
         if item["type"]!="dynamicToolCall" || item["status"]!="completed" || item["success"]==false ||
             item["tool"].as_str().is_none_or(|name|name.rsplit('.').next()!=Some("request_user_input")) { return; }
-        let answers:Vec<Value>=item["contentItems"].as_array().into_iter().flatten().filter_map(|p| {
+        let read=|field:&str| -> Vec<Value> {item[field].as_array().into_iter().flatten().filter_map(|p| {
             // The broker's bounded media projection normalizes native inputText
             // to text before delivering this authenticated item to the ledger.
             if p["type"]!="inputText" && p["type"]!="text" {return None;}
-            let text=p["text"].as_str()?;
-            // Use the existing native frame ceiling. Four permitted 64KiB
-            // answers already exceed the old 256KiB limit once JSON is added.
-            if text.len()>16*1024*1024 {return None;}
-            let value:Value=serde_json::from_str(text).ok()?;
-            value["answers"].is_object().then_some(value)
-        }).collect();
+            native_answer(&p["text"])
+        }).collect()};
+        let mut answers=read("contentItems");
+        if answers.is_empty() {answers=read("toolOutputBlocks");}
         if answers.len()!=1 {return;}
-        for r in self.records.iter_mut().filter(|r| !terminal(r.phase) && r.store==store && r.thread==thread && r.turn==turn && item["id"]==r.item) {
-            let result=&answers[0];
-            r.phase=if result["answers"].as_object().is_some_and(|a| a.is_empty()) {Phase::Cancelled}
+        let ids:Vec<_>=["id","callId","call_id"].iter().filter_map(|key|item[*key].as_str()).collect();
+        self.result(store,thread,turn,&ids,&answers[0],changes);
+    }
+    fn result(&mut self,store:&str,thread:&str,turn:&str,ids:&[&str],result:&Value,changes:&mut Vec<(CommandKey,Phase)>) {
+        for r in self.records.iter_mut().filter(|r| !terminal(r.phase) && r.store==store && r.thread==thread && r.turn==turn && ids.contains(&r.item.as_str())) {
+            let next=if result["answers"].as_object().is_some_and(|a| a.is_empty()) {Phase::Cancelled}
                 else if let Ok(actual)=answer_digest(result,&r.question_ids) {
                     match &r.expected {Some(expected) if *expected==actual => Phase::Confirmed,Some(_)=>Phase::AnsweredElsewhere,None=>Phase::AwaitingConfirmation}
                 } else {continue;};
-            changes.push((r.command.clone(),r.phase));
+            if r.phase!=next {r.phase=next;changes.push((r.command.clone(),r.phase));}
         }
     }
+}
+fn native_answer(value:&Value)->Option<Value> {
+    let text=value.as_str()?;
+    // Match the native frame bound; individual answers keep their smaller limit.
+    if text.len()>16*1024*1024 {return None;}
+    let value:Value=serde_json::from_str(text).ok()?;
+    value["answers"].is_object().then_some(value)
 }
 fn terminal(phase:Phase)->bool {matches!(phase,Phase::Confirmed|Phase::AnsweredElsewhere|Phase::Cancelled)}
 fn valid_id(value:&str)->bool {!value.is_empty()&&value.len()<=512&&!value.chars().any(char::is_control)}
@@ -171,6 +185,50 @@ fn answer_digest(response:&Value, ids:&BTreeSet<String>)->Result<String> {
     #[test] fn different_authoritative_answer_is_handled_elsewhere() {
         let mut r=Receipts::default();r.reserve(key(),"runtime","store",&event(false),&answer("ours")).unwrap();
         assert_eq!(r.observe("store",&result("theirs")),vec![(key(),Phase::AnsweredElsewhere)]);
+    }
+    #[test] fn raw_result_requires_native_call_and_turn_and_can_confirm_three_answers() {
+        let mut input=event(false);
+        input["params"]["questions"]=json!([{"id":"a"},{"id":"b"},{"id":"c"}]);
+        let answers=json!({"answers":{"a":{"answers":["A"]},"b":{"answers":["B"]},"c":{"answers":["C"]}}});
+        let mut r=Receipts::default();r.reserve(key(),"runtime","store",&input,&answers).unwrap();
+        let native=json!({"method":"rawResponseItem/completed","params":{"threadId":"thread","turnId":"turn",
+            "item":{"type":"function_call_output","call_id":"item","output":answers.to_string()}}});
+        for field in ["threadId","turnId"] {
+            let mut wrong=native.clone();wrong["params"][field]=json!("other");
+            assert!(r.observe("store",&wrong).is_empty());
+        }
+        let mut wrong=native.clone();wrong["params"]["item"]["call_id"]=json!("other");
+        assert!(r.observe("store",&wrong).is_empty());
+        assert!(r.observe("other-store",&native).is_empty());
+        assert_eq!(r.observe("store",&native),vec![(key(),Phase::Confirmed)]);
+        assert!(r.observe("store",&native).is_empty());
+    }
+    #[test] fn native_output_blocks_and_cancellation_remain_authoritative() {
+        for cancel in [false,true] {
+            let mut r=Receipts::default();r.reserve(key(),"runtime","store",&event(false),&answer("chosen")).unwrap();
+            let mut native=result("chosen");
+            let output=if cancel {json!({"answers":{}})} else {answer("chosen")};
+            native["params"]["item"]["contentItems"]=json!([{"type":"text","text":"Completed tool"}]);
+            native["params"]["item"]["toolOutputBlocks"]=json!([{"type":"text","text":output.to_string()}]);
+            assert_eq!(r.observe("store",&native),vec![(key(),if cancel {Phase::Cancelled} else {Phase::Confirmed})]);
+        }
+    }
+    #[test] fn bridge_native_question_projection_reconciles_public_answers_but_not_secret_values() {
+        use pocket_bridge::router::{Router,Client,Route};
+        for secret in [false,true] {
+            let mut router=Router::default();
+            router.from_client(Client::Desktop,json!({"id":1,"method":"initialize","params":{
+                "capabilities":{"experimentalApi":true,"optOutNotificationMethods":["rawResponseItem/completed"]}}}));
+            let mut input=event(secret);input["params"]["questions"][0]["question"]=json!("Choose");
+            router.from_runtime(input.clone());
+            let mut receipts=Receipts::default();receipts.reserve(key(),"runtime","store",&input,&answer("native-choice")).unwrap();
+            let native=json!({"method":"rawResponseItem/completed","params":{"threadId":"thread","turnId":"turn","item":{
+                "type":"function_call_output","call_id":"item","output":answer("native-choice").to_string()}}});
+            for route in router.from_runtime(native) {
+                if let Route::Broadcast(value)=route { receipts.observe("store",&value); }
+            }
+            assert_eq!(receipts.records[0].phase,if secret {Phase::AwaitingConfirmation} else {Phase::Confirmed});
+        }
     }
     #[test] fn permitted_multi_question_answers_are_confirmed_beyond_old_parse_limit() {
         let mut questions=Vec::new();let mut answers=serde_json::Map::new();

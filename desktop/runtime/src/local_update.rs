@@ -588,7 +588,19 @@ pub fn is_staged_dashboard(state: &Path, current: &Path, installed: &Path) -> bo
 
 pub fn public_status(state: &Path,operation: &str) -> serde_json::Value {
     if !upgrade::local::canonical_uuid(operation){return serde_json::Value::Null}
-    storage::read::<serde_json::Value>(&journal(state,operation)).map(|s|json!({"phase":s["phase"],"reason":s["reason"]})).unwrap_or(serde_json::Value::Null)
+    storage::read::<serde_json::Value>(&journal(state,operation)).map(|s|{
+        let mut public=json!({"phase":s["phase"],"reason":s["reason"]});
+        if s["reason"]=="restart_lock_owner_active" {
+            if let Some(id)=legacy_restart::notice_id(state,operation){public["noticeId"]=json!(id);}
+        }
+        public
+    }).unwrap_or(serde_json::Value::Null)
+}
+
+/// The visible management window acknowledges the exact lock notice it painted.
+/// This is not a new approval; the signed explicit installer already owns the restart.
+pub fn acknowledge_restart_notice(state:&Path,operation:&str,notice_id:&str)->Result<()> {
+    legacy_restart::acknowledge_notice(state,operation,notice_id)
 }
 
 pub fn run(root: &Path,state: &Path,operation: &str) -> Result<()> {
@@ -603,6 +615,7 @@ fn run_owned(root: &Path,state: &Path,operation: &str) -> Result<()> {
     // Run outside the short-lived installer job. A pre-existing dashboard may
     // predate cooperative self-restart and must also move on silent installs.
     let mut dashboard_done=false;
+    let mut presented_restart_notice=None;
     loop {
         if !dashboard_done && updates::read_status(state).is_ok_and(|s| s.operation_id == operation && s.explicit_install) {
             dashboard_done = crate::ui_update::open(root, state, true).is_ok();
@@ -633,6 +646,16 @@ fn run_owned(root: &Path,state: &Path,operation: &str) -> Result<()> {
                     } else { ("verifying_startup", None) }
                 } else { verifying_since = None; ("waiting", wait_reason) };
                 storage::atomic(&journal(state,operation),&json!({"phase":phase,"reason":reason,"updatedAt":storage::now()}))?;
+                if reason == Some("restart_lock_owner_active") {
+                    if let Some(notice)=legacy_restart::notice_id(state,operation) {
+                        // Lock takeover must display its notice even if the dashboard
+                        // was hidden in the tray or Setup was started silently.
+                        if presented_restart_notice.as_ref()!=Some(&notice)
+                            && crate::ui_update::open(root,state,false).is_ok() {
+                            presented_restart_notice=Some(notice);
+                        }
+                    }
+                }
             },
             Err(error)=>{
                 // Save only fixed failure classifications, never private RPC bodies.

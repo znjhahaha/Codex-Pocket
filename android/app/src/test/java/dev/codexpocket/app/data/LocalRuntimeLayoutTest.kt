@@ -19,6 +19,8 @@ class LocalRuntimeLayoutTest {
         assertFalse(layout.available)
         File(layout.libraries, LocalRuntimeLayout.REQUIRED.last()).writeText("x")
         assertTrue(layout.available)
+        File(layout.libraries,"libcodex-code-mode-host.so").delete()
+        assertFalse("Model tools need the code-mode host",layout.available)
     }
 
     @Test fun childEnvironmentNamesEverythingTheStaticExecutablesCannotFindOnAndroid() {
@@ -32,9 +34,11 @@ class LocalRuntimeLayoutTest {
         assertEquals(environment["HTTPS_PROXY"], environment["https_proxy"])
         // The agent, its host and Codex talk to each other over loopback; that must not go through the tunnel.
         assertTrue(environment.getValue("NO_PROXY").split(',').containsAll(listOf("127.0.0.1", "localhost")))
-        assertEquals("/system/bin/sh", environment["SHELL"])
+        assertEquals("/bin/bash", environment["SHELL"])
+        assertTrue(environment.getValue("PATH").contains("/opt/node/bin"))
+        assertEquals(File(layout.libraries, "libproot-loader.so").path, environment["PROOT_LOADER"])
         assertEquals("此手机", environment["COMPUTERNAME"])
-        assertFalse(environment.containsKey("HTTP_PROXY"))
+        assertEquals(environment["HTTPS_PROXY"], environment["HTTP_PROXY"])
         assertFalse(environment.containsKey(LocalCodexConfig.KEY_VARIABLE))
     }
 
@@ -66,7 +70,7 @@ class LocalRuntimeLayoutTest {
         layout.prepare("first roots")
         val config = File(layout.codexHome, "config.toml")
         val policy = "\n[shell_environment_policy]\nexclude = [\"POCKET_PROVIDER_API_KEY\"]\n"
-        assertEquals("sandbox_mode = \"danger-full-access\"\n$policy", config.readText())
+        assertEquals("sandbox_mode = \"workspace-write\"\napproval_policy = \"on-request\"\n$policy", config.readText())
         assertTrue(layout.projects.isDirectory && layout.state.isDirectory && layout.temporary.isDirectory)
         config.writeText("model = \"chosen\"\n$policy")
         val written = config.lastModified()

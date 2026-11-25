@@ -1,7 +1,7 @@
 //! Bounded, atomic recovery evidence. Records are reserved before any native write.
 use crate::protocol::{MAX_FRAME, Receipt, key};
 use crate::queries::{PreparedRequest, Queries, read_only};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -128,7 +128,9 @@ impl Evidence {
                 .collect()
         };
         Self {
-            schema: 2,
+            // Schema 3 is needed only once an ID is reused across generations.
+            // Older Hosts must fail closed rather than discard archived answers.
+            schema: if state.answers.keys().any(|id| id.starts_with("g:")) { 3 } else { 2 },
             runtime_id: state.runtime_id.clone(),
             generation: state.generation.clone(),
             sequence: state.sequence,
@@ -152,7 +154,7 @@ impl Evidence {
         }
     }
     fn recover(self) -> Result<Recovery> {
-        ensure!(self.schema == 2, "Invalid recovery schema");
+        ensure!(matches!(self.schema, 2 | 3), "Invalid recovery schema");
         let records = |records: BTreeMap<String, CommandEvidence>| {
             records
                 .into_iter()
@@ -204,6 +206,16 @@ fn bytes<T: Serialize>(value: &T) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
 }
 
+fn answer_identity<'a>(stored: &'a str, generation: &str) -> Result<&'a str> {
+    if let Some(scoped) = stored.strip_prefix("g:") {
+        let (owner, id) = scoped.split_once(':').context("Invalid archived answer identity")?;
+        ensure!(owner == generation, "Archived answer generation mismatch");
+        Ok(id)
+    } else {
+        Ok(stored)
+    }
+}
+
 impl Store {
     pub fn open(path: &Path, runtime_id: &str, generation: &str) -> Result<Self> {
         let mut migrated = false;
@@ -212,7 +224,7 @@ impl Store {
                 serde_json::from_slice(&crate::client::read_private(path, MAX_STATE)?)
                     .map_err(|_| anyhow::anyhow!("Invalid recovery data"))?;
             let mut state = match value["schema"].as_u64() {
-                Some(2) => serde_json::from_value::<Evidence>(value)
+                Some(2 | 3) => serde_json::from_value::<Evidence>(value)
                     .map_err(|_| anyhow::anyhow!("Invalid recovery data"))?
                     .recover()?,
                 Some(1) => {
@@ -486,6 +498,30 @@ impl Store {
 }
 
 impl Recovery {
+    pub(crate) fn current_answer_receipt(&self, id: &str) -> Receipt {
+        let receipt = self.receipt(id, true);
+        if receipt.generation == self.generation {
+            receipt
+        } else {
+            Receipt { generation: self.generation.clone(), state: "missing".into(), response: None }
+        }
+    }
+
+    /// A fresh current native question may reuse a predecessor's request ID.
+    /// Archive only its receipt identity; keep its state and original generation.
+    pub(crate) fn reserve_answer(&mut self, id: String, value: &Value) -> Result<Option<Receipt>> {
+        if let Some(previous) = self.answers.get(&id).filter(|r| r.generation != self.generation) {
+            ensure!(self.pending.get(&id).is_some_and(|p| p.generation == self.generation
+                && p.request.get("method").is_some()), "stale_request");
+            ensure!(self.commands.len() + self.answers.len() < MAX_RECORDS, "capacity");
+            let archived = format!("g:{}:{id}", previous.generation);
+            ensure!(!self.answers.contains_key(&archived), "conflict");
+            let previous = self.answers.remove(&id).unwrap();
+            self.answers.insert(archived, previous);
+        }
+        self.reserve(id, value, true)
+    }
+
     /// Digest the persisted allowlist, including identities, even when event
     /// sequence does not advance for a command/answer completion.
     pub fn evidence_digest(&self) -> Result<String> {
@@ -518,7 +554,8 @@ impl Recovery {
             .iter()
             .skip(offset)
             .take(ANSWER_EVIDENCE_PAGE_SIZE)
-            .map(|(id, record)| {
+            .map(|(stored, record)| {
+                let id = answer_identity(stored, &record.generation)?;
                 let request_id = if let Some(text) = id.strip_prefix("s:") {
                     json!(text)
                 } else if let Some(number) = id.strip_prefix("n:") {
@@ -527,7 +564,7 @@ impl Recovery {
                     anyhow::bail!("Invalid historical answer identity")
                 };
                 ensure!(
-                    key(&request_id).as_ref() == Some(id),
+                    key(&request_id).as_deref() == Some(id),
                     "Historical answer identity is not canonical"
                 );
                 Ok(AnswerEvidence {
@@ -583,7 +620,13 @@ impl Recovery {
             "Invalid replay tail"
         );
         let mut result_bytes = 0;
-        for (id, command) in self.commands.iter().chain(&self.answers) {
+        let mut answer_ids = std::collections::BTreeSet::new();
+        for (stored, command, answer) in self.commands.iter().map(|(k,v)|(k,v,false))
+            .chain(self.answers.iter().map(|(k,v)|(k,v,true))) {
+            let id = if answer { answer_identity(stored, &command.generation)? } else { stored.as_str() };
+            if answer {
+                ensure!(answer_ids.insert((&command.generation, id)), "Duplicate answer generation/identity");
+            }
             ensure!(
                 id.len() <= 258
                     && (id.starts_with("s:") || id.starts_with("n:"))
@@ -592,7 +635,7 @@ impl Recovery {
             );
             if let Some(reply) = &command.reply {
                 ensure!(
-                    reply.is_object() && key(&reply["id"]).as_ref() == Some(id),
+                    reply.is_object() && key(&reply["id"]).as_deref() == Some(id),
                     "Invalid receipt"
                 );
                 result_bytes += bytes(reply);

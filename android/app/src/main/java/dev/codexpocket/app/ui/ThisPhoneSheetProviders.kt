@@ -20,6 +20,7 @@ import dev.codexpocket.app.data.LocalProviderModelLoader
 import dev.codexpocket.app.data.LocalProviderModelRequest
 import dev.codexpocket.app.data.LocalProviderModelResult
 import dev.codexpocket.app.data.LocalProviderModelSearch
+import dev.codexpocket.app.data.LocalProviderModel
 import dev.codexpocket.app.ui.kit.*
 
 /** Which model service Codex on this phone uses: OpenAI's own sign-in, or a service the person has a key for. */
@@ -69,6 +70,8 @@ private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (L
     var name by remember { mutableStateOf(existing?.name.orEmpty()) }
     var url by remember { mutableStateOf(existing?.baseUrl.orEmpty()) }
     var model by remember { mutableStateOf(existing?.model.orEmpty()) }
+    var enabledModels by remember { mutableStateOf(existing?.enabledModels.orEmpty()) }
+    var editingModel by remember { mutableStateOf<String?>(null) }
     // A key is not placed in the Activity's unencrypted saved-state bundle, and a saved one is never shown again.
     var key by remember { mutableStateOf("") }
     var problem by remember { mutableStateOf<String?>(null) }
@@ -79,6 +82,13 @@ private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (L
     var query by remember { mutableStateOf("") }
     DisposableEffect(discovery) { onDispose { discovery.close() } }
     val plain = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrectEnabled = false)
+    fun addModel(id: String, declared: LocalProviderModel? = null) {
+        if (id.isNotBlank() && LocalProviderRules.model(id) == id) {
+            if (enabledModels.none { it.id == id }) enabledModels = enabledModels + (declared ?: LocalProviderModel(id))
+            model = id
+            editingModel = id
+        }
+    }
     PText(if (existing == null) "添加第三方服务" else "编辑「${existing.name}」", style = Pocket.type.body)
     PTextField(name, { name = it; problem = null }, Modifier.testTag("this-phone-provider-name"), label = "名称", placeholder = "例如：我的中转站", singleLine = true)
     PTextField(url, { if (it.trim() != url) { discovery.clear(); query = "" }; url = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-url"), label = "接口地址（Base URL）",
@@ -86,8 +96,36 @@ private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (L
     PTextField(key, { if (it.trim() != key) { discovery.clear(); query = "" }; key = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-key"), label = "API Key",
         placeholder = if (existing != null) "留空则继续使用 ${existing.keyHint}" else "sk-…", singleLine = true,
         visualTransformation = PasswordVisualTransformation(), keyboardOptions = plain.copy(keyboardType = KeyboardType.Password))
-    PTextField(model, { model = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-model"), label = "模型（可选）",
+    PTextField(model, { model = it.trim(); problem = null }, Modifier.testTag("this-phone-provider-model"), label = "默认模型（可手动填写）",
         placeholder = "留空使用 Codex 默认模型", singleLine = true, keyboardOptions = plain.copy(keyboardType = KeyboardType.Ascii))
+    PTextAction("添加此模型", { addModel(model) }, Modifier.testTag("this-phone-provider-add-model"),
+        enabled = model.isNotBlank() && LocalProviderRules.model(model) != null)
+    if (enabledModels.isNotEmpty()) PSection("已启用模型") {
+        enabledModels.forEach { configured ->
+            PRow(configured.id, { model = configured.id; editingModel = configured.id },
+                Modifier.testTag("this-phone-enabled:${configured.id}"), selected = model == configured.id,
+                subtitle = if (configured.efforts == null) "思考强度未声明" else configured.efforts.joinToString(" · ").ifEmpty { "不支持思考强度" },
+                trailing = { PTextAction("移除", {
+                    enabledModels = enabledModels.filterNot { it.id == configured.id }
+                    if (model == configured.id) model = enabledModels.firstOrNull()?.id.orEmpty()
+                    if (editingModel == configured.id) editingModel = null
+                }, Modifier.testTag("this-phone-remove-model:${configured.id}")) })
+            if (editingModel == configured.id) {
+                PText("支持的思考强度", style = Pocket.type.labelSmall)
+                PText("按服务公布的能力选择；自定义别名也可在这里设置。", style = Pocket.type.caption, color = Pocket.colors.inkMuted)
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    LocalProviderModel.EFFORTS.forEach { effort ->
+                        PPill(effort, effort in configured.efforts.orEmpty(), {
+                            val values = configured.efforts.orEmpty().toMutableSet().apply { if (!add(effort)) remove(effort) }
+                            enabledModels = enabledModels.map { if (it.id == configured.id)
+                                it.copy(efforts = LocalProviderModel.EFFORTS.filter { value -> value in values }, defaultEffort = it.defaultEffort?.takeIf { value -> value in values }) else it }
+                        }, Modifier.testTag("this-phone-model-effort:${configured.id}:$effort"))
+                    }
+                }
+            }
+        }
+    }
     PButton("获取模型列表", {
         query = ""
         discovery.fetch(LocalProviderModelRequest(existing?.id, url, key))
@@ -112,9 +150,9 @@ private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (L
                 if (matches.isEmpty()) PText("没有匹配的模型", Modifier.padding(8.dp).testTag("this-phone-provider-models-no-match"), style = Pocket.type.bodySmall)
                 else LazyColumn(Modifier.fillMaxWidth().heightIn(max = 240.dp).testTag("this-phone-provider-model-list")) {
                     items(matches, key = { it }) { id ->
-                        PRow(id, { model = id; problem = null }, Modifier.testTag("this-phone-provider-model-option:$id"),
-                            selected = model == id, accentSelection = true, trailing = {
-                                if (model == id) PIcon(PocketIcons.Check, null, Modifier.size(18.dp))
+                        PRow(id, { addModel(id, result.capabilities[id]); problem = null }, Modifier.testTag("this-phone-provider-model-option:$id"),
+                            selected = enabledModels.any { it.id == id }, accentSelection = true, trailing = {
+                                if (enabledModels.any { it.id == id }) PIcon(PocketIcons.Check, null, Modifier.size(18.dp))
                             })
                     }
                 }
@@ -131,7 +169,8 @@ private fun ColumnScope.ProviderForm(existing: LocalProviderSummary?, onSave: (L
             LocalProviderRules.baseUrl(url) == null -> "接口地址需要以 https:// 开头；http:// 只能用于数字 IP 地址。"
             (existing == null || key.isNotEmpty()) && LocalProviderRules.apiKey(key) == null -> "请填写完整的 API Key。"
             LocalProviderRules.model(model) == null -> "模型名称只能包含英文字母、数字和符号。"
-            !onSave(LocalProviderDraft(existing?.id, name, url, key, model)) -> "未能保存，请重试。"
+            !onSave(LocalProviderDraft(existing?.id, name, url, key, model,
+                (enabledModels + LocalProviderModel.initial(model)).distinctBy { it.id })) -> "未能保存，请重试。"
             else -> null
         }
         if (problem == null) { key = ""; onClose() }

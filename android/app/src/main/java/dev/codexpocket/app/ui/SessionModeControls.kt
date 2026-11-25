@@ -51,8 +51,8 @@ internal fun ownershipNoticeText(s: PocketState, legacyMessage: String): String?
 
 @Composable
 internal fun ThreadOwnershipNotice(s: PocketState, repo: PocketRepository) {
-    if (s.automaticConnectionLabel()!=null) PText("正在自动同步会话连接",style=Pocket.type.bodySmall,
-        color=Pocket.colors.inkMuted)
+    val local = LocalExecutionLocation.current?.kind == dev.codexpocket.wire.ExecutionTargetKind.ThisPhone
+    s.automaticConnectionLabel(local)?.let { label -> PText(label, style=Pocket.type.bodySmall, color=Pocket.colors.inkMuted) }
 }
 
 @Composable

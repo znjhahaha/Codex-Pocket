@@ -119,6 +119,39 @@ describe('home upgrade and background recovery policy',()=>{
   expect(model.title).toBe('更新已完成');
   expect(model.description).toContain('不需要现在重启');
  });
+ it.each(['waiting_login','finished','failed'])('prioritizes a stopped %s coordinator over a pending cold start',phase=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'waiting_cold_start',generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1,restartRequested:true,coordinator:{phase,reason:'restart_owner_changed'}};
+  const model=upgradeRecovery(s,100);
+  expect(model).toMatchObject({kind:'staged_dashboard',tone:'attention',blockMutations:false});
+  expect(model.description).toContain('Pocket 后台进程发生变化');
+  expect(model.description).toContain('重试');
+  expect(model.description).not.toContain('无需其他操作');
+  expect(recoveryBlocksMutations(s,100)).toBe(false);
+ });
+ it('shows the dispatch failure instead of claiming a staged installer is progressing',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'waiting_idle',generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1,coordinator:{phase:'waiting_login',reason:'independent_dispatch_failed'}};
+  expect(upgradeRecovery(s,100).description).toContain('更新进程未能启动');
+ });
+ it('does not let a stale handoff progress record mask the stopped installer',()=>{
+  const s=record(snapshot(),'verifying');
+  s.installation!.upgrade!.fromGeneration=target;s.installation!.upgrade!.toGeneration=source;
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'switching',generation:source,downloadedBytes:1,totalBytes:1,coordinator:{phase:'waiting_login',reason:'restart_owner_changed'}};
+  expect(upgradeRecovery(s,100)).toMatchObject({kind:'staged_dashboard',tone:'attention',blockMutations:false});
+ });
+ it('announces the old Pocket lock owner before the backend ends it',()=>{
+  const s=snapshot();
+  s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
+  s.updates={automatic:false,phase:'waiting_cold_start',generation:source,version:'0.7.1',downloadedBytes:1,totalBytes:1,coordinator:{phase:'waiting',reason:'restart_lock_owner_active'}};
+  const model=upgradeRecovery(s,100);
+  expect(model).toMatchObject({kind:'installing',tone:'progress',blockMutations:true});
+  expect(model.description).toContain('检测到旧 Pocket 后台占用');
+  expect(model.description).toContain('正在结束旧后台并继续更新');
+ });
  it('keeps the retry button usable after a cancelled legacy handoff',()=>{
   const s=snapshot();
   s.installation!.ui={state:'staged_dashboard',generation:source,runningVerified:true};
