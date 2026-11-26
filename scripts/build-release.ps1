@@ -116,18 +116,18 @@ function Assert-PocketApkSignerIdentity([string[]]$Verification,[string]$Expecte
 }
 function Get-PocketOnDeviceRuntime([string]$RuntimeDirectory,[string[]]$Abis) {
     if (-not $RuntimeDirectory) {
-        if ($Abis.Count -gt 0) { throw '-OnDeviceAbis requires -OnDeviceRuntime.' }
+        if ($Abis -and $Abis.Count -gt 0) { throw '-OnDeviceAbis requires -OnDeviceRuntime.' }
         return $null
     }
     if (-not (Test-Path -LiteralPath $RuntimeDirectory -PathType Container)) { throw "On-device runtime directory missing: $RuntimeDirectory" }
     $directory = (Get-Item -LiteralPath $RuntimeDirectory).FullName
     $libraries = Join-Path $directory 'jniLibs'
     if (-not [IO.Directory]::Exists($libraries)) { throw 'On-device runtime has no jniLibs directory.' }
-    $selected = if ($Abis.Count -gt 0) {
+    $selected = @(if ($Abis -and $Abis.Count -gt 0) {
         @($Abis | ForEach-Object { $_.Split(',') } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
     } else {
         @(Get-ChildItem -LiteralPath $libraries -Directory | ForEach-Object { $_.Name })
-    }
+    })
     if ($selected.Count -eq 0) { throw 'On-device runtime has no staged ABIs.' }
     $required = @('libpocket-agent.so','libpocket-runtime-host.so','libpocket-runtime-manifest.so','libcodex.so')
     $files = foreach ($abi in $selected) {

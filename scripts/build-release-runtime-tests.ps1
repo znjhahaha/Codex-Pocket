@@ -2,6 +2,7 @@
 # Run directly with PowerShell. All build/signing inputs are synthetic and private
 # to a temporary fixture; no Gradle, Cargo, model, or release publisher is run.
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'build-release.ps1')
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression
