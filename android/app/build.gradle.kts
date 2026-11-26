@@ -6,6 +6,22 @@ plugins {
     kotlin("kapt")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+// Keep these SDK artifacts aligned with Robolectric and the @Config SDKs in host tests.
+// Separate configurations retain every SDK version instead of selecting only the newest.
+val robolectricSdkJars = listOf(
+    "9-robolectric-4913185-2-i7", // API 28
+    "14-robolectric-10818077-i7", // API 34
+    "15-robolectric-13954326-i7", // API 35
+).map { version ->
+    configurations.detachedConfiguration(dependencies.create("org.robolectric:android-all-instrumented:$version")).apply {
+        isTransitive = false
+    }
+}
+val robolectricSdkDirectory = layout.buildDirectory.dir("robolectric-sdks")
+val prepareRobolectricSdks = tasks.register<Sync>("prepareRobolectricSdks") {
+    from(robolectricSdkJars)
+    into(robolectricSdkDirectory)
+}
 val signingProperties = Properties().apply {
     rootProject.file("signing.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
@@ -98,7 +114,14 @@ android {
         java.srcDir("src/huawei/java")
         manifest.srcFile(huaweiManifest)
     }
-    testOptions { unitTests.isIncludeAndroidResources = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all {
+            // Gradle resolves and caches SDKs before testing; Robolectric never downloads mid-test.
+            it.dependsOn(prepareRobolectricSdks)
+            it.systemProperty("robolectric.dependency.dir", robolectricSdkDirectory.get().asFile.absolutePath)
+        }
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     packaging { resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "/META-INF/{LICENSE,NOTICE}.md", "/META-INF/versions/9/OSGI-INF/MANIFEST.MF") }

@@ -17,7 +17,13 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $signing 'release.jks'),[Convert]::FromBase64String($env:POCKET_SIGNING_KEY_BASE64))
     [IO.File]::WriteAllText((Join-Path $signing 'password.txt'),$env:POCKET_SIGNING_PASSWORD,[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $signing 'update-key.pem'),$env:POCKET_UPDATE_PRIVATE_KEY_PEM,[Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $signing 'update-trust.json'),$env:POCKET_UPDATE_TRUST_JSON,[Text.UTF8Encoding]::new($false))
+    $updateTrust = $env:POCKET_UPDATE_TRUST_JSON | ConvertFrom-Json
+    $assetBase = [uri]$env:POCKET_UPDATE_ASSET_BASE
+    if ($assetBase.Scheme -ne 'https' -or $assetBase.Host -notin $updateTrust.allowedHosts -or $assetBase.UserInfo -or $assetBase.Query -or $assetBase.Fragment) {
+        throw 'Update asset base must be a trusted HTTPS release URL.'
+    }
+    $updateTrust.feed = $env:POCKET_UPDATE_ASSET_BASE.TrimEnd('/') + '/windows-update.json'
+    [IO.File]::WriteAllText((Join-Path $signing 'update-trust.json'),($updateTrust | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
     Remove-Item Env:POCKET_UPDATE_PRIVATE_KEY_PEM
     Remove-Item Env:POCKET_SIGNING_KEY_BASE64
     Remove-Item Env:POCKET_SIGNING_PASSWORD

@@ -69,7 +69,8 @@ impl Fixture {
         let launcher = root.path().join("pocket-launcher.exe");
         fs::write(&launcher, b"synthetic launcher identity, never executed").unwrap();
         for dir in ["runtimes", "state", "markers"] {
-            fs::create_dir(root.path().join(dir)).unwrap();
+            // Match installer ownership even when the test token is elevated.
+            admission::private_dir(&root.path().join(dir)).unwrap();
         }
         fs::write(root.path().join("desktop-install.json"),json!({"version":3,"installRoot":root.path(),"bridge":launcher,"stateDirectory":root.path().join("state"),"launcherHash":admission::file_sha256(&launcher).unwrap()}).to_string()).unwrap();
         let installation = Installation::open(root.path()).unwrap();

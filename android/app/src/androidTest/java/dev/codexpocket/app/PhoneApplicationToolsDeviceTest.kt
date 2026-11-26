@@ -118,7 +118,8 @@ class PhoneApplicationToolsDeviceTest {
         assertEquals(listOf(model), repo.state.value.models.map { it.model })
         compose.activity.runOnUiThread { compose.activity.setContent {
             val state by repo.state.collectAsState()
-            PocketTheme("dark") { CompositionLocalProvider(LocalExecutionLocation provides locations.activeLocation.value?.target) {
+            val activeLocation by locations.activeLocation.collectAsState()
+            PocketTheme("dark") { CompositionLocalProvider(LocalExecutionLocation provides activeLocation?.target) {
                 PocketRoot(state, repo)
             } }
         } }

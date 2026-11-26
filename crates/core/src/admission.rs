@@ -10,7 +10,7 @@ use std::{
 };
 #[path = "admission_fs.rs"]
 mod physical;
-pub use physical::{read_json, validate_path};
+pub use physical::{private_dir, read_json, validate_path};
 
 pub const PROTOCOL: u32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

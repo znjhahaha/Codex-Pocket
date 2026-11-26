@@ -5,7 +5,9 @@ struct Fixture { _temp:tempfile::TempDir, root:PathBuf,state:PathBuf,exe:PathBuf
 impl Fixture {
     fn new() -> Self {
         let temp=tempfile::tempdir().unwrap();let root=dunce::canonicalize(temp.path()).unwrap();
-        for dir in [root.clone(),root.join("state/desktop/updates"),root.join("runtimes"),root.join("bin")]{crate::storage::private_directory(&dir).unwrap();}
+        // Receipt directories use admission's explicit TokenUser owner, including under elevation.
+        admission::private_dir(&root.join("state/desktop/updates")).unwrap();
+        for dir in [root.clone(),root.join("runtimes"),root.join("bin")]{crate::storage::private_directory(&dir).unwrap();}
         let files:Vec<_>=["pocket-agent.exe","windows-install.ps1","windows-common.ps1"].into_iter().map(|name|json!({"path":name,"bytes":7,"sha256":hex::encode(sha2::Sha256::digest(b"fixture"))})).collect();
         let bytes=serde_json::to_vec(&json!({"files":files})).unwrap();let generation=hex::encode(sha2::Sha256::digest(&bytes));
         let bin=root.join("bin").join(&generation);crate::storage::private_directory(&bin).unwrap();std::fs::write(bin.join("windows-manifest.json"),bytes).unwrap();

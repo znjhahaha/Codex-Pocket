@@ -9,16 +9,20 @@ pub(super) fn sync_origins<E: Executor>(
         CREATE INDEX IF NOT EXISTS product_conversation_chat ON product_conversation_origins(conversation_id)")?;
     let rows=db.prepare("SELECT t.id,t.operation_id FROM product_timeline t LEFT JOIN product_conversation_origins c ON c.id=t.id WHERE c.id IS NULL")?
         .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Backfill a retained timeline in one commit. A durable commit per message
+    // can exhaust the actor's bounded read window on a Windows disk.
+    let tx = db.unchecked_transaction()?;
     for (id, operation) in rows {
         let origin = operation
             .as_deref()
             .map(|op| service.origin_conversation("operation", op))
             .unwrap_or_else(|| service.origin_conversation("message", &id));
-        db.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO product_conversation_origins(id,conversation_id) VALUES(?1,?2)",
             params![id, origin],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 

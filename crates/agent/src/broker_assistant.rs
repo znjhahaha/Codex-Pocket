@@ -1538,7 +1538,7 @@ mod tests {
     async fn silent_restore_verified_msix_persists_only_binary_after_old_owners_end() {
         use super::preparation_fixture::*;
         use crate::managed_runtime::discovery::{MsixPackage,restore_saved_profile_with};
-        let f=Fixture::new();let apps=f.dir.path().join("WindowsApps");
+        let f=Fixture::new();let apps=dunce::canonicalize(f.dir.path()).unwrap().join("WindowsApps");
         let old=apps.join("OpenAI.Codex_26.1103.7773.0_x64__2p2nqsd0c76g0/app/resources/codex.exe");
         let full_name="OpenAI.Codex_26.1106.6628.0_x64__2p2nqsd0c76g0".to_string();
         let package=MsixPackage{location:apps.join(&full_name),full_name};

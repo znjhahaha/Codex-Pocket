@@ -3519,7 +3519,10 @@ class PocketRepositoryTest {
         server.notify("assistant/stream", streamDelta(5, "断档"))
         until { assistantReads() == 2 }
         for (sequence in 1..40L) server.notify("assistant/stream", streamDelta(sequence * 10, "乱序"))
-        await { it.assistant.lastStreamSequence == 400L }
+        // State is published before its refresh hint is queued. A contiguous marker proves the
+        // last gap's handler returned before we release the read, without requesting another one.
+        server.notify("assistant/stream", streamDelta(401, ""))
+        await { it.assistant.lastStreamSequence == 401L }
         assertEquals("Text from before a gap is dropped, not joined", "乱序", repo.state.value.assistant.streamingCoordinatorText)
         assertEquals(2, assistantReads())
         release.complete(Unit)

@@ -3,10 +3,15 @@ on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build or inspect
+        required: true
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 jobs:
   validate:
@@ -14,18 +19,30 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      build: ${{ steps.state.outputs.build }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: state
+        name: Select unpublished release work
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python scripts/release_state.py draft
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: steps.state.outputs.build == 'true'
+        with:
+          ref: refs/tags/${{ steps.state.outputs.tag }}
       - id: version
         name: Require immutable version tag
+        if: steps.state.outputs.build == 'true'
         env:
-          TAG: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.state.outputs.tag }}
         run: |
           python - <<'PY'
           import json,os,re,tomllib
           tag=os.environ['TAG']
-          if os.environ['REF_TYPE']!='tag' or not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?',tag):
+          if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?',tag):
               raise SystemExit('Run against a version tag, not a mutable branch.')
           version=tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version']
           assert tag=='v'+version, 'Tag and source version differ'
@@ -34,11 +51,14 @@ jobs:
           PY
   windows_android:
     needs: validate
+    if: needs.validate.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 65
     environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
@@ -66,7 +86,7 @@ jobs:
           POCKET_EXPECTED_SIGNER: ${{ vars.POCKET_EXPECTED_SIGNER }}
           POCKET_UPDATE_PRIVATE_KEY_PEM: ${{ secrets.POCKET_UPDATE_PRIVATE_KEY_PEM }}
           POCKET_UPDATE_TRUST_JSON: ${{ vars.POCKET_UPDATE_TRUST_JSON }}
-          POCKET_UPDATE_ASSET_BASE: ${{ vars.POCKET_UPDATE_ASSET_BASE }}
+          POCKET_UPDATE_ASSET_BASE: https://github.com/${{ github.repository }}/releases/download/${{ needs.validate.outputs.tag }}
         run: ./scripts/ci-release.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'pocket-release')
       - name: Preserve failed host test reports
         if: failure()
@@ -93,16 +113,19 @@ jobs:
           retention-days: 14
   relay:
     needs: validate
+    if: needs.validate.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
       - name: Build immutable image archive
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          docker build -f deploy/relay.Dockerfile --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.version="$VERSION" -t "codex-pocket-relay:$VERSION" .
+          docker build -f deploy/relay.Dockerfile --label org.opencontainers.image.revision="$(git rev-parse HEAD)" --label org.opencontainers.image.version="$VERSION" -t "codex-pocket-relay:$VERSION" .
           mkdir -p release
           docker save "codex-pocket-relay:$VERSION" | gzip > "release/codex-pocket-$VERSION-relay-amd64.tar.gz"
           cd release
@@ -115,6 +138,7 @@ jobs:
           retention-days: 14
   draft:
     needs: [validate, windows_android, relay]
+    if: needs.validate.outputs.build == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write

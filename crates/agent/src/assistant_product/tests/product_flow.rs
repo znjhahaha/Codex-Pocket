@@ -38,7 +38,7 @@ async fn product_general_schedule_creates_owned_workspace_task_and_keeps_history
     assert_eq!(state["tasks"].as_array().unwrap().len(),1);
     assert_eq!(state["scheduleRuns"].as_array().unwrap().len(),1);
     assert_eq!(state["scheduleRuns"][0]["task_id"],state["tasks"][0]["id"]);
-    assert_eq!(PathBuf::from(state["tasks"][0]["directory"].as_str().unwrap()),f.root.path().join("assistant/workspace"));
+    assert_eq!(PathBuf::from(state["tasks"][0]["directory"].as_str().unwrap()),dunce::canonicalize(f.root.path().join("assistant/workspace")).unwrap());
     f.stop().await;
 }
 

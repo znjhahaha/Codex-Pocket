@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+fn conversation_origin_backfill_rolls_back_a_failed_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let (frames, _) = tokio::sync::broadcast::channel(32);
+    let worker = Worker::open(
+        root.path().into(), "computer".into(), "profile".into(),
+        Fake::default(), None, Arc::new(|| 1_000_000), frames,
+    ).unwrap();
+    let db = &worker.messages;
+    db.execute_batch("INSERT INTO product_timeline(id,role,text,at_ms) VALUES
+        ('legacy-a','User','First',1),('legacy-b','User','Second',2);
+        CREATE TRIGGER fail_origin_batch BEFORE INSERT ON product_conversation_origins
+        WHEN (SELECT COUNT(*) FROM product_conversation_origins)>0
+        BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;").unwrap();
+    assert!(super::super::conversations::sync_origins(&worker.service, db).is_err());
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM product_conversation_origins", [],
+        |r| r.get::<_, i64>(0)).unwrap(), 0);
+    db.execute_batch("DROP TRIGGER fail_origin_batch").unwrap();
+    super::super::conversations::sync_origins(&worker.service, db).unwrap();
+    let origins = db.prepare("SELECT conversation_id FROM product_conversation_origins ORDER BY id")
+        .unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(origins, vec![worker.service.default_conversation_id(); 2]);
+}
+
 #[tokio::test]
 async fn product_conversations_select_page_replay_stream_and_reopen() {
     let mut f = Fixture::new(false).await;

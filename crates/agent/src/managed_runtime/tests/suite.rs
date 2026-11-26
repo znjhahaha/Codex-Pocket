@@ -9,7 +9,8 @@ use fixture::*;
 
 fn msix_restore_fixture(f:&Fixture)->(SelectedProfile,SelectedProfile,Controller) {
     use crate::managed_runtime::discovery::MsixPackage;
-    let root=f.dir.path().join("WindowsApps");
+    // Registered package locations use physical paths, as saved profiles do.
+    let root=dunce::canonicalize(f.dir.path()).unwrap().join("WindowsApps");
     let old=root.join("OpenAI.Codex_26.1103.7773.0_x64__2p2nqsd0c76g0/app/resources/codex.exe");
     let name="OpenAI.Codex_26.1106.6628.0_x64__2p2nqsd0c76g0".to_string();
     let package=MsixPackage{location:root.join(&name),full_name:name};

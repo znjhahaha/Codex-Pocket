@@ -161,5 +161,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Release workflow routing tests
+        run: python -m unittest discover -s scripts -p test_release_state.py
       - name: Build relay container
         run: docker build --file deploy/relay.Dockerfile --tag pocket-relay:check .

@@ -82,6 +82,7 @@
 !/docs/V052-ACCEPTANCE.md
 !/docs/AWS-RELAY-DEPLOYMENT.md
 !/docs/windows-user-guide.md
+!/docs/ci-release.md
 # Public compatibility documents required by the release inventory
 !/docs/cli-install-implementation.md
 !/docs/resume-windows-report.md

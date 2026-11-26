@@ -86,7 +86,7 @@ class PermissionPanelUiTest {
         var online by mutableStateOf(false)
         var refreshes = 0
         content { PermissionPanel(state, online, false, {}, { refreshes++ }, { fail("Unavailable choice must not submit") }) }
-        compose.onNodeWithText("离线 · 连接电脑后可选择权限").assertIsDisplayed()
+        compose.onNodeWithText("离线 · 连接运行端后可选择权限").assertIsDisplayed()
         compose.onNodeWithTag("permission-preset:request").assertIsSelected()
         compose.onNodeWithTag("permission-preset:full").assertIsNotEnabled()
         compose.onNodeWithTag("permission-refresh").assertIsNotEnabled()

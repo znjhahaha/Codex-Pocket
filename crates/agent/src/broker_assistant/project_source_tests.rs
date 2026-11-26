@@ -240,7 +240,7 @@ async fn cross_source_case(method: &str, bad_owner: bool, wrong_store: bool, rec
     assert_eq!(snapshot["projectAuthorization"][0]["threadId"], "t");
     assert_eq!(
         snapshot["projectAuthorization"][0]["directory"],
-        json!(project)
+        json!(dunce::canonicalize(&project).unwrap())
     );
     assert_eq!(snapshot["projectAuthorization"][0]["verified"], true);
     assert!(source_reads.load(Ordering::SeqCst) >= 3);

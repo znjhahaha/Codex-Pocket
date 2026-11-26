@@ -416,7 +416,7 @@ fn environment_config_home_rejects_reparse_points_and_package_redirection() {
 }
 
 fn msix_fixture(dir:&Path)->(PathBuf,MsixPackage,PathBuf) {
-    let root=dir.join("WindowsApps");
+    let root=dunce::canonicalize(dir).unwrap().join("WindowsApps");
     let old=root.join("OpenAI.Codex_26.1103.7773.0_x64__2p2nqsd0c76g0/app/resources/codex.exe");
     let full_name="OpenAI.Codex_26.1106.6628.0_x64__2p2nqsd0c76g0".to_string();
     let package=MsixPackage{location:root.join(&full_name),full_name};
