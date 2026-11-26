@@ -58,8 +58,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npx playwright test --config src/installRepair.playwright.config.mjs
       - name: Desktop native command tests
+        if: ${{ !cancelled() }}
         run: cargo +1.93.1 test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop
       - name: Windows installer fixtures
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           cargo +1.93.1 build --locked -p pocket-agent

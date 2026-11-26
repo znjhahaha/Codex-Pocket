@@ -22,6 +22,7 @@ async function fixture(page:Page,scenario:Scenario='old') {
    operationId:'fixture-journal',updatedAt:now,fromGeneration:old,toGeneration:target};
   w.__TAURI_INTERNALS__={invoke:async(cmd:string,args:any)=>{
    w.recoveryCalls.push({cmd,args});
+   if(cmd==='detect_lan')return [];
    if(cmd==='dashboard'){
     if(w.nextRecoverySnapshot){w.recoveryState=w.nextRecoverySnapshot;w.nextRecoverySnapshot=null;}
     const state=w.recoveryState;
@@ -49,13 +50,13 @@ async function fixture(page:Page,scenario:Scenario='old') {
 }
 const panel=(page:Page)=>page.getByRole('region',{name:'更新与后台恢复'});
 const refresh=async(page:Page)=>{await page.getByRole('button',{name:'刷新连接状态',exact:true}).click()};
-const mutations=(page:Page)=>page.evaluate(()=>(window as any).recoveryCalls.filter((call:any)=>call.cmd!=='dashboard'));
+const mutations=(page:Page)=>page.evaluate(()=>(window as any).recoveryCalls.filter((call:any)=>!['dashboard','detect_lan'].includes(call.cmd)));
 
 test('old background is explained on the home page and raw identity stays folded',async({page},info)=>{
  await fixture(page);
  await expect(panel(page).getByRole('heading',{name:'已安装新版，旧后台仍在运行'})).toBeVisible();
  await expect(page.getByRole('heading',{name:'电脑已就绪，连接手机。'})).toHaveCount(0);
- await expect(page.getByRole('button',{name:'开启连接',exact:true})).toBeDisabled();
+ await expect(page.getByRole('button',{name:'连接新设备',exact:true})).toBeDisabled();
  await expect(page.getByRole('button',{name:'添加设备',exact:true})).toBeDisabled();
  await expect(page.locator('.connection-facts').getByText('运行中',{exact:true})).toBeVisible();
  await expect(panel(page).getByText('aaaaaaaaaaaa',{exact:true})).not.toBeVisible();
@@ -71,9 +72,9 @@ test('upgrade request is single flight across navigation and remains unverified'
  await fixture(page);await page.evaluate(()=>{(window as any).deferRecovery=true});
  await panel(page).getByRole('button',{name:'检查并更新后台',exact:true}).click();
  await expect(panel(page).getByRole('button',{name:'检查并更新后台',exact:true})).toBeDisabled();
- await page.getByRole('navigation').getByRole('button',{name:'设备',exact:true}).click();
+ await page.getByRole('navigation').getByRole('button',{name:'设备与连接',exact:true}).click();
  await expect(page.getByRole('button',{name:'添加设备',exact:true})).toBeDisabled();
- await page.getByRole('navigation').getByRole('button',{name:'连接',exact:true}).click();
+ await page.getByRole('navigation').getByRole('button',{name:'概览',exact:true}).click();
  await panel(page).getByRole('button',{name:'刷新恢复状态',exact:true}).click();
  expect((await mutations(page)).map((call:any)=>call.cmd)).toEqual(['request_upgrade']);
  await page.evaluate(()=>{(window as any).finishRecovery()});
@@ -90,7 +91,8 @@ test('unsupported legacy backend keeps the Windows login guidance and read-only 
  await expect(panel(page)).toContainText('运行新版 Pocket 安装包');
  await expect(panel(page).getByRole('button',{name:'重试启动后台',exact:true})).toHaveCount(0);
  await panel(page).getByRole('button',{name:'检查详情',exact:true}).click();
- await expect(page.getByRole('heading',{name:'连接诊断',exact:true})).toBeVisible();
+ await expect(page.getByRole('heading',{name:'更新与修复',exact:true})).toBeVisible();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  await expect(page.getByRole('button',{name:'检查安全交接',exact:true})).toHaveCount(0);
  expect(await mutations(page)).toEqual([]);
 });
@@ -175,6 +177,7 @@ test('fresh current startup makes an old waiting-restart journal historical afte
  await refresh(page);await expect(panel(page).getByRole('heading',{name:'后台已恢复并核验'})).toBeVisible();
  await expect(panel(page)).not.toContainText('重新登录 Windows');await expect(panel(page)).toContainText('连接线路仍需单独核验');
  await panel(page).getByRole('button',{name:'检查详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  await expect(page.getByRole('region',{name:'安装与运行版本'})).toContainText('上次后台更新记录');
  await expect(page.getByRole('region',{name:'安装与运行版本'})).not.toContainText('重新登录 Windows');
  expect(await mutations(page)).toEqual([]);

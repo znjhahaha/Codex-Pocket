@@ -20,6 +20,7 @@ async function fixture(page:import('@playwright/test').Page,supported=true,unkno
   }};
  },{supported,unknown,verifiedUi});
  await page.goto('/');await page.getByRole('button',{name:'查看详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
 }
 test('verified current capability enables only pending steps and keeps truthful failure',async({page})=>{
  await fixture(page);
@@ -52,6 +53,7 @@ test('unknown operation survives remount and checks the same ID without a fresh 
  await expect(page.getByRole('button',{name:'重试旧桌面入口清理',exact:true})).toBeDisabled();
  const originalId=await page.evaluate(()=> (window as unknown as {repairCalls:{request:{operationId:string}}[]}).repairCalls[0].request.operationId);
  await page.reload();await page.getByRole('button',{name:'查看详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  await page.getByRole('button',{name:'核对上次修复',exact:true}).click();
  await expect(page.getByText(/所选集成修复失败/)).toBeVisible();
  const calls=await page.evaluate(()=> (window as unknown as {repairCalls:{request:Record<string,unknown>}[]}).repairCalls);
@@ -69,6 +71,7 @@ test('local missing required config reports state read rather than a network fai
   }};
  });
  await page.goto('/');await page.getByRole('button',{name:'查看详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  await expect(page.getByText(/state_read · state_config_missing · OS 2/).first()).toBeVisible();
  await expect(page.getByText(/state_read · state_config_missing · OS 2/).first()).toContainText('1794316209-20576-24');
  await expect(page.getByText('route_configuration_failed')).toHaveCount(0);

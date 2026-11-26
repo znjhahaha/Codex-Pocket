@@ -16,6 +16,7 @@ test('same-version different-generation stays pending and control failure keeps 
  });
  await page.goto('/');
  await page.getByRole('button',{name:'查看详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  const panel=page.getByRole('region',{name:'安装与运行版本'});
  await expect(panel.getByText('当前安装已生效',{exact:true})).toHaveCount(1);
  await expect(panel.getByText('等待重启生效',{exact:true})).toHaveCount(1);
@@ -39,5 +40,6 @@ test('a newer installation can recheck an older waiting-restart operation',async
  });
  await page.goto('/');
  await page.getByRole('button',{name:'查看详情',exact:true}).click();
+ await page.getByText('诊断详情 · 运行环境与安装记录',{exact:true}).click();
  await expect(page.getByRole('button',{name:'检查安全交接',exact:true})).toBeEnabled();
 });
