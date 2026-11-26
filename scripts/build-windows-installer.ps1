@@ -5,6 +5,10 @@ param([Parameter(Mandatory)][string]$ReleaseDirectory,[Parameter(Mandatory)][str
 $ErrorActionPreference='Stop'
 if(!$LegacyNsis){
     if(!$VpkDll -or !$SetupExecutable){throw 'Velopack packaging requires -VpkDll and -SetupExecutable. Use -LegacyNsis only for an explicit legacy compatibility build.'}
+    if(!$UpdateOfferPath -or !$TrustedUpdatePublicKey){throw 'Velopack packaging requires a signed offer and independently pinned public key.'}
+    foreach($path in @($VpkDll,$SetupExecutable,$UpdateOfferPath)) {
+        if(!(Test-Path -LiteralPath $path -PathType Leaf)){throw 'Velopack packaging input is missing.'}
+    }
     & (Join-Path $PSScriptRoot 'build-windows-velopack.ps1') -ReleaseDirectory $ReleaseDirectory -OutputDirectory $OutputDirectory -VpkDll $VpkDll -SetupExecutable $SetupExecutable -UpdateOfferPath $UpdateOfferPath -TrustedUpdatePublicKey $TrustedUpdatePublicKey
     return
 }

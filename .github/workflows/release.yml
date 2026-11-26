@@ -53,7 +53,7 @@ jobs:
     needs: validate
     if: needs.validate.outputs.build == 'true'
     runs-on: windows-2022
-    timeout-minutes: 65
+    timeout-minutes: 120
     environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -68,6 +68,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '8.0.x'
+      - name: Cache Rust dependencies
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-cargo-${{ runner.os }}-1.93.1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-cargo-${{ runner.os }}-1.93.1-
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
         with:
           packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1'
@@ -78,6 +90,9 @@ jobs:
           rustup override set 1.93.1
           python -m pip install cryptography
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage reviewed on-demand phone bootstrap
+        shell: pwsh
+        run: python scripts/android-native/fetch_on_demand.py --output (Join-Path $env:RUNNER_TEMP 'phone-bootstrap') --abi arm64-v8a
       - name: Test, sign and package
         shell: pwsh
         env:
@@ -87,7 +102,7 @@ jobs:
           POCKET_UPDATE_PRIVATE_KEY_PEM: ${{ secrets.POCKET_UPDATE_PRIVATE_KEY_PEM }}
           POCKET_UPDATE_TRUST_JSON: ${{ vars.POCKET_UPDATE_TRUST_JSON }}
           POCKET_UPDATE_ASSET_BASE: https://github.com/${{ github.repository }}/releases/download/${{ needs.validate.outputs.tag }}
-        run: ./scripts/ci-release.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'pocket-release')
+        run: ./scripts/ci-release.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'pocket-release') -OnDeviceRuntime (Join-Path $env:RUNNER_TEMP 'phone-bootstrap') -OnDeviceAbis arm64-v8a
       - name: Preserve failed host test reports
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

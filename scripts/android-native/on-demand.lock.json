@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/znjhahaha/Codex-Pocket",
+  "tag": "v0.7.1-rc.20261125.55",
+  "abi": "arm64-v8a",
+  "apk": {
+    "name": "codex-pocket-0.7.1-rc.20261125.55-arm64.apk",
+    "url": "https://github.com/znjhahaha/Codex-Pocket/releases/download/v0.7.1-rc.20261125.55/codex-pocket-0.7.1-rc.20261125.55-arm64.apk",
+    "bytes": 79076715,
+    "sha256": "c0877aa45de58c850fe431b8dbca319ee142828209e8af7dc4cb254c9ff4741e"
+  },
+  "environment": {
+    "url": "https://github.com/znjhahaha/Codex-Pocket/releases/download/v0.7.1-rc.20261125.55/phone-environment-rc55-20261125-arm64-v8a.zip",
+    "revision": "rc55-20261125",
+    "rootfsRevision": "ubuntu-noble-20261125.2",
+    "archiveBytes": 312117221,
+    "archiveSha256": "d8fbeb1067645c11acd1042bc5890f3ce337e620559aab06e46a7eebc51649f6",
+    "nativeVersion": "0.7.1-rc.20261125.53"
+  },
+  "licenses": [
+    "BUILD-INPUTS.md",
+    "Codex-LICENSE.txt",
+    "Codex-SOURCE.txt",
+    "GPL-3.0.txt",
+    "Pocket-LICENSE.txt",
+    "libandroid-shmem-LICENSE.txt",
+    "libandroid-shmem-copyright.txt",
+    "proot-COPYING.txt",
+    "source-inputs.json",
+    "talloc-LICENSE.txt"
+  ]
+}

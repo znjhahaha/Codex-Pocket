@@ -32,14 +32,37 @@ function New-RuntimeFixture([string[]]$Abis = @('arm64-v8a', 'x86_64')) {
     }
     return $directory
 }
+function New-OnDemandFixture([string[]]$Abis = @('arm64-v8a')) {
+    $directory = Join-Path $script:fixtureRoot ('on demand ' + [guid]::NewGuid().ToString('N'))
+    foreach ($abi in $Abis) {
+        foreach ($name in @('libproot.so','libproot-loader.so','libtalloc.so','libandroid-shmem.so')) {
+            $path = Join-Path $directory "jniLibs/$abi/$name"
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+            $bytes = [byte[]]::new(20)
+            ([byte[]]@(127,69,76,70,2,1)).CopyTo($bytes,0)
+            $bytes[18] = if ($abi -eq 'arm64-v8a') { 183 } else { 62 }
+            [IO.File]::WriteAllBytes($path,$bytes)
+        }
+        Put (Join-Path $directory "assets/phone-linux/$abi/manifest.json") (@{
+            schema=1;abi=$abi;revision='rc55-original';archiveBytes=100;archiveSha256=('a'*64)
+        } | ConvertTo-Json -Compress)
+        Put (Join-Path $directory "assets/phone-linux/$abi/download.json") '{"schema":1,"url":"https://example.com/releases/download/rc55/original.zip"}'
+        Put (Join-Path $directory "assets/phone-linux/$abi/licenses/NOTICE.txt") 'original runtime notices'
+    }
+    return $directory
+}
 function New-ApkFixture([string]$Runtime, [string[]]$Abis = @('arm64-v8a', 'x86_64'),
-    [string]$Omit, [string]$Replace, [string]$Duplicate) {
+    [string]$Omit, [string]$Replace, [string]$Duplicate, [string]$Extra) {
     $path = Join-Path $script:fixtureRoot ([guid]::NewGuid().ToString('N') + '.apk')
     $zip = [IO.Compression.ZipFile]::Open($path, [IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($abi in $Abis) {
-            foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Runtime "jniLibs/$abi") -File) {
-                $entryName = "lib/$abi/$($file.Name)"
+            $files = @(Get-ChildItem -LiteralPath (Join-Path $Runtime "jniLibs/$abi") -File)
+            $metadata = Join-Path $Runtime "assets/phone-linux/$abi"
+            if (Test-Path -LiteralPath $metadata) { $files += @(Get-ChildItem -LiteralPath $metadata -Recurse -File) }
+            foreach ($file in $files) {
+                $relative = $file.FullName.Substring($Runtime.Length + 1).Replace('\','/')
+                $entryName = if ($relative.StartsWith('jniLibs/')) { 'lib/' + $relative.Substring(8) } else { $relative }
                 if ($entryName -eq $Omit) { continue }
                 $bytes = [IO.File]::ReadAllBytes($file.FullName)
                 if ($entryName -eq $Replace) { $bytes[0] = $bytes[0] -bxor 1 }
@@ -49,6 +72,10 @@ function New-ApkFixture([string]$Runtime, [string[]]$Abis = @('arm64-v8a', 'x86_
                     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
                 }
             }
+        }
+        if ($Extra) {
+            $stream = $zip.CreateEntry($Extra).Open()
+            try { $stream.WriteByte(1) } finally { $stream.Dispose() }
         }
     } finally { $zip.Dispose() }
     return $path
@@ -260,6 +287,54 @@ try {
         Put (Join-Path $runtime 'jniLibs/x86_64/libcodex-code-mode-host.so') 'synthetic helper'
         $apk = New-ApkFixture $runtime @('x86_64') -Omit 'lib/x86_64/libcodex-code-mode-host.so'
         Expect-ContentRejection { Invoke-ContentGate $apk $runtime @('x86_64') } 'libcodex-code-mode-host'
+    }
+    Test 'on-demand ARM64 bootstrap and metadata reach release packaging' {
+        $runtime = New-OnDemandFixture
+        Invoke-FixtureBuild (New-ApkFixture $runtime @('arm64-v8a')) @{OnDeviceRuntime=$runtime;OnDeviceAbis=@('arm64-v8a')}
+        Assert ($script:published -eq 1) 'On-demand staging was rejected.'
+        Assert ((Read-GradleArguments) -contains '-PpocketOnDeviceAbis=arm64-v8a') 'ARM64 selection was lost.'
+    }
+    foreach ($entry in @('lib/arm64-v8a/libproot.so','assets/phone-linux/arm64-v8a/manifest.json',
+        'assets/phone-linux/arm64-v8a/download.json','assets/phone-linux/arm64-v8a/licenses/NOTICE.txt')) {
+        Test "on-demand APK requires original $entry" {
+            $runtime = New-OnDemandFixture
+            $apk = New-ApkFixture $runtime @('arm64-v8a') -Omit $entry
+            Expect-ContentRejection { Invoke-ContentGate $apk $runtime @('arm64-v8a') } 'missing'
+            $apk = New-ApkFixture $runtime @('arm64-v8a') -Replace $entry
+            Expect-ContentRejection { Invoke-ContentGate $apk $runtime @('arm64-v8a') } 'differ'
+        }
+    }
+    Test 'on-demand APK rejects duplicate metadata' {
+        $runtime = New-OnDemandFixture
+        $apk = New-ApkFixture $runtime @('arm64-v8a') -Duplicate 'assets/phone-linux/arm64-v8a/download.json'
+        Expect-ContentRejection { Invoke-ContentGate $apk $runtime @('arm64-v8a') } 'duplicat'
+    }
+    foreach ($extra in @('assets/phone-linux/arm64-v8a/rootfs.zip','lib/arm64-v8a/libcodex.so',
+        'lib/arm64-v8a/libpocket-runtime-manifest.so','assets/phone-linux/x86_64/manifest.json',
+        'lib/x86_64/libproot.so')) {
+        Test "on-demand APK rejects unexpected $extra" {
+            $runtime = New-OnDemandFixture
+            $apk = New-ApkFixture $runtime @('arm64-v8a') -Extra $extra
+            Expect-ContentRejection { Invoke-ContentGate $apk $runtime @('arm64-v8a') } 'Unexpected|bundled|unselected'
+        }
+    }
+    Test 'on-demand staging requires complete bootstrap and matching metadata' {
+        foreach ($invalid in @('missing','abi','url','embedded','elf')) {
+            $runtime = New-OnDemandFixture
+            switch ($invalid) {
+                missing { Remove-Item -LiteralPath (Join-Path $runtime 'jniLibs/arm64-v8a/libtalloc.so') }
+                abi { Put (Join-Path $runtime 'assets/phone-linux/arm64-v8a/manifest.json') '{"schema":1,"abi":"x86_64"}' }
+                url { Put (Join-Path $runtime 'assets/phone-linux/arm64-v8a/download.json') '{"schema":1,"url":"http://example.com/unsafe.zip"}' }
+                embedded { Put (Join-Path $runtime 'assets/phone-linux/arm64-v8a/rootfs.zip') 'environment' }
+                elf { Put (Join-Path $runtime 'jniLibs/arm64-v8a/libproot.so') 'wrong architecture' }
+            }
+            Expect-ContentRejection { Get-PocketOnDeviceRuntime $runtime @('arm64-v8a') | Out-Null } 'bootstrap|metadata|missing|On-demand|ELF'
+        }
+    }
+    Test 'mixed bundled and on-demand staging is rejected' {
+        $runtime = New-OnDemandFixture @('arm64-v8a','x86_64')
+        Remove-Item -LiteralPath (Join-Path $runtime 'assets/phone-linux/x86_64/download.json')
+        Expect-ContentRejection { Get-PocketOnDeviceRuntime $runtime @('arm64-v8a','x86_64') | Out-Null } 'metadata|missing'
     }
 } finally {
     foreach ($name in $environment.Keys) { [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process') }

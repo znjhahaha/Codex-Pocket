@@ -120,6 +120,7 @@ function Get-PocketOnDeviceRuntime([string]$RuntimeDirectory,[string[]]$Abis) {
         return $null
     }
     if (-not (Test-Path -LiteralPath $RuntimeDirectory -PathType Container)) { throw "On-device runtime directory missing: $RuntimeDirectory" }
+    Assert-PocketPlainPath $RuntimeDirectory
     $directory = (Get-Item -LiteralPath $RuntimeDirectory).FullName
     $libraries = Join-Path $directory 'jniLibs'
     if (-not [IO.Directory]::Exists($libraries)) { throw 'On-device runtime has no jniLibs directory.' }
@@ -129,21 +130,76 @@ function Get-PocketOnDeviceRuntime([string]$RuntimeDirectory,[string[]]$Abis) {
         @(Get-ChildItem -LiteralPath $libraries -Directory | ForEach-Object { $_.Name })
     })
     if ($selected.Count -eq 0) { throw 'On-device runtime has no staged ABIs.' }
-    $required = @('libpocket-agent.so','libpocket-runtime-host.so','libpocket-runtime-manifest.so','libcodex.so')
-    $files = foreach ($abi in $selected) {
+    foreach ($abi in $selected) {
         if ($abi -cnotin @('arm64-v8a','x86_64')) { throw "Unsupported on-device runtime ABI: $abi" }
+    }
+    # Same mode selection as Gradle: if any selected ABI is on demand, all must be.
+    $onDemand = @($selected | Where-Object { [IO.File]::Exists((Join-Path $directory "assets/phone-linux/$_/download.json")) }).Count -gt 0
+    $bootstrap = @('libproot.so','libproot-loader.so','libtalloc.so','libandroid-shmem.so')
+    $downloaded = @('libpocket-agent.so','libpocket-runtime-host.so','libpocket-runtime-manifest.so','libcodex.so','libcodex-code-mode-host.so')
+    $required = if ($onDemand) { $bootstrap } else { $downloaded[0..3] }
+    $files = foreach ($abi in $selected) {
         $abiDirectory = Join-Path $libraries $abi
         foreach ($name in $required) {
             $path = Join-Path $abiDirectory $name
+            Assert-PocketPlainPath $path
             if (-not [IO.File]::Exists($path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
                 throw "On-device runtime staging missing or empty: $abi/$name"
             }
+            if ($onDemand) {
+                $stream = [IO.File]::OpenRead($path)
+                try {
+                    $head = [byte[]]::new(20)
+                    $count = $stream.Read($head,0,20)
+                } finally { $stream.Dispose() }
+                $machine = if ($abi -eq 'arm64-v8a') { 183 } else { 62 }
+                if ($count -ne 20 -or ($head[0..5] -join ',') -ne '127,69,76,70,2,1' -or
+                    [BitConverter]::ToUInt16($head,18) -ne $machine) { throw "On-demand bootstrap ELF ABI differs: $abi/$name" }
+            }
         }
         foreach ($file in Get-ChildItem -LiteralPath $abiDirectory -Filter '*.so' -File) {
+            Assert-PocketPlainPath $file.FullName
+            if ($onDemand -and $file.Name -cnotin $bootstrap) { throw "On-demand bootstrap contains bundled runtime or unexpected library: $abi/$($file.Name)" }
             [pscustomobject]@{Entry="lib/$abi/$($file.Name)";Path=$file.FullName;Length=$file.Length}
         }
+        $metadata = Join-Path $directory "assets/phone-linux/$abi"
+        if ($onDemand) {
+            foreach ($name in @('manifest.json','download.json')) {
+                $path = Join-Path $metadata $name
+                Assert-PocketPlainPath $path
+                if (-not [IO.File]::Exists($path)) { throw "On-demand metadata missing: $abi/$name" }
+            }
+            try {
+                $manifest = Get-Content -LiteralPath (Join-Path $metadata 'manifest.json') -Raw | ConvertFrom-Json
+                $download = Get-Content -LiteralPath (Join-Path $metadata 'download.json') -Raw | ConvertFrom-Json
+                $url = [uri]$download.url
+                if ($manifest.schema -ne 1 -or $manifest.abi -cne $abi -or
+                    $manifest.revision -cnotmatch '^[A-Za-z0-9._-]{1,96}$' -or
+                    $manifest.archiveSha256 -cnotmatch '^[a-f0-9]{64}$' -or $manifest.archiveBytes -le 0 -or
+                    $download.schema -ne 1 -or -not $url.IsAbsoluteUri -or $url.Scheme -ne 'https' -or
+                    -not $url.Host -or $url.UserInfo -or $url.Query -or $url.Fragment) { throw 'Invalid environment identity or download URL.' }
+            } catch { throw "On-demand metadata invalid for $abi`: $($_.Exception.Message)" }
+            $licenses = Join-Path $metadata 'licenses'
+            if (-not [IO.Directory]::Exists($licenses) -or @(Get-ChildItem -LiteralPath $licenses -Recurse -File).Count -eq 0) {
+                throw "On-demand metadata licenses missing: $abi"
+            }
+        }
+        # Bundled callers retain their existing entry point. When they supply assets,
+        # verify those too; only on-demand callers require the metadata contract above.
+        if ([IO.Directory]::Exists($metadata)) {
+            Assert-PocketPlainPath $metadata
+            foreach ($file in Get-ChildItem -LiteralPath $metadata -Recurse -File) {
+                Assert-PocketPlainPath $file.FullName
+                $relative = $file.FullName.Substring($metadata.Length + 1).Replace('\','/')
+                if ($onDemand -and ($file.Length -eq 0 -or
+                    ($relative -cnotin @('manifest.json','download.json') -and -not $relative.StartsWith('licenses/')))) {
+                    throw "On-demand metadata contains empty or unexpected bundled content: $abi/$relative"
+                }
+                [pscustomobject]@{Entry="assets/phone-linux/$abi/$relative";Path=$file.FullName;Length=$file.Length}
+            }
+        }
     }
-    return [pscustomobject]@{Directory=$directory;Abis=@($selected);Files=@($files)}
+    return [pscustomobject]@{Directory=$directory;Abis=@($selected);Files=@($files);OnDemand=$onDemand}
 }
 function Assert-PocketOnDeviceApk([string]$ApkPath,[string]$RuntimeDirectory,[string[]]$Abis) {
     $runtime = Get-PocketOnDeviceRuntime $RuntimeDirectory $Abis
@@ -151,6 +207,21 @@ function Assert-PocketOnDeviceApk([string]$ApkPath,[string]$RuntimeDirectory,[st
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($ApkPath)
     try {
+        if ($runtime.OnDemand) {
+            $expectedMetadata = @($runtime.Files | Where-Object { $_.Entry.StartsWith('assets/') } | ForEach-Object { $_.Entry })
+            foreach ($entry in $zip.Entries) {
+                if ($entry.FullName.EndsWith('/')) { continue }
+                if ($entry.FullName.StartsWith('assets/phone-linux/') -and $entry.FullName -cnotin $expectedMetadata) {
+                    throw "Unexpected APK on-demand metadata or bundled environment: $($entry.FullName)"
+                }
+                if ($entry.FullName -cmatch '^lib/([^/]+)/([^/]+)$') {
+                    if ($Matches[1] -cnotin $runtime.Abis) { throw "APK contains unselected runtime ABI: $($entry.FullName)" }
+                    if ($Matches[2] -cin @('libcodex.so','libcodex-code-mode-host.so','libpocket-agent.so','libpocket-runtime-host.so','libpocket-runtime-manifest.so')) {
+                        throw "APK on-demand runtime contains bundled downloaded ELF: $($entry.FullName)"
+                    }
+                }
+            }
+        }
         foreach ($file in $runtime.Files) {
             $entries = @($zip.Entries | Where-Object { $_.FullName -ceq $file.Entry })
             if ($entries.Count -ne 1) { throw "APK runtime entry missing or duplicated: $($file.Entry)" }

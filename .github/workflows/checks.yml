@@ -72,6 +72,15 @@ jobs:
           ./scripts/apk-signer-tests.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/build-release-runtime-tests.ps1
+      - name: Release packaging fixtures
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          ./scripts/ci-release-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/package-source-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/package-windows-release-tests.ps1
       - name: Preserve test reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -166,6 +175,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Release workflow routing tests
-        run: python -m unittest discover -s scripts -p test_release_state.py
+        run: |
+          python -m unittest discover -s scripts -p test_release_state.py
+          python -m unittest discover -s scripts/android-native -p test_fetch_on_demand.py
       - name: Build relay container
         run: docker build --file deploy/relay.Dockerfile --tag pocket-relay:check .

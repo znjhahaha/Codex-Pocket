@@ -11,6 +11,19 @@ To inspect an existing release with the current workflow, run **Release draft**
 from `main` and supply its version tag. A new or draft release still runs all
 packaging checks against the selected tag's source.
 
+The full draft includes the signed ARM64 APK, Windows installer and update package,
+source archive, and relay image archive. The Android package retains the on-demand
+phone environment: CI stages only the bootstrap, licenses and download metadata
+from the pinned RC55 APK. The metadata still points to the original RC55 environment
+assets; the environment's native binaries keep their actual version. Releasing the
+app does not rebuild or relabel those binaries.
+
+A green routing check for an already published version does not validate packaging.
+Full CD acceptance requires the `windows_android`, `relay`, and `draft` jobs to
+succeed for a new tag, followed by actual relay publication after the draft is
+published. The existing host checks run before signing and packaging; no phone or
+emulator is started by these workflows.
+
 **Publish approved relay** runs after publication. It publishes the versioned
 relay archive only when both `codex-pocket-<version>-relay-amd64.tar.gz` and
 `relay-SHA256SUMS.txt` are present and uploaded. A release without either asset

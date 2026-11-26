@@ -1,8 +1,11 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$OutputDirectory)
+param([Parameter(Mandatory)][string]$OutputDirectory,
+    [string]$OnDeviceRuntime,[string[]]$OnDeviceAbis)
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$OutputDirectory=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
+if ($OnDeviceRuntime) { $OnDeviceRuntime=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OnDeviceRuntime) }
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Release directory must not already exist.' }
 if (-not $env:POCKET_SIGNING_KEY_BASE64 -or -not $env:POCKET_SIGNING_PASSWORD -or $env:POCKET_EXPECTED_SIGNER -notmatch '^[A-Fa-f0-9]{64}$') {
     throw 'Configure the original Android signing key/password secrets and POCKET_EXPECTED_SIGNER repository variable. No replacement key will be created.'
@@ -44,7 +47,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Desktop runtime tests failed.' }
         & ./android/gradlew.bat -p android :wire:test :app:testDebugUnitTest :app:lintDebug --no-daemon
         if ($LASTEXITCODE -ne 0) { throw 'Android host checks failed.' }
-        & ./scripts/build-release.ps1 -SigningDirectory $signing -OutputDirectory $OutputDirectory -UpdateTrustPath (Join-Path $signing 'update-trust.json')
+        $buildArguments=@{SigningDirectory=$signing;OutputDirectory=$OutputDirectory;UpdateTrustPath=(Join-Path $signing 'update-trust.json')}
+        if ($PSBoundParameters.ContainsKey('OnDeviceRuntime')) { $buildArguments.OnDeviceRuntime=$OnDeviceRuntime }
+        if ($PSBoundParameters.ContainsKey('OnDeviceAbis')) { $buildArguments.OnDeviceAbis=$OnDeviceAbis }
+        & ./scripts/build-release.ps1 @buildArguments
         & cargo test --locked --manifest-path desktop/Cargo.toml -p pocket-desktop
         if ($LASTEXITCODE -ne 0) { throw 'Desktop native command checks failed.' }
         $manifest=Get-Content -LiteralPath (Join-Path $OutputDirectory 'release-manifest.json') -Raw | ConvertFrom-Json
