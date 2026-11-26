@@ -2138,7 +2138,9 @@ class PocketRepositoryTest {
     }
 
     @Test fun missingExplicitModelDoesNotBorrowDefaultNameOrCapabilities() = runBlocking<Unit> {
-        val chosen=repo.state.value.models.first()
+        // Native settings and the model catalog arrive independently after selection.
+        val chosen = await { it.modelCatalogState == ModelCatalogState.Ready &&
+            it.models.any { model -> model.model == "model" } }.models.first { it.model == "model" }
         repo.chooseModel(chosen,null)
         server.intercept={method,params,_->
             if(method=="codex/request"&&params.string("method")=="model/list") buildJsonObject {put("data",buildJsonArray{

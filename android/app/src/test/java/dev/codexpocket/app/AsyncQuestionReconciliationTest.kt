@@ -238,7 +238,7 @@ class AsyncQuestionReconciliationTest {
         assertTrue(repo.state.value.advanced.asyncQuestions.single().flag("submitted"))
         repo.answerAsyncBatch(listOf(pending to "Performance first")).join()
         assertEquals(1, link.writes.size)
-        link.receiptStatus = "rejected"
+        link.receipt = buildJsonObject { put("status", "rejected") }
         repo.checkCommands().join()
         assertFalse("A definitely rejected async command must release only its submission guard",
             repo.state.value.advanced.asyncQuestions.single().flag("submitted"))
@@ -250,8 +250,12 @@ class AsyncQuestionReconciliationTest {
         repo.editDraft("A separate unsent draft")
         link.unknownSend = true
         repo.answerAsyncBatch(listOf(repo.state.value.advanced.asyncQuestions.single() to "Performance first")).join()
-        link.receiptStatus = "accepted"
-        link.receiptResult = buildJsonObject { put("turn", turn(listOf(reply()), "answer-turn")) }
+        // Unknown outcomes trigger a background reconciliation too. Publish the complete
+        // response atomically so it cannot consume acceptance before the native answer exists.
+        link.receipt = buildJsonObject {
+            put("status", "accepted")
+            put("result", buildJsonObject { put("turn", turn(listOf(reply()), "answer-turn")) })
+        }
         repo.checkCommands().join()
         assertNoPending()
         assertEquals("A separate unsent draft", repo.state.value.draft?.text)
@@ -291,8 +295,7 @@ class AsyncQuestionReconciliationTest {
         @Volatile var items = listOf(question)
         @Volatile var sendResult: JsonObject = buildJsonObject { put("turn", turn(emptyList())) }
         @Volatile var unknownSend = false
-        @Volatile var receiptStatus = "unknown"
-        @Volatile var receiptResult: JsonObject? = null
+        @Volatile var receipt = buildJsonObject { put("status", "unknown") }
         var onSend: suspend () -> Unit = {}
         val writes = CopyOnWriteArrayList<String>()
         override suspend fun connect(config: ConnectionConfig) = Unit
@@ -304,9 +307,7 @@ class AsyncQuestionReconciliationTest {
                     put("thread", buildJsonObject { put("id", params.string("threadId")) })
                     put("data", buildJsonArray { add(turn(items)) }); put("nextCursor", JsonNull); put("historyEpoch", "fixture")
                 }
-                "commands/status" -> buildJsonObject {
-                    put("status", receiptStatus); receiptResult?.let { put("result", it) }
-                }
+                "commands/status" -> receipt
                 "codex/request" -> {
                     check(params.string("method") in setOf("turn/start", "turn/steer"))
                     check(commandId != null)

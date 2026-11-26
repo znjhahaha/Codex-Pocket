@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import dev.codexpocket.app.data.*
+import dev.codexpocket.app.ui.fastUnavailableReason
 import dev.codexpocket.app.ui.stateLabel
 import dev.codexpocket.wire.*
 import java.io.File
@@ -209,7 +210,8 @@ class V053PlanRepositoryTest {
     }
 
     @Test fun fastPendingDisablesDuplicatesAndFailureRetainsState() = runBlocking<Unit> {
-        await { !it.busy && !it.sendBusy }
+        // An idle selection may still be waiting for the model's Fast capability.
+        await { it.modelCatalogState == ModelCatalogState.Ready && fastUnavailableReason(it) == null }
         val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
         server.intercept = { method, params, _ ->
             if (method == "codex/request" && params.string("method") == "thread/settings/update") {
@@ -217,8 +219,8 @@ class V053PlanRepositoryTest {
             }; null
         }
         val first = repo.setFastMode(true)
-        withTimeout(5000) { entered.await() }
         try {
+            withTimeout(5000) { entered.await() }
             assertTrue(key in repo.state.value.fastPending)
             repo.setFastMode(true).join()
             assertEquals(1, server.calls.count { it.nativeMethod == "thread/settings/update" })
